@@ -2,9 +2,11 @@ package task
 
 import (
 	"encoding/json"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"testing"
 	"time"
@@ -24,11 +26,22 @@ func setup(t *testing.T, cmd ...string) (Config, *s3fake.Server) {
 		Timeout:      10 * time.Second,
 		Reput:        time.Hour,
 		UploadBudget: 5 * time.Second,
+		KillAfter:    time.Second,
 		Grace:        2 * time.Second,
 		MultipartMin: 1 << 20,
 		TermLog:      filepath.Join(dir, "termination-log"),
 		Cmd:          cmd,
 	}, s
+}
+
+// runSignalled runs the task and delivers SIGTERM after delay on a test-owned channel.
+func runSignalled(cfg Config, delay time.Duration) int {
+	sigs := make(chan os.Signal, 1)
+	go func() {
+		time.Sleep(delay)
+		sigs <- syscall.SIGTERM
+	}()
+	return run(cfg, sigs)
 }
 
 func termMsg(t *testing.T, cfg Config) termMessage {
@@ -119,12 +132,8 @@ func TestTimeoutKeepsPartialOutput(t *testing.T) {
 
 func TestSIGTERMStopsTaskAndFlushes(t *testing.T) {
 	cfg, s := setup(t, "sh", "-c", "echo started; sleep 30")
-	go func() {
-		time.Sleep(500 * time.Millisecond)
-		syscall.Kill(os.Getpid(), syscall.SIGTERM)
-	}()
 	start := time.Now()
-	Run(cfg)
+	runSignalled(cfg, 500*time.Millisecond)
 	if time.Since(start) > 5*time.Second {
 		t.Fatal("task not stopped")
 	}
@@ -139,12 +148,8 @@ func TestSIGTERMStopsTaskAndFlushes(t *testing.T) {
 
 func TestSIGTERMReachesGrandchildren(t *testing.T) {
 	cfg, _ := setup(t, "sh", "-c", "sleep 30 & wait")
-	go func() {
-		time.Sleep(300 * time.Millisecond)
-		syscall.Kill(os.Getpid(), syscall.SIGTERM)
-	}()
 	start := time.Now()
-	Run(cfg)
+	runSignalled(cfg, 300*time.Millisecond)
 	if time.Since(start) > 5*time.Second {
 		t.Fatal("process group not stopped")
 	}
@@ -166,17 +171,34 @@ func TestCollectAndHeartbeat(t *testing.T) {
 }
 
 func TestOOMKilledMessage(t *testing.T) {
-	code, msg := exitStatus(nil, Result{OOMKills: 0}, time.Second)
-	if code != 0 || msg != "" {
-		t.Fatal(code, msg)
-	}
 	cmd := killedProcessErr(t)
-	if code, msg := exitStatus(cmd, Result{OOMKills: 1}, time.Second); code != 137 || msg != "OOMKilled" {
-		t.Fatalf("got %d %q", code, msg)
+	for _, c := range []struct {
+		name     string
+		err      error
+		res      Result
+		wantCode int
+		wantMsg  string
+	}{
+		{"success", nil, Result{}, 0, ""},
+		{"killed, no oom kill", cmd, Result{}, 137, ""},
+		{"killed, oom kill", cmd, Result{OOMKills: 1}, 137, "OOMKilled"},
+		{"oom kill below the direct child", &exec.ExitError{ProcessState: exitedWith(t, 1)}, Result{OOMKills: 2}, 137, "OOMKilled"},
+		{"oom kill, child exited 0", nil, Result{OOMKills: 1}, 0, ""},
+	} {
+		code, msg := exitStatus(c.err, c.res, time.Second)
+		if code != c.wantCode || msg != c.wantMsg {
+			t.Errorf("%s: got %d %q, want %d %q", c.name, code, msg, c.wantCode, c.wantMsg)
+		}
 	}
-	if code, msg := exitStatus(cmd, Result{}, time.Second); code != 137 || msg != "" {
-		t.Fatalf("got %d %q", code, msg)
+}
+
+func exitedWith(t *testing.T, code int) *os.ProcessState {
+	cmd := exec.Command("sh", "-c", "exit 1")
+	cmd.Run()
+	if cmd.ProcessState == nil || cmd.ProcessState.ExitCode() != code {
+		t.Fatal("cannot build a process state")
 	}
+	return cmd.ProcessState
 }
 
 // killedProcessErr returns the Wait error of a process that died from SIGKILL.
@@ -187,4 +209,141 @@ func killedProcessErr(t *testing.T) error {
 	}
 	cmd.Process.Kill()
 	return cmd.Wait()
+}
+
+// The oom_kill counter comes from the container's own cgroup (/proc/self/cgroup),
+// not from the root of /sys/fs/cgroup.
+func TestOOMKillsReadsOwnCgroup(t *testing.T) {
+	dir := t.TempDir()
+	cg := filepath.Join(dir, "kubepods", "pod1", "ctr")
+	os.MkdirAll(cg, 0o755)
+	os.WriteFile(filepath.Join(cg, "memory.events"), []byte("low 0\nmax 3\noom 2\noom_kill 2\n"), 0o644)
+	os.WriteFile(filepath.Join(dir, "memory.events"), []byte("oom_kill 99\n"), 0o644)
+	self := filepath.Join(dir, "cgroup")
+	os.WriteFile(self, []byte("0::/kubepods/pod1/ctr\n"), 0o644)
+	oldRoot, oldSelf := cgroupRoot, selfCgroup
+	cgroupRoot, selfCgroup = dir, self
+	defer func() { cgroupRoot, selfCgroup = oldRoot, oldSelf }()
+	if n := oomKills(); n != 2 {
+		t.Fatalf("oomKills = %d, want 2", n)
+	}
+}
+
+func TestProtectFromOOMWritesCgroupAndScore(t *testing.T) {
+	dir := t.TempDir()
+	os.WriteFile(filepath.Join(dir, "cgroup"), []byte("0::/\n"), 0o644)
+	oldRoot, oldSelf, oldAdj := cgroupRoot, selfCgroup, selfOOMAdj
+	cgroupRoot, selfCgroup, selfOOMAdj = dir, filepath.Join(dir, "cgroup"), filepath.Join(dir, "adj")
+	defer func() { cgroupRoot, selfCgroup, selfOOMAdj = oldRoot, oldSelf, oldAdj }()
+	protectFromOOM()
+	if b, _ := os.ReadFile(filepath.Join(dir, "memory.oom.group")); string(b) != "0" {
+		t.Fatalf("memory.oom.group = %q", b)
+	}
+	if b, _ := os.ReadFile(filepath.Join(dir, "adj")); string(b) != "-1000" {
+		t.Fatalf("oom_score_adj = %q", b)
+	}
+}
+
+// A background process that keeps the output files open must not turn a
+// successful task into a harness error.
+func TestBackgroundGrandchildDoesNotFailTask(t *testing.T) {
+	cfg, _ := setup(t, "sh", "-c", "echo hi; (sleep 20 &); exit 0")
+	start := time.Now()
+	Run(cfg)
+	if time.Since(start) > 4*time.Second {
+		t.Fatalf("Run took %s", time.Since(start))
+	}
+	if tm := termMsg(t, cfg); tm.ExitCode != 0 || tm.ErrorMsg != "" {
+		t.Fatalf("termination message = %+v", tm)
+	}
+}
+
+func TestSIGTERMDuringVersionCommandStopsAtOnce(t *testing.T) {
+	cfg, _ := setup(t, "sh", "-c", "touch "+filepath.Join(t.TempDir(), "ran"))
+	cfg.VersionCmd = "sleep 30"
+	start := time.Now()
+	runSignalled(cfg, 200*time.Millisecond)
+	if time.Since(start) > 4*time.Second {
+		t.Fatalf("version command not interrupted: %s", time.Since(start))
+	}
+	if tm := termMsg(t, cfg); !tm.Cancelled {
+		t.Fatalf("termination message = %+v", tm)
+	}
+	if _, err := os.Stat(filepath.Join(cfg.Spool, "stdout")); err == nil {
+		t.Fatal("the task was started after SIGTERM")
+	}
+}
+
+// SIGTERM after the task ended, while the final upload keeps failing: the
+// shutdown deadline counts from the signal, not from UploadBudget.
+func TestSIGTERMDuringFinalUploadEndsWithinGrace(t *testing.T) {
+	cfg, s := setup(t, "sh", "-c", "echo x")
+	s.Fail = func(*http.Request) int { return http.StatusInternalServerError }
+	cfg.UploadBudget = time.Minute
+	cfg.Grace = 800 * time.Millisecond
+	start := time.Now()
+	runSignalled(cfg, 300*time.Millisecond)
+	if d := time.Since(start); d > 5*time.Second {
+		t.Fatalf("Run took %s", d)
+	}
+	tm := termMsg(t, cfg)
+	if tm.UploadComplete {
+		t.Fatalf("termination message = %+v", tm)
+	}
+	if _, err := os.Stat(filepath.Join(cfg.Spool, "manifest.json")); err != nil {
+		t.Fatal("manifest.json not written locally")
+	}
+}
+
+func TestStaleSpoolFromEarlierAttemptIsRemoved(t *testing.T) {
+	cfg, s := setup(t, "sh", "-c", "echo new")
+	os.MkdirAll(cfg.Spool, 0o755)
+	os.WriteFile(filepath.Join(cfg.Spool, ".uploaded.json"), []byte(`{"stdout":{"mode":"put","size":4}}`), 0o644)
+	os.WriteFile(filepath.Join(cfg.Spool, "extra.txt"), []byte("old run"), 0o644)
+	Run(cfg)
+	var m struct {
+		Objects map[string]struct{ Size int64 }
+	}
+	b, _ := s.Object("t1", "manifest.json")
+	json.Unmarshal(b, &m)
+	if _, ok := m.Objects["extra.txt"]; ok {
+		t.Fatalf("stale file in manifest: %s", b)
+	}
+	if b, _ := s.Object("t1", "stdout"); string(b) != "new\n" {
+		t.Fatalf("stdout = %q", b)
+	}
+}
+
+// A large collected file goes through UploadPart and is listed as multipart.
+func TestLargeCollectedFileUsesMultipart(t *testing.T) {
+	cfg, s := setup(t, "sh", "-c", "true")
+	cfg.URLs = s.URLs(t, t.TempDir(), "t1", files, map[string]int{"extra.txt": 4}, 1<<20)
+	src := filepath.Join(t.TempDir(), "big")
+	os.WriteFile(src, make([]byte, 2<<20+512<<10), 0o644) // 2.5 MiB: 3 parts
+	cfg.Collect = []string{src + ":extra.txt"}
+	Run(cfg)
+	b, _ := s.Object("t1", "manifest.json")
+	var m struct {
+		Complete bool
+		Objects  map[string]struct {
+			Method string
+			Parts  []struct{ N int }
+		}
+	}
+	if err := json.Unmarshal(b, &m); err != nil {
+		t.Fatal(err)
+	}
+	if o := m.Objects["extra.txt"]; !m.Complete || o.Method != "multipart" || len(o.Parts) != 3 {
+		t.Fatalf("manifest = %s", b)
+	}
+}
+
+func TestTermMessageStaysWithinLimit(t *testing.T) {
+	cfg, _ := setup(t, "true")
+	m := termMessage{Result: Result{Task: "t1", ExitCode: 3, Version: strings.Repeat("v", 20000), ErrorMsg: "boom"}}
+	writeTermMessage(cfg.TermLog, m)
+	got := termMsg(t, cfg)
+	if got.ExitCode != 3 || got.ErrorMsg != "boom" || got.Version == "" {
+		t.Fatalf("termination message = %+v", got)
+	}
 }

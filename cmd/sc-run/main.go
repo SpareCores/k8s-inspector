@@ -77,8 +77,9 @@ func runExec(args []string) int {
 	fs.Var(&collect, "collect", "extra file to upload, src:name (repeatable)")
 	fs.DurationVar(&cfg.Reput, "reput", 60*time.Second, "interval of re-uploading growing files")
 	fs.DurationVar(&cfg.UploadBudget, "upload-budget", 10*time.Minute, "final upload budget")
-	fs.DurationVar(&cfg.Grace, "grace", 45*time.Second, "final upload budget after SIGTERM")
-	mib := fs.Int64("multipart-mib", 32, "files above this size use UploadPart URLs")
+	fs.DurationVar(&cfg.KillAfter, "kill-after", 5*time.Second, "SIGTERM to SIGKILL for the task")
+	fs.DurationVar(&cfg.Grace, "grace", 15*time.Second, "whole shutdown after SIGTERM (task, upload, manifest); below terminationGracePeriodSeconds")
+	mib := fs.Int64("multipart-mib", 32, "files above this size use UploadPart URLs (parts are at least 5 MiB)")
 	fs.StringVar(&cfg.TermLog, "termination-log", "/dev/termination-log", "termination message path")
 	check(fs.Parse(args))
 	cfg.Collect = collect
@@ -103,7 +104,9 @@ func runFlush(args []string) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), *budget)
 	defer cancel()
-	m, err := upload.New(*taskName, *spool, *urls, *mib<<20).Finalize(ctx)
+	mctx, mcancel := context.WithTimeout(context.Background(), time.Minute)
+	defer mcancel()
+	m, err := upload.New(*taskName, *spool, *urls, *mib<<20).Finalize(ctx, mctx)
 	check(err)
 	if !m.Complete {
 		fatalf("flush: %d file(s) still missing: %s", len(m.Missing), strings.Join(m.Missing, ", "))

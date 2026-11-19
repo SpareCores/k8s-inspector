@@ -5,6 +5,7 @@
 package upload
 
 import (
+	"bytes"
 	"context"
 	"crypto/md5"
 	"encoding/hex"
@@ -12,6 +13,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"log"
 	"net/http"
 	"os"
@@ -29,8 +31,8 @@ const (
 	manifestFile = "manifest.json"
 )
 
-// Uploader syncs one task's spool directory. Methods are safe to call from
-// one goroutine at a time; a mutex guards the periodic and the final upload.
+// Uploader syncs one task's spool directory. A mutex serialises the periodic
+// and the final upload.
 type Uploader struct {
 	Task               string
 	Spool              string
@@ -84,6 +86,12 @@ type Manifest struct {
 	Missing  []string          `json:"missing,omitempty"`
 }
 
+// errPermanent marks failures that retrying cannot fix (no URL entry, a bad
+// urls.json, a 4xx answer other than an expired or throttled request).
+var errPermanent = errors.New("permanent")
+
+func permanent(err error) error { return fmt.Errorf("%w: %w", errPermanent, err) }
+
 // New returns an Uploader with the default timeouts and retry delays.
 func New(task, spool, urlsPath string, threshold int64) *Uploader {
 	return &Uploader{
@@ -99,7 +107,8 @@ func New(task, spool, urlsPath string, threshold int64) *Uploader {
 
 // Sync uploads every spool file whose content is not confirmed yet. Each
 // request is tried up to attempts times (0 = until ctx ends). It returns the
-// names of the files that still failed.
+// names of the files that failed and may succeed on a later pass. Permanent
+// failures are logged and left to the manifest's missing list.
 func (u *Uploader) Sync(ctx context.Context, attempts int) []string {
 	u.mu.Lock()
 	defer u.mu.Unlock()
@@ -115,22 +124,26 @@ func (u *Uploader) Sync(ctx context.Context, attempts int) []string {
 	for _, name := range names {
 		if err := u.syncFile(ctx, name, attempts); err != nil {
 			log.Printf("upload %s: %v", name, err)
-			failed = append(failed, name)
+			if !errors.Is(err, errPermanent) {
+				failed = append(failed, name)
+			}
 		}
 	}
 	return failed
 }
 
 // Finalize uploads everything, retrying whole passes with backoff until all
-// files are confirmed or ctx ends, then writes and uploads manifest.json.
-func (u *Uploader) Finalize(ctx context.Context) (Manifest, error) {
+// retryable files are confirmed or syncCtx ends, then writes and uploads
+// manifest.json under manifestCtx. The caller ends syncCtx earlier than
+// manifestCtx, so a spent upload budget still leaves time for the manifest.
+func (u *Uploader) Finalize(syncCtx, manifestCtx context.Context) (Manifest, error) {
 	delay := u.Backoff
 	for {
-		failed := u.Sync(ctx, 3)
-		if len(failed) == 0 || ctx.Err() != nil {
+		failed := u.Sync(syncCtx, 3)
+		if len(failed) == 0 || syncCtx.Err() != nil {
 			break
 		}
-		if !sleep(ctx, delay) {
+		if !sleep(syncCtx, delay) {
 			break
 		}
 		delay = min(delay*2, u.MaxBackoff)
@@ -139,13 +152,9 @@ func (u *Uploader) Finalize(ctx context.Context) (Manifest, error) {
 	if err != nil {
 		return m, err
 	}
-	// The manifest may only go up with a fresh context: a spent budget must
-	// not stop the one object that says "finished".
-	mctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), time.Minute)
-	defer cancel()
 	u.mu.Lock()
 	defer u.mu.Unlock()
-	err = u.retry(mctx, 5, func() error { return u.putFile(mctx, manifestFile) })
+	err = u.retry(manifestCtx, 5, func() error { return u.putFile(manifestCtx, manifestFile) })
 	return m, err
 }
 
@@ -192,7 +201,7 @@ func (u *Uploader) putFile(ctx context.Context, name string) error {
 		return err
 	}
 	if entry.Put == "" {
-		return fmt.Errorf("no PUT URL for %s/%s", u.Task, name)
+		return permanent(fmt.Errorf("no PUT URL for %s/%s", u.Task, name))
 	}
 	f, err := os.Open(filepath.Join(u.Spool, name))
 	if err != nil {
@@ -228,13 +237,14 @@ func (u *Uploader) syncMultipart(ctx context.Context, name string, size int64, a
 		return err
 	}
 	st := u.state[name]
-	if st.Mode != "multipart" || st.UploadID != entry.UploadID {
+	if st.Mode != "multipart" || st.UploadID != entry.UploadID || st.PartSize != entry.PartSize {
 		st = fileState{Mode: "multipart", UploadID: entry.UploadID, PartSize: entry.PartSize}
 	}
 	n := int((size + entry.PartSize - 1) / entry.PartSize)
 	if n > len(entry.Parts) {
 		return fmt.Errorf("%s needs %d parts, URLs cover %d", name, n, len(entry.Parts))
 	}
+	st.Parts = st.Parts[:min(len(st.Parts), n)]
 	f, err := os.Open(filepath.Join(u.Spool, name))
 	if err != nil {
 		return err
@@ -243,7 +253,7 @@ func (u *Uploader) syncMultipart(ctx context.Context, name string, size int64, a
 	for i := 0; i < n; i++ {
 		off := int64(i) * entry.PartSize
 		partLen := min(entry.PartSize, size-off)
-		if len(st.Parts) > i && st.Parts[i].Size == partLen {
+		if len(st.Parts) > i && st.Parts[i].N == i+1 && st.Parts[i].Size == partLen {
 			continue
 		}
 		var etag string
@@ -256,6 +266,9 @@ func (u *Uploader) syncMultipart(ctx context.Context, name string, size int64, a
 				return fmt.Errorf("part %d: upload changed in urls.json", i+1)
 			}
 			etag, err = u.send(ctx, e.Parts[i], io.NewSectionReader(f, off, partLen), partLen)
+			if err == nil && etag == "" {
+				err = fmt.Errorf("part %d: response has no ETag", i+1)
+			}
 			return err
 		})
 		if err != nil {
@@ -292,20 +305,38 @@ func (u *Uploader) send(ctx context.Context, url string, body io.Reader, size in
 	defer resp.Body.Close()
 	msg, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
 	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("PUT: %s: %s", resp.Status, strings.TrimSpace(string(msg)))
+		err := fmt.Errorf("PUT: %s: %s", resp.Status, strings.TrimSpace(string(msg)))
+		if permanentStatus(resp.StatusCode, msg) {
+			return "", permanent(err)
+		}
+		return "", err
 	}
 	return strings.Trim(resp.Header.Get("ETag"), `"`), nil
+}
+
+// permanentStatus reports whether a 4xx answer will not change on a retry.
+// 403 (expired URL, may be re-signed), 408 and 429 are transient, and so is
+// S3's 400 ExpiredToken.
+func permanentStatus(code int, body []byte) bool {
+	switch code {
+	case http.StatusForbidden, http.StatusRequestTimeout, http.StatusTooManyRequests:
+		return false
+	}
+	return code >= 400 && code < 500 && !bytes.Contains(body, []byte("ExpiredToken"))
 }
 
 // entry re-reads urls.json, so URLs re-signed during a step are picked up.
 func (u *Uploader) entry(name string) (urls.Entry, error) {
 	f, err := urls.Load(u.URLs)
+	if errors.Is(err, fs.ErrNotExist) {
+		return urls.Entry{}, err // the Secret mount may be mid-refresh: retry
+	}
 	if err != nil {
-		return urls.Entry{}, err
+		return urls.Entry{}, permanent(err)
 	}
 	e, ok := f.Lookup(u.Task, name)
 	if !ok {
-		return e, fmt.Errorf("no URL for %s/%s", u.Task, name)
+		return e, permanent(fmt.Errorf("no URL for %s/%s", u.Task, name))
 	}
 	return e, nil
 }
@@ -314,8 +345,8 @@ func (u *Uploader) retry(ctx context.Context, attempts int, op func() error) err
 	delay := u.Backoff
 	for i := 1; ; i++ {
 		err := op()
-		if err == nil {
-			return nil
+		if err == nil || errors.Is(err, errPermanent) {
+			return err
 		}
 		if ctx.Err() != nil {
 			return errors.Join(err, ctx.Err())
@@ -360,7 +391,7 @@ func (u *Uploader) writeManifest() (Manifest, error) {
 			return m, err
 		}
 		st, ok := u.state[name]
-		if !ok || st.Size != info.Size() {
+		if !ok || st.Size != info.Size() || (st.Mode == "put" && st.MtimeNS != info.ModTime().UnixNano()) {
 			m.Missing = append(m.Missing, name)
 			continue
 		}

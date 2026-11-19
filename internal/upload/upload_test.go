@@ -2,7 +2,9 @@ package upload
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -11,6 +13,7 @@ import (
 	"time"
 
 	"github.com/sparecores/k8s-inspector/internal/s3fake"
+	"github.com/sparecores/k8s-inspector/internal/urls"
 )
 
 var standard = []string{"stdout", "stderr", "version", "result.json", "manifest.json"}
@@ -88,7 +91,7 @@ func TestMultipartUploadsPartsAndReplacesGrownTail(t *testing.T) {
 		t.Fatalf("part 4 = %q", b)
 	}
 
-	m, err := u.Finalize(context.Background())
+	m, err := u.Finalize(context.Background(), context.Background())
 	if err != nil || !m.Complete {
 		t.Fatalf("finalize: %v %+v", err, m)
 	}
@@ -167,9 +170,14 @@ func TestFinalizeListsMissingAndFlushRecovers(t *testing.T) {
 	write(t, filepath.Join(spool, "stdout"), "x")
 	write(t, filepath.Join(spool, "extra.log"), "no url for this one")
 
-	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	// A file without a URL entry is permanent: Finalize must not retry it until the budget ends.
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	m, err := u.Finalize(ctx)
+	start := time.Now()
+	m, err := u.Finalize(ctx, ctx)
+	if time.Since(start) > 3*time.Second {
+		t.Fatalf("finalize retried a permanent failure for %s", time.Since(start))
+	}
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -184,11 +192,99 @@ func TestFinalizeListsMissingAndFlushRecovers(t *testing.T) {
 	s.Requests = 0
 	u2 := New("t1", spool, s.URLs(t, t.TempDir(), "t1", append(standard, "extra.log"), nil, 0), 16)
 	u2.Backoff = time.Millisecond
-	m, err = u2.Finalize(context.Background())
+	m, err = u2.Finalize(context.Background(), context.Background())
 	if err != nil || !m.Complete {
 		t.Fatalf("flush: %v %+v", err, m)
 	}
 	if s.Requests != 2 { // extra.log and the manifest only; stdout was confirmed before
 		t.Fatalf("flush made %d requests, want 2", s.Requests)
+	}
+}
+
+func TestClientErrorsAreNotRetriedExceptTransientOnes(t *testing.T) {
+	for code, wantRequests := range map[int]int{
+		http.StatusBadRequest:      1,
+		http.StatusNotFound:        1,
+		http.StatusForbidden:       3, // expired URL: may be re-signed
+		http.StatusTooManyRequests: 3,
+	} {
+		s := s3fake.New(t)
+		s.Fail = func(*http.Request) int { return code }
+		u, spool := newUploader(t, s, nil, 0)
+		write(t, filepath.Join(spool, "stdout"), "x")
+		u.Sync(context.Background(), 3)
+		if s.Requests != wantRequests {
+			t.Errorf("status %d: %d requests, want %d", code, s.Requests, wantRequests)
+		}
+	}
+}
+
+// A part size change under the same upload id must not reuse the old parts.
+func TestMultipartPartSizeChangeResetsState(t *testing.T) {
+	s := s3fake.New(t)
+	u, spool := newUploader(t, s, map[string]int{"big": 8}, 8)
+	write(t, filepath.Join(spool, "big"), "aaaaaaaabbbbbbbbcccc") // 3 parts of 8
+	if failed := u.Sync(context.Background(), 1); len(failed) != 0 {
+		t.Fatalf("failed: %v", failed)
+	}
+
+	dir := t.TempDir()
+	u.URLs = s.URLs(t, dir, "t1", standard, map[string]int{"big": 8}, 16) // same upload id U1, parts of 16
+	s.Requests = 0
+	if failed := u.Sync(context.Background(), 1); len(failed) != 0 {
+		t.Fatalf("failed: %v", failed)
+	}
+	if s.Requests != 2 {
+		t.Fatalf("part size change: %d part uploads, want 2", s.Requests)
+	}
+	m, err := u.Finalize(context.Background(), context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if o := m.Objects["big"]; len(o.Parts) != 2 || o.PartSize != 16 {
+		t.Fatalf("manifest object = %+v", o)
+	}
+}
+
+// A file rewritten with the same size whose upload failed must not be listed as uploaded.
+func TestManifestListsRewrittenSameSizeFileAsMissing(t *testing.T) {
+	s := s3fake.New(t)
+	u, spool := newUploader(t, s, nil, 0)
+	path := filepath.Join(spool, "stdout")
+	write(t, path, "aaaa")
+	u.Sync(context.Background(), 1)
+	write(t, path, "bbbb")
+	later := time.Now().Add(time.Hour)
+	if err := os.Chtimes(path, later, later); err != nil {
+		t.Fatal(err)
+	}
+	m, err := u.writeManifest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m.Complete || len(m.Missing) != 1 || m.Missing[0] != "stdout" {
+		t.Fatalf("manifest = %+v", m)
+	}
+}
+
+func TestPartWithoutETagIsRejected(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {})) // 200, no ETag
+	defer srv.Close()
+	dir := t.TempDir()
+	spool := filepath.Join(dir, "spool")
+	os.Mkdir(spool, 0o755)
+	f := urls.File{Version: 1, Objects: map[string]urls.Entry{
+		"t1/big": {UploadID: "U1", PartSize: 8, Parts: []string{srv.URL + "/p1", srv.URL + "/p2"}},
+	}}
+	data, _ := json.Marshal(f)
+	write(t, filepath.Join(dir, "urls.json"), string(data))
+	u := New("t1", spool, filepath.Join(dir, "urls.json"), 4)
+	u.Backoff = time.Millisecond
+	write(t, filepath.Join(spool, "big"), "0123456789")
+	if failed := u.Sync(context.Background(), 2); len(failed) != 1 {
+		t.Fatalf("failed = %v", failed)
+	}
+	if st := u.state["big"]; len(st.Parts) != 0 {
+		t.Fatalf("empty ETag recorded: %+v", st.Parts)
 	}
 }

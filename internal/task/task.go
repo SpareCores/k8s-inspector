@@ -6,12 +6,12 @@ package task
 
 import (
 	"bufio"
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"log"
 	"os"
 	"os/exec"
@@ -21,6 +21,7 @@ import (
 	"strings"
 	"syscall"
 	"time"
+	"unicode/utf8"
 
 	"github.com/sparecores/k8s-inspector/internal/heartbeat"
 	"github.com/sparecores/k8s-inspector/internal/upload"
@@ -33,10 +34,17 @@ const (
 )
 
 const (
-	killAfter       = 10 * time.Second // SIGTERM to SIGKILL for the task
 	versionTimeout  = 60 * time.Second
 	heartbeatPeriod = 10 * time.Second
 	maxTermMessage  = 4096
+	maxTermText     = 256 // cap of version and error text in the termination message once it is too big
+)
+
+// cgroup v2 and procfs locations; variables so tests can point them at a temp dir.
+var (
+	cgroupRoot = "/sys/fs/cgroup"
+	selfCgroup = "/proc/self/cgroup"
+	selfOOMAdj = "/proc/self/oom_score_adj"
 )
 
 // Config describes one task invocation.
@@ -50,11 +58,14 @@ type Config struct {
 	Collect      []string // "src:name": copy src into the spool as name after the task
 	Reput        time.Duration
 	UploadBudget time.Duration // final upload budget after the task ends
-	Grace        time.Duration // final upload budget after SIGTERM
+	KillAfter    time.Duration // SIGTERM to SIGKILL for the task
+	// Grace is the whole shutdown, counted from the first SIGTERM: stopping the
+	// task, the final upload and the manifest. Keep it below the Pod's
+	// terminationGracePeriodSeconds. The last quarter is reserved for the manifest.
+	Grace        time.Duration
 	MultipartMin int64
 	TermLog      string // termination message path
 	Cmd          []string
-	Uploader     *upload.Uploader // optional, for tests
 }
 
 // Result is result.json and, with Upload, the termination message.
@@ -84,15 +95,40 @@ func Run(cfg Config) int {
 	sigs := make(chan os.Signal, 1)
 	signal.Notify(sigs, syscall.SIGTERM, syscall.SIGINT)
 	defer signal.Stop(sigs)
+	return run(cfg, sigs)
+}
 
+func run(cfg Config, sigs <-chan os.Signal) int {
 	if err := os.MkdirAll(cfg.Spool, 0o755); err != nil {
 		log.Printf("spool: %v", err)
 		return 1
 	}
-	up := cfg.Uploader
-	if up == nil {
-		up = upload.New(cfg.Task, cfg.Spool, cfg.URLs, cfg.MultipartMin)
+	if err := cleanSpool(cfg.Spool); err != nil {
+		log.Printf("spool: %v", err)
+		return 1
 	}
+	up := upload.New(cfg.Task, cfg.Spool, cfg.URLs, cfg.MultipartMin)
+
+	// The first signal stops the task and starts one shutdown clock: syncCtx
+	// ends a quarter of Grace before hardCtx, which leaves time for the manifest.
+	stopCtx, stop := context.WithCancel(context.Background())
+	hardCtx, hardCancel := context.WithCancel(context.Background())
+	syncCtx, syncCancel := context.WithCancel(hardCtx)
+	defer stop()
+	defer hardCancel()
+	defer syncCancel()
+	finished := make(chan struct{})
+	defer close(finished)
+	go func() {
+		select {
+		case sig := <-sigs:
+			log.Printf("received %s, shutting down within %s", sig, cfg.Grace)
+			stop()
+			time.AfterFunc(cfg.Grace*3/4, syncCancel)
+			time.AfterFunc(cfg.Grace, hardCancel)
+		case <-finished:
+		}
+	}()
 
 	bg, stopBG := context.WithCancel(context.Background())
 	bgDone := make(chan struct{})
@@ -101,7 +137,7 @@ func Run(cfg Config) int {
 		background(bg, cfg, up)
 	}()
 
-	res, signalled := execute(cfg, sigs)
+	res := execute(stopCtx, cfg)
 
 	stopBG()
 	<-bgDone
@@ -109,19 +145,36 @@ func Run(cfg Config) int {
 	if err := writeJSON(filepath.Join(cfg.Spool, "result.json"), res); err != nil {
 		log.Printf("result.json: %v", err)
 	}
+	// What is known goes out first; the upload outcome updates it if time allows.
+	writeTermMessage(cfg.TermLog, termMessage{Result: res})
 
-	budget := cfg.UploadBudget
-	if signalled {
-		budget = cfg.Grace
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), budget)
+	uploadCtx, cancel := context.WithTimeout(syncCtx, cfg.UploadBudget)
 	defer cancel()
-	m, err := up.Finalize(ctx)
+	manifestCtx, cancelManifest := context.WithTimeout(hardCtx, time.Minute)
+	defer cancelManifest()
+	m, err := up.Finalize(uploadCtx, manifestCtx)
 	if err != nil {
 		log.Printf("finalize: %v", err)
 	}
 	writeTermMessage(cfg.TermLog, termMessage{Result: res, UploadComplete: m.Complete && err == nil, Missing: len(m.Missing)})
 	return 0
+}
+
+// cleanSpool removes the files of an earlier attempt, so a task never mixes
+// its output or upload state with a previous run's.
+func cleanSpool(dir string) error {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return err
+	}
+	for _, e := range entries {
+		if e.Type().IsRegular() {
+			if err := os.Remove(filepath.Join(dir, e.Name())); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 // background touches the heartbeat and re-uploads growing files until ctx ends.
@@ -150,37 +203,43 @@ func background(ctx context.Context, cfg Config, up *upload.Uploader) {
 	}
 }
 
-// execute runs the version command and the task. signalled is true when
-// SIGTERM or SIGINT arrived, which shortens the final upload budget.
-func execute(cfg Config, sigs <-chan os.Signal) (res Result, signalled bool) {
+// execute runs the version command and the task. stopCtx ends when SIGTERM or
+// SIGINT arrived.
+func execute(stopCtx context.Context, cfg Config) (res Result) {
 	res = Result{Task: cfg.Task, Start: now(), KernelVersion: kernelVersion(), BootTime: bootTime()}
 	defer func() { res.End = now() }()
 
 	if cfg.VersionCmd != "" {
-		res.Version = runVersion(cfg.VersionCmd)
+		res.Version = runVersion(stopCtx, cfg.VersionCmd)
 		writeFile(filepath.Join(cfg.Spool, "version"), res.Version)
 	}
+	if stopCtx.Err() != nil {
+		res.Cancelled, res.ExitCode, res.ErrorMsg = true, 128+int(syscall.SIGTERM), "cancelled"
+		return res
+	}
 
+	// The child writes straight into the spool files: no pipes, so a background
+	// grandchild holding them open cannot delay or fail the exit.
 	stdout, err1 := os.Create(filepath.Join(cfg.Spool, "stdout"))
 	stderr, err2 := os.Create(filepath.Join(cfg.Spool, "stderr"))
 	if err := errors.Join(err1, err2); err != nil {
 		res.ExitCode, res.ErrorMsg = CodeHarnessError, err.Error()
-		return res, false
+		return res
 	}
 	defer stdout.Close()
 	defer stderr.Close()
 
 	cmd := exec.Command(cfg.Cmd[0], cfg.Cmd[1:]...)
-	cmd.Stdout = io.MultiWriter(stdout, os.Stdout)
-	cmd.Stderr = io.MultiWriter(stderr, os.Stderr)
+	cmd.Stdout = stdout
+	cmd.Stderr = stderr
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	cmd.WaitDelay = 5 * time.Second // do not hang on pipes held by stray grandchildren
 
 	oomBefore := oomKills()
 	if err := cmd.Start(); err != nil {
 		res.ExitCode, res.ErrorMsg = CodeHarnessError, "cannot start command: "+err.Error()
-		return res, false
+		return res
 	}
+	protectFromOOM() // after Start: the task must not inherit oom_score_adj -1000
 	pgid := cmd.Process.Pid
 	done := make(chan error, 1)
 	go func() { done <- cmd.Wait() }()
@@ -192,22 +251,21 @@ func execute(cfg Config, sigs <-chan os.Signal) (res Result, signalled bool) {
 	case waitErr = <-done:
 	case <-timeout.C:
 		res.TimedOut = true
-		waitErr = terminate(pgid, done)
-	case sig := <-sigs:
-		log.Printf("received %s, stopping the task", sig)
-		signalled, res.Cancelled = true, true
-		waitErr = terminate(pgid, done)
+		waitErr = terminate(pgid, done, cfg.KillAfter)
+	case <-stopCtx.Done():
+		res.Cancelled = true
+		waitErr = terminate(pgid, done, cfg.KillAfter)
 	}
 	_ = syscall.Kill(-pgid, syscall.SIGKILL) // stragglers
 	reap()
 
 	res.OOMKills = oomKills() - oomBefore
 	res.ExitCode, res.ErrorMsg = exitStatus(waitErr, res, cfg.Timeout)
-	return res, signalled
+	return res
 }
 
 // terminate sends SIGTERM to the task's process group, then SIGKILL after killAfter.
-func terminate(pgid int, done <-chan error) error {
+func terminate(pgid int, done <-chan error, killAfter time.Duration) error {
 	_ = syscall.Kill(-pgid, syscall.SIGTERM)
 	select {
 	case err := <-done:
@@ -235,18 +293,24 @@ func exitStatus(waitErr error, res Result, timeout time.Duration) (int, string) 
 		return CodeHarnessError, waitErr.Error()
 	}
 	switch {
-	case code == 137 && res.OOMKills > 0:
-		return code, "OOMKilled"
 	case res.Cancelled:
 		return code, "cancelled"
+	case code != 0 && res.OOMKills > 0:
+		// The kernel killed something in the container's cgroup. The direct child
+		// is usually resource-tracker, whose own exit code says little.
+		return 137, "OOMKilled"
 	}
 	return code, ""
 }
 
-func runVersion(cmdline string) string {
-	ctx, cancel := context.WithTimeout(context.Background(), versionTimeout)
+func runVersion(ctx context.Context, cmdline string) string {
+	ctx, cancel := context.WithTimeout(ctx, versionTimeout)
 	defer cancel()
-	out, err := exec.CommandContext(ctx, "sh", "-c", cmdline).Output()
+	cmd := exec.CommandContext(ctx, "sh", "-c", cmdline)
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Cancel = func() error { return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL) } // the whole group
+	cmd.WaitDelay = time.Second
+	out, err := cmd.Output()
 	if err != nil {
 		log.Printf("version command: %v", err)
 	}
@@ -284,16 +348,37 @@ func copyFile(src, dst string) error {
 	return out.Close()
 }
 
-// writeTermMessage writes the compact result for the Kubernetes API (4 KiB max).
+// writeTermMessage writes the compact result for the Kubernetes API (4 KiB
+// max, result.json keeps the full text). Version text goes first, then the
+// error text; if that is still too big, both are dropped.
 func writeTermMessage(path string, m termMessage) {
 	data, _ := json.Marshal(m)
 	if len(data) > maxTermMessage {
-		m.ErrorMsg = ""
+		m.Version = truncate(m.Version, maxTermText)
+		data, _ = json.Marshal(m)
+	}
+	if len(data) > maxTermMessage {
+		m.ErrorMsg = truncate(m.ErrorMsg, maxTermText)
+		data, _ = json.Marshal(m)
+	}
+	if len(data) > maxTermMessage {
+		m.Version, m.ErrorMsg = "", ""
 		data, _ = json.Marshal(m)
 	}
 	if err := os.WriteFile(path, data, 0o644); err != nil {
 		log.Printf("termination message: %v", err)
 	}
+}
+
+// truncate cuts s to at most n bytes without splitting a UTF-8 character.
+func truncate(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	for n > 0 && !utf8.RuneStart(s[n]) {
+		n--
+	}
+	return s[:n]
 }
 
 func writeJSON(path string, v any) error {
@@ -334,19 +419,56 @@ func bootTime() int64 {
 	return 0
 }
 
-// oomKills reads the oom_kill counter of the container's cgroup (cgroup v2).
-func oomKills() int {
-	data, err := os.ReadFile("/sys/fs/cgroup/memory.events")
+// cgroupFile returns the path of a file in this container's own cgroup (v2),
+// resolved from /proc/self/cgroup so it also works when the container sees the
+// host hierarchy. It is "" on cgroup v1.
+func cgroupFile(name string) string {
+	data, err := os.ReadFile(selfCgroup)
 	if err != nil {
+		return ""
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		if p, ok := strings.CutPrefix(line, "0::"); ok {
+			return filepath.Join(cgroupRoot, p, name)
+		}
+	}
+	return ""
+}
+
+// oomKills reads the oom_kill counter of the container's cgroup, which counts
+// every kill in it, whatever process the kernel picked.
+func oomKills() int {
+	path := cgroupFile("memory.events")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if !errors.Is(err, fs.ErrNotExist) || path != "" {
+			log.Printf("oom counter unavailable, OOM kills will not be reported: %v", err)
+		}
 		return 0
 	}
-	for _, line := range bytes.Split(data, []byte("\n")) {
-		if v, ok := strings.CutPrefix(string(line), "oom_kill "); ok {
+	for _, line := range strings.Split(string(data), "\n") {
+		if v, ok := strings.CutPrefix(line, "oom_kill "); ok {
 			n, _ := strconv.Atoi(v)
 			return n
 		}
 	}
 	return 0
+}
+
+// protectFromOOM keeps an OOM kill of the task from taking sc-run with it. The
+// kubelet sets memory.oom.group=1 on the container cgroup, so the kernel would
+// kill every process in it. sc-run turns that off (it is privileged) and makes
+// itself unattractive to the OOM killer. Failures only mean the controller
+// falls back to the container's OOMKilled reason.
+func protectFromOOM() {
+	if path := cgroupFile("memory.oom.group"); path == "" {
+		log.Printf("warning: no cgroup v2 path, memory.oom.group not changed")
+	} else if err := os.WriteFile(path, []byte("0"), 0o644); err != nil {
+		log.Printf("warning: memory.oom.group: %v", err)
+	}
+	if err := os.WriteFile(selfOOMAdj, []byte("-1000"), 0o644); err != nil {
+		log.Printf("warning: oom_score_adj: %v", err)
+	}
 }
 
 // reap collects orphaned children when sc-run is the container's PID 1.

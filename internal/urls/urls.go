@@ -40,6 +40,11 @@ func Load(path string) (File, error) {
 	if f.Version != 1 {
 		return f, fmt.Errorf("%s: unsupported version %d", path, f.Version)
 	}
+	for key, e := range f.Objects {
+		if len(e.Parts) > 0 && e.PartSize <= 0 {
+			return f, fmt.Errorf("%s: %s has parts but part_size %d (must be > 0)", path, key, e.PartSize)
+		}
+	}
 	return f, nil
 }
 
