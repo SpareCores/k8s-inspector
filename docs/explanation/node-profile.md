@@ -18,8 +18,16 @@ Defined by the cluster platform, one set per vendor. k8s-inspector only selects 
 | NodePools `bench-<vendor>` (`-lowmem` for ≤ 2 GiB, `-gpu`) | taint `frankenscube/bench=true:NoSchedule`, label `frankenscube/pool=bench`, `WhenEmpty`, `consolidateAfter: 0s`, `expireAfter: 48h`, `terminationGracePeriod: 1h`, limits below the vendor quota, node repair off | dedicated, short-lived, bounded |
 
 Measured on an OCI node with default settings: the node's own daemons use about 630 MiB RSS at idle, the default
-kubelet reservation holds back about 1.5 GiB of an 8 GiB node, and the node is about 98 % idle. With `Lean` an 8 GiB
-type leaves about 7.0 GiB allocatable instead of 5.9 GiB.
+kubelet reservation holds back about 1.5 GiB of an 8 GiB node, and the node is about 98 % idle. With `Lean`
+(maxPods 10, 192 MiB kube-reserved, 128 MiB system-reserved, 50 MiB eviction threshold, Go memory limits on node
+daemons, volatile journald, unused units masked) SCarpenter computes these allocatable amounts; they are not yet
+measured on a live 1 GiB node:
+
+| Node memory | 1 GiB | 2 GiB | 4 GiB | 8 GiB |
+|---|---|---|---|---|
+| Allocatable with `Lean` | 577 MiB | 1524 MiB | 3418 MiB | 7207 MiB |
+
+Without `Lean`, the default kube-reserved is min(255 MiB + 11 MiB × maxPods, 25 % of memory), at least 320 MiB.
 
 1 GiB types need `Lean` (the default reservation alone exceeds the node). If that is still too little, a
 host-network-only bench node without flannel and kube-proxy saves about 130 MiB more (decision K16).

@@ -21,8 +21,9 @@ with `automountServiceAccountToken: false` and have no RBAC.
 
 ## Instance metadata (IMDS)
 
-The vendors' metadata services serve each node's user-data, which holds the node's bootstrap material. SCarpenter
-restricts metadata access to the node's own components by default, per NodeClass (`instanceMetadata.access`).
+The vendors' metadata services serve each node's user-data, which holds the node's bootstrap material. By default
+SCarpenter lets only an allowlist of its own host units reach the metadata service; other host processes, Pods and
+hostNetwork Pods get nothing. `spec.instanceMetadata.access: Open` on an SCNodeClass lifts the restriction.
 
 On bench NodeClasses the setting is `Open` (decision K17): the resource tracker inside every benchmark image detects
 the cloud through the metadata service, and a privileged container could read the node's disk anyway, so a restriction
