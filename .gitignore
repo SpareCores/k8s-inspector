@@ -1,3 +1,5 @@
 dist/
 __pycache__/
 urls.json
+*.urls.json
+urls-new.json

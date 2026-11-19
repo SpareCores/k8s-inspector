@@ -96,7 +96,7 @@ spec:
   nodeName: <anchor's node>
   restartPolicy: Never
   activeDeadlineSeconds: 5820            # pull 15m + version 1m + timeout 60m + upload 10m + slack
-  terminationGracePeriodSeconds: 60      # room for sc-run's final flush on eviction
+  terminationGracePeriodSeconds: 20      # sc-run's shutdown budget (--grace 15s) plus 5 s margin
   hostNetwork: true
   dnsPolicy: Default
   hostPID: false                         # true only for storage

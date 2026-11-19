@@ -41,6 +41,20 @@ The anchor is the only Pod the scheduler and SCarpenter ever see for a run.
 
 Pod specs: [Kubernetes objects](../reference/objects.md).
 
+## Memory pressure and shutdown inside a step
+
+`sc-run` shares the task's container cgroup. It turns `memory.oom.group` off and sets its own `oom_score_adj` to
+`-1000` after starting the task, so an OOM kill takes the task and not `sc-run`, which can then still write
+`result.json` and the termination message (details and the fallback to the container's `OOMKilled` reason:
+[exit codes](../reference/exit-codes.md)).
+
+On SIGTERM (eviction, Pod deletion, spot drain) one deadline counts from the signal: `--grace` (15 s) covers stopping the
+task (SIGTERM, SIGKILL after 5 s, also during the version command), the final upload and `manifest.json`, which gets
+the last quarter. `result.json` and the termination message are written before the upload starts, and the termination
+message is updated afterwards if time allows. Step Pods use `terminationGracePeriodSeconds: 20`. Permanent upload
+errors (no URL for a file, a 4xx other than 403, 408 and 429) are not retried: the file is listed as missing in the
+manifest. `exec` starts with an empty spool, so a rerun never mixes its output with an earlier attempt's.
+
 ## Step overhead
 
 Every step adds a little idle time on the node between two benchmarks. Its parts:

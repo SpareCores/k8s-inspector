@@ -1,5 +1,6 @@
 # llm: downloads models into the hostPath /models until the disk is ~10 % free (disk fill, eviction
-# thresholds), then runs llama-bench. Presign it with --large llm/resource_tracker.jsonl if wanted.
+# thresholds), then runs llama-bench. A synthetic 64 MiB file (synthetic.bin) goes through the multipart path:
+# presign it with --file llm/synthetic.bin --large llm/synthetic.bin (README section 2).
 apiVersion: v1
 kind: Pod
 metadata:
@@ -13,7 +14,7 @@ spec:
   nodeName: __NODE_NAME__
   restartPolicy: Never
   activeDeadlineSeconds: 7260            # pull 15m + version 1m + timeout 90m + upload 10m + slack 5m
-  terminationGracePeriodSeconds: 60
+  terminationGracePeriodSeconds: 20
   hostNetwork: true
   dnsPolicy: Default
   automountServiceAccountToken: false
@@ -23,10 +24,10 @@ spec:
   - name: llm
     image: ghcr.io/sparecores/benchmark-llm:main
     # The image entrypoint is `resource-tracker -- /benchmark.py`; command replaces it, so it is restated here.
-    command: [/k8si/bin/sc-run, exec, --task, llm, --timeout, 90m,
+    command: [/k8si/bin/sc-run, exec, --task, llm, --timeout, 90m, --multipart-mib, "5",
               --spool, /k8si/runs/__RUN_ID__/llm, --urls, /k8si-urls/urls.json,
               --heartbeat-dir, /k8si/runs/__RUN_ID__, --version-cmd, "/benchmark.py --version",
-              --, /usr/local/bin/resource-tracker, --, /benchmark.py]
+              --, sh, -c, "dd if=/dev/zero of=/k8si/runs/__RUN_ID__/llm/synthetic.bin bs=1M count=64 status=none; exec /usr/local/bin/resource-tracker -- /benchmark.py"]
     env:
     - {name: TRACKER_PROJECT_NAME, value: inspector}
     - {name: TRACKER_JOB_NAME, value: llm}

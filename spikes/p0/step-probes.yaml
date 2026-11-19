@@ -13,7 +13,7 @@ spec:
   nodeName: __NODE_NAME__
   restartPolicy: Never
   activeDeadlineSeconds: 2160            # pull 15m + version 1m + timeout 5m + upload 10m + slack 5m
-  terminationGracePeriodSeconds: 60
+  terminationGracePeriodSeconds: 20
   hostNetwork: true
   dnsPolicy: Default
   automountServiceAccountToken: false

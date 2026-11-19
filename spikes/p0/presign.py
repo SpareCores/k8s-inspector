@@ -29,8 +29,13 @@ STANDARD_FILES = ["stdout", "stderr", "version", "result.json", "resource_tracke
 def s3_client(args):
     session = boto3.Session(profile_name=args.profile, region_name=args.region)
     # "when_required": newer boto3 otherwise signs a checksum of an empty body into presigned PUT URLs.
-    config = Config(signature_version="s3v4", request_checksum_calculation="when_required")
-    return session.client("s3", config=config)
+    # Path-style addressing for S3-compatible endpoints (for example OCI) given by --endpoint-url.
+    config = Config(
+        signature_version="s3v4",
+        request_checksum_calculation="when_required",
+        s3={"addressing_style": "path"} if args.endpoint_url else {},
+    )
+    return session.client("s3", config=config, endpoint_url=args.endpoint_url)
 
 
 def key(args, task, name):
@@ -60,6 +65,13 @@ def presign(args):
     if args.resign:
         with open(args.resign) as f:
             old = json.load(f)["objects"]
+        # A re-sign keeps what the old file had: the multipart files, their part size and part count.
+        for k, e in old.items():
+            if e.get("upload_id"):
+                task, name = k.split("/", 1)
+                large.add((task, name))
+                if name not in extra.get(task, []) and name not in STANDARD_FILES:
+                    extra.setdefault(task, []).append(name)
     objects = {}
     for task in args.task:
         for name in STANDARD_FILES + extra.get(task, []):
@@ -70,18 +82,21 @@ def presign(args):
                 )
             }
             if (task, name) in large:
-                upload_id = old.get(f"{task}/{name}", {}).get("upload_id")
+                old_entry = old.get(f"{task}/{name}", {})
+                upload_id = old_entry.get("upload_id")
+                part_size = old_entry.get("part_size", args.part_mib * MIB)
+                n_parts = len(old_entry.get("parts", [])) or args.parts
                 if not upload_id:
                     upload_id = s3.create_multipart_upload(Bucket=args.bucket, Key=k)["UploadId"]
                 entry["upload_id"] = upload_id
-                entry["part_size"] = args.part_mib * MIB
+                entry["part_size"] = part_size
                 entry["parts"] = [
                     s3.generate_presigned_url(
                         "upload_part",
                         Params={"Bucket": args.bucket, "Key": k, "UploadId": upload_id, "PartNumber": n},
                         ExpiresIn=args.expires,
                     )
-                    for n in range(1, args.parts + 1)
+                    for n in range(1, n_parts + 1)
                 ]
             objects[f"{task}/{name}"] = entry
 
@@ -127,13 +142,19 @@ def complete(args):
 
 def abort(args):
     s3 = s3_client(args)
-    prefix = f"{args.prefix.strip('/')}/{args.run_id}/"
-    count = 0
-    for page in s3.get_paginator("list_multipart_uploads").paginate(Bucket=args.bucket, Prefix=prefix):
-        for u in page.get("Uploads", []):
-            s3.abort_multipart_upload(Bucket=args.bucket, Key=u["Key"], UploadId=u["UploadId"])
-            count += 1
-    print(f"aborted {count} open multipart uploads under {prefix}")
+    run_prefix = f"{args.prefix.strip('/')}/{args.run_id}/"
+    if args.task:
+        prefixes = [f"{run_prefix}tasks/{task}/" for task in args.task]
+    else:
+        prefixes = [run_prefix]
+        print("warning: no --task: aborts the open uploads of every task, including a step that is still running")
+    for prefix in prefixes:
+        count = 0
+        for page in s3.get_paginator("list_multipart_uploads").paginate(Bucket=args.bucket, Prefix=prefix):
+            for u in page.get("Uploads", []):
+                s3.abort_multipart_upload(Bucket=args.bucket, Key=u["Key"], UploadId=u["UploadId"])
+                count += 1
+        print(f"aborted {count} open multipart uploads under {prefix}")
 
 
 def verify(args):
@@ -182,7 +203,8 @@ def main():
     common.add_argument("--prefix", required=True, help="key prefix, e.g. spikes/p0")
     common.add_argument("--run-id", required=True)
     common.add_argument("--task", action="append", default=[], help="task name (repeat)")
-    common.add_argument("--region")
+    common.add_argument("--region", required=True, help="the bucket's region (presigned URLs are scoped to it)")
+    common.add_argument("--endpoint-url", help="S3-compatible endpoint, for example OCI's (uses path-style addressing)")
     common.add_argument("--profile", help="AWS profile (default: the usual credential chain)")
     sub = p.add_subparsers(dest="command", required=True)
 
@@ -190,10 +212,10 @@ def main():
     ps.add_argument("--expires", type=int, default=3600, help="URL lifetime in seconds")
     ps.add_argument("--file", action="append", default=[], help="extra output <task>/<file> (repeat)")
     ps.add_argument("--large", action="append", default=[], help="<task>/<file> that gets multipart URLs (repeat)")
-    ps.add_argument("--part-mib", type=int, default=16)
+    ps.add_argument("--part-mib", type=int, default=16, help="part size, at least 5 (S3 minimum); --resign keeps the old file's")
     ps.add_argument("--parts", type=int, default=64, help="UploadPart URLs per large file")
     ps.add_argument("--out", default="urls.json")
-    ps.add_argument("--resign", metavar="OLD_URLS_JSON", help="reuse the multipart upload ids of this file")
+    ps.add_argument("--resign", metavar="OLD_URLS_JSON", help="reuse the multipart uploads, part size and part count of this file")
     ps.set_defaults(func=presign)
     for name, func in (("complete", complete), ("abort", abort), ("verify", verify)):
         sub.add_parser(name, parents=[common]).set_defaults(func=func)
@@ -201,6 +223,8 @@ def main():
     args = p.parse_args()
     if args.command != "abort" and not args.task:
         p.error("at least one --task is required")
+    if args.command == "presign" and args.part_mib < 5:
+        p.error("--part-mib must be at least 5")
     args.func(args)
 
 

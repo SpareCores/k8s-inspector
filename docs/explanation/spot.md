@@ -22,7 +22,7 @@ no SKU can loop on struggling spot capacity.**
 
 | Signal | Reaction |
 |---|---|
-| The drain evicts the step Pod (SIGTERM, grace = the step's `terminationGracePeriodSeconds`, 60 s) | `sc-run` stops the task and runs its final flush first: the spool's last state and a manifest marked `interrupted` reach object storage within seconds. |
+| The drain evicts the step Pod (SIGTERM, grace = the step's `terminationGracePeriodSeconds`, 20 s) | `sc-run` stops the task and flushes within `--grace` (15 s, counted from the SIGTERM): `result.json` (`cancelled: true`), the spool's last state and `manifest.json` reach object storage if the link allows, and the termination message is written first either way. |
 | Interruption reason on the NodeClaim or Node | The controller classifies the attempt as `SPOT_INTERRUPTED` (not a generic node loss), records it, and starts the next attempt. |
 | Node vanished without a notice (before the SCarpenter feature, or a missed notice) | Same classification from the capacity type of the lost node; outputs are salvaged as in [output pipeline](outputs.md#what-can-still-be-lost). |
 

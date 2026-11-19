@@ -16,7 +16,7 @@ Variables used below:
 
 ```sh
 export RUN_ID=p0                      # also the Secret and spool directory name
-export BUCKET=<bucket> PREFIX=spikes/p0 AWS_PROFILE=<profile>
+export BUCKET=<bucket> PREFIX=spikes/p0 AWS_PROFILE=<profile> REGION=<bucket region>
 TASKS="--task dmidecode --task lshw --task lscpu --task lstopo --task virtualization --task stressngfull --task membench --task llm"
 ```
 
@@ -36,16 +36,20 @@ docker buildx build --platform linux/amd64,linux/arm64 \
 at least as long as the longest step (llm: about 2 h), or re-sign during the step (section 5).
 
 ```sh
-./presign.py presign --bucket $BUCKET --prefix $PREFIX --run-id $RUN_ID $TASKS \
+./presign.py presign --bucket $BUCKET --prefix $PREFIX --run-id $RUN_ID --region $REGION $TASKS \
+  --file llm/synthetic.bin --large llm/synthetic.bin \
   --large llm/resource_tracker.jsonl --large membench/resource_tracker.jsonl \
-  --expires 14400 --out urls.json
+  --expires 14400 --out urls.json         # S3-compatible store (OCI): add --endpoint-url https://...
 kubectl apply -f namespace.yaml
 kubectl -n inspector create secret generic p0-urls --from-file=urls.json=urls.json
 ```
 
 Objects are keyed `<PREFIX>/<RUN_ID>/tasks/<task>/<file>`. Every task gets `stdout`, `stderr`, `version`,
 `result.json`, `resource_tracker.jsonl` and `manifest.json`; `--file <task>/<name>` adds more, `--large <task>/<name>`
-adds multipart URLs (16 MiB x 64 parts = 1 GiB by default).
+adds multipart URLs (16 MiB x 64 parts = 1 GiB by default; `--part-mib` is at least 5). `--region` is required: URLs are
+signed for it. `step-llm.yaml` writes a synthetic 64 MiB `synthetic.bin` into its spool, so the multipart path runs
+for sure (`--multipart-mib 5` in the llm and membench steps; `resource_tracker.jsonl` stays a plain PUT unless it
+grows beyond 5 MiB).
 
 ### urls.json schema
 
@@ -59,8 +63,8 @@ adds multipart URLs (16 MiB x 64 parts = 1 GiB by default).
      "parts": ["<presigned UploadPart URL for part 1>", "<part 2>", "..."]}}}
 ```
 
-The key is `<task>/<file name relative to the task's spool directory>`. A file with `parts` goes through UploadPart when it
-is larger than `--multipart-mib` (32) or has no `put`; otherwise it is PUT. `sc-run` re-reads the file before every
+The key is `<task>/<file name relative to the task's spool directory>`. A file with `parts` (and a `part_size` above 0) goes through UploadPart when it
+is larger than `--multipart-mib` (32, the spike steps use 5) or has no `put`; otherwise it is PUT. `sc-run` re-reads the file before every
 request, so a re-signed Secret takes effect within the kubelet's refresh time (about a minute).
 
 ## 3. Anchor and node
@@ -78,7 +82,8 @@ kubectl -n inspector get pod p0-anchor -o jsonpath='{.status.conditions}'   # Re
 ./step.sh step-probes.yaml $NODE
 kubectl -n inspector wait pod/p0-probes --for=jsonpath='{.status.phase}'=Succeeded --timeout=40m
 ./step.sh step-stressngfull.yaml $NODE            # then the same for step-membench.yaml, step-llm.yaml
-kubectl -n inspector logs p0-stressngfull          # sc-run tees the task's output
+# sc-run writes the task's output only to the spool files (no tee): read it from the uploaded objects, or
+kubectl -n inspector logs p0-stressngfull          # sc-run's own messages (upload retries, warnings)
 ```
 
 A step Pod that ended stays until deleted, so its status can still be read. Check the result of each step:
@@ -97,7 +102,8 @@ If `verify` reports missing objects, run a `flush` step, then `complete` and `ve
 TASK=membench ./step.sh step-flush.yaml $NODE
 ```
 
-`./presign.py abort ...` aborts multipart uploads that stay open (unused large-file slots) after `complete`.
+`./presign.py abort ... --task <t>` aborts multipart uploads that stay open (unused large-file slots) after `complete`.
+Without `--task` it aborts every open upload of the run, also those of a step that is still running.
 
 ## 5. Release
 
@@ -208,16 +214,33 @@ kubectl -n inspector get pod p0-oom -o jsonpath='{.status.containerStatuses[0].s
 ```
 
 Record: the Pod phase and reason, the container `reason` (`Completed`, `OOMKilled`, `Error`), the exit code and the
-`message`. If the kernel kills the task but not `sc-run`, the Pod shows `Completed` with `exit_code: 137` and
-`error_msg: OOMKilled` only in the message and `result.json`. If it kills `sc-run` too, the API shows `OOMKilled`.
-Also check that the `DeadlineExceeded` Pod still uploaded: `sc-run` gets SIGTERM and has `--grace` (45 s) and the Pod's
-`terminationGracePeriodSeconds` (60 s) for the final flush; if `manifest.json` is missing, run `flush`.
+`message`. Expected: `sc-run` survives (it sets `memory.oom.group=0` and `oom_score_adj=-1000`), the Pod shows
+`Completed` with `exit_code: 137` and `error_msg: OOMKilled` in the message and `result.json`, and `oom_kills` is above 0.
+If `sc-run` is killed too (no `result.json`, container reason `OOMKilled`), the controller falls back to the reason: check
+`kubectl logs` for the `warning: memory.oom.group` / `oom_score_adj` lines, and `cat /sys/fs/cgroup/memory.oom.group`
+inside the container (the kubelet's default is `1`; `kubelet singleProcessOOMKill` is the node-level alternative).
+
+### `sc-run` survives an OOM
+
+A quick synthetic check before the membench run (privileged Pod with a 256 Mi limit, `stress-ng` image; `sc-run` must be
+installed by the anchor):
+
+```sh
+kubectl -n inspector run p0-oomcheck --image=ghcr.io/sparecores/stress-ng:main --restart=Never --overrides='{"spec":{"nodeName":"'$NODE'","hostNetwork":true,"tolerations":[{"operator":"Exists"}],"containers":[{"name":"c","image":"ghcr.io/sparecores/stress-ng:main","securityContext":{"privileged":true},"resources":{"limits":{"memory":"256Mi"}},"terminationMessagePolicy":"File","command":["/k8si/bin/sc-run","exec","--task","oomcheck","--spool","/k8si/runs/oomcheck","--urls","/nonexistent","--upload-budget","5s","--timeout","2m","--","stress-ng","--vm","1","--vm-bytes","1G","--vm-keep","-t","60s"],"volumeMounts":[{"name":"k8si","mountPath":"/k8si"}]}],"volumes":[{"name":"k8si","hostPath":{"path":"/var/lib/k8s-inspector"}}]}}'
+kubectl -n inspector get pod p0-oomcheck -o jsonpath='{.status.containerStatuses[0].state.terminated.message}{"\n"}'   # exit_code 137, error_msg OOMKilled, oom_kills >= 1
+```
+
+The upload fails (no `/nonexistent`), which is fine: only the termination message and `/var/lib/k8s-inspector/runs/oomcheck/result.json` matter.
+Delete the Pod afterwards. The membench step with its 256 Mi limit variant below is the real check.
+Also check that the `DeadlineExceeded` Pod still uploaded: `sc-run` gets SIGTERM and has `--grace` (15 s from the signal, covering task stop, upload and manifest) within the Pod's
+`terminationGracePeriodSeconds` (20 s); `result.json` and the termination message come first. If `manifest.json` is
+missing, run `flush`.
 
 ### Mechanics to observe (no number, a yes or no)
 
 | Mechanism | How |
 |---|---|
 | Growing logs re-PUT every 60 s | during membench, `aws s3 ls s3://$BUCKET/$PREFIX/$RUN_ID/tasks/membench/` twice: `stdout` grows |
-| Multipart with part retry | llm or membench `resource_tracker.jsonl` goes through parts; block the endpoint briefly (a node firewall rule is outside this repo) or watch `kubectl logs` for `upload ...` retries |
-| URL re-signing during a step | presign with `--expires 600`, start `step-llm.yaml`, then `./presign.py presign ... --resign urls.json --expires 14400 --out urls-new.json`, `kubectl -n inspector create secret generic p0-urls --from-file=urls.json=urls-new.json --dry-run=client -o yaml \| kubectl apply -f -`; uploads must continue after 10 minutes (403 errors in `kubectl logs` until the kubelet refreshes the mount) |
+| Multipart with part retry | llm's `synthetic.bin` (64 MiB, 4 parts of 16 MiB) must show `"method": "multipart"` with 4 parts in its `manifest.json`, and `complete` + `verify` must pass (check the assembled size, 67108864 bytes); block the endpoint briefly (a node firewall rule is outside this repo) or watch `kubectl logs` for `upload ...` retries |
+| URL re-signing during a step | presign with `--expires 600`, start `step-llm.yaml`, then `./presign.py presign ... --region $REGION --resign urls.json --expires 14400 --out urls-new.json` (keeps the multipart files, part size and part count of `urls.json`), `kubectl -n inspector create secret generic p0-urls --from-file=urls.json=urls-new.json --dry-run=client -o yaml \| kubectl apply -f -`; uploads must continue after 10 minutes (403 errors in `kubectl logs` until the kubelet refreshes the mount) |
 | `flush` | `step-flush.yaml` after a step whose `verify` failed |

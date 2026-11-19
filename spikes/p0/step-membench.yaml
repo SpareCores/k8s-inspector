@@ -13,7 +13,7 @@ spec:
   nodeName: __NODE_NAME__
   restartPolicy: Never
   activeDeadlineSeconds: 4260            # pull 15m + version 1m + timeout 40m + upload 10m + slack 5m
-  terminationGracePeriodSeconds: 60
+  terminationGracePeriodSeconds: 20
   hostNetwork: true
   dnsPolicy: Default
   automountServiceAccountToken: false
@@ -22,8 +22,9 @@ spec:
   containers:
   - name: membench
     image: ghcr.io/sparecores/membench:main
-    # Image entrypoint (restated, check with `crane config`): resource-tracker -- nice -n -20 /usr/local/bin/membench
-    command: [/k8si/bin/sc-run, exec, --task, membench, --timeout, 40m,
+    # Image entrypoint (sc-membench/Dockerfile): resource-tracker -- nice -n -20 /usr/local/bin/membench
+    # (sc-inspector passes `-Hv -t 1800` and `-V` for the version). command replaces it, so it is restated here.
+    command: [/k8si/bin/sc-run, exec, --task, membench, --timeout, 40m, --multipart-mib, "5",
               --spool, /k8si/runs/__RUN_ID__/membench, --urls, /k8si-urls/urls.json,
               --heartbeat-dir, /k8si/runs/__RUN_ID__, --version-cmd, "/usr/local/bin/membench -V",
               --, /usr/local/bin/resource-tracker, --, nice, -n, "-20", /usr/local/bin/membench, -Hv, -t, "1800"]
