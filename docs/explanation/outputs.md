@@ -21,8 +21,8 @@ controller signs every request). It:
    - **large files** (above 32 MiB, or any file the task definition marks large): S3 multipart. Each 16 MiB part is
      uploaded once it is complete (logs only grow), with per-part retry; the tail is uploaded as the current last
      part number and overwritten as it grows (re-uploading a part number replaces it);
-   - **final flush** when the task exits: every file once more, then `manifest.json` (file names, sizes, sha256,
-     multipart part ETags). The manifest is written last; its presence means "sc-run finished uploading".
+   - **final flush** when the task exits: every file once more, then `manifest.json` (file names, sizes, md5,
+     multipart part ETags; [format](../reference/objects.md#manifestjson)). The manifest is written last; its presence means "sc-run finished uploading".
 5. writes a short summary (exit code, timed out, OOM kills, upload state) to the termination message and exits 0; the
    task's own exit code is in the result, never in the Pod phase.
 

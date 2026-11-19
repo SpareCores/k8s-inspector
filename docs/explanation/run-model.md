@@ -18,8 +18,11 @@ The anchor is the only Pod the scheduler and SCarpenter ever see for a run.
 - It holds the node: a Running Pod keeps the node non-empty, and `karpenter.sh/do-not-disrupt: "true"` blocks
   consolidation and drift. It does **not** block spot reclaim, `expireAfter` or a manual delete.
 - Its container is `sc-run hold`: it first installs the `sc-run` binary into a hostPath directory that the steps
-  mount, then sleeps. It exits by itself when no step heartbeat has been seen for 45 minutes, so a dead controller
-  cannot keep a node (decision K14).
+  mount, then sleeps. It exits by itself when no heartbeat has been seen for 45 minutes, so a dead controller
+  cannot keep a node (decision K14). The heartbeat is the mtime of the file `heartbeat` in the run's hostPath
+  directory (`/var/lib/k8s-inspector/runs/<run_id>`): `sc-run exec` touches it every 10 s while a task runs, and
+  `kubectl exec <anchor> -- /sc-run heartbeat <dir>` touches it between steps. The idle clock starts when the anchor
+  starts.
 - Releasing the node = deleting the anchor (or its own exit). Terminal Pods do not count, so the node is empty and
   `WhenEmpty`/`consolidateAfter: 0s` removes it. Measured on OCI: about 1 minute to Node removal, 4-8 minutes until the
   NodeClaim is gone.

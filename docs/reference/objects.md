@@ -129,8 +129,45 @@ spec:
 
 - The probe step is one Pod with one container per probe task, each wrapped by `sc-run`.
 - The `flush` step uses the `sc-run` image with `args: [flush, --spool, …, --urls, …]` and the same mounts.
-- Secret `<run name>-urls` (owner: the BenchmarkRun): `urls.json` with presigned PUT URLs per output key and
-  `{uploadId, parts: [url…]}` per large file, re-signed hourly.
+- Secret `<run name>-urls` (owner: the BenchmarkRun): `urls.json`, re-signed hourly ([schema](#url-file)).
+- `sc-run` subcommands: `hold` (anchor), `exec` (a task), `flush`, and the helpers `install <dir>`, `ready <dir>`
+  (exit 0 when the binary is installed) and `heartbeat <dir>`.
+
+## URL file
+
+`urls.json` in the run's Secret. `sc-run` re-reads it before every request, so a re-signed Secret takes effect when
+the kubelet refreshes the mount.
+
+```json
+{"version": 1,
+ "objects": {
+   "<task>/stdout": {"put": "<presigned PutObject URL>"},
+   "<task>/resource_tracker.jsonl": {
+     "put": "<presigned PutObject URL>",
+     "upload_id": "<multipart upload id>", "part_size": 16777216,
+     "parts": ["<presigned UploadPart URL, part 1>", "<part 2>"]}}}
+```
+
+The key is the task name and the file name relative to the task's spool directory. A file with `parts` is uploaded
+with UploadPart when it is larger than 32 MiB (or has no `put`), otherwise with PUT; re-signing keeps the
+`upload_id`. Files without an entry stay in the spool and are listed as missing.
+
+## `manifest.json`
+
+Written by `sc-run` last, in the task's spool directory and its object prefix:
+
+```json
+{"version": 1, "task": "membench", "complete": true,
+ "objects": {
+   "stdout": {"method": "put", "size": 123, "md5": "…", "etag": "…"},
+   "resource_tracker.jsonl": {"method": "multipart", "size": 40000000, "upload_id": "…", "part_size": 16777216,
+                              "parts": [{"n": 1, "size": 16777216, "etag": "…"}]}},
+ "missing": []}
+```
+
+The controller completes every `multipart` object from `parts`, `HEAD`-checks every `size`, and aborts the unused
+multipart uploads. `sc-run` keeps what it has confirmed in `.uploaded.json` in the spool, which is how `flush` knows
+what is left.
 
 ## Other objects
 
