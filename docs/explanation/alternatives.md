@@ -40,6 +40,6 @@
 
 ## Other components not added
 
-Kueue, a device plugin or the GPU Operator ([GPU](gpu.md)), Docker on nodes, an agent or uploader sidecar on bench
+Kueue, the GPU Operator ([GPU](gpu.md)), Docker on nodes, an agent or uploader sidecar on bench
 nodes, a resource-tracker DaemonSet, webhooks, a model-cache proxy, Crossplane or other infrastructure operators
 ([DBaaS](dbaas.md)), an out-of-cluster force-deleter ([monitoring](monitoring.md#alerts)), a web UI (postponed, K36).
