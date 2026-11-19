@@ -1,0 +1,46 @@
+# llm: downloads models into the hostPath /models until the disk is ~10 % free (disk fill, eviction
+# thresholds), then runs llama-bench. Presign it with --large llm/resource_tracker.jsonl if wanted.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: p0-llm
+  namespace: inspector
+  labels:
+    inspector.sparecores.com/run: __RUN_ID__
+    inspector.sparecores.com/role: step
+    inspector.sparecores.com/task: llm
+spec:
+  nodeName: __NODE_NAME__
+  restartPolicy: Never
+  activeDeadlineSeconds: 7260            # pull 15m + version 1m + timeout 90m + upload 10m + slack 5m
+  terminationGracePeriodSeconds: 60
+  hostNetwork: true
+  dnsPolicy: Default
+  automountServiceAccountToken: false
+  enableServiceLinks: false
+  tolerations: [{operator: Exists}]
+  containers:
+  - name: llm
+    image: ghcr.io/sparecores/benchmark-llm:main
+    # The image entrypoint is `resource-tracker -- /benchmark.py`; command replaces it, so it is restated here.
+    command: [/k8si/bin/sc-run, exec, --task, llm, --timeout, 90m,
+              --spool, /k8si/runs/__RUN_ID__/llm, --urls, /k8si-urls/urls.json,
+              --heartbeat-dir, /k8si/runs/__RUN_ID__, --version-cmd, "/benchmark.py --version",
+              --, /usr/local/bin/resource-tracker, --, /benchmark.py]
+    env:
+    - {name: TRACKER_PROJECT_NAME, value: inspector}
+    - {name: TRACKER_JOB_NAME, value: llm}
+    - {name: TRACKER_EXTERNAL_RUN_ID, value: __RUN_ID__}
+    - {name: TRACKER_QUIET, value: "false"}
+    - {name: TRACKER_OUTPUT, value: /k8si/runs/__RUN_ID__/llm/resource_tracker.jsonl}
+    securityContext: {privileged: true, seccompProfile: {type: Unconfined}}
+    resources: {requests: {cpu: 10m, memory: 64Mi}}
+    terminationMessagePolicy: File
+    volumeMounts:
+    - {name: k8si, mountPath: /k8si}
+    - {name: urls, mountPath: /k8si-urls, readOnly: true}
+    - {name: models, mountPath: /models}
+  volumes:
+  - {name: k8si, hostPath: {path: /var/lib/k8s-inspector, type: Directory}}
+  - {name: urls, secret: {secretName: p0-urls}}
+  - {name: models, hostPath: {path: /var/lib/k8s-inspector/models, type: DirectoryOrCreate}}

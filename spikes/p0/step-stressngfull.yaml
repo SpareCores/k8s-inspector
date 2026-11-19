@@ -1,0 +1,55 @@
+# stressngfull: the CPU "SCore" benchmark. No CPU limit.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: p0-stressngfull
+  namespace: inspector
+  labels:
+    inspector.sparecores.com/run: __RUN_ID__
+    inspector.sparecores.com/role: step
+    inspector.sparecores.com/task: stressngfull
+spec:
+  nodeName: __NODE_NAME__
+  restartPolicy: Never
+  activeDeadlineSeconds: 3660            # pull 15m + version 1m + timeout 30m + upload 10m + slack 5m
+  terminationGracePeriodSeconds: 60
+  hostNetwork: true
+  dnsPolicy: Default
+  automountServiceAccountToken: false
+  enableServiceLinks: false
+  tolerations: [{operator: Exists}]
+  containers:
+  - name: stressngfull
+    image: ghcr.io/sparecores/stress-ng:main
+    # The image entrypoint is `resource-tracker -- sh`; command replaces it, so it is restated here.
+    command:
+    - /k8si/bin/sc-run
+    - exec
+    - --task=stressngfull
+    - --timeout=30m
+    - --spool=/k8si/runs/__RUN_ID__/stressngfull
+    - --urls=/k8si-urls/urls.json
+    - --heartbeat-dir=/k8si/runs/__RUN_ID__
+    - --version-cmd=stress-ng --version | awk '{print $3}'
+    - --
+    - /usr/local/bin/resource-tracker
+    - --
+    - sh
+    - -c
+    - |
+      for ncpu in $(awk -f /usr/local/bin/count.awk $(nproc)); do echo -n "$ncpu,"; nice -n -20 stress-ng --metrics --cpu $ncpu --cpu-method div16 -t 10 | egrep "metrc.*cpu" | awk "{print \$9}"; done
+    env:
+    - {name: TRACKER_PROJECT_NAME, value: inspector}
+    - {name: TRACKER_JOB_NAME, value: stressngfull}
+    - {name: TRACKER_EXTERNAL_RUN_ID, value: __RUN_ID__}
+    - {name: TRACKER_QUIET, value: "false"}
+    - {name: TRACKER_OUTPUT, value: /k8si/runs/__RUN_ID__/stressngfull/resource_tracker.jsonl}
+    securityContext: {privileged: true, seccompProfile: {type: Unconfined}}
+    resources: {requests: {cpu: 10m, memory: 64Mi}}
+    terminationMessagePolicy: File
+    volumeMounts:
+    - {name: k8si, mountPath: /k8si}
+    - {name: urls, mountPath: /k8si-urls, readOnly: true}
+  volumes:
+  - {name: k8si, hostPath: {path: /var/lib/k8s-inspector, type: Directory}}
+  - {name: urls, secret: {secretName: p0-urls}}

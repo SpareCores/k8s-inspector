@@ -1,0 +1,38 @@
+# Holds one fresh bench node and installs sc-run into /var/lib/k8s-inspector/bin.
+# Edit the instance type to the shape under test. __RUN_ID__ is filled by step.sh.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: p0-anchor
+  namespace: inspector
+  labels:
+    inspector.sparecores.com/run: __RUN_ID__
+    inspector.sparecores.com/role: anchor
+  annotations:
+    karpenter.sh/do-not-disrupt: "true"
+spec:
+  restartPolicy: Never
+  activeDeadlineSeconds: 28800
+  automountServiceAccountToken: false
+  enableServiceLinks: false
+  hostNetwork: true
+  dnsPolicy: Default
+  nodeSelector:
+    karpenter.sh/nodepool: bench-oci
+    node.kubernetes.io/instance-type: oci.VM.Standard.E5.Flex.2-16
+    karpenter.sh/capacity-type: on-demand
+  tolerations:
+  - {key: frankenscube/bench, operator: Exists}
+  containers:
+  - name: hold
+    image: ghcr.io/sparecores/k8s-inspector-sc-run:main
+    imagePullPolicy: Always
+    args: [hold, --install, /k8si/bin, --heartbeat-dir, /k8si/runs/__RUN_ID__, --idle-timeout, 45m]
+    readinessProbe:
+      exec: {command: [/sc-run, ready, /k8si/bin]}
+      periodSeconds: 2
+    resources: {requests: {cpu: 1m, memory: 8Mi}}
+    volumeMounts:
+    - {name: k8si, mountPath: /k8si}
+  volumes:
+  - {name: k8si, hostPath: {path: /var/lib/k8s-inspector, type: DirectoryOrCreate}}

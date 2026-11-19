@@ -1,0 +1,44 @@
+# membench: uses most of the node's RAM. No memory limit: the cgroup limit in effect is
+# kubepods.slice (allocatable), which is what the P0 eviction measurement observes.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: p0-membench
+  namespace: inspector
+  labels:
+    inspector.sparecores.com/run: __RUN_ID__
+    inspector.sparecores.com/role: step
+    inspector.sparecores.com/task: membench
+spec:
+  nodeName: __NODE_NAME__
+  restartPolicy: Never
+  activeDeadlineSeconds: 4260            # pull 15m + version 1m + timeout 40m + upload 10m + slack 5m
+  terminationGracePeriodSeconds: 60
+  hostNetwork: true
+  dnsPolicy: Default
+  automountServiceAccountToken: false
+  enableServiceLinks: false
+  tolerations: [{operator: Exists}]
+  containers:
+  - name: membench
+    image: ghcr.io/sparecores/membench:main
+    # Image entrypoint (restated, check with `crane config`): resource-tracker -- nice -n -20 /usr/local/bin/membench
+    command: [/k8si/bin/sc-run, exec, --task, membench, --timeout, 40m,
+              --spool, /k8si/runs/__RUN_ID__/membench, --urls, /k8si-urls/urls.json,
+              --heartbeat-dir, /k8si/runs/__RUN_ID__, --version-cmd, "/usr/local/bin/membench -V",
+              --, /usr/local/bin/resource-tracker, --, nice, -n, "-20", /usr/local/bin/membench, -Hv, -t, "1800"]
+    env:
+    - {name: TRACKER_PROJECT_NAME, value: inspector}
+    - {name: TRACKER_JOB_NAME, value: membench}
+    - {name: TRACKER_EXTERNAL_RUN_ID, value: __RUN_ID__}
+    - {name: TRACKER_QUIET, value: "false"}
+    - {name: TRACKER_OUTPUT, value: /k8si/runs/__RUN_ID__/membench/resource_tracker.jsonl}
+    securityContext: {privileged: true, seccompProfile: {type: Unconfined}}
+    resources: {requests: {cpu: 10m, memory: 64Mi}}
+    terminationMessagePolicy: File
+    volumeMounts:
+    - {name: k8si, mountPath: /k8si}
+    - {name: urls, mountPath: /k8si-urls, readOnly: true}
+  volumes:
+  - {name: k8si, hostPath: {path: /var/lib/k8s-inspector, type: Directory}}
+  - {name: urls, secret: {secretName: p0-urls}}

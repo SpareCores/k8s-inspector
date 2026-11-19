@@ -1,0 +1,78 @@
+# The hardware probe group: one Pod, one container per probe task, all in parallel.
+# __NODE_NAME__ and __RUN_ID__ are filled by step.sh. No tracker, as in sc-inspector.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: p0-probes
+  namespace: inspector
+  labels:
+    inspector.sparecores.com/run: __RUN_ID__
+    inspector.sparecores.com/role: step
+    inspector.sparecores.com/task: probe
+spec:
+  nodeName: __NODE_NAME__
+  restartPolicy: Never
+  activeDeadlineSeconds: 2160            # pull 15m + version 1m + timeout 5m + upload 10m + slack 5m
+  terminationGracePeriodSeconds: 60
+  hostNetwork: true
+  dnsPolicy: Default
+  automountServiceAccountToken: false
+  enableServiceLinks: false
+  tolerations: [{operator: Exists}]
+  containers:
+  - name: dmidecode
+    image: ghcr.io/sparecores/dmidecode:main
+    command: [/k8si/bin/sc-run, exec, --task, dmidecode, --timeout, 5m,
+              --spool, /k8si/runs/__RUN_ID__/dmidecode, --urls, /k8si-urls/urls.json,
+              --heartbeat-dir, /k8si/runs/__RUN_ID__, --version-cmd, "dmidecode --version",
+              --, dmidecode]
+    securityContext: {privileged: true, seccompProfile: {type: Unconfined}}
+    resources: {requests: {cpu: 10m, memory: 32Mi}}
+    terminationMessagePolicy: File
+    volumeMounts: &mounts
+    - {name: k8si, mountPath: /k8si}
+    - {name: urls, mountPath: /k8si-urls, readOnly: true}
+  - name: lshw
+    image: ghcr.io/sparecores/hwinfo:main
+    command: [/k8si/bin/sc-run, exec, --task, lshw, --timeout, 5m,
+              --spool, /k8si/runs/__RUN_ID__/lshw, --urls, /k8si-urls/urls.json,
+              --heartbeat-dir, /k8si/runs/__RUN_ID__, --version-cmd, "lshw -version",
+              --, lshw, -json]
+    securityContext: {privileged: true, seccompProfile: {type: Unconfined}}
+    resources: {requests: {cpu: 10m, memory: 32Mi}}
+    terminationMessagePolicy: File
+    volumeMounts: *mounts
+  - name: lscpu
+    image: ghcr.io/sparecores/hwinfo:main
+    command: [/k8si/bin/sc-run, exec, --task, lscpu, --timeout, 5m,
+              --spool, /k8si/runs/__RUN_ID__/lscpu, --urls, /k8si-urls/urls.json,
+              --heartbeat-dir, /k8si/runs/__RUN_ID__,
+              --version-cmd, "lscpu --version | awk '{print $4}'",
+              --, bash, -c, "lscpu -JB | jq"]
+    securityContext: {privileged: true, seccompProfile: {type: Unconfined}}
+    resources: {requests: {cpu: 10m, memory: 32Mi}}
+    terminationMessagePolicy: File
+    volumeMounts: *mounts
+  - name: lstopo
+    image: ghcr.io/sparecores/hwinfo:main
+    command: [/k8si/bin/sc-run, exec, --task, lstopo, --timeout, 30s,
+              --spool, /k8si/runs/__RUN_ID__/lstopo, --urls, /k8si-urls/urls.json,
+              --heartbeat-dir, /k8si/runs/__RUN_ID__, --version-cmd, "lstopo --version",
+              --, lstopo, --of, xml]
+    securityContext: {privileged: true, seccompProfile: {type: Unconfined}}
+    resources: {requests: {cpu: 10m, memory: 32Mi}}
+    terminationMessagePolicy: File
+    volumeMounts: *mounts
+  - name: virtualization
+    image: ghcr.io/sparecores/virtualization:main
+    command: [/k8si/bin/sc-run, exec, --task, virtualization, --timeout, 5m,
+              --spool, /k8si/runs/__RUN_ID__/virtualization, --urls, /k8si-urls/urls.json,
+              --heartbeat-dir, /k8si/runs/__RUN_ID__,
+              --, /usr/local/bin/check_virt.sh]
+    securityContext: {privileged: true, seccompProfile: {type: Unconfined}}
+    resources: {requests: {cpu: 10m, memory: 32Mi}}
+    terminationMessagePolicy: File
+    volumeMounts: *mounts
+  volumes:
+  - {name: k8si, hostPath: {path: /var/lib/k8s-inspector, type: Directory}}
+  - {name: urls, secret: {secretName: p0-urls}}

@@ -1,0 +1,32 @@
+# Re-uploads whatever of a task's spool is not confirmed uploaded (same node, fresh URLs).
+# Needs TASK=<task name> in the environment of step.sh.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: p0-flush-__TASK__
+  namespace: inspector
+  labels:
+    inspector.sparecores.com/run: __RUN_ID__
+    inspector.sparecores.com/role: flush
+    inspector.sparecores.com/task: __TASK__
+spec:
+  nodeName: __NODE_NAME__
+  restartPolicy: Never
+  activeDeadlineSeconds: 900
+  hostNetwork: true
+  dnsPolicy: Default
+  automountServiceAccountToken: false
+  enableServiceLinks: false
+  tolerations: [{operator: Exists}]
+  containers:
+  - name: flush
+    image: ghcr.io/sparecores/k8s-inspector-sc-run:main
+    args: [flush, --task, __TASK__, --spool, /k8si/runs/__RUN_ID__/__TASK__, --urls, /k8si-urls/urls.json]
+    resources: {requests: {cpu: 1m, memory: 16Mi}}
+    terminationMessagePolicy: File
+    volumeMounts:
+    - {name: k8si, mountPath: /k8si}
+    - {name: urls, mountPath: /k8si-urls, readOnly: true}
+  volumes:
+  - {name: k8si, hostPath: {path: /var/lib/k8s-inspector, type: Directory}}
+  - {name: urls, secret: {secretName: p0-urls}}
