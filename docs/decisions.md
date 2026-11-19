@@ -1,42 +1,42 @@
 # Decisions
 
-Status: **accepted** (decided by the maintainers) or **open** (recommendation in bold, awaiting a decision).
+Status: **accepted** (decided by the maintainers), **open** (recommendation in bold, awaiting a decision) or postponed.
 
 | # | Decision | Status | Choice / recommendation |
 |---|---|---|---|
 | K1 | Sequencing tasks on a node | accepted | anchor Pod + one Pod per step ([run model](explanation/run-model.md)) |
 | K2 | Controller placement | accepted | long-running Deployment, 1 replica, `apps` pool; not a CronJob, not on control planes |
 | K3 | Output path | accepted | `sc-run` spool + presigned PUT / UploadPart straight to the final keys; controller creates and completes multipart uploads; node released only after verification ([output pipeline](explanation/outputs.md)) |
-| K4 | Controller's object storage credentials | open | **cluster OIDC → IAM role, 12 h sessions; no static keys** |
-| K5 | Task identity | open | **legacy-compatible hash, digests pinned outside it, per-task `revision`** |
+| K4 | Controller's object storage credentials | accepted | cluster OIDC → IAM role, 12 h sessions; no static keys |
+| K5 | Task identity | accepted | legacy-compatible hash, digests pinned outside it, per-task `revision` |
 | K6 | Rerun the fleet on the new platform | open | **decide after the first vendor's A/B**; if yes, cheapest SKUs first via `revision` |
-| K7 | Exit codes | open | **keep -1/-3/-4/-5/256/>0, add -6 for timeouts, drop -2; -4 retried 3× then -5, DBaaS included** |
-| K8 | GPU fallback, vLLM ladder, nvbandwidth size | open | **adaptive in the controller (ported)** |
-| K9 | Memory limits | open | **0.85 × Node allocatable for geekbench and vLLM only; no CPU limits** |
-| K10 | Publish granularity | open | **per task, every 5 minutes** |
-| K11 | DBaaS provisioning | open | **Job running Pulumi (DB only, networks pre-created), client node first, DB removed first** ([DBaaS](explanation/dbaas.md)) |
-| K12 | Multi-instance runs | open | **deferred**; nothing in the single-node design blocks two anchors per run |
-| K13 | First target vendor | accepted | OCI, with forced runs (OCI not eligible in Keeper; Keeper unchanged) |
-| K14 | Anchor implementation | open | **`sc-run hold`, 45 min idle timeout, installs `sc-run` for the steps** |
-| K15 | Unsupported GPU classes (GRID/fractional, AMD, pre-Pascal) | open | **not benchmarked on k8s; legacy until it retires, then dropped** |
+| K7 | Exit codes | accepted | keep -1/-3/-4/-5/256/>0, add -6 for timeouts, drop -2; -4 retried 3× then -5, DBaaS included |
+| K8 | GPU fallback, vLLM ladder, nvbandwidth size | accepted | adaptive in the controller (ported) |
+| K9 | Memory limits | accepted | 0.85 × Node allocatable for geekbench and vLLM only; no CPU limits |
+| K10 | Publish granularity | accepted | per task, every 5 minutes |
+| K11 | DBaaS provisioning | accepted | Job running Pulumi (DB only, networks pre-created), client node first, DB removed first ([DBaaS](explanation/dbaas.md)) |
+| K12 | Multi-instance runs | accepted | deferred; nothing in the single-node design blocks two anchors per run |
+| K13 | First target vendor | accepted | OCI, with forced runs (Keeper's eligibility rules do not allow inspector runs on OCI SKUs; Keeper unchanged). Results pushed to sc-inspector-data `main` reach sc-crawler and the published data, so the first OCI SKUs are published only after their outputs are checked ([roadmap](roadmap.md)) |
+| K14 | Anchor implementation | accepted | `sc-run hold`, 45 min idle timeout, installs `sc-run` for the steps |
+| K15 | Unsupported GPU classes (GRID/fractional, AMD, pre-Pascal) | accepted | not benchmarked on k8s; legacy until it retires, then dropped |
 | K16 | Host-network-only bench nodes (no flannel/kube-proxy) | open | **only if `Lean` leaves too little on 1 GiB types (P0 measures it)** |
-| K17 | Instance metadata on bench nodes | open | **`Open` on bench NodeClasses; later pass cloud facts as env and return to the default** |
-| K18 | Node footprint on bench pools | open | **`Lean` on every bench NodePool** |
-| K19 | Caps and batching | open | **2 in flight per vendor (GPU 1), `$/h` per vendor; hourly vendors fill ≥ 0.5 h or wait ≤ 14 d; per-second vendors ~10 min of work or ≤ 3 d** |
-| K20 | Spot | accepted (strategy); open (parameters) | spot-first with per-run and per-SKU budgets and on-demand fallback ([spot](explanation/spot.md)); **SpotFirst for OCI, AWS, GCP; OnDemand elsewhere; defaults 2 attempts / 60 min lost / quarantine after 2 in 14 d** |
-| K21 | Root disk | open | **128 GiB, 256 GiB for GPU** |
+| K17 | Instance metadata on bench nodes | accepted | `Open` on bench NodeClasses; later pass cloud facts as env and return to the default |
+| K18 | Node footprint on bench pools | accepted | `Lean` on every bench NodePool |
+| K19 | Caps and batching | accepted | 2 in flight per vendor (GPU 1), `$/h` per vendor; hourly vendors fill ≥ 0.5 h or wait ≤ 14 d; per-second vendors ~10 min of work or ≤ 3 d |
+| K20 | Spot | accepted | spot-first with per-run and per-SKU budgets and on-demand fallback ([spot](explanation/spot.md)); SpotFirst for OCI, AWS, GCP; OnDemand elsewhere; defaults 2 attempts / 60 min lost / quarantine after 2 in 14 d |
+| K21 | Root disk | accepted | 128 GiB, 256 GiB for GPU |
 | K22 | Nodes that outlive every teardown layer | accepted | alert "bench node running too long" in the monitoring phase; no automatic out-of-cluster force-deleter for now |
-| K23 | Model cache | open | **per-node hostPath only** |
-| K24 | `parse.yml` | open | **publisher parses at publish time; `parse.yml` kept for legacy until P8** |
-| K25 | Eligibility source | open | **keep the Keeper HTTP call (fail closed)** |
-| K26 | Taint and pool label prefix | open | **`frankenscube/bench`, `frankenscube/pool`**, consistent with the existing pools |
-| K27 | Run state and lease | open | **`BenchmarkRun` custom resource (lease + status); git holds results only** ([state model](explanation/state.md)) |
-| K28 | Monitoring stack | open | **VictoriaMetrics + kube-state-metrics + VictoriaLogs + Fluent Bit (not on bench) + vmalert + Alertmanager, in the cluster platform**; notification channel to choose |
+| K23 | Model cache | accepted | per-node hostPath only |
+| K24 | `parse.yml` | accepted | publisher parses at publish time; `parse.yml` kept for legacy until P8 |
+| K25 | Eligibility source | accepted | keep the Keeper HTTP call (fail closed) |
+| K26 | Taint and pool label prefix | accepted | `frankenscube/bench`, `frankenscube/pool`, consistent with the existing pools |
+| K27 | Run state and lease | accepted | `BenchmarkRun` custom resource (lease + status); git holds results only ([state model](explanation/state.md)) |
+| K28 | Monitoring stack | accepted | VictoriaMetrics + kube-state-metrics + VictoriaLogs + Fluent Bit (not on bench) + vmalert + Alertmanager, in the cluster platform; notifications go to the `#alerts` channel of the Spare Cores Slack (Alertmanager → Slack) |
 | K29 | Where results and code go | accepted | development on `main` of k8s-inspector; results to `main` of sc-inspector-data, no pilot branch |
 | K30 | Legacy pipeline | accepted | stopped vendor by vendor once k8s-inspector is proven for it; never both for one vendor; no coexistence logic |
 | K31 | Languages | accepted | controller in Python, latest stable CPython (3.15 at the time of writing; 3.14 if a dependency lacks wheels); `sc-run` in Go (one static binary for every image, standard library only, a few MB of memory) |
-| K32 | pgbench dataset upload to the CDN | open | **drop it**: the dataset is already on the CDN; runs only read it (`SC_CDN_UPLOAD=0`); no write access to the CDN prefix |
+| K32 | pgbench dataset upload to the CDN | accepted | drop it: the dataset is already on the CDN; runs only read it (`SC_CDN_UPLOAD=0`); no write access to the CDN prefix |
 | K33 | Storage benchmark on Flatcar | accepted | fix sc-images last (P7); until then the storage task may fail on k8s nodes |
-| K34 | OCI SKU names in sc-inspector-data | open | **Keeper's `api_reference` (`<shape>.<ocpus>-<gb>` for flexible shapes)**; confirm when sc-crawler gains OCI |
-| K35 | `apps` pool vendor | accepted (target) | UpCloud once its SCarpenter lane passed a real-cloud run; cluster-platform change |
+| K34 | OCI SKU names in sc-inspector-data | accepted | Keeper's `api_reference` (`<shape>.<ocpus>-<gb>` for flexible shapes), the names sc-crawler already uses |
+| K35 | `apps` pool vendor | accepted (target) | UpCloud once SCarpenter's UpCloud worker support (being finished) has passed a real-cloud run; cluster-platform change |
 | K36 | Web UI for runs | open (postponed) | later; `BenchmarkRun` printer columns serve `kubectl` meanwhile |

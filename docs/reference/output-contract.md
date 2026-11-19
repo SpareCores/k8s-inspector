@@ -54,8 +54,10 @@ Timing files: `api_start` = run created, `api_end` = NodeClaim launched, `machin
 Variant dirs `<N>` are integers; a run picks its variant after the probe step with the ported `variant_id.py`
 (`ID_VERSION=1`).
 
-Vendors not known to sc-crawler (OCI today) are ignored by it; their data can be published before sc-crawler supports
-them. OCI SKU directories use Keeper's `api_reference` (for example `VM.Standard.E5.Flex.2-16`).
+sc-crawler supports OCI, and the published data already has OCI servers, so results under `data/oci/...` on `main` flow
+into sc-crawler and the published data. A SKU is published only after its outputs are checked to parse correctly and to
+match the legacy layout; P0 spikes never publish. OCI SKU directories use Keeper's `api_reference` (for example
+`VM.Standard.E5.Flex.2-16`), which sc-crawler also uses.
 
 ## meta.json
 

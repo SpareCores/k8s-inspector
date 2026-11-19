@@ -3,7 +3,7 @@
 *Planned: describes the CLI once it exists.*
 
 A forced run benchmarks one SKU now, skipping Keeper eligibility and the "is it due" check. It is how OCI SKUs are
-benchmarked while Keeper's inspector rules do not cover OCI.
+benchmarked while Keeper's eligibility rules do not allow inspector runs on OCI SKUs.
 
 ## Before you start
 
@@ -30,7 +30,7 @@ benchmarked while Keeper's inspector rules do not cover OCI.
    kubectl -n inspector logs -f -l inspector.sparecores.com/run=<run name>,inspector.sparecores.com/role=step
    ```
 
-3. When the phase is `Done`, the results are in sc-inspector-data under `data/oci/VM.Standard.E5.Flex.2-16/`, and
+3. When the phase is `Done`, the results are in sc-inspector-data (check them first: they flow into sc-crawler and the published data) under `data/oci/VM.Standard.E5.Flex.2-16/`, and
    the raw outputs under `logs/inspect/oci/VM.Standard.E5.Flex.2-16/<date>/<run_id>/`.
 
 ## Cancel or pause

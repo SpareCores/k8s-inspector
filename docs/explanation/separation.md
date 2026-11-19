@@ -21,7 +21,7 @@ and a restart in the middle of a git push is wasted work.
 The `apps` pool should run on UpCloud, where the project has the most credits. UpCloud bills by the hour with a
 monthly cap, so one always-on small node costs a fixed amount, while launching and removing nodes within an hour
 would pay a full hour each time; the long-running Deployment avoids that churn. Two preconditions, both outside this
-repository: SCarpenter's UpCloud lane has not yet run against the real cloud, and the vendor list of the `apps` pool is
+repository: SCarpenter's UpCloud worker support is being finished and has not yet run against the real cloud, and the vendor list of the `apps` pool is
 cluster platform configuration. Until both are done, the controller runs on the current `apps` vendor.
 
 Resources: requests `cpu: 100m`, `memory: 512Mi`, limit `memory: 1Gi`, an emptyDir of 4 GiB for the git checkout and

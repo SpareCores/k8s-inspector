@@ -24,5 +24,5 @@ Consequences:
 - **Spot**: only where the table says yes, per the [spot strategy](../explanation/spot.md).
 - **DBaaS**: run only where the managed database exists; hourly database billing makes a failed attempt cost an hour
   ([DBaaS](../explanation/dbaas.md)).
-- **Keeper**: OCI SKUs are not yet eligible in Keeper's inspector rules, so OCI runs are forced runs
+- **Keeper**: Keeper's eligibility rules do not allow inspector runs on OCI SKUs (the Keeper API does serve them), so OCI runs are forced runs
   ([start a forced run](../how-to/run-forced.md)).

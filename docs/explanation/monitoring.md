@@ -56,7 +56,7 @@ The first two alerts replace an automatic out-of-cluster force-deleter (decision
 teardown layer is a bug to look at, and an alert reaches a human within minutes. If alerts show that such leaks
 happen and are slow to handle, an automatic sweeper can be added later.
 
-Notification channel (email, chat) is a cluster-platform choice (part of K28).
+Alerts go through Alertmanager to the `#alerts` channel of the Spare Cores Slack (K28).
 
 ## UI
 

@@ -11,6 +11,6 @@ You will benchmark one small OCI instance type end to end and find its results i
 4. **Watch the node arrive.** `kubectl get benchmarkruns,nodeclaims -w`: Provisioning → Running, the node's labels.
 5. **Watch a step.** `kubectl logs -f` on the step Pod; the spool on the node; objects appearing in storage.
 6. **See the release.** Phase Releasing → the node and NodeClaim disappear.
-7. **Find the results.** The commit in sc-inspector-data; `meta.json` fields; the raw outputs in object storage.
+7. **Find the results.** The commit in sc-inspector-data; `meta.json` fields; the raw outputs in object storage. Pushed results under `data/oci/...` flow into sc-crawler and the published data, so publish a SKU only after its outputs parse correctly and match the legacy layout.
 8. **Break something on purpose.** Run `stressngfull` with a 1-minute timeout override and read the `-6` record.
 9. **Clean up.** Nothing to clean: the `BenchmarkRun` goes away 24 h after publishing.
