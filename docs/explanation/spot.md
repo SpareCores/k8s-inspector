@@ -1,0 +1,61 @@
+# Spot strategy
+
+Spot (OCI: preemptible) capacity costs 50-90 % less, and spot and on-demand VMs of a type are the same hardware, so the
+results are comparable (the capacity type is recorded in `meta.json`). The risks are interruptions and capacity
+shortages. The strategy keeps the savings and bounds the loss: **an interruption costs at most the task in flight, and
+no SKU can loop on struggling spot capacity.**
+
+## What the platform gives
+
+- Spot exists at AWS, GCP, Azure, Alibaba Cloud and OCI. Hetzner, OVHcloud, UpCloud and Vultr have none
+  ([vendors](../reference/vendors.md)).
+- SCarpenter launches spot through `karpenter.sh/capacity-type`, with spot offerings in its catalog. When a Pod allows
+  both `spot` and `on-demand`, spot is preferred and an unavailable spot offering falls back to on-demand by itself
+  (offerings with capacity errors are skipped for 3 minutes).
+- **Interruption handling is a planned SCarpenter feature**: per-vendor detection of the reclaim notice, then cordon
+  and drain of the node, with the interruption reason visible on the NodeClaim and the Node. Notices are short (Azure
+  30 s, AWS and OCI 2 min, GCP 0 or 2 min, Alibaba 5 min): too short to finish a task, long enough to flush its
+  outputs.
+- `karpenter.sh/do-not-disrupt` does not stop a reclaim or its drain.
+
+## How k8s-inspector reacts to an interruption
+
+| Signal | Reaction |
+|---|---|
+| The drain evicts the step Pod (SIGTERM, grace = the step's `terminationGracePeriodSeconds`, 60 s) | `sc-run` stops the task and runs its final flush first: the spool's last state and a manifest marked `interrupted` reach object storage within seconds. |
+| Interruption reason on the NodeClaim or Node | The controller classifies the attempt as `SPOT_INTERRUPTED` (not a generic node loss), records it, and starts the next attempt. |
+| Node vanished without a notice (before the SCarpenter feature, or a missed notice) | Same classification from the capacity type of the lost node; outputs are salvaged as in [output pipeline](outputs.md#what-can-still-be-lost). |
+
+The design works without the SCarpenter feature (the 60 s re-PUT bounds the loss); the feature only makes the
+classification exact and the flush complete.
+
+## The strategy
+
+1. **Per-task results are durable.** Each task's outputs and `status.json` are confirmed in object storage before the
+   next task starts ([output pipeline](outputs.md)).
+2. **Resume, do not restart.** After an interruption the same `BenchmarkRun` starts a new attempt (new anchor, new
+   node) with only the remaining tasks. The probe step runs again on every attempt (it is short); if the new node is a
+   different hardware variant, the due tasks are re-evaluated against that variant, as sc-inspector does.
+3. **Per-run spot budget.** A run allows spot for at most `maxSpotAttempts` (default 2) interrupted attempts and
+   `maxLostMinutes` (default 60) of lost task time. When either is exceeded, the next attempt requires `on-demand`.
+4. **Per-SKU memory.** The controller keeps per-SKU interruption counts in the ConfigMap `k8s-inspector-spot`. A SKU
+   with `interruptionsToQuarantine` (default 2) interruptions within `quarantineDays` (default 14) starts on-demand
+   for that period. Losing this ConfigMap is harmless: spot is tried again.
+5. **Provisioning budget.** An anchor allows `spot, on-demand`, so a spot shortage falls back by itself. If the anchor
+   is still pending after the normal provisioning budget, the attempt ends as `-1` like any capacity failure (backoff
+   2 h, 6 h, 24 h).
+6. **Long tasks run on-demand.** Tasks whose timeout exceeds `spotMaxTaskMinutes` (default 240, so `stressnglongrun`
+   with 26 h) are never planned on spot; a run that contains one is on-demand.
+7. **Statistics are recorded.** `status.attempts` lists each attempt's capacity type, node, duration and outcome.
+   `meta.json` gets `capacity_type` and `spot_attempts`; the controller exports interruption counts per vendor and SKU
+   as metrics ([monitoring](monitoring.md)).
+
+Worst case per run: two lost tasks plus two extra node boots, then the rest on-demand. There is no retry loop: the
+attempt counter lives in the run object, and a run that exhausts its budgets either completes on-demand or ends with
+`-4` per remaining task, which counts towards the usual cap of three before `-5` ([exit codes](../reference/exit-codes.md)).
+
+## Per-vendor policy
+
+Spot is a per-vendor setting ([configuration](../reference/configuration.md)): `SpotFirst` or `OnDemand`. The initial
+policy: `SpotFirst` for OCI (to exercise the strategy in the first phase, where interruptions are cheap), AWS and GCP;
+`OnDemand` elsewhere until a vendor's spot lane in SCarpenter is proven (decision K20).
