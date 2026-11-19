@@ -219,6 +219,46 @@ func TestClientErrorsAreNotRetriedExceptTransientOnes(t *testing.T) {
 	}
 }
 
+func TestS3TransientBadRequestCodesAreRetried(t *testing.T) {
+	for body, wantRequests := range map[string]int{
+		"<Error><Code>RequestTimeout</Code></Error>": 3,
+		"<Error><Code>IncompleteBody</Code></Error>": 3,
+		"<Error><Code>ExpiredToken</Code></Error>":   3,
+		"<Error><Code>MalformedXML</Code></Error>":   1,
+	} {
+		s := s3fake.New(t)
+		s.Fail = func(*http.Request) int { return http.StatusBadRequest }
+		s.FailBody = body
+		u, spool := newUploader(t, s, nil, 0)
+		write(t, filepath.Join(spool, "stdout"), "x")
+		u.Sync(context.Background(), 3)
+		if s.Requests != wantRequests {
+			t.Errorf("%s: %d requests, want %d", body, s.Requests, wantRequests)
+		}
+	}
+}
+
+// The manifest's timeout starts after the sync phase: a slow sync must not use it up.
+func TestManifestTimeoutStartsAfterSync(t *testing.T) {
+	s := s3fake.New(t)
+	u, spool := newUploader(t, s, nil, 0)
+	u.ManifestTimeout = 300 * time.Millisecond
+	write(t, filepath.Join(spool, "stdout"), "x")
+	s.Fail = func(r *http.Request) int {
+		if strings.HasSuffix(r.URL.Path, "/stdout") {
+			time.Sleep(400 * time.Millisecond) // sync alone outlasts ManifestTimeout
+		}
+		return 0
+	}
+	m, err := u.Finalize(context.Background(), context.Background())
+	if err != nil || !m.Complete {
+		t.Fatalf("finalize: %v %+v", err, m)
+	}
+	if _, ok := s.Object("t1", "manifest.json"); !ok {
+		t.Fatal("manifest.json not uploaded")
+	}
+}
+
 // A part size change under the same upload id must not reuse the old parts.
 func TestMultipartPartSizeChangeResetsState(t *testing.T) {
 	s := s3fake.New(t)

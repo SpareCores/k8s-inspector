@@ -1,5 +1,5 @@
 # The sc-run image: the anchor runs it, and it copies the binary to the node for the steps.
-FROM --platform=$BUILDPLATFORM golang:1 AS build
+FROM --platform=$BUILDPLATFORM golang:1.22 AS build
 ARG TARGETOS TARGETARCH
 WORKDIR /src
 COPY go.mod ./

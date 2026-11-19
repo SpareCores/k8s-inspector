@@ -150,9 +150,7 @@ func run(cfg Config, sigs <-chan os.Signal) int {
 
 	uploadCtx, cancel := context.WithTimeout(syncCtx, cfg.UploadBudget)
 	defer cancel()
-	manifestCtx, cancelManifest := context.WithTimeout(hardCtx, time.Minute)
-	defer cancelManifest()
-	m, err := up.Finalize(uploadCtx, manifestCtx)
+	m, err := up.Finalize(uploadCtx, hardCtx)
 	if err != nil {
 		log.Printf("finalize: %v", err)
 	}
@@ -455,17 +453,11 @@ func oomKills() int {
 	return 0
 }
 
-// protectFromOOM keeps an OOM kill of the task from taking sc-run with it. The
-// kubelet sets memory.oom.group=1 on the container cgroup, so the kernel would
-// kill every process in it. sc-run turns that off (it is privileged) and makes
-// itself unattractive to the OOM killer. Failures only mean the controller
-// falls back to the container's OOMKilled reason.
+// protectFromOOM keeps an OOM kill of the task from taking sc-run with it:
+// the kernel skips tasks with oom_score_adj -1000, also in a group kill
+// (memory.oom.group=1, the kubelet's default). A failure only means the
+// controller falls back to the container's OOMKilled reason.
 func protectFromOOM() {
-	if path := cgroupFile("memory.oom.group"); path == "" {
-		log.Printf("warning: no cgroup v2 path, memory.oom.group not changed")
-	} else if err := os.WriteFile(path, []byte("0"), 0o644); err != nil {
-		log.Printf("warning: memory.oom.group: %v", err)
-	}
 	if err := os.WriteFile(selfOOMAdj, []byte("-1000"), 0o644); err != nil {
 		log.Printf("warning: oom_score_adj: %v", err)
 	}

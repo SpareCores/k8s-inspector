@@ -104,9 +104,7 @@ func runFlush(args []string) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), *budget)
 	defer cancel()
-	mctx, mcancel := context.WithTimeout(context.Background(), time.Minute)
-	defer mcancel()
-	m, err := upload.New(*taskName, *spool, *urls, *mib<<20).Finalize(ctx, mctx)
+	m, err := upload.New(*taskName, *spool, *urls, *mib<<20).Finalize(ctx, context.Background())
 	check(err)
 	if !m.Complete {
 		fatalf("flush: %d file(s) still missing: %s", len(m.Missing), strings.Join(m.Missing, ", "))

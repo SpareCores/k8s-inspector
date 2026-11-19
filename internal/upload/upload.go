@@ -41,6 +41,7 @@ type Uploader struct {
 	MultipartThreshold int64        // files above this use UploadPart when the entry has parts
 	Backoff            time.Duration
 	MaxBackoff         time.Duration
+	ManifestTimeout    time.Duration // budget for the manifest, counted from the end of the sync phase
 
 	mu    sync.Mutex
 	state map[string]fileState
@@ -102,6 +103,7 @@ func New(task, spool, urlsPath string, threshold int64) *Uploader {
 		MultipartThreshold: threshold,
 		Backoff:            time.Second,
 		MaxBackoff:         30 * time.Second,
+		ManifestTimeout:    time.Minute,
 	}
 }
 
@@ -136,7 +138,7 @@ func (u *Uploader) Sync(ctx context.Context, attempts int) []string {
 // retryable files are confirmed or syncCtx ends, then writes and uploads
 // manifest.json under manifestCtx. The caller ends syncCtx earlier than
 // manifestCtx, so a spent upload budget still leaves time for the manifest.
-func (u *Uploader) Finalize(syncCtx, manifestCtx context.Context) (Manifest, error) {
+func (u *Uploader) Finalize(syncCtx, hardCtx context.Context) (Manifest, error) {
 	delay := u.Backoff
 	for {
 		failed := u.Sync(syncCtx, 3)
@@ -148,6 +150,9 @@ func (u *Uploader) Finalize(syncCtx, manifestCtx context.Context) (Manifest, err
 		}
 		delay = min(delay*2, u.MaxBackoff)
 	}
+	// The manifest's own timeout starts now, not when the sync phase began.
+	manifestCtx, cancel := context.WithTimeout(hardCtx, u.ManifestTimeout)
+	defer cancel()
 	m, err := u.writeManifest()
 	if err != nil {
 		return m, err
@@ -315,14 +320,23 @@ func (u *Uploader) send(ctx context.Context, url string, body io.Reader, size in
 }
 
 // permanentStatus reports whether a 4xx answer will not change on a retry.
-// 403 (expired URL, may be re-signed), 408 and 429 are transient, and so is
-// S3's 400 ExpiredToken.
+// 403 (expired URL, may be re-signed), 408 and 429 are transient, and so are
+// S3's 400 answers with the error codes ExpiredToken, TokenRefreshRequired,
+// RequestTimeout and IncompleteBody.
 func permanentStatus(code int, body []byte) bool {
 	switch code {
 	case http.StatusForbidden, http.StatusRequestTimeout, http.StatusTooManyRequests:
 		return false
 	}
-	return code >= 400 && code < 500 && !bytes.Contains(body, []byte("ExpiredToken"))
+	if code < 400 || code >= 500 {
+		return false
+	}
+	for _, c := range []string{"ExpiredToken", "TokenRefreshRequired", "RequestTimeout", "IncompleteBody"} {
+		if bytes.Contains(body, []byte("<Code>"+c+"</Code>")) {
+			return false
+		}
+	}
+	return true
 }
 
 // entry re-reads urls.json, so URLs re-signed during a step are picked up.

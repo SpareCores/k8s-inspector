@@ -229,15 +229,15 @@ func TestOOMKillsReadsOwnCgroup(t *testing.T) {
 	}
 }
 
-func TestProtectFromOOMWritesCgroupAndScore(t *testing.T) {
+func TestProtectFromOOMWritesScoreOnly(t *testing.T) {
 	dir := t.TempDir()
 	os.WriteFile(filepath.Join(dir, "cgroup"), []byte("0::/\n"), 0o644)
 	oldRoot, oldSelf, oldAdj := cgroupRoot, selfCgroup, selfOOMAdj
 	cgroupRoot, selfCgroup, selfOOMAdj = dir, filepath.Join(dir, "cgroup"), filepath.Join(dir, "adj")
 	defer func() { cgroupRoot, selfCgroup, selfOOMAdj = oldRoot, oldSelf, oldAdj }()
 	protectFromOOM()
-	if b, _ := os.ReadFile(filepath.Join(dir, "memory.oom.group")); string(b) != "0" {
-		t.Fatalf("memory.oom.group = %q", b)
+	if _, err := os.Stat(filepath.Join(dir, "memory.oom.group")); err == nil {
+		t.Fatal("memory.oom.group must not be written")
 	}
 	if b, _ := os.ReadFile(filepath.Join(dir, "adj")); string(b) != "-1000" {
 		t.Fatalf("oom_score_adj = %q", b)

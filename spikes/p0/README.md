@@ -214,11 +214,11 @@ kubectl -n inspector get pod p0-oom -o jsonpath='{.status.containerStatuses[0].s
 ```
 
 Record: the Pod phase and reason, the container `reason` (`Completed`, `OOMKilled`, `Error`), the exit code and the
-`message`. Expected: `sc-run` survives (it sets `memory.oom.group=0` and `oom_score_adj=-1000`), the Pod shows
+`message`. Expected: `sc-run` survives (it sets `oom_score_adj=-1000`, which the kernel's group kill skips; the other processes of the task are killed together, which is expected), the Pod shows
 `Completed` with `exit_code: 137` and `error_msg: OOMKilled` in the message and `result.json`, and `oom_kills` is above 0.
 If `sc-run` is killed too (no `result.json`, container reason `OOMKilled`), the controller falls back to the reason: check
-`kubectl logs` for the `warning: memory.oom.group` / `oom_score_adj` lines, and `cat /sys/fs/cgroup/memory.oom.group`
-inside the container (the kubelet's default is `1`; `kubelet singleProcessOOMKill` is the node-level alternative).
+`kubectl logs` for the `warning: oom_score_adj` line. `cat /sys/fs/cgroup/memory.oom.group` inside the container
+stays `1` (the kubelet's default), which is expected.
 
 ### `sc-run` survives an OOM
 

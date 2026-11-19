@@ -72,7 +72,8 @@ def presign(args):
                 large.add((task, name))
                 if name not in extra.get(task, []) and name not in STANDARD_FILES:
                     extra.setdefault(task, []).append(name)
-    objects = {}
+    # A re-sign only replaces the named tasks; the others pass through unchanged.
+    objects = {k: e for k, e in old.items() if k.split("/", 1)[0] not in args.task}
     for task in args.task:
         for name in STANDARD_FILES + extra.get(task, []):
             k = key(args, task, name)

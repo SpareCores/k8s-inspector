@@ -24,6 +24,8 @@ type Server struct {
 
 	// Fail may return a non-zero HTTP status to inject a failure for a request.
 	Fail func(r *http.Request) int
+	// FailBody replaces the body of an injected failure (default "injected").
+	FailBody string
 
 	mu       sync.Mutex
 	Objects  map[string][]byte         // path -> body of PutObject
@@ -50,7 +52,11 @@ func (s *Server) handle(w http.ResponseWriter, r *http.Request) {
 	}
 	if s.Fail != nil {
 		if code := s.Fail(r); code != 0 {
-			http.Error(w, "injected", code)
+			body := "injected"
+			if s.FailBody != "" {
+				body = s.FailBody
+			}
+			http.Error(w, body, code)
 			return
 		}
 	}

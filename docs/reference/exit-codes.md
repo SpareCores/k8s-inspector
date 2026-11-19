@@ -16,9 +16,9 @@
 OOM detection: `sc-run` compares the `oom_kill` counter of its own cgroup (`memory.events`, path from
 `/proc/self/cgroup`) before and after the task, so it sees a kill anywhere under the task, not only of the direct child
 (the direct child is usually `resource-tracker`). Since Kubernetes 1.28 the kubelet sets `memory.oom.group=1` on
-container cgroups, which would make the kernel kill `sc-run` together with the task. `sc-run` is privileged: at start
-it writes `0` to its cgroup's `memory.oom.group` and `-1000` to its own `oom_score_adj` (after the task started, so
-the task does not inherit it), and logs a warning if either fails. If `sc-run` is killed anyway, there is no
+container cgroups, so the kernel kills every process of the task at once. The kernel skips tasks with
+`oom_score_adj` `-1000` in a group kill, so `sc-run` writes `-1000` to its own `oom_score_adj` (after the task
+started, so the task does not inherit it) and survives; it logs a warning if the write fails. If `sc-run` is killed anyway, there is no
 `result.json`; the controller then uses the container's own `OOMKilled` termination reason and records `137` with
 `OOMKilled`.
 

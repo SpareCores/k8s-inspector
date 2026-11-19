@@ -43,8 +43,8 @@ Pod specs: [Kubernetes objects](../reference/objects.md).
 
 ## Memory pressure and shutdown inside a step
 
-`sc-run` shares the task's container cgroup. It turns `memory.oom.group` off and sets its own `oom_score_adj` to
-`-1000` after starting the task, so an OOM kill takes the task and not `sc-run`, which can then still write
+`sc-run` shares the task's container cgroup. It sets its own `oom_score_adj` to `-1000` after starting the task,
+and the kernel's OOM kill (including the group kill) skips such tasks, so it takes the task and not `sc-run`, which can then still write
 `result.json` and the termination message (details and the fallback to the container's `OOMKilled` reason:
 [exit codes](../reference/exit-codes.md)).
 
