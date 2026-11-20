@@ -16,8 +16,10 @@ from k8s_inspector.model import BenchmarkRun, CapacityMode, Config, RunPhase, Ru
 
 log = logging.getLogger(__name__)
 
-# Phases in which a run holds (or is about to hold) a node: they count against maxInFlight and the spend cap.
+# Phases in which a run holds (or is about to hold) a node. A run in any other phase (Failed, Cancelled) still
+# counts while its anchor Pod exists, until the runner deletes the anchor and releases the node.
 ACTIVE_PHASES = frozenset({RunPhase.PENDING, RunPhase.PROVISIONING, RunPhase.RUNNING, RunPhase.RELEASING})
+ANCHOR_LABELS = {"inspector.sparecores.com/role": "anchor"}
 
 
 @dataclass(frozen=True)
@@ -39,11 +41,22 @@ def spend_per_hour(runs: list[BenchmarkRun]) -> float:
     return total
 
 
-def check_vendor_budget(runs: list[BenchmarkRun], settings: Settings, vendor: str) -> None:
+def holding_runs(kube: Kube, runs: list[BenchmarkRun], vendor: str) -> list[BenchmarkRun]:
+    """Runs of `vendor` that hold or are acquiring a node: in an active phase, or (Failed, Cancelled) with an
+    anchor Pod still alive."""
+    anchored = {_labels(pod).get(crd.LABEL_RUN) for pod in kube.list("pod", labels=ANCHOR_LABELS)}
+    return [r for r in runs if r.spec.vendor == vendor and (r.status.phase in ACTIVE_PHASES or r.name in anchored)]
+
+
+def _labels(pod: dict) -> dict:
+    return pod.get("metadata", {}).get("labels") or {}
+
+
+def check_vendor_budget(active: list[BenchmarkRun], settings: Settings, vendor: str) -> None:
     """Raise `ValueError` when one more run of `vendor` would pass `maxInFlight` (0 pauses the vendor) or when
-    the running nodes already cost `maxUsdPerHour`. Shared by `force_run` and (later) autoPlan."""
+    the running nodes already cost `maxUsdPerHour`. `active` is `holding_runs`. Shared by `force_run` and
+    (later) autoPlan."""
     vendor_settings = settings.vendors[vendor]
-    active = [r for r in runs if r.spec.vendor == vendor and r.status.phase in ACTIVE_PHASES]
     limit = vendor_settings.max_in_flight
     if limit is None:
         limit = settings.defaults.max_in_flight
@@ -85,7 +98,7 @@ def force_run(
     names = [task.name for task in selected]
     if not force:
         _check_keeper(cfg, vendor, sku, names)
-    check_vendor_budget(crd.list_runs(kube), settings, vendor)
+    check_vendor_budget(holding_runs(kube, crd.list_runs(kube), vendor), settings, vendor)
 
     spec = RunSpec(
         vendor=vendor,

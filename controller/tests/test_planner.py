@@ -26,6 +26,7 @@ class FakeKube:
 
     def __init__(self) -> None:
         self.objects: dict[str, dict] = {}
+        self.pods: list[dict] = []
 
     def create(self, kind, manifest):
         name = manifest["metadata"]["name"]
@@ -42,6 +43,8 @@ class FakeKube:
         return copy.deepcopy(self.objects[name])
 
     def list(self, kind, labels=None):
+        if kind == "pod":
+            return [p for p in self.pods if labels.items() <= p["metadata"]["labels"].items()]
         return [copy.deepcopy(o) for o in self.objects.values()]
 
     def merge_patch(self, kind, name, body, subresource_status=False):
@@ -133,6 +136,23 @@ def test_max_in_flight_counts_active_runs_only(kube):
 
     kube.set_status(first.name, phase="Done")
     kube.set_status(second.name, phase="Cancelled")
+    planner.force_run(kube, cfg, "oci", "c")
+
+
+def test_max_in_flight_counts_failed_and_cancelled_runs_until_anchor_is_gone(kube):
+    cfg = make_config(max_in_flight=2)
+    first = planner.force_run(kube, cfg, "oci", "a")
+    second = planner.force_run(kube, cfg, "oci", "b")
+    kube.set_status(first.name, phase="Failed")
+    kube.set_status(second.name, phase="Cancelled")
+    kube.pods = [
+        {"metadata": {"labels": {"inspector.sparecores.com/run": name, "inspector.sparecores.com/role": "anchor"}}}
+        for name in (first.name, second.name)
+    ]
+    with pytest.raises(ValueError, match="2 of 2"):
+        planner.force_run(kube, cfg, "oci", "c")
+
+    kube.pods = kube.pods[:1]  # the runner deleted the second anchor
     planner.force_run(kube, cfg, "oci", "c")
 
 

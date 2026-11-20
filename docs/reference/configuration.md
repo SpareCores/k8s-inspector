@@ -31,13 +31,13 @@ vendors:
   oci:
     enabled: true
     autoPlan: false              # per-vendor override
-    maxInFlight: 2               # 0 pauses the vendor
-    maxUsdPerHour: 2.0
+    maxInFlight: 2               # 0 pauses the vendor; unset: defaults.maxInFlight
+    maxUsdPerHour: 2.0           # checked before a run starts
     capacity: SpotFirst          # SpotFirst (the default) | OnDemand
     publish: false               # true, or a list of SKUs: the publisher pushes these results to sc-inspector-data
     nodePools: {cpu: bench-oci, lowmem: bench-oci-lowmem, gpu: null}
 defaults:
-  maxInFlight: 2
+  maxInFlight: 2                 # conservative default for every vendor without its own maxInFlight
   maxInFlightGpu: 1
 batching:                        # hourly-billed vendors: start when expected work fills enough of the billed hour
   hourlyMinFillRatio: 0.5
@@ -84,3 +84,11 @@ status [--failing] | cancel <run> | publish [--rescan --since 7d [--sku <sku>]â€
 the `BenchmarkRun` until the publisher purges it, so the CLI never races the runner. Deleting the `BenchmarkRun` with `kubectl` also stops the run, but drops
 the record. `--sku` (repeatable, with `--rescan`) names a SKU that was never published, so its outputs are recovered too.
 Every command logs JSON lines on stderr.
+
+## Running instances per vendor
+
+Bench NodePools have no `limits`: the goal is to benchmark every instance type of a vendor, so there is no pool-level
+size or total bound. The only cap on started and running instances of a vendor is `vendors.<v>.maxInFlight`
+(default `defaults.maxInFlight`, 2; 0 pauses the vendor). It counts every run that holds or is acquiring a node
+(Pending, Provisioning, Running, Releasing, and a Failed or Cancelled run until its anchor Pod is deleted) and applies
+to forced runs and to autoPlan. `maxUsdPerHour` is checked before a run starts, against the node prices of those runs.

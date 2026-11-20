@@ -15,7 +15,7 @@ Defined by the cluster platform, one set per vendor. k8s-inspector only selects 
 | Instance metadata | `Open` ([security](security.md#instance-metadata-imds)) | resource tracker cloud detection |
 | Butane | mask `docker.socket`, `systemd-sysupdate*`, `systemd-oomd`, the SSH key fetch units; stop vendor agents after Ready | less background noise |
 | Billing retention | off | a node is never reused |
-| NodePools `bench-<vendor>` (`-lowmem` for ≤ 2 GiB, `-gpu`) | taint `frankenscube/bench=true:NoSchedule`, label `frankenscube/pool=bench`, `WhenEmpty`, `consolidateAfter: 0s`, `expireAfter: 48h`, `terminationGracePeriod: 1h`, limits below the vendor quota, node repair off | dedicated, short-lived, bounded |
+| NodePools `bench-<vendor>` (`-lowmem` for ≤ 2 GiB, `-gpu`) | taint `frankenscube/bench=true:NoSchedule`, label `frankenscube/pool=bench`, `WhenEmpty`, `consolidateAfter: 0s`, `expireAfter: 48h`, `terminationGracePeriod: 1h`, no `limits` (every instance type of the vendor must be benchmarkable; the controller bounds running instances with `maxInFlight`), node repair off | dedicated, short-lived |
 
 Without `Lean`, the default kube-reserved is min(255 MiB + 11 MiB × maxPods, 25 % of memory), at least 320 MiB.
 `Lean` is a flat reservation: 192 MiB kube-reserved + 128 MiB system-reserved + 50 MiB eviction threshold = 370 MiB.

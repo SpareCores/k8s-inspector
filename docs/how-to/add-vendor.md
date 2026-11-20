@@ -8,7 +8,7 @@ vendor.*
 - SCarpenter's lane for the vendor is Supported, or at least its real-cloud smoke run passed and the
   vendor's quirks are understood ([vendors](../reference/vendors.md)).
 - The cluster platform has, for the vendor: bench SCNodeClass(es) and NodePools `bench-<vendor>` (and `-lowmem`,
-  `-gpu` when needed) as in [node profile](../explanation/node-profile.md), quotas and NodePool limits, and (for DBaaS)
+  `-gpu` when needed) as in [node profile](../explanation/node-profile.md), the vendor quota raised as far as `maxInFlight` needs (the NodePools have no `limits`), and (for DBaaS)
   pre-created networks in the targeted regions.
 
 ## Steps

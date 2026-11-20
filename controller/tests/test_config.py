@@ -184,3 +184,15 @@ def test_vendor_publish_is_a_bool_or_a_list_of_skus():
     assert parse(True) is True and parse(["a", "b"]) == ("a", "b")
     with pytest.raises(ValueError, match="vendors.aws.publish"):
         parse("yes")
+
+
+def test_max_in_flight_global_default_and_vendor_override():
+    settings = parse_settings(
+        {
+            "defaults": {"maxInFlight": 4},
+            "vendors": {"aws": {"enabled": True}, "oci": {"enabled": True, "maxInFlight": 0}},
+        }
+    )
+    assert settings.defaults.max_in_flight == 4
+    assert settings.vendors["aws"].max_in_flight is None  # falls back to defaults.maxInFlight
+    assert settings.vendors["oci"].max_in_flight == 0  # pauses the vendor
