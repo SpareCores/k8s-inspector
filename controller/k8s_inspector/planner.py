@@ -5,6 +5,7 @@ vendors), state.md "What git still records", exit-codes.md "Planner retry" and t
 feature-mapping.md. The lease is the BenchmarkRun name: creating a second run for a SKU raises `RunExists`.
 """
 
+import json
 import logging
 import threading
 import time
@@ -14,8 +15,18 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
 from k8s_inspector import crd, keeper, pods, publisher, tasks
-from k8s_inspector.kube import Kube
-from k8s_inspector.model import BenchmarkRun, CapacityMode, Config, ExitCode, PodRole, RunPhase, RunSpec, TaskDef
+from k8s_inspector.kube import Kube, NotFound
+from k8s_inspector.model import (
+    BenchmarkRun,
+    CapacityMode,
+    CapacityType,
+    Config,
+    ExitCode,
+    PodRole,
+    RunPhase,
+    RunSpec,
+    TaskDef,
+)
 
 log = logging.getLogger(__name__)
 
@@ -242,6 +253,56 @@ def due_reason(task: TaskDef, meta: dict | None, now: datetime) -> str | None:
     return None
 
 
+OFFERED_MAX_AGE = timedelta(minutes=30)  # an older offered-types ConfigMap is stale: SCarpenter stopped writing it
+
+
+def not_offered(kube: Kube, cfg: Config, vendor: str, skus: list[str]) -> dict[str, str]:
+    """The SKUs (of `skus`) that SCarpenter's offered-types ConfigMap `scarpenter-offered-<benchClass>-<vendor>`
+    in `scarpenterNamespace` does not offer for the vendor's capacity mode, with the reason. A SKU is matched by
+    the entry's `apiReference`; it is not offered when its entry is missing or `available` is false, or when
+    the mode is OnDemand and `on-demand` is not in its `capacityTypes` (SpotFirst takes either type).
+
+    Fails open: a ConfigMap that is absent (vendor not opted in), unreadable, malformed or stale filters
+    nothing, and the reason is logged. In a truncated list a missing entry proves nothing, so only entries
+    with `available` false count."""
+    settings = cfg.settings
+    name = f"scarpenter-offered-{settings.bench_class}-{vendor}"
+    try:
+        data = json.loads(kube.get_configmap_in(settings.scarpenter_namespace, name)["data"]["types.json"])
+        generated = datetime.fromisoformat(data["generatedAt"])
+        truncated = data["truncated"] is True
+        # apiReference -> (available, capacityTypes, reason); a malformed entry fails the whole read
+        entries = {
+            e["apiReference"]: (e["available"], e["capacityTypes"], e.get("reason", "unavailable"))
+            for e in data["types"].values()
+        }
+    except NotFound:
+        log.info("autoPlan does not filter vendor %s: ConfigMap %s not found", vendor, name)
+        return {}
+    except Exception as e:  # unreadable, bad JSON or a missing key: one reason, fail open
+        log.warning("autoPlan does not filter vendor %s: cannot use ConfigMap %s: %r", vendor, name, e)
+        return {}
+    if datetime.now(UTC) - generated > OFFERED_MAX_AGE:
+        log.warning("autoPlan does not filter vendor %s: ConfigMap %s is stale (generated %s)", vendor, name, generated)
+        return {}
+    if truncated:
+        log.warning("ConfigMap %s is truncated: autoPlan skips only SKUs it lists as unavailable", name)
+
+    need = CapacityType.ON_DEMAND if settings.vendors[vendor].capacity == CapacityMode.ON_DEMAND else None
+    skipped = {}
+    for sku in skus:
+        if sku not in entries:
+            if not truncated:
+                skipped[sku] = "not listed"
+            continue
+        available, capacity_types, reason = entries[sku]
+        if not available:
+            skipped[sku] = reason
+        elif need and need not in capacity_types:
+            skipped[sku] = f"no {need} capacity"
+    return skipped
+
+
 def start_order(vendor: str, sku: str) -> tuple[int, str]:
     """Legacy `lib.instance_start_order_key`: crc32 of `vendor/sku` mixes the sizes (price order would exhaust the
     quota of a new vendor on the small SKUs first); the SKU name breaks ties."""
@@ -264,7 +325,8 @@ def plan_cycle(
     Keeper does not block, until the caps are reached: usually one run per vendor and cycle. GPU tasks are dropped
     for a SKU whose `nvidia_smi` Keeper blocks (no GPU); a SKU with only GPU tasks due is not planned. A vendor
     whose publishing is stalled (`publisher.publishing_stalled`) is skipped: new runs would only pile up
-    unpublished. With `dry_run` nothing is created and the first such SKU of each vendor is returned.
+    unpublished. SKUs SCarpenter does not offer (`not_offered`) are skipped.
+    With `dry_run` nothing is created and the first such SKU of each vendor is returned.
 
     Fails closed: when Keeper or git cannot be read the cycle plans nothing (for git: nothing for that vendor)
     and logs why."""
@@ -310,6 +372,12 @@ def plan_cycle(
         skus = sorted(blocked.get(vendor, {}), key=lambda sku: start_order(vendor, sku))
         if not skus:
             log.info("autoPlan: Keeper lists no ACTIVE servers for vendor %s", vendor)
+        skipped = not_offered(kube, cfg, vendor, skus)
+        if skipped:
+            examples = ", ".join(f"{sku} ({why})" for sku, why in list(skipped.items())[:3])
+            log.info(
+                "autoPlan skips %d SKUs of vendor %s not offered by SCarpenter, e.g. %s", len(skipped), vendor, examples
+            )
         bad_names = [sku for sku in skus if not pods.is_label_value(sku)]
         if bad_names:
             log.warning(
@@ -319,7 +387,7 @@ def plan_cycle(
         for sku in skus:
             if crd.run_name(vendor, sku) in leased or not publisher.publish_allowed(settings, vendor, sku):
                 continue
-            if sku in bad_names:
+            if sku in bad_names or sku in skipped:
                 continue
             if None in metas.get(sku, {}).values():  # unreadable meta.json: the publisher logged which
                 continue

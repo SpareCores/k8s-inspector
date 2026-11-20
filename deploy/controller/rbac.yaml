@@ -41,6 +41,32 @@ subjects:
   name: k8s-inspector
   namespace: inspector
 ---
+# SCarpenter's offered-types ConfigMaps (planner.not_offered). Plain get: the names depend on the configured
+# benchClass and the enabled vendors.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: k8s-inspector-offered-types
+  namespace: scarpenter-system
+rules:
+- apiGroups: [""]
+  resources: [configmaps]
+  verbs: [get]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: k8s-inspector-offered-types
+  namespace: scarpenter-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: k8s-inspector-offered-types
+subjects:
+- kind: ServiceAccount
+  name: k8s-inspector
+  namespace: inspector
+---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:

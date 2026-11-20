@@ -107,7 +107,7 @@ def test_rbac_is_least_privilege_for_what_the_controller_calls():
     granted = {
         (rule["apiGroups"][0], resource): set(rule["verbs"])
         for doc in docs
-        if doc["kind"] == "Role"
+        if doc["kind"] == "Role" and doc["metadata"]["namespace"] == "inspector"
         for rule in doc["rules"]
         for resource in rule["resources"]
     }
@@ -127,3 +127,12 @@ def test_rbac_is_least_privilege_for_what_the_controller_calls():
     assert cluster[("", "nodes")] == {"get"}
     assert granted[("", "events")] == {"list"}  # Karpenter FailedScheduling event of the anchor
     assert ("batch", "jobs") not in granted
+
+
+def test_rbac_reads_scarpenter_offered_types_in_its_namespace():
+    docs = list(yaml.safe_load_all((CRD_PATH.parents[1] / "controller" / "rbac.yaml").read_text()))
+    (role,) = [d for d in docs if d["kind"] == "Role" and d["metadata"]["namespace"] == "scarpenter-system"]
+    assert [(r["resources"], r["verbs"]) for r in role["rules"]] == [(["configmaps"], ["get"])]
+    (binding,) = [d for d in docs if d["kind"] == "RoleBinding" and d["metadata"]["namespace"] == "scarpenter-system"]
+    assert binding["roleRef"]["name"] == role["metadata"]["name"]
+    assert binding["subjects"] == [{"kind": "ServiceAccount", "name": "k8s-inspector", "namespace": "inspector"}]

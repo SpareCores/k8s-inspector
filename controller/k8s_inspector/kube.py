@@ -187,6 +187,13 @@ class Kube:
         except ApiError as e:
             raise _translate(e) from e
 
+    def get_configmap_in(self, namespace: str, name: str) -> dict:
+        """A ConfigMap of another namespace (SCarpenter's offered-types). Raise `NotFound`."""
+        try:
+            return self._client.get(core_v1.ConfigMap, name, namespace=namespace).to_dict()
+        except ApiError as e:
+            raise _translate(e) from e
+
     def list(self, kind: str, labels: dict[str, str] | None = None) -> list[dict]:
         resource, ns = self._target(kind)
         try:

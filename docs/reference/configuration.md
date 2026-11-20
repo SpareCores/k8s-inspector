@@ -28,6 +28,8 @@ warning and ignored; an invalid value is an error and the controller keeps the l
 
 ```yaml
 benchPool: bench                 # the one NodePool every vendor's bench nodes come from
+benchClass: bench                # the SCNodeClass of that pool (names SCarpenter's offered-types ConfigMaps, see autoPlan)
+scarpenterNamespace: scarpenter-system  # namespace of those ConfigMaps
 planner:
   intervalMinutes: 5
   autoPlan: false                # true: the controller picks SKUs itself (below); false: only forced runs
@@ -104,6 +106,8 @@ it is due and the vendor has room. Per vendor:
    lease, also while it is finished and not yet published) is skipped, and so is a SKU whose name is not a valid label
    value (the anchor selects the SKU by label; one warning per vendor and cycle) or whose `meta.json` in git is
    malformed (logged by the publisher). If Keeper lists no servers for the vendor, the planner logs it at info level.
+   A SKU that SCarpenter does not offer is skipped too (see [Offered types](#offered-types)); forced runs are never
+   filtered.
 4. A task of a SKU is due when Keeper does not block it (a block reason drops the task; the `keeper_gated` tasks are
    blocked by Keeper except on its allowlist, so they run only where Keeper allows them) and its
    `data/<vendor>/<sku>/schedule/<task>/meta.json` in sc-inspector-data `main` says so: no meta yet, or a
@@ -120,6 +124,24 @@ The git state is read from the publisher's checkout (blobless, sparse: only the 
 vendor), under the publisher's lock. If Keeper or git cannot be read, the cycle (or that vendor) plans nothing and
 logs why: the planner never creates runs blindly. `k8s-inspector plan [--dry-run]` runs one cycle in its own
 checkout; with `--dry-run` it creates nothing and prints the first SKU that would start for each vendor.
+
+### Offered types
+
+SCarpenter publishes which instance types it can launch in ConfigMap `scarpenter-offered-<benchClass>-<vendor>`
+(for example `scarpenter-offered-bench-oci`) in namespace `scarpenterNamespace`, key `types.json`. Once per vendor and
+cycle autoPlan reads it (the controller needs `get` on ConfigMaps there, `deploy/controller/rbac.yaml`) and skips a
+SKU, matched by the entry's `apiReference`, when:
+
+- its entry is missing or `available` is false (e.g. a tenancy quota), or
+- the vendor's `capacity` is `OnDemand` and `on-demand` is not in the entry's `capacityTypes` (`SpotFirst` takes
+  either type).
+
+One info line per vendor and cycle gives the count and a few examples with SCarpenter's `reason`. Such SKUs would
+only end in `-1 SCARPENTER_NO_OFFERING` after the fail-fast wait.
+
+The filter fails open: a ConfigMap that is absent (the vendor is not opted in), unreadable, malformed or stale
+(`generatedAt` older than 30 minutes) filters nothing, and the cycle logs why. In a ConfigMap with `truncated: true`
+only entries with `available: false` are skipped; a missing entry proves nothing.
 
 ## CLI
 

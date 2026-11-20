@@ -1,4 +1,5 @@
 import copy
+import json
 import threading
 import zlib
 from datetime import UTC, datetime, timedelta
@@ -30,6 +31,12 @@ class FakeKube:
         self.objects: dict[str, dict] = {}
         self.pods: list[dict] = []
         self.nodeclaims: list[dict] = []
+        self.foreign_configmaps: dict[tuple[str, str], dict] = {}  # (namespace, name) -> ConfigMap
+
+    def get_configmap_in(self, namespace, name):
+        if (namespace, name) not in self.foreign_configmaps:
+            raise NotFound(name)
+        return copy.deepcopy(self.foreign_configmaps[namespace, name])
 
     def create(self, kind, manifest):
         name = manifest["metadata"]["name"]
@@ -583,3 +590,85 @@ def test_run_forever_survives_errors_and_stops():
     stop.wait = lambda timeout=None: stop_wait(0)  # no real sleeping
     planner.run_forever(FakeKube(), provider, lambda vendor: {}, stop)
     assert len(calls) == 2
+
+
+# --------------------------------------------------------------------------- SCarpenter offered types
+
+
+def offered_configmap(types: dict, *, age=timedelta(minutes=1), truncated=False) -> dict:
+    """ConfigMap `scarpenter-offered-bench-oci` as SCarpenter writes it; `types` is {sku: entry fields}."""
+    document = {
+        "generatedAt": (datetime.now(UTC) - age).isoformat().replace("+00:00", "Z"),
+        "class": "bench",
+        "vendor": "oci",
+        "truncated": truncated,
+        "types": {
+            f"oci.{sku}": {"apiReference": sku, "capacityTypes": [], "offerings": [], **fields}
+            for sku, fields in types.items()
+        },
+    }
+    return {"data": {"types.json": json.dumps(document)}}
+
+
+def publish_offered(kube, configmap: dict) -> None:
+    kube.foreign_configmaps["scarpenter-system", "scarpenter-offered-bench-oci"] = configmap
+
+
+OFFERED = {"available": True, "capacityTypes": ["on-demand", "spot"]}
+QUOTA = {"available": False, "reason": "QuotaGate", "detail": "headroom 6, need 16"}
+
+
+def planned_skus(kube, cfg=None) -> list[str]:
+    return [p.sku for p in plan(kube, cfg or auto_config(), {}, dry_run=True)]
+
+
+def test_offered_types_skip_unavailable_skus(kube, keeper_skus, caplog):
+    keeper_skus["oci"] = {"quota": {}, "ok": {}}
+    publish_offered(kube, offered_configmap({"quota": QUOTA, "ok": OFFERED}))
+    with caplog.at_level("INFO"):
+        assert planned_skus(kube) == ["ok"]
+    assert "autoPlan skips 1 SKUs of vendor oci not offered by SCarpenter, e.g. quota (QuotaGate)" in caplog.text
+
+
+def test_offered_types_skip_a_sku_without_an_entry(kube, keeper_skus):
+    keeper_skus["oci"] = {"unknown": {}, "ok": {}}
+    publish_offered(kube, offered_configmap({"ok": OFFERED}))
+    assert planned_skus(kube) == ["ok"]
+
+
+def test_offered_types_on_demand_mode_needs_an_on_demand_offering(kube, keeper_skus):
+    keeper_skus["oci"] = {"spot-only": {}}
+    publish_offered(kube, offered_configmap({"spot-only": {"available": True, "capacityTypes": ["spot"]}}))
+    assert planned_skus(kube, auto_config(capacity=CapacityMode.ON_DEMAND)) == []
+    assert planned_skus(kube, auto_config(capacity=CapacityMode.SPOT_FIRST)) == ["spot-only"]
+
+
+@pytest.mark.parametrize(
+    "configmap",
+    [
+        None,  # vendor not opted in
+        offered_configmap({"s1": QUOTA}, age=timedelta(minutes=31)),  # stale
+        {"data": {"types.json": "{not json"}},
+        {"data": {}},
+        {"data": {"types.json": json.dumps({"generatedAt": "now", "truncated": False, "types": {}})}},
+    ],
+    ids=["absent", "stale", "bad-json", "no-key", "bad-time"],
+)
+def test_offered_types_unusable_configmap_filters_nothing(kube, keeper_skus, caplog, configmap):
+    if configmap:
+        publish_offered(kube, configmap)
+    with caplog.at_level("INFO"):
+        assert planned_skus(kube) == ["s1"]
+    assert "autoPlan does not filter vendor oci" in caplog.text
+
+
+def test_offered_types_truncated_list_skips_only_listed_unavailable(kube, keeper_skus):
+    keeper_skus["oci"] = {"quota": {}, "unknown": {}}
+    publish_offered(kube, offered_configmap({"quota": QUOTA}, truncated=True))
+    assert planned_skus(kube) == ["unknown"]
+
+
+def test_force_run_ignores_offered_types(kube):
+    publish_offered(kube, offered_configmap({"s1": QUOTA}))
+    run = planner.force_run(kube, make_config(), "oci", "s1", force=True)
+    assert run.spec.sku == "s1"

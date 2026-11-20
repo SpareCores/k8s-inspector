@@ -72,6 +72,12 @@ class FakeKube:
         except KeyError:
             raise NotFound(f"{kind} {name}") from None
 
+    def get_configmap_in(self, namespace: str, name: str) -> dict:
+        try:
+            return copy.deepcopy(self._store(f"configmap/{namespace}")[name])
+        except KeyError:
+            raise NotFound(f"configmap {namespace}/{name}") from None
+
     def list(self, kind: str, labels: dict | None = None) -> list[dict]:
         found = []
         for obj in self._store(kind).values():
