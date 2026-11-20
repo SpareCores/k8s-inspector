@@ -243,14 +243,12 @@ def test_unlaunched_nodeclaims_count_by_spec_requirements(kube):
     cfg = make_config(max_in_flight=1)
     pool = {"karpenter.sh/nodepool": "bench"}
     requirements = [{"key": "scarpenter.sparecores.com/vendor", "operator": "In", "values": ["oci"]}]
-    by_type = [{"key": "node.kubernetes.io/instance-type", "operator": "In", "values": ["oci.VM.Standard.E4.Flex-4"]}]
     kube.nodeclaims = [{"metadata": {"labels": pool}, "spec": {"requirements": requirements}}]
     with pytest.raises(ValueError, match="1 of 1"):
         planner.force_run(kube, cfg, "oci", "a")
-    kube.nodeclaims = [{"metadata": {"labels": pool}, "spec": {"requirements": by_type}}]
-    with pytest.raises(ValueError, match="1 of 1"):
-        planner.force_run(kube, cfg, "oci", "a")
-    kube.nodeclaims = [{"metadata": {"labels": pool}, "spec": {"requirements": [{**by_type[0], "values": ["aws.m5"]}]}}]
+    kube.nodeclaims = [
+        {"metadata": {"labels": pool}, "spec": {"requirements": [{**requirements[0], "values": ["aws"]}]}}
+    ]
     planner.force_run(kube, cfg, "oci", "a")
 
 

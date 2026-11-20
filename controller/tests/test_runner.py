@@ -32,7 +32,7 @@ from k8s_inspector.model import (
     UploadSettings,
     VendorSettings,
 )
-from k8s_inspector.runner import RELAUNCH_ANNOTATION, Runner
+from k8s_inspector.runner import RELAUNCH_ANNOTATION, SKU_NOT_SELECTABLE, Runner
 from k8s_inspector.storage import Storage, object_key, render_urls_json
 
 START = datetime(2026, 11, 20, 10, 0, tzinfo=UTC)
@@ -61,7 +61,8 @@ class Harness:
         return Runner(self.kube, self.storage, lambda: self.cfg, "inspector", clock=self.clock)
 
     def start(self, tasks: list[str], **spec) -> None:
-        spec = RunSpec(vendor="oci", sku="VM.Standard.E5.Flex.2-16", run_id="r20261120t1000-aaaa", tasks=tasks, **spec)
+        sku = spec.pop("sku", "VM.Standard.E5.Flex.2-16")
+        spec = RunSpec(vendor="oci", sku=sku, run_id="r20261120t1000-aaaa", tasks=tasks, **spec)
         self.name = crd.create_run(self.kube, spec).name
         self.storage.objects[object_key(self.run_key(), "lscpu", "stdout")] = LSCPU.encode()
 
@@ -214,7 +215,7 @@ def test_unlaunched_nodeclaim_at_the_deadline_is_boot_failure_not_ice(h):
     h.runner.reconcile(h.name)
     anchor = h.kube.get("pod", f"{h.name}-a1")
     selector = anchor["spec"]["nodeSelector"]
-    h.kube.create(  # as Karpenter creates it: pool label only, the instance type in spec.requirements
+    h.kube.create(  # as Karpenter creates it: pool label only, vendor and SKU in spec.requirements
         "nodeclaim",
         {
             "metadata": {
@@ -224,11 +225,8 @@ def test_unlaunched_nodeclaim_at_the_deadline_is_boot_failure_not_ice(h):
             },
             "spec": {
                 "requirements": [
-                    {
-                        "key": "node.kubernetes.io/instance-type",
-                        "operator": "In",
-                        "values": [selector["node.kubernetes.io/instance-type"]],
-                    }
+                    {"key": key, "operator": "In", "values": [selector[key]]}
+                    for key in ("scarpenter.sparecores.com/vendor", "scarpenter.sparecores.com/api-reference")
                 ]
             },
         },
@@ -865,6 +863,14 @@ def test_reconcile_failing_for_half_an_hour_ends_the_run_without_deleting_the_an
     monkeypatch.undo()
     h.runner.reconcile(h.name)  # the Failed phase releases the node
     assert h.pod_names() == []
+
+
+def test_sku_that_is_not_a_label_value_fails_as_harness_error_without_an_anchor(h):
+    h.start(["geekbench"], sku="VM.Standard.E5 Flex")  # a space cannot be a label value
+    h.runner.reconcile(h.name)
+    assert h.pod_names("anchor") == []
+    assert h.codes()["geekbench"] == (ExitCode.HARNESS_ERROR, SKU_NOT_SELECTABLE)
+    assert h.run.status.phase == RunPhase.FAILED
 
 
 def test_pending_run_that_cannot_start_gets_its_tasks_so_the_lease_can_expire(h):

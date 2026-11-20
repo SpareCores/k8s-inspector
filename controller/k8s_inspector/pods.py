@@ -31,7 +31,8 @@ from k8s_inspector.steps import VLLM_PROBE_TIMEOUT
 
 NODEPOOL_LABEL = "karpenter.sh/nodepool"
 VENDOR_LABEL = "scarpenter.sparecores.com/vendor"
-INSTANCE_TYPE_LABEL = "node.kubernetes.io/instance-type"
+API_REFERENCE_LABEL = "scarpenter.sparecores.com/api-reference"
+_LABEL_VALUE = re.compile(r"(?:[A-Za-z0-9](?:[-_.A-Za-z0-9]{0,61}[A-Za-z0-9])?)?")
 
 NODE_DIR = "/var/lib/k8s-inspector"  # hostPath on the node; mounted at /k8si in every Pod
 MOUNT_DIR = "/k8si"
@@ -133,6 +134,11 @@ def _duration(value: timedelta) -> str:
 # --------------------------------------------------------------------------- rendering
 
 
+def is_label_value(value: str) -> bool:
+    """Kubernetes label value rules: at most 63 characters, alphanumeric ends, `-_.` and alphanumerics inside."""
+    return _LABEL_VALUE.fullmatch(value) is not None and bool(value)
+
+
 def render_anchor(
     run: BenchmarkRun,
     attempt: int,
@@ -143,7 +149,7 @@ def render_anchor(
     owner: OwnerRef,
 ) -> dict:
     """The anchor Pod (objects.md "Anchor Pod"): nodeSelector (`karpenter.sh/nodepool: <benchPool>`,
-    `node.kubernetes.io/instance-type: <vendor>.<sku>`, `scarpenter.sparecores.com/vendor: <vendor>`),
+    `scarpenter.sparecores.com/vendor: <vendor>`, `scarpenter.sparecores.com/api-reference: <sku>`),
     capacity-type node affinity from `capacity` (`[spot, on-demand]` or `[on-demand]`),
     `do-not-disrupt`, toleration `frankenscube/bench`, container
     `hold` with `cfg.env.sc_run_image` and args `hold --install /k8si/bin --heartbeat-dir
@@ -172,8 +178,8 @@ def render_anchor(
             "dnsPolicy": "Default",
             "nodeSelector": {
                 "karpenter.sh/nodepool": cfg.settings.bench_pool,
-                "node.kubernetes.io/instance-type": f"{spec.vendor}.{spec.sku}",
-                "scarpenter.sparecores.com/vendor": spec.vendor,
+                VENDOR_LABEL: spec.vendor,
+                API_REFERENCE_LABEL: spec.sku,
             },
             "affinity": {
                 "nodeAffinity": {
@@ -740,18 +746,14 @@ def _claim_requirement(claim: dict, key: str) -> str | None:
     return None
 
 
-def claim_instance_type(claim: dict) -> str | None:
-    """A NodeClaim's instance type: the label (after launch), else the `spec.requirements` entry (from creation)."""
+def claim_api_reference(claim: dict) -> str | None:
+    """A NodeClaim's raw SKU name: the label (after launch), else the `spec.requirements` entry (from creation)."""
     labels = claim.get("metadata", {}).get("labels") or {}
-    return labels.get(INSTANCE_TYPE_LABEL) or _claim_requirement(claim, INSTANCE_TYPE_LABEL)
+    return labels.get(API_REFERENCE_LABEL) or _claim_requirement(claim, API_REFERENCE_LABEL)
 
 
 def claim_vendor(claim: dict) -> str | None:
-    """A NodeClaim's vendor: the label (after launch), else the vendor requirement, else the prefix of the
-    `<vendor>.<sku>` instance type (before launch only `spec.requirements` carries them)."""
+    """A NodeClaim's vendor: the label (after launch), else the vendor requirement (before launch only
+    `spec.requirements` carries it)."""
     labels = claim.get("metadata", {}).get("labels") or {}
-    vendor = labels.get(VENDOR_LABEL) or _claim_requirement(claim, VENDOR_LABEL)
-    if vendor:
-        return vendor
-    instance_type = claim_instance_type(claim)
-    return instance_type.partition(".")[0] if instance_type and "." in instance_type else None
+    return labels.get(VENDOR_LABEL) or _claim_requirement(claim, VENDOR_LABEL)

@@ -253,8 +253,11 @@ class Cluster:
         name = self.node_name(anchor)
         when = node_created or self.clock.now + timedelta(seconds=30)
         selector = anchor["spec"]["nodeSelector"]
+        vendor, sku = selector["scarpenter.sparecores.com/vendor"], selector["scarpenter.sparecores.com/api-reference"]
         labels = {
-            "node.kubernetes.io/instance-type": selector["node.kubernetes.io/instance-type"],
+            "node.kubernetes.io/instance-type": f"{vendor}.{sku}",
+            "scarpenter.sparecores.com/vendor": vendor,
+            "scarpenter.sparecores.com/api-reference": sku,
             "karpenter.sh/nodepool": selector["karpenter.sh/nodepool"],
             "karpenter.sh/capacity-type": self.capacity,
             "topology.kubernetes.io/region": "eu-test-1",
@@ -311,7 +314,14 @@ class Cluster:
             {
                 "metadata": {
                     "name": f"claim-{anchor['metadata']['name']}",
-                    "labels": {k: selector[k] for k in ("karpenter.sh/nodepool", "node.kubernetes.io/instance-type")},
+                    "labels": {
+                        k: selector[k]
+                        for k in (
+                            "karpenter.sh/nodepool",
+                            "scarpenter.sparecores.com/vendor",
+                            "scarpenter.sparecores.com/api-reference",
+                        )
+                    },
                     "creationTimestamp": iso(self.clock.now + timedelta(seconds=1)),
                 },
                 "status": {"conditions": [{"type": "Launched", "status": "False", "message": message}]},

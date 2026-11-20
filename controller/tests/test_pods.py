@@ -93,8 +93,8 @@ def test_anchor(run, cfg):
     assert "blockOwnerDeletion" not in pod["metadata"]["ownerReferences"][0]
     assert spec["nodeSelector"] == {
         "karpenter.sh/nodepool": "bench",
-        "node.kubernetes.io/instance-type": "oci.VM.Standard.E5.Flex.2-16",
         "scarpenter.sparecores.com/vendor": "oci",
+        "scarpenter.sparecores.com/api-reference": "VM.Standard.E5.Flex.2-16",
     }
     expr = spec["affinity"]["nodeAffinity"]["requiredDuringSchedulingIgnoredDuringExecution"]["nodeSelectorTerms"][0]
     assert expr["matchExpressions"][0]["values"] == ["spot", "on-demand"]
@@ -395,3 +395,22 @@ def test_rejected_pod_is_recognised_and_classified_with_its_message():
     evicted_later = finished_pod({"name": "membench", "state": {"running": {}}}, reason="Evicted")
     evicted_later["status"]["message"] = message
     assert not pods.is_rejected(evicted_later)  # a container ran: a real eviction
+
+
+@pytest.mark.parametrize(
+    ("value", "ok"),
+    [
+        ("VM.Standard.E5.Flex.2-16", True),
+        ("m5.large", True),
+        ("a", True),
+        ("a" * 63, True),
+        ("a" * 64, False),
+        ("", False),
+        ("-m5", False),
+        ("m5.", False),
+        ("has space", False),
+        ("a/b", False),
+    ],
+)
+def test_is_label_value(value, ok):
+    assert pods.is_label_value(value) is ok

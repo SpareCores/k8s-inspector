@@ -97,6 +97,7 @@ log = logging.getLogger(__name__)
 LABEL_RUN = crd.LABEL_RUN
 RESYNC_SECONDS = 300
 MAX_FAILING = timedelta(minutes=30)  # reconciles of a run failing for this long end the run
+SKU_NOT_SELECTABLE = "SKU name is not a valid label value; SCarpenter cannot select it by api-reference"
 ACTIVE = (RunPhase.PENDING, RunPhase.PROVISIONING, RunPhase.RUNNING, RunPhase.RELEASING)
 MAX_PROVISION_RETRIES = 3  # attempts lost before a node was usable (stale node, anchor deleted)
 EXTRA_ATTEMPTS = 2  # attempts beyond `max_spot_attempts` (the on-demand one plus one spare)
@@ -108,7 +109,7 @@ DISK_PRESSURE_TAINT = "node.kubernetes.io/disk-pressure"
 # Kubernetes and SCarpenter names read from Node and NodeClaim.
 NODEPOOL_LABEL = pods.NODEPOOL_LABEL
 CAPACITY_LABEL = "karpenter.sh/capacity-type"
-INSTANCE_TYPE_LABEL = pods.INSTANCE_TYPE_LABEL
+INSTANCE_TYPE_LABEL = "node.kubernetes.io/instance-type"  # the node's label, recorded as the instance type
 SCARPENTER = "scarpenter.sparecores.com"
 RELAUNCH_ANNOTATION = "inspector.sparecores.com/relaunch"  # on a step Pod recreated after a DiskPressure rejection
 PRICE_ANNOTATION = f"{SCARPENTER}/price"
@@ -718,6 +719,8 @@ class Runner:
         now = self._now()
         quarantined = spot.is_quarantined(self.kube, run.spec.vendor, run.spec.sku, settings, now)
         capacity = spot.capacity_for_next_attempt(run, selected, settings, quarantined)
+        if not pods.is_label_value(run.spec.sku):
+            return self._end_run(run, ExitCode.HARNESS_ERROR, SKU_NOT_SELECTABLE, AttemptOutcome.HARNESS_ERROR)
         anchor = pods.render_anchor(
             run,
             attempt,
@@ -770,15 +773,16 @@ class Runner:
             self._fail_run(run, error)
 
     def _pending_claims(self, anchor: dict) -> list[dict]:
-        """NodeClaims created for this anchor's pool and instance type since the anchor exists."""
+        """NodeClaims created for this anchor's pool, vendor and SKU since the anchor exists."""
         selector = anchor["spec"]["nodeSelector"]
         created = _time(_meta(anchor).get("creationTimestamp"))
-        # Before launch a NodeClaim has only the pool label; its instance type is in `spec.requirements`.
+        # Before launch a NodeClaim has only the pool label; its vendor and SKU are in `spec.requirements`.
         claims = self.kube.list("nodeclaim", labels={NODEPOOL_LABEL: selector[NODEPOOL_LABEL]})
         return [
             c
             for c in claims
-            if pods.claim_instance_type(c) == selector[INSTANCE_TYPE_LABEL]
+            if pods.claim_vendor(c) == selector[pods.VENDOR_LABEL]
+            and pods.claim_api_reference(c) == selector[pods.API_REFERENCE_LABEL]
             and (created is None or (_time(_meta(c).get("creationTimestamp")) or created) >= created)
         ]
 
