@@ -80,7 +80,9 @@ The publisher runs in the controller every 5 minutes and on demand. It never mov
      `attempts[].lscpu_stdout`, an attempt being the one in the task's `status.json`) and the
      `variant.json` files in the checkout; the publisher assigns a new number when the hardware is new. A task with
      a negative exit code and no usable `lscpu` result goes to `schedule/<task>/meta.json` only; one with exit code
-     0 or above waits for the next cycle rather than land in the wrong variant.
+     0 or above waits for the next cycle rather than land in the wrong variant, until `keepRunHours` after its end:
+     then it is marked published without a commit, logged as an error and counted in
+     `k8s_inspector_unpublishable_tasks_total`, so the run no longer holds the SKU lease.
    - The **timing** files come from the attempt of the task: the latest `run.json` `attempts[]` entry with an lscpu
      result (else its `timing` map) gives `api_start` (the attempt's anchor created), `api_end`, `machine_start`,
      `node_registered` and `node_ready`; the publisher adds `inspector_start`/`inspector_end` (first task start, last
@@ -93,7 +95,9 @@ The publisher runs in the controller every 5 minutes and on demand. It never mov
      count.
    - A SKU is published only when its vendor is enabled with `publish: true` or a list that names it
      ([configuration](../reference/configuration.md)); the runs of other SKUs are deleted after `keepRunHours`, their
-     outputs stay in object storage, and `publish --rescan --sku` can publish them later.
+     outputs stay in object storage, and `publish --rescan --sku` can publish them later. While the ConfigMap is
+     missing or empty the defaults are in effect, which allow nothing; the controller then deletes no unpublished
+     run.
    - A forced run of a SKU that git does not know and that has no `lscpu` result (a typo) publishes nothing.
    - A task whose rendering fails 12 cycles in a row is published without parser output.
    - Git over SSH pins GitHub's published host keys (`StrictHostKeyChecking=yes`); the deploy key is the only secret.

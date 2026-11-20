@@ -85,7 +85,7 @@ def test_parser_defaults_and_other_commands():
 # --------------------------------------------------------------------------- status
 
 
-def make_run(sku, phase, tasks=(), vendor="oci", deleting=False, **status):
+def make_run(sku, phase, tasks=(), vendor="oci", **status):
     return BenchmarkRun(
         f"{vendor}-{sku}",
         "inspector",
@@ -94,7 +94,6 @@ def make_run(sku, phase, tasks=(), vendor="oci", deleting=False, **status):
         NOW - timedelta(minutes=125),
         RunSpec(vendor, sku, "r1"),
         RunStatus(phase=phase, tasks=list(tasks), **status),
-        deleting=deleting,
     )
 
 
@@ -112,12 +111,12 @@ def test_render_status_table():
             capacity_type=CapacityType.SPOT,
             attempt=2,
         ),
-        make_run("a", RunPhase.PENDING, deleting=True),
+        make_run("a", RunPhase.PENDING),
     ]
     lines = cli.render_status(runs, NOW).splitlines()
 
     assert lines[0].split() == ["NAME", "VENDOR", "SKU", "PHASE", "PROGRESS", "STEP", "CAPACITY", "ATTEMPT", "AGE"]
-    assert lines[1].split() == ["oci-a", "oci", "a", "Cancelling", "0/0", "-", "-", "0", "2h"]
+    assert lines[1].split() == ["oci-a", "oci", "a", "Pending", "0/0", "-", "-", "0", "2h"]
     assert lines[2].split() == ["oci-b", "oci", "b", "Running", "3/20", "07-geekbench", "spot", "2", "2h"]
     assert (
         len({line.index("VENDOR") if i == 0 else line.index(" oci ") for i, line in enumerate(lines[:1] + lines[1:2])})
@@ -293,31 +292,29 @@ def test_plan_command(env, monkeypatch, capsys):
     assert capsys.readouterr().out == "oci s lscpu,membench (hash changed)\n"
 
 
-def test_cancel(env, monkeypatch, capsys):
+def test_cancel_requests_the_cancel_with_an_annotation(env, monkeypatch, capsys):
     runs = {"oci-a": make_run("a", RunPhase.RUNNING), "oci-d": make_run("d", RunPhase.DONE)}
-    cancelled = []
+    patches = []
 
     def get_run(kube, name):
         if name not in runs:
             raise NotFound(name)
         return runs[name]
 
-    class FakeRunner:
-        def __init__(self, kube, storage, provider, namespace):
-            pass
+    class PatchingKube(FakeKube):
+        def merge_patch(self, kind, name, body, subresource_status=False):
+            patches.append((kind, name, body, subresource_status))
 
-        def cancel(self, name):
-            cancelled.append(name)
-
+    monkeypatch.setattr(cli, "Kube", lambda namespace: PatchingKube())
     monkeypatch.setattr(crd, "get_run", get_run)
     monkeypatch.setattr(crd, "delete_run", lambda *a: pytest.fail("cancel must keep the BenchmarkRun"))
-    monkeypatch.setattr(cli, "Runner", FakeRunner)
-    monkeypatch.setattr(cli, "Storage", lambda env, uploads: object())
 
     assert cli.main(["cancel", "oci-a"]) == 0
-    assert cancelled == ["oci-a"]
+    assert patches == [
+        ("benchmarkrun", "oci-a", {"metadata": {"annotations": {"inspector.sparecores.com/cancel": "true"}}}, False)
+    ]
     assert cli.main(["cancel", "oci-d"]) == 0  # finished: nothing to cancel
-    assert cancelled == ["oci-a"]
+    assert len(patches) == 1
     assert cli.main(["cancel", "nope"]) == 1
     assert "no such run" in capsys.readouterr().err
 

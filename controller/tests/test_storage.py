@@ -266,3 +266,14 @@ def test_write_and_list_status_and_run_json(store):
         storage.object_key(RUN, "stress", "status.json"),
     ]
     assert len(store.list_status_keys(storage.run_prefix(other))) == 1
+
+
+def test_key_prefix_is_prepended_to_every_key(store, monkeypatch):
+    monkeypatch.setattr(storage, "_key_prefix", "")  # restored after the test; Storage() sets it
+    Storage(EnvConfig(bucket=BUCKET, bucket_region="eu-west-1", key_prefix="k8s-inspector/spikes"), UploadSettings())
+    prefix = "k8s-inspector/spikes/logs/inspect/aws/m5.large/2026/03/07/"
+    assert storage.day_prefix("aws", "m5.large", RUN.day) == prefix
+    assert storage.object_key(RUN, "membench", "stdout") == f"{prefix}{RUN.run_id}/tasks/membench/stdout"
+    store.write_status_json(RUN, "membench", {"exit_code": 0})
+    assert store.list_status_keys(prefix) == [storage.object_key(RUN, "membench", "status.json")]
+    assert store.list_status_keys("logs/inspect/") == []

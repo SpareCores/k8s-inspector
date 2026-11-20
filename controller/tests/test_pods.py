@@ -271,12 +271,19 @@ def test_stuck_containers():
             ]
         return {"spec": {"containers": [{"name": n} for n in names]}, "status": status}
 
-    assert pods.stuck_containers(pod("ImagePullBackOff", "ErrImagePull"), NOW, 15) == {"a", "b"}
-    assert pods.stuck_containers(pod("ContainerCreating", None), NOW, 15) == {"a"}  # b ran: not stuck
-    assert pods.stuck_containers(pod("ImagePullBackOff", None, start="2026-11-20T09:50:00Z"), NOW, 15) == set()
-    assert pods.stuck_containers(pod("CrashLoopBackOff", "CrashLoopBackOff"), NOW, 15) == set()
-    assert pods.stuck_containers({"status": {"phase": "Pending"}}, NOW, 15) == set()  # not started by a kubelet
-    assert pods.stuck_containers(pod(), NOW, 15) == {"a", "b"}  # no sandbox yet: every container waits
+    timeout = {"a": "IMAGE_PULL_TIMEOUT", "b": "IMAGE_PULL_TIMEOUT"}
+    assert pods.stuck_containers(pod("ImagePullBackOff", "ErrImagePull"), NOW, 15) == timeout
+    assert pods.stuck_containers(pod("ContainerCreating", None), NOW, 15) == {"a": "IMAGE_PULL_TIMEOUT"}  # b ran
+    assert pods.stuck_containers(pod("ImagePullBackOff", None, start="2026-11-20T09:50:00Z"), NOW, 15) == {}
+    assert pods.stuck_containers(pod("CrashLoopBackOff", "CrashLoopBackOff"), NOW, 15) == {}
+    assert pods.stuck_containers({"status": {"phase": "Pending"}}, NOW, 15) == {}  # not started by a kubelet
+    assert pods.stuck_containers(pod(), NOW, 15) == timeout  # no sandbox yet: every container waits
+    # waiting states that never resolve fail like stuck pulls and carry the waiting message
+    config = pod("CreateContainerConfigError", "InvalidImageName")
+    config["status"]["containerStatuses"][0]["state"]["waiting"]["message"] = 'secret "x" not found'
+    assert pods.stuck_containers(config, NOW, 15) == {"a": 'secret "x" not found', "b": "InvalidImageName"}
+    assert pods.stuck_containers(pod("ErrImageNeverPull", None), NOW, 15) == {"a": "ErrImageNeverPull"}
+    assert pods.stuck_containers(pod("ErrImageNeverPull", None, start="2026-11-20T09:50:00Z"), NOW, 15) == {}
     assert pods.unfinished_containers(pod("ContainerCreating", None)) == {"a"}
 
 

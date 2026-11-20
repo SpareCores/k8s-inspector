@@ -7,6 +7,6 @@ runs from that queue (no locks inside the state machine); a planner thread and a
 periodic loops. They share only `Kube`, `Storage` (both thread-safe) and write BenchmarkRun status through
 `crd.update_status` (optimistic concurrency).
 
-Layout (see INTERFACES.md for owners and signatures): model, config, log, kube, crd, tasks, steps, storage,
+Layout: model, config, log, kube, crd, tasks, steps, storage,
 pods, spot, runner, planner, keeper, variant, render, publisher, cli.
 """

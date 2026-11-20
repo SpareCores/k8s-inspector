@@ -1,3 +1,4 @@
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -157,6 +158,13 @@ def test_retry_without_gpu():
     assert steps.retry_without_gpu(retry, {"llm": outcome("llm", 256, container_start_error=True)}) is None
     g = steps.next_step([gpu_only], {}, facts(has_nvidia_gpu=True), index=2)
     assert steps.retry_without_gpu(g, {"nvbandwidth": outcome("nvbandwidth", 256, container_start_error=True)}) is None
+
+
+def test_retry_without_gpu_keeps_the_containers_that_started():
+    probes = steps.probe_step([task("lscpu", parallel=True), task("lshw", parallel=True)], index=1)
+    probes = replace(probes, gpu_runtime=True)
+    retry = steps.retry_without_gpu(probes, {"lscpu": outcome("lscpu"), "lshw": outcome("lshw", 256)})
+    assert [c.key for c in retry.containers] == ["lshw"] and not retry.gpu_runtime
 
 
 def test_retry_without_gpu_on_any_start_failure():

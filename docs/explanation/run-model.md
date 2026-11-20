@@ -102,8 +102,12 @@ A run has one or more attempts. Only the [spot strategy](spot.md) and a failed p
 anchor, a vanished anchor) create more than one. An anchor that ends while its node is healthy is a `NODE_LOST` attempt without a spot
 record.
 
-A run whose reconciles fail 10 times in a row, or for 30 minutes, ends `Failed`: its unfinished tasks are `256`
-(harness error), and the anchor and the urls Secret are deleted, so the SKU lease is released.
+A run whose reconciles keep failing for 30 minutes (a time window, not a count: a short API or S3 outage does not
+end a run) ends `Failed` with the attempt outcome `HarnessError`: its unfinished tasks are `256` (harness error) and
+the status is recorded first. No Pod is deleted at that moment; the next pass removes the anchor and the urls Secret,
+so the SKU lease is released.
+
+An attempt that is lost after every task is done goes to `Publishing` without a retry.
 
 ## Teardown layers
 

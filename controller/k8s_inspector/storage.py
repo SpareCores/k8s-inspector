@@ -18,6 +18,7 @@ import json
 import os
 from collections.abc import Sequence
 from dataclasses import replace
+from datetime import date
 
 import boto3
 from botocore.config import Config
@@ -45,7 +46,7 @@ REFRESH_MARGIN_SECONDS = 15 * 60
 # Files every task container produces (sc-run exec); each gets a presigned PUT.
 STANDARD_FILES = ("stdout", "stderr", "version", "result.json", "resource_tracker.jsonl", "manifest.json")
 # Standard files of serial tasks that also get multipart slots from the start (they can outgrow 32 MiB); a task
-# adds its own via `TaskDef.large_outputs`. Not settled by the docs: see INTERFACES.md "Decisions".
+# adds its own via `TaskDef.large_outputs`.
 # Parallel (probe) tasks get none of them: they run without resource-tracker and their logs are small, and
 # the urls Secret must stay far below the 1 MiB object limit.
 LARGE_STANDARD_FILES = ("stdout", "stderr", "resource_tracker.jsonl")
@@ -60,9 +61,17 @@ class UrlsTooLarge(ValueError):
 # --------------------------------------------------------------------------- key layout (pure)
 
 
+_key_prefix = ""  # K8SI_KEY_PREFIX, set once by `Storage.__init__`; "" or ending in "/"
+
+
+def day_prefix(vendor: str, sku: str, day: date) -> str:
+    """`<key prefix>logs/inspect/<vendor>/<sku>/<Y>/<m>/<d>/` (with trailing slash)."""
+    return f"{_key_prefix}logs/inspect/{vendor}/{sku}/{day:%Y/%m/%d}/"
+
+
 def run_prefix(run: RunKey) -> str:
-    """`logs/inspect/<vendor>/<sku>/<Y>/<m>/<d>/<run_id>/` (with trailing slash)."""
-    return f"logs/inspect/{run.vendor}/{run.sku}/{run.day:%Y/%m/%d}/{run.run_id}/"
+    """`<day_prefix>/<run_id>/` (with trailing slash)."""
+    return f"{day_prefix(run.vendor, run.sku, run.day)}{run.run_id}/"
 
 
 def object_key(run: RunKey, key: str, name: str) -> str:
@@ -136,6 +145,8 @@ class Storage:
         """Build the boto3 client for `env.bucket_region` (and `env.s3_endpoint_url`), using the web identity
         role when `env.role_arn` is set (token file: `AWS_WEB_IDENTITY_TOKEN_FILE`, default the ServiceAccount
         token). No network call here."""
+        global _key_prefix
+        _key_prefix = f"{env.key_prefix.strip('/')}/" if env.key_prefix.strip("/") else ""
         self.bucket = env.bucket
         self.uploads = uploads
         self.s3 = _s3_client(env, uploads)
@@ -371,7 +382,7 @@ class Storage:
     # ---- discovery (publisher rescan, DR)
 
     def list_status_keys(self, run_prefix_or_day_prefix: str) -> list[str]:
-        """Object keys of `status.json` objects under a prefix (rescan: `logs/inspect/<vendor>/<sku>/<Y>/<m>/<d>/`)."""
+        """Object keys of `status.json` objects under a prefix (rescan: `day_prefix()`)."""
         pages = self.s3.get_paginator("list_objects_v2").paginate(Bucket=self.bucket, Prefix=run_prefix_or_day_prefix)
         keys = (o["Key"] for page in pages for o in page.get("Contents", []))
         return [k for k in keys if k.endswith("/status.json") and "/tasks/" in k]

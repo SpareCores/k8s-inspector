@@ -8,6 +8,7 @@ values raise `ValueError` naming the key.
 
 import logging
 from collections.abc import Callable, Mapping
+from dataclasses import replace
 from typing import Any
 
 import yaml
@@ -62,6 +63,7 @@ def load_env(environ: Mapping[str, str]) -> EnvConfig:
         namespace=optional("K8SI_NAMESPACE") or "inspector",
         sc_run_image=optional("K8SI_SC_RUN_IMAGE") or "",
         s3_endpoint_url=optional("K8SI_S3_ENDPOINT_URL"),
+        key_prefix=optional("K8SI_KEY_PREFIX") or "",
     )
 
 
@@ -151,7 +153,6 @@ _DEADLINES = {
     "provisionGpuHours": ("provision_gpu_hours", _pos_int),
     "imagePullMinutes": ("image_pull_minutes", _pos_int),
     "holdIdleMinutes": ("hold_idle_minutes", _pos_int),
-    "orphanNodeClaimMinutes": ("orphan_node_claim_minutes", _pos_int),
 }
 _PUBLISH = {"intervalMinutes": ("interval_minutes", _pos_int), "keepRunHours": ("keep_run_hours", _nonneg_int)}
 _UPLOADS = {
@@ -239,7 +240,8 @@ def parse_settings(data: Mapping) -> Settings:
 
 def load_settings(kube: Kube, namespace: str) -> Settings:
     """GET ConfigMap `k8s-inspector`, `yaml.safe_load` its `config.yaml`, `parse_settings`. A missing
-    ConfigMap yields the defaults (no vendor enabled)."""
+    ConfigMap or an empty `config.yaml` yields the defaults (no vendor enabled, `from_configmap` false: the
+    caller must not treat that as a decision, e.g. to delete runs)."""
     # `kube` is bound to its own namespace; the argument documents which one is meant.
     try:
         configmap = kube.get("configmap", SETTINGS_CONFIGMAP)
@@ -247,13 +249,15 @@ def load_settings(kube: Kube, namespace: str) -> Settings:
         log.info("ConfigMap %s/%s not found, using defaults", namespace, SETTINGS_CONFIGMAP)
         return Settings()
     text = (configmap.get("data") or {}).get(SETTINGS_KEY)
-    if text is None:
+    if not text:
         return Settings()
     try:
         data = yaml.safe_load(text)
     except yaml.YAMLError as e:
         raise ValueError(f"ConfigMap {SETTINGS_CONFIGMAP} key {SETTINGS_KEY} is not valid YAML: {e}") from e
-    return parse_settings(data or {})
+    if not data:
+        return Settings()
+    return replace(parse_settings(data), from_configmap=True)
 
 
 def load_config(environ: Mapping[str, str], kube: Kube) -> Config:

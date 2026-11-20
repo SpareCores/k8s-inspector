@@ -165,6 +165,7 @@ class _MeteredPublisher(Publisher):
     def publish_once(self, settings: Settings | None = None) -> PublishResult:
         result = super().publish_once(settings)
         self._metrics.record_publish()
+        self._metrics.record_unpublishable(result.unpublishable)
         return result
 
 
@@ -309,7 +310,7 @@ def render_status(runs: list[BenchmarkRun], now: datetime, failing: bool = False
             run.name,
             run.spec.vendor,
             run.spec.sku,
-            "Cancelling" if run.deleting else run.status.phase.value,
+            run.status.phase.value,
             run.status.progress,
             run.status.current_step or "-",
             run.status.capacity_type.value if run.status.capacity_type else "-",
@@ -328,8 +329,9 @@ def cmd_status(args: argparse.Namespace) -> int:
 
 
 def cmd_cancel(args: argparse.Namespace) -> int:
-    """`Runner.cancel`: unfinished tasks end `-4 CANCELLED`, Pods are deleted, the BenchmarkRun is kept."""
-    kube, provider = _connect()
+    """Request the cancel (`crd.request_cancel`: an annotation) on the BenchmarkRun and return: the `serve` runner ends
+    the unfinished tasks `-4 CANCELLED`, deletes the Pods and keeps the BenchmarkRun."""
+    kube, _ = _connect()
     try:
         run = crd.get_run(kube, args.run)
     except NotFound:
@@ -337,9 +339,8 @@ def cmd_cancel(args: argparse.Namespace) -> int:
     if run.status.phase in (RunPhase.DONE, RunPhase.FAILED, RunPhase.CANCELLED):
         print(f"{run.name} is already {run.status.phase.value}; nothing to do")
         return 0
-    cfg = provider()
-    Runner(kube, Storage(cfg.env, cfg.settings.uploads), provider, cfg.env.namespace).cancel(run.name)
-    print(f"cancelled {run.name}")
+    crd.request_cancel(kube, run.name)
+    print(f"cancel requested for {run.name}; the serve process performs it")
     return 0
 
 

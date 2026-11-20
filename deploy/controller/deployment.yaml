@@ -51,6 +51,8 @@ spec:
         - {name: KEEPER_API_KEY_FILE, value: /etc/k8s-inspector/keeper/api-key}
         # AWS web identity: the controller exchanges the projected token for a role session (K8SI_ROLE_ARN).
         - {name: AWS_WEB_IDENTITY_TOKEN_FILE, value: /var/run/secrets/aws/token}
+        # Optional: prefix of every object key (default empty), e.g. a scratch prefix for a first run.
+        # - {name: K8SI_KEY_PREFIX, value: k8s-inspector/spikes/}
         - {name: HOME, value: /work}
         - {name: TMPDIR, value: /tmp}
         livenessProbe:

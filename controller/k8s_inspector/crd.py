@@ -30,6 +30,7 @@ API_VERSION = "inspector.sparecores.com/v1alpha1"
 KIND = "BenchmarkRun"
 LABEL_RUN = "inspector.sparecores.com/run"
 LABEL_VENDOR = "inspector.sparecores.com/vendor"
+ANNOTATION_CANCEL = "inspector.sparecores.com/cancel"
 
 MAX_NAME_LENGTH = 63  # DNS-1123 label, also the limit for label values and Pod name prefixes
 UPDATE_ATTEMPTS = 5
@@ -203,7 +204,7 @@ def from_dict(obj: dict) -> BenchmarkRun:
             database=spec.get("database"),
         ),
         status=_status_from_dict(obj.get("status") or {}),
-        deleting=bool(meta.get("deletionTimestamp")),
+        cancel_requested=(meta.get("annotations") or {}).get(ANNOTATION_CANCEL) == "true",
     )
 
 
@@ -303,6 +304,12 @@ def update_status(kube: Kube, name: str, mutate: Callable[[RunStatus], None]) ->
         except Conflict:
             continue
     raise Conflict(f"BenchmarkRun {name}: status update still conflicting after {UPDATE_ATTEMPTS} attempts")
+
+
+def request_cancel(kube: Kube, name: str) -> None:
+    """Ask the serve runner to cancel the run (annotation). The runner does the cancelling, so a CLI and the
+    runner never race on the same run. Raise `kube.NotFound`."""
+    kube.merge_patch("benchmarkrun", name, {"metadata": {"annotations": {ANNOTATION_CANCEL: "true"}}})
 
 
 def delete_run(kube: Kube, name: str) -> None:

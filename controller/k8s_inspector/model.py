@@ -60,6 +60,7 @@ class AttemptOutcome(StrEnum):
     NODE_LOST = "NodeLost"
     PROVISIONING_FAILED = "ProvisioningFailed"
     CANCELLED = "Cancelled"
+    HARNESS_ERROR = "HarnessError"  # the controller gave up on the run
 
 
 class PodRole(StrEnum):
@@ -259,7 +260,7 @@ class BenchmarkRun:
     created: datetime
     spec: RunSpec
     status: RunStatus = field(default_factory=RunStatus)
-    deleting: bool = False  # metadata.deletionTimestamp is set (= cancel)
+    cancel_requested: bool = False  # annotation `inspector.sparecores.com/cancel: "true"` (crd.request_cancel)
 
 
 # --------------------------------------------------------------------------- node, outcomes
@@ -391,6 +392,7 @@ class EnvConfig:
     namespace: str = "inspector"
     sc_run_image: str = ""  # K8SI_SC_RUN_IMAGE: "ghcr.io/sparecores/sc-run@sha256:..." (not in configuration.md)
     s3_endpoint_url: str | None = None  # K8SI_S3_ENDPOINT_URL: S3-compatible endpoint (OCI), optional
+    key_prefix: str = ""  # K8SI_KEY_PREFIX: prepended to every object key (e.g. "k8s-inspector/spikes/"), optional
 
 
 @dataclass(frozen=True)
@@ -440,7 +442,6 @@ class Deadlines:
     provision_gpu_hours: int = 6
     image_pull_minutes: int = 15
     hold_idle_minutes: int = 45
-    orphan_node_claim_minutes: int = 30
 
 
 @dataclass(frozen=True)
@@ -472,6 +473,7 @@ class Settings:
     deadlines: Deadlines = field(default_factory=Deadlines)
     publish: PublishSettings = field(default_factory=PublishSettings)
     uploads: UploadSettings = field(default_factory=UploadSettings)
+    from_configmap: bool = False  # False: the ConfigMap is missing or empty and these are the defaults
 
 
 @dataclass(frozen=True)

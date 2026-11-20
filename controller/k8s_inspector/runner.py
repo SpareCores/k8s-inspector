@@ -27,12 +27,14 @@ Phases:
 - Running: no step in flight -> prechecks (`-3`), vLLM ladder failures, next step (`steps.probe_step` first,
   which always contains `lscpu`, then `steps.next_step`): sign URLs into the Secret, heartbeat, create the Pod.
   Step Pod finished -> `pods.classify`, `storage.finish_task`, a `flush` Pod (max 2) while uploads are
-  incomplete, then `status.json` per task (the commit point) and `status.tasks`. A step that cannot start its GPU
-  runtime is recreated once without it. Containers stuck pulling their image -> `-4 IMAGE_PULL_TIMEOUT` (the
-  others of the Pod keep their results). Every `uploads.resign_every_minutes` the Secret is re-signed. No step
+  incomplete, then `status.json` per task (the commit point) and `status.tasks`. The containers of a step that
+  cannot start their GPU runtime are recreated once without it (the others keep their results). Containers stuck
+  pulling their image -> `-4 IMAGE_PULL_TIMEOUT`, or stuck in a waiting state that never resolves (bad image
+  name, missing Secret key) -> `-4` with the waiting message (the others of the Pod keep their results). Every
+  `uploads.resign_every_minutes` the Secret is re-signed. No step
   left -> Releasing.
-- Anchor, Node or NodeClaim lost while Running: close the attempt (an anchor that ended on a healthy node is
-  `NODE_LOST`, else `spot.classify_node_loss`), delete the Pods and wait until none of them can still be
+- Anchor, Node or NodeClaim lost (or draining) while Running: close the attempt (an anchor that ended on a
+  healthy node is `NODE_LOST`, else `spot.classify_node_loss`), delete the Pods and wait until none of them can still be
   uploading, then salvage the in-flight tasks (only when they are not retried). A spot interruption starts the
   next attempt with the unfinished tasks (the in-flight task runs again); any other loss, or too many attempts,
   ends the unfinished tasks as `-4 NODE_LOST|SPOT_INTERRUPTED`. The Secret is deleted last.
@@ -40,12 +42,14 @@ Phases:
   publisher takes over and sets Done).
 - Cancelled/Failed/Publishing/Done: only leftover anchors are deleted.
 
-A reconcile that keeps failing (`MAX_FAILURES` times in a row, or for `MAX_FAILING`) ends the run: unfinished
-tasks `256 HARNESS_ERROR`, anchor and Secret deleted, phase Failed.
+A reconcile that keeps failing for `MAX_FAILING` ends the run: unfinished tasks `256 HARNESS_ERROR`, open
+uploads aborted, phase Failed (attempt outcome `HarnessError`). Nothing is deleted there: the Failed phase
+removes the anchor (and with it the step Pods) on the next pass, and the Secret goes with the run.
 
-Cancel: `cancel()` records `-4 CANCELLED` for every unfinished task, deletes the Pods and sets phase Cancelled.
-The BenchmarkRun is kept for the publisher: the CRD has no finalizer, so a plain `kubectl delete` leaves no
-object to record anything on (leftover Pods are still deleted).
+Cancel: the CLI sets the annotation `inspector.sparecores.com/cancel: "true"` (`crd.request_cancel`); the runner
+sees it and `cancel()` records `-4 CANCELLED` for every unfinished task, deletes the Pods and sets phase
+Cancelled. The BenchmarkRun is kept for the publisher: the CRD has no finalizer, so a plain `kubectl delete`
+leaves no object to record anything on (leftover Pods are still deleted).
 """
 
 import base64
@@ -87,8 +91,8 @@ log = logging.getLogger(__name__)
 
 LABEL_RUN = crd.LABEL_RUN
 RESYNC_SECONDS = 300
-MAX_FAILURES = 10  # reconciles of a run failing in a row before the run is ended
-MAX_FAILING = timedelta(minutes=30)  # ... or failing for this long
+MAX_FAILING = timedelta(minutes=30)  # reconciles of a run failing for this long end the run
+ACTIVE = (RunPhase.PENDING, RunPhase.PROVISIONING, RunPhase.RUNNING, RunPhase.RELEASING)
 MAX_PROVISION_RETRIES = 3  # attempts lost before a node was usable (stale node, anchor deleted)
 EXTRA_ATTEMPTS = 2  # attempts beyond `max_spot_attempts` (the on-demand one plus one spare)
 BACKOFF_SECONDS = (2, 5, 15, 30, 60)
@@ -269,7 +273,7 @@ class Runner:
         self._lock = threading.Lock()
         self._queued: set[str] = set()
         self._known: set[str] = set()  # run names seen, to notice deletions between LISTs
-        self._failures: dict[str, tuple[int, datetime]] = {}  # run -> (reconciles failed in a row, since when)
+        self._failing: dict[str, tuple[int, datetime]] = {}  # run -> (reconciles failed in a row, since when)
         self._nodes: dict[str, _Node] = {}  # cache per run
         self._signed_at: dict[str, datetime] = {}  # when the urls Secret was last signed, per run
 
@@ -305,7 +309,9 @@ class Runner:
             RunPhase.RELEASING: self._releasing,
         }
         try:
-            if run.status.phase in handlers:
+            if run.cancel_requested and run.status.phase in ACTIVE:
+                self._cancel(run, cfg, live)
+            elif run.status.phase in handlers:
                 handlers[run.status.phase](run, cfg, live)
             else:
                 self._delete_anchors(live)  # finished: nothing may be left holding a node
@@ -313,10 +319,11 @@ class Runner:
             log.info("run %s changed under the reconcile, dropping the pass", run.name)
 
     def cancel(self, run_name: str) -> None:
-        """Cancel the run: unfinished tasks end `-4 CANCELLED`, Pods are deleted, phase Cancelled. Synchronous (the
-        CLI calls it from its own process). Does nothing for a run that is already over."""
+        """Cancel the run: unfinished tasks end `-4 CANCELLED`, Pods are deleted, phase Cancelled. Synchronous. The
+        CLI does not call it: it sets the cancel annotation and `reconcile` calls this. Does nothing for a run
+        that is already over."""
         run = crd.get_run(self.kube, run_name)
-        if run.status.phase in (RunPhase.PENDING, RunPhase.PROVISIONING, RunPhase.RUNNING, RunPhase.RELEASING):
+        if run.status.phase in ACTIVE:
             live = {_meta(p)["name"]: p for p in self.kube.list("pod", labels={LABEL_RUN: run.name})}
             self._cancel(run, self._cfg(), live)
 
@@ -343,15 +350,15 @@ class Runner:
     def _work(self, name: str) -> None:
         try:
             self.reconcile(name)
-            self._failures.pop(name, None)
+            self._failing.pop(name, None)
         except Exception as error:
-            failures, since = self._failures.get(name, (0, self._now()))
-            self._failures[name] = (failures + 1, since)
-            if failures + 1 >= MAX_FAILURES or self._now() - since >= MAX_FAILING:
+            failures, since = self._failing.get(name, (0, self._now()))
+            self._failing[name] = (failures + 1, since)
+            if self._now() - since >= MAX_FAILING:
                 log.exception("reconcile of %s keeps failing, ending the run", name)
                 try:
                     self._give_up(name, error)
-                    self._failures.pop(name, None)
+                    self._failing.pop(name, None)
                     return
                 except Exception:
                     log.exception("ending run %s failed, retrying", name)
@@ -367,10 +374,9 @@ class Runner:
             run = crd.get_run(self.kube, name)
         except NotFound:
             return self._forget(name)
-        if run.status.phase in (RunPhase.PENDING, RunPhase.PROVISIONING, RunPhase.RUNNING, RunPhase.RELEASING):
-            live = {_meta(p)["name"]: p for p in self.kube.list("pod", labels={LABEL_RUN: name})}
+        if run.status.phase in ACTIVE:
             message = f"the controller gave up on the run: {type(error).__name__}"  # no details: may hold URLs
-            self._end_run(run, live, ExitCode.HARNESS_ERROR, message, AttemptOutcome.NODE_LOST)
+            self._end_run(run, ExitCode.HARNESS_ERROR, message, AttemptOutcome.HARNESS_ERROR)
 
     def _watch(self, kind: str, labels: dict | None, stop: threading.Event) -> None:
         while not stop.is_set():
@@ -582,14 +588,15 @@ class Runner:
             if attempt.n == status.attempt and attempt.outcome is None:
                 attempt.outcome, attempt.end = outcome, self._now()
 
-    def _end_run(
-        self, run: BenchmarkRun, live: dict[str, dict], code: int, message: str, outcome: AttemptOutcome
-    ) -> None:
-        """The run cannot go on: unfinished tasks end with `code`, Pods and Secret go, phase Failed."""
+    def _end_run(self, run: BenchmarkRun, code: int, message: str, outcome: AttemptOutcome) -> None:
+        """The run cannot go on: unfinished tasks end with `code` (open uploads of the running ones aborted),
+        the Secret goes, phase Failed. The Pods stay: the Failed phase deletes the anchor on the next pass, and
+        recording first means a failing cluster API cannot leave a run without a record."""
         log.warning("run %s failed: %s", run.name, message)
-        for name in live:
-            self.kube.delete("pod", name)
         run = self._ensure_tasks(run)
+        for t in run.status.tasks:
+            if t.state == TaskState.RUNNING:
+                self.storage.abort_open(crd.run_key(run), t.name)
         run = self._fail_tasks(run, None, code, message)
 
         def mutate(status: RunStatus) -> None:
@@ -601,9 +608,9 @@ class Runner:
         self._write_run_json(run, self._nodes.pop(run.name, None))
         self._delete_secret(run)
 
-    def _fail_run(self, run: BenchmarkRun, live: dict[str, dict], message: str) -> None:
+    def _fail_run(self, run: BenchmarkRun, message: str) -> None:
         """No usable node: unfinished tasks end `-1`."""
-        self._end_run(run, live, ExitCode.NO_NODE, message, AttemptOutcome.PROVISIONING_FAILED)
+        self._end_run(run, ExitCode.NO_NODE, message, AttemptOutcome.PROVISIONING_FAILED)
 
     # ----------------------------------------------------------------------- run.json
 
@@ -676,9 +683,7 @@ class Runner:
         try:
             pool = pods.node_pool(run, cfg, gpu=gpu, lowmem=lowmem)
         except ValueError as e:
-            self._end_run(
-                run, live, ExitCode.HARNESS_ERROR, f"cannot place the run: {e}", AttemptOutcome.PROVISIONING_FAILED
-            )
+            self._end_run(run, ExitCode.HARNESS_ERROR, f"cannot place the run: {e}", AttemptOutcome.PROVISIONING_FAILED)
             return
         anchor = pods.render_anchor(
             run,
@@ -714,7 +719,7 @@ class Runner:
             return self._retry_provisioning(run, cfg, live, "the anchor Pod disappeared")
         if pods.is_finished(anchor):
             reason = anchor.get("status", {}).get("reason") or anchor["status"].get("phase")
-            return self._fail_run(run, live, f"SCARPENTER_BOOT_FAILURE: anchor ended before running ({reason})")
+            return self._fail_run(run, f"SCARPENTER_BOOT_FAILURE: anchor ended before running ({reason})")
         if pods.is_running(anchor) and pods.is_ready(anchor):
             return self._node_ready(run, cfg, live, anchor)
 
@@ -731,7 +736,7 @@ class Runner:
             default = "BOOT_FAILURE" if claims else "ICE"
             error = scarpenter_error(f"no node after {int(budget.total_seconds() // 60)} minutes", default)
         if error:
-            self._fail_run(run, live, error)
+            self._fail_run(run, error)
 
     def _pending_claims(self, anchor: dict) -> list[dict]:
         """NodeClaims created for this anchor's pool and instance type since the anchor exists."""
@@ -749,7 +754,7 @@ class Runner:
         """The attempt never got a usable node: close it and start the next one, a few times."""
         lost = sum(1 for a in run.status.attempts if a.outcome == AttemptOutcome.PROVISIONING_FAILED)
         if lost + 1 >= MAX_PROVISION_RETRIES:
-            return self._fail_run(run, live, f"SCARPENTER_BOOT_FAILURE: {why}, {lost + 1} attempts")
+            return self._fail_run(run, f"SCARPENTER_BOOT_FAILURE: {why}, {lost + 1} attempts")
         log.warning("run %s attempt %d: %s, retrying", run.name, run.status.attempt, why)
         self._delete_anchors(live)
 
@@ -860,14 +865,25 @@ class Runner:
             raw = self.storage.read_bytes(object_key(key, "gpu_facts", "stdout"))
             nd.facts.gpu_vram_mib, nd.facts.gpu_compute_cap = parse_gpu_facts(raw or b"")
 
+    def _get_node(self, name: str | None) -> dict | None:
+        if not name:
+            return None
+        try:
+            return self.kube.get("node", name)
+        except NotFound:
+            return None
+
+    @staticmethod
+    def _draining(node: dict, claim: dict | None) -> bool:
+        """The Node is being deleted or its NodeClaim carries an interruption notice."""
+        return bool(_meta(node).get("deletionTimestamp")) or _interrupted(claim)
+
     def _node_state(self, run: BenchmarkRun, anchor: dict | None) -> tuple[_Node | None, bool]:
-        """(node, draining) of the running attempt. node None: anchor or Node are gone. draining: the Node is being
-        deleted or its NodeClaim carries an interruption notice."""
+        """(node, draining) of the running attempt. node None: anchor or Node are gone."""
         if anchor is None or pods.is_finished(anchor):
             return None, False
-        try:
-            node = self.kube.get("node", pods.pod_node(anchor))
-        except NotFound:
+        node = self._get_node(pods.pod_node(anchor))
+        if node is None:
             return None, False
         nd = self._nodes.get(run.name)
         if nd is None or nd.attempt != run.status.attempt or nd.facts.node_name != _meta(node)["name"]:
@@ -877,8 +893,7 @@ class Runner:
         nd.gpu_count = _quantity(
             node.get("status", {}).get("allocatable", {}).get(GPU_RESOURCE, 0)
         )  # the plugin may register late
-        draining = bool(_meta(node).get("deletionTimestamp")) or _interrupted(nd.claim)
-        return nd, draining
+        return nd, self._draining(node, nd.claim)
 
     # ----------------------------------------------------------------------- Running
 
@@ -890,7 +905,7 @@ class Runner:
         if any(t.state == TaskState.RUNNING for t in run.status.tasks):
             return self._watch_step(run, cfg, live, nd, draining)
         if draining:
-            return  # the node goes away: no new step on it
+            return self._attempt_lost(run, cfg, live, nd)  # the node goes away: no new step on it
         run = self._precheck(run, nd)
         run = self._ladder_failures(run, nd)
         step = self._plan(run, nd, _step_index(run.status.current_step) + 1)
@@ -993,7 +1008,9 @@ class Runner:
             return self._fail_running(run, nd, live, "the step in flight cannot be read back from the status")
         pod = live.get(pods.step_pod_name(run.name, run.status.attempt, step))
         if pod is None:
-            if not draining:
+            if draining:
+                self._attempt_lost(run, cfg, live, nd)  # evicted outright: nothing is left to wait for
+            else:
                 self._launch(run, cfg, live, nd, step)  # the Pod was lost: the same step again
         elif {s["name"] for s in pod["spec"]["containers"]} != {pods.container_name(c.key) for c in step.containers}:
             log.error("run %s: Pod %s does not match the stored step", run.name, _meta(pod)["name"])
@@ -1001,9 +1018,13 @@ class Runner:
         elif pods.is_finished(pod):
             self._finish_step(run, cfg, live, nd, step, pod, draining)
         elif stuck := pods.stuck_containers(pod, self._now(), cfg.settings.deadlines.image_pull_minutes):
-            if pods.unfinished_containers(pod) <= stuck:  # the others are done: nothing left to wait for
-                keys = {c.key for c in step.containers if pods.container_name(c.key) in stuck}
-                self._finish_step(run, cfg, live, nd, step, pod, draining, stuck=keys)
+            if pods.unfinished_containers(pod) <= stuck.keys():  # the others are done: nothing left to wait for
+                messages = {
+                    c.key: stuck[pods.container_name(c.key)]
+                    for c in step.containers
+                    if pods.container_name(c.key) in stuck
+                }
+                self._finish_step(run, cfg, live, nd, step, pod, draining, stuck=messages)
             else:
                 self._resign_if_due(run, cfg)
         else:
@@ -1029,25 +1050,22 @@ class Runner:
         step: Step,
         pod: dict,
         draining: bool,
-        stuck: frozenset[str] | set[str] = frozenset(),
+        stuck: dict[str, str] | None = None,
     ) -> None:
-        """The step Pod ended (or, with `stuck`, only containers stuck pulling are left: those keys)."""
+        """The step Pod ended (or, with `stuck`, only containers stuck waiting are left: their keys and the
+        `error_msg` of their tasks)."""
         pod_name = _meta(pod)["name"]
+        stuck = stuck or {}
         outcomes = pods.classify(pod, step.containers)
-        for key in stuck:
-            outcomes[key] = TaskOutcome(
-                key, ExitCode.NEVER_FINISHED, Reason.IMAGE_PULL_TIMEOUT.value, from_sc_run=False
-            )
+        for key, message in stuck.items():
+            outcomes[key] = TaskOutcome(key, ExitCode.NEVER_FINISHED, message, from_sc_run=False)
         if draining and any(
             o.exit_code == ExitCode.NEVER_FINISHED and o.error_msg in (Reason.EVICTED, Reason.CANCELLED)
             for o in outcomes.values()
         ):
             return self._attempt_lost(run, cfg, live, nd)
-        if retry := steps.retry_without_gpu(step, outcomes):
-            self.kube.delete("pod", pod_name)
-            return self._start_step(run, cfg, live, nd, replace(retry, name=f"{step.name}-cpu"), fallback=True)
-        if stuck:
-            self.kube.delete("pod", pod_name)  # before recording: it must not keep running
+        retry = steps.retry_without_gpu(step, outcomes)
+        retried = {c.key for c in retry.containers} if retry else set()  # run again below, not recorded now
 
         flushes = sorted(n for n in live if n.startswith(f"{pod_name}-flush"))
         if flushes and not pods.is_finished(live[flushes[-1]]):
@@ -1055,7 +1073,9 @@ class Runner:
         key = crd.run_key(run)
         verdicts: dict[str, Verification | None] = {}
         for c in step.containers:
-            if outcomes[c.key].container_start_error or c.key in stuck:
+            if c.key in retried:
+                verdicts[c.key] = None  # its uploads are reused by the new Pod
+            elif outcomes[c.key].container_start_error or c.key in stuck:
                 self.storage.abort_open(key, c.key)  # nothing ran: nothing to verify
                 verdicts[c.key] = None
             else:
@@ -1078,6 +1098,8 @@ class Runner:
         plans = self._current_plans(run) if failing else []
         results = []
         for c in step.containers:
+            if c.key in retried:
+                continue
             outcome, verdict = outcomes[c.key], verdicts[c.key]
             code, message = outcome.exit_code, outcome.error_msg
             if c in failing:  # the Pods are over: salvage what the uploaded parts allow
@@ -1087,28 +1109,20 @@ class Runner:
             if c.task.images and c.key == c.task.name and code != 0:  # the benchmark after a successful probe
                 message = f"benchmark failed on {steps.vllm_label(c.image)} after successful probe ({message or code})"
             results.append(_Result(c.task, c.key, code, message, outcome, verdict, c.image, pod_name))
+        if stuck or retry:
+            self.kube.delete("pod", pod_name)  # right before recording: nothing may flush from it before that
         if step.name == steps.PROBE_STEP_NAME:
             nd.facts.boot_time = next((o.btime for o in outcomes.values() if o.btime), nd.facts.boot_time)
-        run = self._record(run, nd, results, end_step=True)
+        run = self._record(run, nd, results, end_step=retry is None)
         if step.name == steps.PROBE_STEP_NAME:
             self._learn_probe_facts(run, nd)
             self._write_run_json(run, nd)
+        if retry:
+            return self._start_step(run, cfg, live, nd, replace(retry, name=f"{step.name}-cpu"), fallback=True)
         self._heartbeat(run)
-        if not draining:
-            self._running(run, cfg, live)
+        self._running(run, cfg, live)
 
     # ----------------------------------------------------------------------- losing the node
-
-    def _node_healthy(self, run: BenchmarkRun) -> bool:
-        """The attempt's Node exists and is not going away: only the anchor ended."""
-        attempt = self._attempt(run)
-        if attempt is None or not attempt.node:
-            return False
-        try:
-            node = self.kube.get("node", attempt.node)
-        except NotFound:
-            return False
-        return not _meta(node).get("deletionTimestamp") and not _interrupted(self._get_claim(attempt.node_claim))
 
     def _attempt_lost(self, run: BenchmarkRun, cfg: Config, live: dict[str, dict], nd: _Node | None) -> None:
         """Anchor or Node gone (spot reclaim, expiry, manual delete). Close the attempt, then either run the rest
@@ -1118,9 +1132,10 @@ class Runner:
         key = crd.run_key(run)
         attempt = self._attempt(run)
         outcome = attempt.outcome
+        node = self._get_node(attempt.node)
+        claim = self._get_claim(attempt.node_claim) or (nd.claim if nd else None)
         if outcome is None:
-            claim = self._get_claim(attempt.node_claim) or (nd.claim if nd else None)
-            healthy = self._node_healthy(run)
+            healthy = node is not None and not self._draining(node, claim)  # only the anchor ended
             outcome = (
                 AttemptOutcome.NODE_LOST if healthy else spot.classify_node_loss(run, nd.facts if nd else None, claim)
             )
@@ -1137,11 +1152,15 @@ class Runner:
         for name in still_up:
             self.kube.delete("pod", name)
         if any(live[n]["metadata"]["labels"]["inspector.sparecores.com/role"] != PodRole.ANCHOR for n in still_up) and (
-            attempt.node and self._node_exists(attempt.node)
+            node is not None
         ):
             return
 
-        retry = interrupted and len(run.status.attempts) < cfg.settings.spot.max_spot_attempts + EXTRA_ATTEMPTS
+        retry = (
+            interrupted
+            and bool(self._unfinished(run))
+            and len(run.status.attempts) < cfg.settings.spot.max_spot_attempts + EXTRA_ATTEMPTS
+        )
         running = [t.name for t in run.status.tasks if t.state == TaskState.RUNNING]
         verdicts: dict[str, Verification] = {}
         if retry:
@@ -1174,13 +1193,6 @@ class Runner:
         self._delete_secret(run)  # last: the salvage needed its URLs list
         if retry:
             self.enqueue(run.name)
-
-    def _node_exists(self, name: str) -> bool:
-        try:
-            self.kube.get("node", name)
-        except NotFound:
-            return False
-        return True
 
     # ----------------------------------------------------------------------- Releasing
 
@@ -1216,6 +1228,7 @@ class Runner:
     # ----------------------------------------------------------------------- cancel
 
     def _cancel(self, run: BenchmarkRun, cfg: Config, live: dict[str, dict]) -> None:
+        run = self._ensure_tasks(run)  # a run cancelled before its first attempt still needs its tasks
         key = crd.run_key(run)
         for pod_name in live:
             self.kube.delete("pod", pod_name)

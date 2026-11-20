@@ -87,6 +87,17 @@ class FakeStorage:
         if stderr:
             self.objects[f"{base}/stderr"] = stderr
 
+    def put_run_json(self, run: RunKey, lscpu_stdout: str) -> None:
+        """`run.json` with the lscpu output of attempt 1 (the attempt of the golden statuses)."""
+        attempt = {
+            "attempt": 1,
+            "api_start": "2026-09-29T12:57:13Z",
+            "machine_start": "2026-09-29T12:58:07Z",
+            "lscpu_stdout": lscpu_stdout,
+        }
+        doc = {"attempts": [attempt]}
+        self.objects[okey(run, "run.json")] = json.dumps(doc).encode()
+
     def read_json(self, run, key, name):
         raw = self.objects.get(okey(run, f"tasks/{key}/{name}"))
         return json.loads(raw) if raw else None
@@ -147,7 +158,7 @@ def cluster(monkeypatch):
 def golden_status(name: str, root: Path = GOLDEN) -> dict:
     meta = json.loads((root / name / "meta.json").read_text())
     meta.pop("outputs")
-    return {**meta, "run_id": RUN_ID}
+    return {**meta, "run_id": RUN_ID, "attempt": 1}
 
 
 def put_golden(storage: FakeStorage, name: str, run: RunKey = KEY) -> None:
@@ -166,7 +177,7 @@ def storage() -> FakeStorage:
     for name in ("lscpu", "geekbench", "openssl"):
         put_golden(s, name)
     s.put_task("vllm-probe-vllm_x", {"exit_code": 0})
-    s.objects[okey(KEY, "run.json")] = json.dumps({"timing": {"machine_start": "2026-09-29T12:58:07Z"}}).encode()
+    s.put_run_json(KEY, (GOLDEN / "lscpu/stdout").read_text())
     return s
 
 
@@ -288,12 +299,28 @@ def test_no_node_result_goes_to_schedule_only(tmp_path, origin, storage, cluster
     assert [p.name for p in inst.iterdir()] == ["schedule"]
 
 
+def _put_openssl_without_lscpu(storage: FakeStorage, ended: datetime) -> None:
+    status = golden_status("openssl") | {"end": ended.replace(tzinfo=None).isoformat()}
+    storage.put_task("openssl", status, (GOLDEN / "openssl/stdout").read_bytes())
+
+
 def test_finished_task_without_lscpu_waits(tmp_path, origin, cluster):
     storage = FakeStorage()
-    put_golden(storage, "openssl")
+    _put_openssl_without_lscpu(storage, datetime.now(UTC))
     run = cluster.add_run(["openssl"])
     result = make_publisher(tmp_path, origin, storage).publish_once(ENABLED)
-    assert result.tasks_published == 0 and not run.status.tasks[0].published
+    assert result.tasks_published == 0 and result.unpublishable == 0 and not run.status.tasks[0].published
+
+
+def test_finished_task_without_lscpu_is_given_up_after_keep_run_hours(tmp_path, origin, cluster, caplog):
+    storage = FakeStorage()
+    _put_openssl_without_lscpu(storage, datetime.now(UTC) - timedelta(hours=25))
+    run = cluster.add_run(["openssl"])
+    result = make_publisher(tmp_path, origin, storage).publish_once(ENABLED)
+    task = run.status.tasks[0]
+    assert result == publisher.PublishResult(0, None, (), unpublishable=1)
+    assert task.published and task.commit is None
+    assert "not publishable" in caplog.text
 
 
 def test_new_hardware_gets_the_next_variant_and_a_known_one_is_reused(tmp_path, origin, storage, cluster):
@@ -307,6 +334,7 @@ def test_new_hardware_gets_the_next_variant_and_a_known_one_is_reused(tmp_path, 
         if row["field"] == "Model name:":
             row["data"] = "Neoverse-N2"
     storage.put_task("lscpu", golden_status("lscpu") | {"run_id": "r2"}, json.dumps(lscpu).encode(), run=other)
+    storage.put_run_json(other, json.dumps(lscpu))
     run2 = cluster.add_run(["lscpu"])
     run2.name, run2.spec.run_id = "run2", "r2"
     cluster.runs["run2"] = run2
@@ -362,6 +390,7 @@ def test_rescan_publishes_what_git_lacks(tmp_path, origin, storage, cluster):
     recent = RunKey("hcloud", "cax31", today, "r-recent")
     for name in ("lscpu", "openssl"):
         put_golden(storage, name, recent)
+    storage.put_run_json(recent, (GOLDEN / "lscpu/stdout").read_text())
     result = pub.rescan(7, settings=ENABLED)
     assert result.run_ids == ("r-recent",) and result.tasks_published == 2  # the 2026-09-29 run is older than 7 days
     check = clone(origin, tmp_path) / "data/hcloud/cax31"
@@ -438,7 +467,7 @@ def test_listed_sku_publishes_and_others_wait(tmp_path, origin, storage, cluster
 
 def test_finished_runs_that_will_never_be_published_are_deleted_to_free_the_lease(tmp_path, origin, storage, cluster):
     pub = make_publisher(tmp_path, origin, storage)
-    only = replace(ENABLED, vendors={"hcloud": VendorSettings(enabled=True, publish=("cax31",))})
+    only = replace(ENABLED, vendors={"hcloud": VendorSettings(enabled=True, publish=("cax31",))}, from_configmap=True)
     never = cluster.add_run(NAMES, sku="cx22")
     keep = cluster.add_run(NAMES)  # publishable, not published yet
     running = cluster.add_run(NAMES, sku="cx32", phase=RunPhase.RUNNING)
@@ -446,15 +475,22 @@ def test_finished_runs_that_will_never_be_published_are_deleted_to_free_the_leas
     assert never.name not in cluster.runs and keep.name in cluster.runs and running.name in cluster.runs
 
 
+def test_without_the_configmap_unpublished_runs_are_not_deleted(tmp_path, origin, storage, cluster):
+    pub = make_publisher(tmp_path, origin, storage)
+    unpublished = cluster.add_run(NAMES)
+    assert pub.delete_expired_runs(Settings()) == 0  # defaults: nothing is allowed, which is not a decision
+    assert unpublished.name in cluster.runs
+
+
 def test_mark_ignores_a_task_recorded_again_after_it_was_read(tmp_path, origin, storage, cluster):
     run = cluster.add_run(NAMES)
     pub = make_publisher(tmp_path, origin, storage)
     original = pub._publish
 
-    def racing(items):
+    def racing(items, settings):
         task = run.status.tasks[1]  # the runner records geekbench again while the publisher renders
         task.end, task.attempt = task.end + timedelta(minutes=5), 2
-        return original(items)
+        return original(items, settings)
 
     pub._publish = racing
     pub.publish_once(ENABLED)
@@ -502,6 +538,7 @@ def test_variant_comes_from_the_attempt_that_ran_the_task_and_timing_from_the_la
 
 def test_multi_attempt_run_without_per_attempt_lscpu_does_not_guess_a_variant(tmp_path, origin, storage, cluster):
     storage.objects[okey(KEY, "run.json")] = json.dumps({"attempts": [{"attempt": 1}, {"attempt": 2}]}).encode()
+    _put_openssl_without_lscpu(storage, datetime.now(UTC))
     run = cluster.add_run(["openssl"])
     assert make_publisher(tmp_path, origin, storage).publish_once(ENABLED).tasks_published == 0
     assert not run.status.tasks[0].published

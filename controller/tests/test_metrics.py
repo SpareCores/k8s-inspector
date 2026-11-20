@@ -104,14 +104,16 @@ def test_attempt_counters(runs, metrics):
     attempts = [
         AttemptStatus(1, CapacityType.SPOT, outcome=AttemptOutcome.SPOT_INTERRUPTED),
         AttemptStatus(2, CapacityType.ON_DEMAND, outcome=AttemptOutcome.COMPLETED),
-        AttemptStatus(3, CapacityType.ON_DEMAND),  # open: not counted
+        AttemptStatus(3, CapacityType.ON_DEMAND, outcome=AttemptOutcome.HARNESS_ERROR),
+        AttemptStatus(4, CapacityType.ON_DEMAND),  # open: not counted
     ]
     runs.append(make_run("a", RunPhase.RUNNING, attempts=attempts))
     text = metrics.render()
 
     assert 'k8s_inspector_run_attempts_total{capacity_type="spot",outcome="interrupted",vendor="oci"} 1' in text
     assert 'k8s_inspector_run_attempts_total{capacity_type="on-demand",outcome="completed",vendor="oci"} 1' in text
-    assert text.count("run_attempts_total{") == 2
+    assert 'outcome="harness_error"' in text
+    assert text.count("run_attempts_total{") == 3
 
 
 def test_backlog_lag_spend_and_node_age(runs, metrics):
@@ -132,6 +134,20 @@ def test_backlog_lag_spend_and_node_age(runs, metrics):
     assert 'k8s_inspector_spend_usd_per_hour{vendor="oci"} 0.25' in text
     assert 'k8s_inspector_spend_usd_per_hour{vendor="aws"} 0' in text
     assert 'k8s_inspector_node_age_seconds{run="oci-a",sku="a",vendor="oci"} 2700' in text
+
+
+def test_backlog_counts_only_skus_that_may_be_published(runs):
+    listed = Settings(vendors={"oci": VendorSettings(enabled=True, publish=("a",))})
+    runs.append(make_run("a", RunPhase.PUBLISHING, [done("lscpu", 0)]))
+    runs.append(make_run("b", RunPhase.PUBLISHING, [done("lscpu", 0), done("openssl", 0)]))
+    text = Metrics(None, lambda: listed, clock=lambda: NOW).render()
+    assert "k8s_inspector_publish_backlog 1\n" in text
+
+
+def test_unpublishable_tasks_counter(runs, metrics):
+    assert "k8s_inspector_unpublishable_tasks_total 0\n" in metrics.render()
+    metrics.record_unpublishable(2)
+    assert "k8s_inspector_unpublishable_tasks_total 2\n" in metrics.render()
 
 
 def test_last_publish_timestamp_starts_at_process_start(runs, metrics):

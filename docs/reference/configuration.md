@@ -14,6 +14,7 @@ Values are deployment configuration of the cluster platform, not part of this re
 | `K8SI_NAMESPACE` | namespace of runs (default `inspector`) |
 | `K8SI_SC_RUN_IMAGE` | the `sc-run` image of anchors and flush steps, digest-pinned (`ghcr.io/sparecores/k8s-inspector-sc-run@sha256:…`); `serve` and `run` refuse to start without it |
 | `K8SI_S3_ENDPOINT_URL` | optional S3-compatible endpoint, for object storage that is not AWS S3 (OCI) |
+| `K8SI_KEY_PREFIX` | optional prefix of every object key, default empty (for example `k8s-inspector/spikes/` writes a first run under a scratch prefix); the bucket role must cover it ([output contract](output-contract.md)) |
 
 The controller serves Prometheus metrics on port 9090 (`/metrics`, [monitoring](../explanation/monitoring.md)) and `/healthz`, which is the liveness probe.
 
@@ -78,7 +79,8 @@ removed from the legacy pipeline ([roadmap](../roadmap.md)); there is no shared 
 status [--failing] | cancel <run> | publish [--rescan --since 7d [--sku <sku>]…]`. Inside the cluster:
 `kubectl -n inspector exec deploy/k8s-inspector -- k8s-inspector …`.
 
-`cancel` ends the run in place (unfinished tasks `-4 CANCELLED`, Pods deleted, phase `Cancelled`) and keeps the
-`BenchmarkRun` until the publisher purges it. Deleting the `BenchmarkRun` with `kubectl` also stops the run, but drops
+`cancel` only sets the annotation `inspector.sparecores.com/cancel: "true"` on the `BenchmarkRun` and returns; the
+`serve` process ends the run in place (unfinished tasks `-4 CANCELLED`, Pods deleted, phase `Cancelled`) and keeps
+the `BenchmarkRun` until the publisher purges it, so the CLI never races the runner. Deleting the `BenchmarkRun` with `kubectl` also stops the run, but drops
 the record. `--sku` (repeatable, with `--rescan`) names a SKU that was never published, so its outputs are recovered too.
 Every command logs JSON lines on stderr.

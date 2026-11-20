@@ -56,6 +56,8 @@ SECRET_ENV = {
 }
 START_ERRORS = {"StartError", "CreateContainerError", "RunContainerError", "ContainerCannotRun"}
 PULL_WAITING = {"ErrImagePull", "ImagePullBackOff", "ContainerCreating"}
+# Waiting reasons that never resolve by themselves (bad image name, missing Secret key, `imagePullPolicy: Never`).
+CONFIG_WAITING = {"CreateContainerConfigError", "InvalidImageName", "ErrImageNeverPull"}
 
 
 # --------------------------------------------------------------------------- names and labels
@@ -558,19 +560,28 @@ def _parse_time(value: str | None) -> datetime | None:
     return datetime.fromisoformat(value) if value else None
 
 
-def stuck_containers(pod: dict, now: datetime, limit_minutes: int) -> set[str]:
-    """Names of the containers that wait in `ErrImagePull`/`ImagePullBackOff`/`ContainerCreating` for longer
-    than `limit_minutes` since the Pod started (all of them while the kubelet has not created the sandbox).
-    The runner ends their tasks with `-4 IMAGE_PULL_TIMEOUT`; containers that started are left alone."""
+def stuck_containers(pod: dict, now: datetime, limit_minutes: int) -> dict[str, str]:
+    """Container name -> `error_msg` of the containers that wait for longer than `limit_minutes` since the Pod
+    started: pulling their image (`ErrImagePull`/`ImagePullBackOff`/`ContainerCreating`, all of them while the
+    kubelet has not created the sandbox) -> `IMAGE_PULL_TIMEOUT`; or in a waiting state that never resolves
+    (`CONFIG_WAITING`) -> the waiting message. The runner ends their tasks with `-4`; containers that started
+    are left alone."""
     started = _parse_time(pod.get("status", {}).get("startTime"))
     if started is None or now - started <= timedelta(minutes=limit_minutes):
-        return set()
+        return {}
     statuses = _container_statuses(pod)
     if not statuses:  # admitted by the kubelet, sandbox still being created
         if _phase(pod) != "Pending":
-            return set()
-        return {c["name"] for c in pod.get("spec", {}).get("containers", [])}
-    return {s["name"] for s in statuses if s.get("state", {}).get("waiting", {}).get("reason") in PULL_WAITING}
+            return {}
+        return {c["name"]: Reason.IMAGE_PULL_TIMEOUT.value for c in pod.get("spec", {}).get("containers", [])}
+    stuck = {}
+    for s in statuses:
+        waiting = s.get("state", {}).get("waiting", {})
+        if waiting.get("reason") in PULL_WAITING:
+            stuck[s["name"]] = Reason.IMAGE_PULL_TIMEOUT.value
+        elif waiting.get("reason") in CONFIG_WAITING:
+            stuck[s["name"]] = waiting.get("message") or waiting["reason"]
+    return stuck
 
 
 def unfinished_containers(pod: dict) -> set[str]:

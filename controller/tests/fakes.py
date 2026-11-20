@@ -221,7 +221,8 @@ class FakeStorage(Storage):
 class Cluster:
     """Karpenter and the kubelet. `behaviour[key]` is a list of scripted results for that container key, used
     in order (default: success). Result dict keys: `exit_code`, `oom_kills`, `timed_out`, `cancelled`,
-    `start_error`, `pull_stuck` (the Pod stays Pending in ErrImagePull), `btime`."""
+    `start_error`, `pull_stuck` (the Pod stays Pending in ErrImagePull, or in the waiting reason given as a string,
+    with `message`), `btime`."""
 
     def __init__(self, kube: FakeKube, clock: Clock) -> None:
         self.kube, self.clock = kube, clock
@@ -342,7 +343,10 @@ class Cluster:
             spec = queue.pop(0) if queue else {}
             if spec.get("pull_stuck"):
                 stuck = True
-                statuses.append({"name": name, "state": {"waiting": {"reason": "ErrImagePull"}}})
+                waiting = {"reason": spec["pull_stuck"] if isinstance(spec["pull_stuck"], str) else "ErrImagePull"}
+                if "message" in spec:
+                    waiting["message"] = spec["message"]
+                statuses.append({"name": name, "state": {"waiting": waiting}})
             else:
                 statuses.append({"name": name, **self._terminated(key, spec)})
         if stuck:

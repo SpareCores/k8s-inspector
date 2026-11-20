@@ -24,6 +24,7 @@ logs/inspect/<vendor>/<sku>/<Y>/<m>/<d>/<run_id>/tasks/<task>/stdout
 | `<task>` | task name; vLLM probes as `vllm-probe-<image>`; a task repeated in a later attempt overwrites its keys |
 | `run.json` | controller, see [run.json](#runjson) |
 | `status.json` | controller, after uploads are verified: the final `meta.json` content plus Kubernetes facts (Pod, reason, image digest, node) |
+| `K8SI_KEY_PREFIX` | optional, default empty: prepended to every key above (`<prefix>logs/inspect/…`), also when listing for `publish --rescan`; set it to run against a scratch prefix |
 | Bucket rules | `AbortIncompleteMultipartUpload` after 7 days on `logs/inspect/`; the existing retention otherwise |
 
 Access: the controller's IAM role may create, complete, abort and list multipart uploads, put, get, head and list under

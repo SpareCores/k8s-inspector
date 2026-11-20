@@ -185,15 +185,13 @@ def test_hold_after_round_trip(delta, text):
     assert crd.from_dict(manifest).spec.hold_after == delta
 
 
-def test_from_dict_tolerates_missing_status_and_reads_deleting():
+def test_from_dict_tolerates_missing_status():
     manifest = crd.to_manifest(spec(database={"vendor": "aws", "id": "rds", "engineVersion": "16"}), "inspector")
     manifest["metadata"].update(creationTimestamp="2026-11-20T09:30:00Z", uid="u", resourceVersion="3")
     run = crd.from_dict(manifest)
-    assert run.status == RunStatus() and not run.deleting
+    assert run.status == RunStatus()
     assert (run.uid, run.resource_version, run.created) == ("u", "3", T0)
     assert run.spec.database == {"vendor": "aws", "id": "rds", "engineVersion": "16"}
-    manifest["metadata"]["deletionTimestamp"] = "2026-11-20T10:00:00Z"
-    assert crd.from_dict(manifest).deleting
 
 
 def full_status() -> RunStatus:

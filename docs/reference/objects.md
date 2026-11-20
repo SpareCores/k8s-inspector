@@ -11,6 +11,7 @@ All namespaced objects live in namespace `inspector`. API group of the custom re
 | `inspector.sparecores.com/vendor` | BenchmarkRun, Pods | vendor id |
 | `inspector.sparecores.com/attempt` | anchor, steps | attempt number |
 | `inspector.sparecores.com/task` | steps | task name (`probe` for the probe step) |
+| `inspector.sparecores.com/cancel: "true"` | BenchmarkRun | cancel request (`k8s-inspector cancel`); the controller ends the run |
 | `karpenter.sh/do-not-disrupt: "true"` | anchor, controller Pod | blocks voluntary disruption |
 
 ## BenchmarkRun
@@ -51,7 +52,7 @@ status:
   tasks:
   - {name: geekbench, state: Running, attempt: 1, start: …, end: null, exitCode: null, published: false, commit: null}   # state: Pending | Running | Done; optional: errorMsg, gpuFallback
   attempts:
-  - {n: 1, capacityType: spot, nodeClaim: …, node: …, start: …, end: null, outcome: null}   # Completed | SpotInterrupted | NodeLost | ProvisioningFailed | Cancelled
+  - {n: 1, capacityType: spot, nodeClaim: …, node: …, start: …, end: null, outcome: null}   # Completed | SpotInterrupted | NodeLost | ProvisioningFailed | Cancelled | HarnessError
   conditions: []
 ```
 

@@ -166,8 +166,9 @@ def _start_failed(outcome: TaskOutcome) -> bool:
 
 
 def retry_without_gpu(step: Step, outcomes: Mapping[str, TaskOutcome]) -> Step | None:
-    """GPU-first-then-CPU: when a container of a `gpu_runtime` step did not start, the same step without the
-    runtime class (same containers; the runner creates it once). None when no container failed to start, a
+    """GPU-first-then-CPU: when a container of a `gpu_runtime` step did not start, a step without the
+    runtime class with just the containers that did not start (the others ran: their results stand; the runner
+    creates the step once). None when no container failed to start, a
     failed container's task has `gpu=True` (no CPU fallback) or it is the vLLM GPU image (a CPU run of it is
     pointless: the ladder moves on to the CPU images)."""
     if not step.gpu_runtime:
@@ -175,7 +176,7 @@ def retry_without_gpu(step: Step, outcomes: Mapping[str, TaskOutcome]) -> Step |
     failed = [c for c in step.containers if c.key in outcomes and _start_failed(outcomes[c.key])]
     if not failed or any(c.task.gpu or ("BENCHMARK_VLLM_MODE", "gpu") in c.env for c in failed):
         return None
-    return replace(step, gpu_runtime=False)
+    return replace(step, gpu_runtime=False, containers=tuple(failed))
 
 
 # --------------------------------------------------------------------------- the step in `status.step`

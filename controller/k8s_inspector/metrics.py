@@ -6,7 +6,8 @@ each finished task and each closed attempt once, keyed by run uid. After a resta
 Prometheus handles as a counter reset (kept runs are counted once more).
 
 Exposed: `k8s_inspector_runs`, `_tasks_total`, `_run_attempts_total`, `_node_age_seconds`, `_publish_backlog`,
-`_publish_lag_seconds` (age of the oldest done, unpublished task), `_last_publish_timestamp_seconds`
+`_publish_lag_seconds` (age of the oldest done, unpublished task), `_unpublishable_tasks_total` (tasks given up
+on: no lscpu result), `_last_publish_timestamp_seconds`
 (last publish cycle that did not fail, set by `record_publish`; process start before the first one),
 `_spend_usd_per_hour`, `_task_duration_seconds` (summary sum/count). Not yet: `_dbaas_instances` (P4).
 `/healthz` answers 200 as long as the process serves.
@@ -24,7 +25,7 @@ from k8s_inspector import crd
 from k8s_inspector.kube import Kube
 from k8s_inspector.model import AttemptOutcome, ExitCode, RunPhase, Settings, TaskState
 from k8s_inspector.planner import ACTIVE_PHASES, spend_per_hour
-from k8s_inspector.publisher import vendor_allowed
+from k8s_inspector.publisher import publish_allowed
 
 log = logging.getLogger(__name__)
 
@@ -37,6 +38,7 @@ _ATTEMPT_LABEL = {
     AttemptOutcome.NODE_LOST: "node_lost",
     AttemptOutcome.PROVISIONING_FAILED: "provisioning_failed",
     AttemptOutcome.CANCELLED: "cancelled",
+    AttemptOutcome.HARNESS_ERROR: "harness_error",
 }
 
 Labels = tuple[tuple[str, str], ...]  # sorted (name, value) pairs: hashable key of one series
@@ -81,11 +83,17 @@ class Metrics:
         self._seen: set[tuple] = set()
         self._gauges: list[str] = []  # last good snapshot, served when the API server is unreachable
         self._last_publish = time.time()  # process start until the first cycle: a stuck publisher still ages
+        self._counters["unpublishable_tasks_total"][()] = 0
 
     def record_publish(self) -> None:
         """A publish cycle finished without error."""
         with self._lock:
             self._last_publish = time.time()
+
+    def record_unpublishable(self, count: int) -> None:
+        """Tasks the publisher gave up on (finished, but no lscpu result to pick a variant from)."""
+        with self._lock:
+            self._counters["unpublishable_tasks_total"][()] += count
 
     def render(self) -> str:
         """Prometheus text format. A failing LIST keeps the previous gauges: the liveness probe scrapes this
@@ -143,7 +151,7 @@ class Metrics:
             for task in run.status.tasks:
                 if task.state != TaskState.DONE:
                     continue
-                if not task.published and vendor_allowed(settings, vendor):
+                if not task.published and publish_allowed(settings, vendor, run.spec.sku):
                     backlog += 1
                     if task.end and (oldest_unpublished is None or task.end < oldest_unpublished):
                         oldest_unpublished = task.end

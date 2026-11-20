@@ -19,18 +19,19 @@ Decisions:
   that will never be published are deleted `publish.keep_run_hours` after their last task ended, which frees the
   SKU lease.
 - The hardware variant comes from the lscpu stdout of the attempt that ran the task (`run.json`
-  `attempts[].lscpu_stdout`, attempt = `status.json` `attempt`; a run with a single attempt may fall back to
-  `tasks/lscpu/stdout`), matched against the `variant.json` files in the checkout (`variant.pick_variant`).
-  Without a usable lscpu result a task with a negative exit code (no node, never finished) goes to
-  `schedule/<task>/meta.json` only; a task with exit code >= 0 stays unpublished (and is retried every cycle)
-  rather than being filed under the wrong variant. A forced run of a SKU that git does not know, without lscpu
-  (a typo), publishes nothing and is marked published without a commit.
+  `attempts[].lscpu_stdout`, attempt = `status.json` `attempt`), matched against the `variant.json` files in
+  the checkout (`variant.pick_variant`). Without a usable lscpu result a task with a negative exit code (no
+  node, never finished) goes to `schedule/<task>/meta.json` only; a task with exit code >= 0 stays unpublished
+  (and is retried every cycle) rather than being filed under the wrong variant, until `publish.keep_run_hours`
+  after its end: then it is marked published without a commit, logged as an error and counted in
+  `PublishResult.unpublishable` (`k8s_inspector_unpublishable_tasks_total`), so the run frees its lease. A forced
+  run of a SKU that git does not know, without lscpu (a typo), publishes nothing and is marked published
+  without a commit.
 - A task whose rendering keeps failing is published without parser output after `MAX_RENDER_FAILURES` cycles.
 - vLLM probe keys (`vllm-probe-<image>`) are not tasks of the data tree: they are marked published unrendered.
 - Timing files come from `run.json`: the latest attempt that has an lscpu result (`attempts[]`: `api_start`,
   `api_end`, `machine_start`, `node_registered`, `node_ready`), else its `timing` object, completed with
-  `api_start` = run creation (old runs) and `inspector_start`/`inspector_end` = first task start / last task
-  end. They go to the variant of that attempt.
+  `inspector_start`/`inspector_end` = first task start / last task end. They go to the variant of that attempt.
 - `rescan` finds the SKUs of a vendor from the git tree (`data/<vendor>/*`): a SKU never published has to be
   passed with `skus`. A DBaaS run is recognised by `run.json` `database`.
 """
@@ -88,6 +89,7 @@ class PublishResult:
     tasks_published: int
     commit: str | None  # None when nothing changed
     run_ids: tuple[str, ...]
+    unpublishable: int = 0  # tasks given up on: finished, but no lscpu result to pick a variant from
 
 
 @dataclass
@@ -98,7 +100,6 @@ class _Item:
     key: str
     run_name: str | None = None
     database: dict | None = None
-    created: datetime | None = None
     forced: bool = False
     end: datetime | None = None  # TaskStatus.end / .attempt as read: `_mark` marks only when they are unchanged
     attempt: int | None = None
@@ -202,10 +203,8 @@ class Publisher:
             runs = crd.list_runs(self._kube)
             items = []
             for run in runs:
-                if run.deleting:
-                    continue
                 items.extend(self._items_of(run, settings))
-            return self._publish(items)
+            return self._publish(items, settings)
 
     def rescan(self, since_days: int, skus: Iterable[str] = (), settings: Settings | None = None) -> PublishResult:
         """Disaster recovery (`publish --rescan --since 7d`): list recent date prefixes of the enabled
@@ -231,22 +230,21 @@ class Publisher:
                         continue
                     for days_back in range(since_days + 1):
                         items.extend(self._items_in_bucket(settings, vendor, sku, today - timedelta(days=days_back)))
-            return self._publish(items)
+            return self._publish(items, settings)
 
     def delete_expired_runs(self, settings: Settings) -> int:
         """Delete BenchmarkRuns whose tasks are all published, `publish.keep_run_hours` after the last one,
         and finished runs that will never be published (SKU not allowed, see `publish_allowed`) that long
-        after their last task ended: deleting a run frees its SKU lease. Returns how many."""
+        after their last task ended: deleting a run frees its SKU lease. Without the ConfigMap the allowlist is
+        the default (nothing allowed), so unpublished runs are kept then. Returns how many."""
         keep = timedelta(hours=settings.publish.keep_run_hours)
         now = datetime.now(UTC)
         deleted = 0
         for run in crd.list_runs(self._kube):
-            if run.deleting:
-                continue
             published_at = _published_at(run)
             if _all_published(run) and published_at:
                 since, why = published_at, "published"
-            elif run.status.phase in DONE_PHASES and not _publishable(settings, run):
+            elif settings.from_configmap and run.status.phase in DONE_PHASES and not _publishable(settings, run):
                 since, why = _finished_at(run), "never to be published"
             else:
                 continue
@@ -298,12 +296,11 @@ class Publisher:
         key = crd.run_key(run)
         times = tuple((t.start, t.end) for t in run.status.tasks)
         return [
-            _Item(key, t.name, run.name, run.spec.database, run.created, run.spec.force, t.end, t.attempt, times)
-            for t in pending
+            _Item(key, t.name, run.name, run.spec.database, run.spec.force, t.end, t.attempt, times) for t in pending
         ]
 
     def _items_in_bucket(self, settings: Settings, vendor: str, sku: str, day: date) -> list[_Item]:
-        prefix = f"logs/inspect/{vendor}/{sku}/{day:%Y/%m/%d}/"
+        prefix = storage_keys.day_prefix(vendor, sku, day)
         by_run: dict[str, list[tuple[str, dict]]] = {}
         for object_key in self._storage.list_status_keys(prefix):
             run_id, _, rest = object_key.removeprefix(prefix).partition("/tasks/")
@@ -336,8 +333,8 @@ class Publisher:
         stderr = self._storage.read_bytes(storage_keys.object_key(item.run, item.key, "stderr")) or b""
         if item.run not in cache:
             cache[item.run] = self._read_run_facts(item.run)
-        run_json, legacy_lscpu, legacy_status = cache[item.run]
-        lscpu, lscpu_status = _lscpu_of(status, run_json, legacy_lscpu, legacy_status)
+        run_json, legacy_status = cache[item.run]
+        lscpu, lscpu_status = _lscpu_of(status, run_json, legacy_status)
         return _Loaded(
             item, render.RenderInput(item.run, task, item.key, status, stdout, stderr), lscpu, lscpu_status, run_json
         )
@@ -346,18 +343,14 @@ class Publisher:
         raw = self._storage.read_bytes(storage_keys.run_json_key(run))
         return json.loads(raw) if raw else None
 
-    def _read_run_facts(self, run: RunKey) -> tuple[dict | None, bytes | None, dict | None]:
-        """`run.json` (attempts, timing) and the shared `tasks/lscpu` result (the only source of runs without
-        per-attempt lscpu)."""
-        legacy_status = self._storage.read_json(run, "lscpu", "status.json")
-        legacy = None
-        if legacy_status and legacy_status.get("exit_code") == 0:
-            legacy = self._storage.read_bytes(storage_keys.object_key(run, "lscpu", "stdout"))
-        return self._read_run_json(run), legacy, legacy_status
+    def _read_run_facts(self, run: RunKey) -> tuple[dict | None, dict | None]:
+        """`run.json` (attempts, timing) and the status of the shared `tasks/lscpu` task (`first_seen` and
+        version of the variant, used when it is from the attempt that ran the task)."""
+        return self._read_run_json(run), self._storage.read_json(run, "lscpu", "status.json")
 
     # ------------------------------------------------------------------ the cycle
 
-    def _publish(self, items: list[_Item]) -> PublishResult:
+    def _publish(self, items: list[_Item], settings: Settings) -> PublishResult:
         items = sorted(items, key=lambda i: (i.run.vendor, i.run.sku, i.run.run_id, i.key))
         cache: dict[RunKey, tuple] = {}
         loaded: list[_Loaded] = []
@@ -376,7 +369,8 @@ class Publisher:
 
         for attempt in range(1, MAX_PUSH_ATTEMPTS + 1):
             self._sync(self._sparse_dirs(loaded))
-            rendered, discarded = self._render_all(loaded)
+            keep = timedelta(hours=settings.publish.keep_run_hours)
+            rendered, discarded, unpublishable = self._render_all(loaded, keep)
             commit = self._commit(rendered)
             if commit is None:
                 sha = self._git("rev-parse", "HEAD").strip()
@@ -388,14 +382,19 @@ class Publisher:
         else:
             raise RuntimeError(f"push rejected {MAX_PUSH_ATTEMPTS} times")
         self._mark_published(rendered, sha)
-        self._mark_published(discarded, None)
-        return PublishResult(len(rendered), commit, tuple(sorted({r[0].item.run.run_id for r in rendered})))
+        self._mark_published(discarded + unpublishable, None)
+        run_ids = tuple(sorted({r[0].item.run.run_id for r in rendered}))
+        return PublishResult(len(rendered), commit, run_ids, sum(1 for one in unpublishable if one.item.run_name))
 
-    def _render_all(self, loaded: list[_Loaded]) -> tuple[list[tuple[_Loaded, int | None]], list[_Loaded]]:
-        """Render into the checkout; returns the tasks that are done (rendered, or skipped as stale) and the
-        ones to mark published without a commit (nothing to publish)."""
+    def _render_all(
+        self, loaded: list[_Loaded], keep: timedelta
+    ) -> tuple[list[tuple[_Loaded, int | None]], list[_Loaded], list[_Loaded]]:
+        """Render into the checkout; returns the tasks that are done (rendered, or skipped as stale), the ones
+        to mark published without a commit (nothing to publish) and the unpublishable ones (no variant to
+        file them under, `keep` after their end)."""
         rendered = []
         discarded = []
+        unpublishable = []
         first_with_variant: dict[RunKey, _Loaded] = {}
         for one in loaded:
             item = one.item
@@ -412,14 +411,19 @@ class Publisher:
             self._render_failures.pop(failed, None)
             if variant is _DISCARDED:
                 discarded.append(one)
-            elif variant is not _SKIPPED:
+            elif variant is _SKIPPED:
+                end = _parse_status_time(one.inp.status.get("end"))
+                if end and datetime.now(UTC) - end >= keep:
+                    log.error("%s/%s: no lscpu result after %s, not publishable", item.run.run_id, item.key, keep)
+                    unpublishable.append(one)
+            else:
                 one.variant = variant
                 rendered.append((one, variant))
                 if variant is not None:
                     first_with_variant.setdefault(item.run, one)
         for one in first_with_variant.values():
             self._render_timing(one)
-        return rendered, discarded
+        return rendered, discarded, unpublishable
 
     def _render_one(self, one: _Loaded, *, degraded: bool = False):
         item, inp = one.item, one.inp
@@ -479,7 +483,6 @@ class Publisher:
         starts = [_utc(s) for s, _ in item.run_times if s]
         ends = [_utc(e) for _, e in item.run_times if e]
         defaults = {
-            "api_start": item.created,
             "inspector_start": min(starts) if starts else None,
             "inspector_end": max(ends) if ends else None,
         }
@@ -590,16 +593,14 @@ def _attempt_entry(run_json: dict | None, n: int | None) -> dict | None:
     return next((a for a in (run_json or {}).get("attempts") or [] if n is not None and a.get("attempt") == n), None)
 
 
-def _lscpu_of(status: dict, run_json: dict | None, legacy: bytes | None, legacy_status: dict | None):
-    """`(lscpu stdout, lscpu status)` of the attempt that ran the task: `run.json` attempts[n].lscpu_stdout;
-    the shared `tasks/lscpu` result only when the run has at most one attempt (a later attempt overwrites it)."""
+def _lscpu_of(status: dict, run_json: dict | None, legacy_status: dict | None):
+    """`(lscpu stdout, lscpu status)` of the attempt that ran the task: `run.json` attempts[n].lscpu_stdout.
+    The status is the shared `tasks/lscpu` one when it is from the same attempt (a later attempt overwrites it)."""
     n = status.get("attempt")
     entry = _attempt_entry(run_json, n)
     if entry and entry.get("lscpu_stdout"):
         same = legacy_status and legacy_status.get("attempt") == n
         return entry["lscpu_stdout"].encode(), legacy_status if same else None
-    if len((run_json or {}).get("attempts") or []) <= 1:
-        return legacy, legacy_status
     return None, None
 
 

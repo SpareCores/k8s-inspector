@@ -39,6 +39,7 @@ def test_env_defaults_and_optionals():
     assert (env.bucket, env.bucket_region) == ("b", "eu-test-1")
     assert (env.namespace, env.git_branch, env.git_url) == ("inspector", "main", "")
     assert env.role_arn is None and env.s3_endpoint_url is None and env.sc_run_image == ""
+    assert env.key_prefix == ""
 
 
 def test_env_all_variables():
@@ -54,11 +55,13 @@ def test_env_all_variables():
             "K8SI_NAMESPACE": "other",
             "K8SI_SC_RUN_IMAGE": "ghcr.io/sparecores/sc-run@sha256:abc",
             "K8SI_S3_ENDPOINT_URL": "https://s3.test",
+            "K8SI_KEY_PREFIX": "k8s-inspector/spikes/",
         }
     )
     assert env.git_branch == "dev" and env.namespace == "other"
     assert env.keeper_api_key_file == "/keys/keeper"
     assert env.sc_run_image.endswith("@sha256:abc") and env.s3_endpoint_url == "https://s3.test"
+    assert env.key_prefix == "k8s-inspector/spikes/"
 
 
 @pytest.mark.parametrize("missing", ["K8SI_BUCKET", "K8SI_BUCKET_REGION"])
@@ -159,6 +162,11 @@ def test_load_settings_reads_config_yaml_key():
 @pytest.mark.parametrize("configmap", [None, {}, {"data": {}}, {"data": {SETTINGS_KEY: ""}}])
 def test_load_settings_missing_or_empty_gives_defaults(configmap):
     assert load_settings(FakeKube(configmap), "inspector") == Settings()
+
+
+def test_load_settings_tells_whether_they_come_from_the_configmap():
+    assert not load_settings(FakeKube(None), "inspector").from_configmap
+    assert load_settings(FakeKube({"data": {SETTINGS_KEY: "planner: {autoPlan: true}"}}), "inspector").from_configmap
 
 
 def test_load_settings_invalid_yaml_is_a_clear_error():

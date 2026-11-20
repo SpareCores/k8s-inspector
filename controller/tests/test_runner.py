@@ -20,6 +20,7 @@ from k8s_inspector.model import (
     Config,
     EnvConfig,
     ExitCode,
+    NodeFacts,
     NodePools,
     RunPhase,
     RunSpec,
@@ -308,6 +309,8 @@ def test_capacity_error_on_the_nodeclaim_fails_the_run_with_minus_one(h):
     run = h.run
     assert run.status.phase == RunPhase.FAILED
     assert h.codes()["geekbench"] == (-1, "SCARPENTER_ICE: InsufficientInstanceCapacity in zone")
+    assert h.pod_names() == [f"{h.name}-a1"]  # recorded first, the anchor goes with the next pass
+    h.runner.reconcile(h.name)
     assert h.pod_names() == []
     assert run.status.attempts[0].outcome == AttemptOutcome.PROVISIONING_FAILED
 
@@ -440,14 +443,43 @@ def test_interruption_notice_relabels_the_evicted_step_as_spot_interrupted(h):
     assert h.pod_names() == []  # anchor released
 
 
-def test_draining_node_gets_no_new_step(h):
+INTERRUPTION = {"metadata": {"annotations": {"scarpenter.sparecores.com/interruption": "SpotInterrupted"}}}
+
+
+def test_draining_node_between_steps_ends_the_attempt_at_once(h):
     h.start(["geekbench"])
     h.runner.reconcile(h.name)
     h.cluster.react()  # the node arrives
-    notice = {"metadata": {"annotations": {"scarpenter.sparecores.com/interruption": "SpotInterrupted"}}}
-    h.kube.patch_obj("nodeclaim", f"claim-node-{h.name}-a1", notice)
+    h.kube.patch_obj("nodeclaim", f"claim-node-{h.name}-a1", INTERRUPTION)
     h.runner.reconcile(h.name)
-    assert h.run.status.phase == RunPhase.RUNNING and h.pod_names("step") == []
+    run = h.run
+    assert h.pod_names("step") == [] and h.pod_names() == []  # no step on it, the anchor is released
+    assert run.status.attempts[0].outcome == AttemptOutcome.SPOT_INTERRUPTED
+    assert run.status.phase == RunPhase.PENDING
+
+
+def test_node_draining_when_a_step_ends_records_the_step_and_ends_the_attempt(h):
+    h.start(["geekbench"])
+    h.drive(stop=in_step("02-geekbench"))
+    h.cluster.react()  # the step finishes
+    h.kube.patch_obj("nodeclaim", f"claim-node-{h.name}-a1", INTERRUPTION)
+    h.runner.reconcile(h.name)
+    run = h.run
+    assert h.codes()["geekbench"] == (0, None)
+    assert run.status.attempts[0].outcome == AttemptOutcome.SPOT_INTERRUPTED and run.status.phase == RunPhase.PUBLISHING
+
+
+def test_eviction_that_deletes_the_step_pod_outright_ends_the_attempt(h):
+    h.start(["geekbench"])
+    h.drive(stop=in_step("02-geekbench"))
+    h.kube.patch_obj("nodeclaim", f"claim-node-{h.name}-a1", INTERRUPTION)
+    h.kube.delete("pod", f"{h.name}-a1-02-geekbench")  # no Failed Pod is left to read the eviction from
+    h.runner.reconcile(h.name)
+    run = h.run
+    assert run.status.attempts[0].outcome == AttemptOutcome.SPOT_INTERRUPTED
+    assert h.task("geekbench").state == TaskState.PENDING and run.status.phase == RunPhase.PENDING
+    assert "geekbench" in h.storage.aborted and h.pod_names() == []
+    assert [n for k, n in h.kube.created if k == "pod"].count(f"{h.name}-a1-02-geekbench") == 1  # not relaunched
 
 
 # --------------------------------------------------------------------------- restart and cancel
@@ -507,6 +539,33 @@ def test_cancel_records_minus_four_cancelled_and_releases_the_node(h):
     assert "geekbench" in h.storage.aborted and h.storage.status["membench"]["reason"] == "CANCELLED"
     h.runner.reconcile(h.name)  # a terminal run stays as it is
     assert h.run.status.phase == RunPhase.CANCELLED
+
+
+def test_cancel_annotation_makes_the_runner_cancel_the_run(h):
+    h.start(["membench", "geekbench"])
+    h.drive(stop=in_step("02-geekbench"))
+    crd.request_cancel(h.kube, h.name)
+    assert h.run.cancel_requested and h.run.status.phase == RunPhase.RUNNING  # the CLI only asks
+    h.runner.reconcile(h.name)
+    run = h.run
+    assert run.status.phase == RunPhase.CANCELLED and run.status.attempts[0].outcome == AttemptOutcome.CANCELLED
+    assert h.codes()["geekbench"] == (-4, "CANCELLED") and h.codes()["membench"] == (-4, "CANCELLED")
+    assert h.pod_names() == [] and "geekbench" in h.storage.aborted
+
+
+def test_cancel_annotation_on_a_pending_run_and_on_a_finished_one(h):
+    h.start(["geekbench"])
+    crd.request_cancel(h.kube, h.name)
+    h.runner.reconcile(h.name)
+    assert h.run.status.phase == RunPhase.CANCELLED and h.codes()["geekbench"] == (-4, "CANCELLED")
+    assert h.pod_names() == []
+
+    other = Harness()
+    other.start(["geekbench"])
+    other.drive()
+    crd.request_cancel(other.kube, other.name)
+    other.runner.reconcile(other.name)
+    assert other.run.status.phase == RunPhase.PUBLISHING and other.codes()["geekbench"] == (0, None)
 
 
 def test_deleted_run_leaves_no_pods_behind(h):
@@ -650,35 +709,54 @@ def fail_reconciles(h, times: int) -> None:
         h.runner._work(h.name)
 
 
-def test_reconcile_failing_ten_times_ends_the_run_with_harness_errors(h, monkeypatch):
+def break_reconcile(h, monkeypatch) -> None:
+    monkeypatch.setattr(h.runner, "reconcile", lambda name: (_ for _ in ()).throw(RuntimeError("boom")))
+
+
+def test_outage_shorter_than_half_an_hour_does_not_end_the_run(h, monkeypatch):
     h.start(["geekbench"])
     h.drive(stop=in_step("02-geekbench"))
-    monkeypatch.setattr(h.kube, "list", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")))
-    fail_reconciles(h, runner_mod.MAX_FAILURES - 1)
+    with monkeypatch.context() as outage:
+        break_reconcile(h, outage)
+        for _ in range(30):  # many failures, all inside the window
+            fail_reconciles(h, 1)
+            h.clock.advance(minutes=1)
+        assert h.run.status.phase == RunPhase.RUNNING
+    fail_reconciles(h, 1)  # S3 is back: the run goes on and the failing window starts afresh
+    h.clock.advance(minutes=29)
+    with monkeypatch.context() as outage:
+        break_reconcile(h, outage)
+        fail_reconciles(h, 1)
     assert h.run.status.phase == RunPhase.RUNNING
-    monkeypatch.undo()
-    monkeypatch.setattr(h.runner, "reconcile", lambda name: (_ for _ in ()).throw(RuntimeError("boom")))
+    run = h.drive()
+    assert run.status.phase == RunPhase.PUBLISHING and h.codes()["geekbench"] == (0, None)
+
+
+def test_reconcile_failing_for_half_an_hour_ends_the_run_without_deleting_the_anchor_first(h, monkeypatch):
+    h.start(["geekbench"])
+    h.drive(stop=in_step("02-geekbench"))
+    break_reconcile(h, monkeypatch)
+    fail_reconciles(h, 1)
+    h.clock.advance(minutes=31)
     fail_reconciles(h, 1)
     run = h.run
     assert run.status.phase == RunPhase.FAILED
     assert h.codes()["geekbench"] == (ExitCode.HARNESS_ERROR, "the controller gave up on the run: RuntimeError")
-    assert h.pod_names() == [] and h.kube.list("secret") == []
-    assert run.status.attempts[0].outcome is not None
-
-
-def test_reconcile_failing_for_half_an_hour_ends_the_run(h, monkeypatch):
-    h.start(["geekbench"])
-    h.drive(stop=in_step("02-geekbench"))
-    monkeypatch.setattr(h.runner, "reconcile", lambda name: (_ for _ in ()).throw(RuntimeError("boom")))
-    fail_reconciles(h, 1)
-    h.clock.advance(minutes=31)
-    fail_reconciles(h, 1)
-    assert h.run.status.phase == RunPhase.FAILED
+    assert run.status.attempts[0].outcome == AttemptOutcome.HARNESS_ERROR  # not a node loss
+    assert "geekbench" in h.storage.aborted  # the running task's open uploads
+    assert h.kube.list("secret") == [] and h.storage.status["geekbench"]["exit_code"] == ExitCode.HARNESS_ERROR
+    assert not [d for d in h.kube.deleted if d[0] == "pod"]  # recorded first, no Pod deleted by the give-up
+    assert f"{h.name}-a1" in h.pod_names("anchor")
+    monkeypatch.undo()
+    h.runner.reconcile(h.name)  # the Failed phase releases the node
+    assert h.pod_names() == []
 
 
 def test_pending_run_that_cannot_start_gets_its_tasks_so_the_lease_can_expire(h):
     h.start(["no_such_task"])
-    fail_reconciles(h, runner_mod.MAX_FAILURES)
+    fail_reconciles(h, 1)
+    h.clock.advance(minutes=31)
+    fail_reconciles(h, 1)
     run = h.run
     assert run.status.phase == RunPhase.FAILED
     assert [(t.name, t.state, t.exit_code, t.published) for t in run.status.tasks] == [
@@ -738,6 +816,21 @@ def test_urls_secret_of_the_largest_step_stays_far_below_the_object_limit(h):
     assert len(base64.b64encode(secret["stringData"]["urls.json"].encode())) < 700 * 1024
 
 
+def test_urls_secret_of_the_pgbench_step_stays_far_below_the_object_limit(h):
+    """pgbench has the most multipart slots: resource tracker and the collected server log with `max_parts` parts."""
+    storage = Storage.__new__(Storage)
+    storage.bucket, storage.uploads, storage.s3 = "b", UploadSettings(), _Presigner()
+    facts = NodeFacts("n", "oci.x", "amd64", START, 1)
+    step = steps.next_step([tasks.get_task("pgbench_postgres_ro_durable")], {}, facts, index=2)
+    h.start(["pgbench_postgres_ro_durable"])
+    run = h.run
+    urls = render_urls_json(storage.presign(storage.plan_uploads(crd.run_key(run), step.containers)))
+    owner = runner_mod.OwnerRef("inspector.sparecores.com/v1alpha1", "BenchmarkRun", run.name, "u")
+    secret = pods.render_urls_secret(run, urls, owner)
+    assert 150 < urls.count("X-Amz-Signature") < 400  # the parts of the large files are in there
+    assert len(base64.b64encode(secret["stringData"]["urls.json"].encode())) < 700 * 1024
+
+
 # --------------------------------------------------------------------------- partial image pull, node loss details
 
 
@@ -753,6 +846,73 @@ def test_only_the_containers_stuck_pulling_end_with_image_pull_timeout(h):
     assert f"{h.name}-a1-01-probes" not in h.pod_names()
     run = h.drive()
     assert h.task("geekbench").exit_code == 0 and run.status.phase == RunPhase.PUBLISHING
+
+
+def probe_pod_exists(h) -> bool:
+    return h.kube.list("pod", {"inspector.sparecores.com/task": "probe"}) != []
+
+
+def test_stuck_pull_with_a_flush_neither_relaunches_the_step_nor_deletes_it_early(h):
+    h.cluster.behaviour["dmidecode"] = [{"pull_stuck": True}]
+    h.storage.incomplete["lscpu"] = 1  # lscpu ran, but its uploads need a flush
+    h.start(["dmidecode"])
+    h.drive(stop=lambda run: probe_pod_exists(h))
+    h.cluster.react()
+    h.clock.advance(minutes=16)
+    h.runner.reconcile(h.name)
+    probe = f"{h.name}-a1-01-probes"
+    assert {probe, f"{probe}-flush1"} <= set(h.pod_names())  # the stuck Pod stays until the flush is over
+    h.runner.reconcile(h.name)  # the flush is still going
+    assert h.task("dmidecode").state == TaskState.RUNNING
+    h.cluster.react()
+    h.runner.reconcile(h.name)
+    assert h.codes()["dmidecode"] == (-4, "IMAGE_PULL_TIMEOUT") and h.codes()["lscpu"] == (0, None)
+    assert probe not in h.pod_names()
+    assert [n for k, n in h.kube.created if k == "pod"].count(probe) == 1
+
+
+def test_container_waiting_on_a_bad_config_fails_after_the_pull_budget_with_its_message(h):
+    message = 'secret "inspector-secrets" not found'
+    h.cluster.behaviour["geekbench"] = [{"pull_stuck": "CreateContainerConfigError", "message": message}]
+    h.start(["membench", "geekbench"])
+    h.drive(stop=lambda run: h.kube.list("pod", {"inspector.sparecores.com/task": "geekbench"}) != [])
+    h.cluster.react()
+    h.clock.advance(minutes=14)
+    h.runner.reconcile(h.name)
+    assert h.task("geekbench").state == TaskState.RUNNING
+    h.clock.advance(minutes=2)
+    h.runner.reconcile(h.name)
+    assert h.codes()["geekbench"] == (-4, message)
+    assert f"{h.name}-a1-02-geekbench" not in h.pod_names() and "geekbench" in h.storage.aborted
+    run = h.drive()
+    assert h.task("membench").exit_code == 0 and run.status.phase == RunPhase.PUBLISHING
+
+
+@pytest.mark.parametrize("reason", ["InvalidImageName", "ErrImageNeverPull"])
+def test_other_unresolvable_waiting_states_fail_like_a_stuck_pull(h, reason):
+    h.cluster.behaviour["geekbench"] = [{"pull_stuck": reason}]
+    h.start(["geekbench"])
+    h.drive(stop=lambda run: h.kube.list("pod", {"inspector.sparecores.com/task": "geekbench"}) != [])
+    h.cluster.react()
+    h.clock.advance(minutes=16)
+    h.runner.reconcile(h.name)
+    assert h.codes()["geekbench"] == (-4, reason)
+
+
+def test_gpu_fallback_reruns_only_the_containers_that_did_not_start(h):
+    h.cluster.node_labels = {"scarpenter.sparecores.com/accelerator-manufacturer": "nvidia"}
+    h.cluster.node_allocatable = {"memory": "15Gi", "cpu": "2", "nvidia.com/gpu": "1"}
+    h.cluster.behaviour["dmidecode"] = [{"start_error": True}]
+    h.start(["dmidecode"])
+    h.storage.objects[object_key(h.run_key(), "gpu_facts", "stdout")] = b"16384, 8.0\n"
+    h.drive()
+    created = [n for k, n in h.kube.created if k == "pod"]
+    assert f"{h.name}-a1-01-probes" in created and f"{h.name}-a1-01-probes-cpu" in created
+    assert h.storage.planned.count("lscpu") == 1 and h.storage.planned.count("dmidecode") == 1
+    assert h.task("dmidecode").exit_code == 0 and h.task("dmidecode").gpu_fallback
+    assert h.task("lscpu").exit_code == 0 and not h.task("lscpu").gpu_fallback
+    assert not h.task("gpu_facts").gpu_fallback and h.task("gpu_facts").exit_code == 0
+    assert h.storage.status["lscpu"]["gpu_fallback"] is False
 
 
 def test_anchor_that_ended_on_a_healthy_node_is_node_lost_not_spot(h):

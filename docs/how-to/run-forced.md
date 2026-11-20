@@ -35,8 +35,9 @@ benchmarked while Keeper's eligibility rules do not allow inspector runs on OCI 
 
 ## Cancel or pause
 
-- Cancel a run: `k8s-inspector cancel <run name>` . Unfinished tasks are recorded as
-  `-4 CANCELLED`, the node is released and the `BenchmarkRun` stays (phase `Cancelled`). Deleting the `BenchmarkRun`
+- Cancel a run: `k8s-inspector cancel <run name>` sets the annotation `inspector.sparecores.com/cancel: "true"`
+  and returns; the controller then records the unfinished tasks as `-4 CANCELLED`, releases the node and keeps the
+  `BenchmarkRun` (phase `Cancelled`). Check with `k8s-inspector status`. Deleting the `BenchmarkRun`
   with `kubectl` also releases the node but drops the record.
 - Pause a vendor: set `vendors.<vendor>.maxInFlight: 0` in the ConfigMap. Running runs finish.
 
