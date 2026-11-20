@@ -77,7 +77,8 @@ def run_key(run: BenchmarkRun) -> RunKey:
 
 
 def _format_time(value: datetime | None) -> str | None:
-    return None if value is None else value.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+    """RFC 3339 UTC; keeps microseconds (sub-second tasks need them), omitted when zero like `isoformat()`."""
+    return None if value is None else value.astimezone(UTC).replace(tzinfo=None).isoformat() + "Z"
 
 
 def _parse_time(value: str | None) -> datetime | None:

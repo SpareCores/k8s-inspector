@@ -402,7 +402,10 @@ func writeFile(path, s string) {
 	}
 }
 
-func now() string { return time.Now().UTC().Format(time.RFC3339) }
+// timeLayout is RFC 3339 in UTC with microseconds: sub-second tasks need a non-zero duration.
+const timeLayout = "2006-01-02T15:04:05.000000Z07:00"
+
+func now() string { return time.Now().UTC().Format(timeLayout) }
 
 func kernelVersion() string {
 	data, _ := os.ReadFile("/proc/sys/kernel/osrelease")

@@ -89,6 +89,13 @@ def test_status_meta_roundtrip_has_legacy_fields_first_then_added():
     assert not text.endswith("\n")
 
 
+def test_iso_is_legacy_naive_utc_and_omits_zero_fraction():
+    micro = datetime(2026, 11, 20, 12, 0, 44, 123456, tzinfo=UTC)
+    assert render._iso(micro) == "2026-11-20T12:00:44.123456"
+    assert render._iso(micro.replace(microsecond=0)) == "2026-11-20T12:00:44"  # as Python's isoformat() does
+    assert render._iso(None) is None
+
+
 def test_build_status():
     t0 = datetime(2026, 11, 20, 9, 30, 0, 123456, tzinfo=UTC)
     run = BenchmarkRun(

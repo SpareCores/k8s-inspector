@@ -238,6 +238,15 @@ def full_status() -> RunStatus:
     )
 
 
+def test_time_keeps_microseconds_and_omits_zero_fraction():
+    micro = datetime(2026, 11, 20, 12, 0, 44, 123456, tzinfo=UTC)
+    whole = micro.replace(microsecond=0)
+    assert crd._format_time(micro) == "2026-11-20T12:00:44.123456Z"
+    assert crd._format_time(whole) == "2026-11-20T12:00:44Z"
+    assert crd._parse_time("2026-11-20T12:00:44.123456Z") == micro
+    assert crd._parse_time("2026-11-20T12:00:44Z") == whole
+
+
 def test_status_round_trip():
     status = full_status()
     d = crd.status_to_dict(status)

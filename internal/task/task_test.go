@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strconv"
 	"strings"
@@ -16,6 +17,8 @@ import (
 
 	"github.com/sparecores/k8s-inspector/internal/s3fake"
 )
+
+var microsecondUTC = regexp.MustCompile(`^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{6}Z$`)
 
 var files = []string{"stdout", "stderr", "version", "result.json", "manifest.json", "extra.txt"}
 
@@ -91,6 +94,19 @@ func TestSuccessUploadsOutputsAndManifest(t *testing.T) {
 	}
 	if !m.Complete || m.Objects["stdout"].Size != 4 || m.Objects["result.json"].Size == 0 {
 		t.Fatalf("manifest = %s", b)
+	}
+	var res Result
+	rb, _ := s.Object("t1", "result.json")
+	if err := json.Unmarshal(rb, &res); err != nil {
+		t.Fatal(err)
+	}
+	for _, ts := range []string{res.Start, res.End} {
+		if !microsecondUTC.MatchString(ts) {
+			t.Fatalf("timestamp %q is not RFC 3339 UTC with microseconds", ts)
+		}
+		if _, err := time.Parse(time.RFC3339, ts); err != nil {
+			t.Fatalf("timestamp %q: %v", ts, err)
+		}
 	}
 	tm := termMsg(t, cfg)
 	if tm.ExitCode != 0 || !tm.UploadComplete || tm.Version != "1.2.3" {
