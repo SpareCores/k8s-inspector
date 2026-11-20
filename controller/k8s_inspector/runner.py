@@ -110,6 +110,7 @@ NODEPOOL_LABEL = "karpenter.sh/nodepool"
 CAPACITY_LABEL = "karpenter.sh/capacity-type"
 INSTANCE_TYPE_LABEL = "node.kubernetes.io/instance-type"
 SCARPENTER = "scarpenter.sparecores.com"
+RELAUNCH_ANNOTATION = "inspector.sparecores.com/relaunch"  # on a step Pod recreated after a DiskPressure rejection
 PRICE_ANNOTATION = f"{SCARPENTER}/price"
 NODECLASS_HASH_ANNOTATION = f"{SCARPENTER}/nodeclass-hash"
 ACCELERATOR_MANUFACTURER_LABEL = f"{SCARPENTER}/accelerator-manufacturer"
@@ -294,8 +295,8 @@ class Runner:
         self._failing: dict[str, tuple[int, datetime]] = {}  # run -> (reconciles failed in a row, since when)
         self._nodes: dict[str, _Node] = {}  # cache per run
         self._signed_at: dict[str, datetime] = {}  # when the urls Secret was last signed, per run
-        self._disk_wait: dict[str, datetime] = {}  # run -> since when its node has had DiskPressure
-        self._relaunched: set[str] = set()  # step Pods already relaunched once after a DiskPressure rejection
+        # run -> since when its node has had DiskPressure. In memory: a controller restart restarts the wait.
+        self._disk_wait: dict[str, datetime] = {}
 
     def check_config(self) -> None:
         """Fail fast when `K8SI_SC_RUN_IMAGE` is empty (anchor and flush Pods could not be created)."""
@@ -435,7 +436,6 @@ class Runner:
         self._nodes.pop(name, None)
         self._signed_at.pop(name, None)
         self._disk_wait.pop(name, None)
-        self._relaunched = {n for n in self._relaunched if not n.startswith(name)}
         self._known.discard(name)
         for pod in self.kube.list("pod", labels={LABEL_RUN: name}):
             self.kube.delete("pod", _meta(pod)["name"])
@@ -965,15 +965,14 @@ class Runner:
         more. True when handled; False when it is time to record the rejection (already relaunched once, or the
         pressure outlasted the wait)."""
         name = _meta(pod)["name"]
-        if name in self._relaunched:
-            return False
+        if (_meta(pod).get("annotations") or {}).get(RELAUNCH_ANNOTATION):
+            return False  # the marker lives on the recreated Pod, so it survives a controller restart
         if self._wait_for_disk(run, nd):
             return True
         if nd.disk_pressure:
             return False
-        self._relaunched.add(name)
         self.kube.delete("pod", name, grace_seconds=0)
-        self._launch(run, cfg, live, nd, step)
+        self._launch(run, cfg, live, nd, step, annotations={RELAUNCH_ANNOTATION: "1"})
         return True
 
     def _probe_tasks(self, run: BenchmarkRun, nd: _Node) -> list[TaskDef]:
@@ -1043,7 +1042,15 @@ class Runner:
             found.exit_code = found.error_msg = found.commit = None
             found.published, found.gpu_fallback = False, fallback
 
-    def _launch(self, run: BenchmarkRun, cfg: Config, live: dict[str, dict], nd: _Node, step: Step) -> None:
+    def _launch(
+        self,
+        run: BenchmarkRun,
+        cfg: Config,
+        live: dict[str, dict],
+        nd: _Node,
+        step: Step,
+        annotations: dict[str, str] | None = None,
+    ) -> None:
         """Sign URLs, heartbeat, create the Pod. Every part is repeatable. URLs that do not fit a Secret cannot
         work on a retry either: the step's tasks end 256."""
         try:
@@ -1064,6 +1071,8 @@ class Runner:
             owner=self._anchor_owner(run, live),
             gpu_count=nd.gpu_count,
         )
+        if annotations:
+            _meta(pod).setdefault("annotations", {}).update(annotations)
         self._create("pod", pod)
 
     def _watch_step(self, run: BenchmarkRun, cfg: Config, live: dict[str, dict], nd: _Node, draining: bool) -> None:

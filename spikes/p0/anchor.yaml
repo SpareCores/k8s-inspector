@@ -29,7 +29,7 @@ spec:
     readinessProbe:
       exec: {command: [/sc-run, ready, /k8si/bin]}
       periodSeconds: 2
-    resources: {requests: {cpu: 1m, memory: 8Mi}}
+    resources: {requests: {cpu: 1m, memory: 16Mi}}
     volumeMounts:
     - {name: k8si, mountPath: /k8si}
   volumes:

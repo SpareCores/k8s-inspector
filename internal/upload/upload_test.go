@@ -376,3 +376,30 @@ func TestRetryLogsEveryDistinctError(t *testing.T) {
 		t.Errorf("%d log lines, want 3 (repeats suppressed):\n%s", n, got)
 	}
 }
+
+// A transport error must not carry the presigned query string into the log.
+func TestTransportErrorDoesNotLogPresignedQuery(t *testing.T) {
+	var buf bytes.Buffer
+	log.SetOutput(&buf)
+	t.Cleanup(func() { log.SetOutput(os.Stderr) })
+	s := s3fake.New(t)
+	u, spool := newUploader(t, s, nil, 0)
+	write(t, filepath.Join(spool, "stdout"), "x")
+	data, _ := os.ReadFile(u.URLs)
+	signed := strings.ReplaceAll(string(data), "/t1/stdout", "/t1/stdout?X-Amz-Signature=SECRET&X-Amz-Security-Token=SECRET")
+	write(t, u.URLs, signed)
+	s.Close() // connection refused
+
+	if failed := u.Sync(context.Background(), 2); len(failed) != 1 {
+		t.Fatalf("failed = %v", failed)
+	}
+	got := buf.String()
+	if !strings.Contains(got, "t1/stdout") || !strings.Contains(got, "refused") {
+		t.Errorf("log lacks host/path or cause:\n%s", got)
+	}
+	for _, bad := range []string{"X-Amz-", "SECRET"} {
+		if strings.Contains(got, bad) {
+			t.Errorf("log contains %q:\n%s", bad, got)
+		}
+	}
+}

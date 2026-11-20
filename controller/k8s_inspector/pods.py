@@ -699,6 +699,7 @@ def _outcome_from_state(key: str, status: dict | None, pod: dict) -> TaskOutcome
         outcome.exit_code, outcome.error_msg = ExitCode.NEVER_FINISHED, Reason.DEADLINE_EXCEEDED.value
     elif is_rejected(pod):
         outcome.exit_code, outcome.error_msg = ExitCode.NEVER_FINISHED, pod["status"]["message"]
+        outcome.container_start_error = True  # never started: nothing to flush
     elif pod_reason == "Evicted":
         outcome.exit_code, outcome.error_msg = ExitCode.NEVER_FINISHED, Reason.EVICTED.value
     elif terminated and terminated.get("exitCode") == 0:

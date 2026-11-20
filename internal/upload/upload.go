@@ -16,6 +16,7 @@ import (
 	"io/fs"
 	"log"
 	"net/http"
+	neturl "net/url"
 	"os"
 	"path/filepath"
 	"sort"
@@ -322,12 +323,12 @@ func (u *Uploader) send(ctx context.Context, url string, body io.Reader, size in
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPut, url, body)
 	if err != nil {
-		return "", err
+		return "", permanent(redactURL(err))
 	}
 	req.ContentLength = size
 	resp, err := u.Client.Do(req)
 	if err != nil {
-		return "", err
+		return "", redactURL(err)
 	}
 	defer resp.Body.Close()
 	msg, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
@@ -339,6 +340,21 @@ func (u *Uploader) send(ctx context.Context, url string, body io.Reader, size in
 		return "", err
 	}
 	return strings.Trim(resp.Header.Get("ETag"), `"`), nil
+}
+
+// redactURL strips the URL from a *url.Error: presigned URLs carry their
+// credentials in the query string, and the error text is logged. Only method,
+// host and path remain.
+func redactURL(err error) error {
+	var ue *neturl.Error
+	if !errors.As(err, &ue) {
+		return err
+	}
+	where := "?"
+	if pu, perr := neturl.Parse(ue.URL); perr == nil && pu.Host != "" {
+		where = pu.Host + pu.Path
+	}
+	return fmt.Errorf("%s %s: %w", ue.Op, where, ue.Err)
 }
 
 // permanentStatus reports whether a 4xx answer will not change on a retry.

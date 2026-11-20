@@ -29,7 +29,7 @@ from k8s_inspector.model import (
     UploadSettings,
     VendorSettings,
 )
-from k8s_inspector.runner import Runner
+from k8s_inspector.runner import RELAUNCH_ANNOTATION, Runner
 from k8s_inspector.storage import Storage, object_key, render_urls_json
 
 START = datetime(2026, 11, 20, 10, 0, tzinfo=UTC)
@@ -1121,6 +1121,9 @@ def test_step_rejected_for_disk_pressure_is_relaunched_once_after_it_clears(h):
     h.runner.reconcile(h.name)
     assert h.task("geekbench").state == TaskState.RUNNING  # waits: nothing recorded
     set_disk_pressure(h, False)
+    h.runner.reconcile(h.name)
+    pod = h.kube.get("pod", geekbench_name)
+    assert pod["metadata"]["annotations"][RELAUNCH_ANNOTATION] == "1"  # read back after a restart
     run = h.drive()
     assert h.codes()["geekbench"] == (0, None)
     assert [n for k, n in h.kube.created if k == "pod" and n.endswith("geekbench")].count(geekbench_name) == 2
@@ -1129,9 +1132,11 @@ def test_step_rejected_for_disk_pressure_is_relaunched_once_after_it_clears(h):
 
 def test_step_rejected_twice_ends_minus_four_with_the_rejection_message(h):
     h.cluster.behaviour["geekbench"] = [{"rejected": True}, {"rejected": True}]
+    h.storage.lost.add("geekbench")  # a verification would fail and start flush Pods: a never-started task has none
     h.start(["geekbench"])
     h.drive()
     assert h.codes()["geekbench"] == (-4, "Pod was rejected: The node had condition: [DiskPressure].")
+    assert not [n for k, n in h.kube.created if k == "pod" and "-flush" in n]
 
 
 def test_old_manifest_status_and_result_are_cleared_before_every_launch(h):
