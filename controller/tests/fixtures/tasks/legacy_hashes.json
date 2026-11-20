@@ -1,0 +1,32 @@
+{
+ "hashes": {
+  "bw_mem": "1d83d562246b8fbef143f974b78f8edfc7542d64",
+  "compression_text": "29bacc7bf4bdbf93a6085edc26b7882af8dcce64",
+  "dmidecode": "95edacc2e9e6940dae91cd47ab8a407fe38b4bcf",
+  "ffmpeg": "4d02ae81d9791d1ff74f6cac351c082dd4fd5644",
+  "geekbench": "02ba7e3a942beca58580b2e6bcfc4378824bfcaf",
+  "llm": "e25296eadb4d38faa23965d201bba3e7cf5c0d45",
+  "lsblk": "0f8ca92aecac0d4b026a502b9dd69efc469d19ce",
+  "lsblk_discard": "f878ac7773fa2f2b9f1fc5a0ef1d72b9299ace29",
+  "lsblk_topo": "d9c1bfe029afd5267a2ac7b6fe16a1890a1d48bb",
+  "lscpu": "f8f5751bc85123698d44e45813d37a5da2da0848",
+  "lshw": "3da21fb0474ef078fa456fa88234442cd52a3e7d",
+  "lstopo": "06d1a4f194bda9ce842d43a4e7017d9b004f86db",
+  "membench": "9dfbb8289ff6d48963aa69a14d3879d97fd14d53",
+  "nvbandwidth": "8c7ada2c2656db86f98e3166387b4e5c45f97659",
+  "nvidia_smi": "839158cbd4fb9109cadab82b03c4f84951747b0b",
+  "openssl": "dd41d078ec08a7a4c7ad6cab74ae45b34f549ea0",
+  "passmark": "b665a7e4325fea8606d5d81642c4b530ab99fb4d",
+  "pgbench_postgres_dbaas_ro_durable": "3aaf3fd6be1de4a28fd1206d9a223379b1352055",
+  "pgbench_postgres_ro_durable": "eafb59ca4418846f0d64e9397e1bafad77b873ec",
+  "redis": "3017390de7f0afebf68b42df4039403fa012bc91",
+  "static_web": "37c10ffddb142963b705ffc3385491fcff540474",
+  "storage": "34b7e2b158d7719ed99678de6d6309bfac706c06",
+  "stressng_benchmarks": "e8d5a23405fdcec807368587cfb40255c2cd43dd",
+  "stressngfull": "b25af993d7fbbcfd02529034e37785e65a1380c3",
+  "stressnglongrun": "2f900acde0e9a483e36826f9e429b7bdd1928b92",
+  "timing": "2a055e80294257d70cac585c344d124f9d5cc9e3",
+  "virtualization": "2d0638ff43887aaf9be0baf8f148cb47d2d1f5b3",
+  "vllm": "423672d23c8f0d5838a08d902dad4aa3bcee2561"
+ }
+}

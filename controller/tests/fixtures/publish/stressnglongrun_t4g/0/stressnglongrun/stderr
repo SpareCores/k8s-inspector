@@ -1,0 +1,113 @@
+---
+system-info:
+      stress-ng-version: 0.17.08
+      run-by: root
+      date-yyyy-mm-dd: 2024:07:09
+      time-hh-mm-ss: 12:02:12
+      epoch-secs: 1720526532
+      hostname: ip-172-31-17-137
+      sysname: Linux
+      nodename: ip-172-31-17-137
+      release: 6.8.0-1009-aws
+      version: '#9-Ubuntu SMP Fri May 17 20:15:49 UTC 2024'
+      machine: aarch64
+      compiler: 'musl-gcc 13.2.1'
+      uptime: 131
+      totalram: 4018012160
+      freeram: 172802048
+      sharedram: 35000320
+      bufferram: 113164288
+      totalswap: 0
+      freeswap: 0
+      pagesize: 4096
+      cpus: 2
+      cpus-online: 2
+      ticks-per-second: 100
+
+metrics:
+    - stressor: cpu
+      bogo-ops: 15028
+      bogo-ops-per-second-usr-sys-time: 1518.829422
+      bogo-ops-per-second-real-time: 3005.565246
+      wall-clock-time: 5.000058
+      user-time: 9.894462
+      system-time: 0.000000
+      cpu-usage-per-instance: 98.943476
+      max-rss: 1320
+
+...
+---
+system-info:
+      stress-ng-version: 0.17.08
+      run-by: root
+      date-yyyy-mm-dd: 2024:07:09
+      time-hh-mm-ss: 12:03:05
+      epoch-secs: 1720526585
+      hostname: ip-172-31-17-137
+      sysname: Linux
+      nodename: ip-172-31-17-137
+      release: 6.8.0-1009-aws
+      version: '#9-Ubuntu SMP Fri May 17 20:15:49 UTC 2024'
+      machine: aarch64
+      compiler: 'musl-gcc 13.2.1'
+      uptime: 184
+      totalram: 4018012160
+      freeram: 173060096
+      sharedram: 35000320
+      bufferram: 113172480
+      totalswap: 0
+      freeswap: 0
+      pagesize: 4096
+      cpus: 2
+      cpus-online: 2
+      ticks-per-second: 100
+
+metrics:
+    - stressor: cpu
+      bogo-ops: 14949
+      bogo-ops-per-second-usr-sys-time: 1508.728249
+      bogo-ops-per-second-real-time: 2989.767068
+      wall-clock-time: 5.000055
+      user-time: 9.897300
+      system-time: 0.011045
+      cpu-usage-per-instance: 99.082359
+      max-rss: 1192
+
+...
+---
+system-info:
+      stress-ng-version: 0.17.08
+      run-by: root
+      date-yyyy-mm-dd: 2024:07:09
+      time-hh-mm-ss: 12:04:05
+      epoch-secs: 1720526645
+      hostname: ip-172-31-17-137
+      sysname: Linux
+      nodename: ip-172-31-17-137
+      release: 6.8.0-1009-aws
+      version: '#9-Ubuntu SMP Fri May 17 20:15:49 UTC 2024'
+      machine: aarch64
+      compiler: 'musl-gcc 13.2.1'
+      uptime: 245
+      totalram: 4018012160
+      freeram: 173576192
+      sharedram: 35000320
+      bufferram: 113180672
+      totalswap: 0
+      freeswap: 0
+      pagesize: 4096
+      cpus: 2
+      cpus-online: 2
+      ticks-per-second: 100
+
+metrics:
+    - stressor: cpu
+      bogo-ops: 14978
+      bogo-ops-per-second-usr-sys-time: 1512.108325
+      bogo-ops-per-second-real-time: 2995.581288
+      wall-clock-time: 5.000031
+      user-time: 9.902382
+      system-time: 0.002993
+      cpu-usage-per-instance: 99.053131
+      max-rss: 1320
+

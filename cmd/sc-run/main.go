@@ -67,7 +67,7 @@ func runHold(args []string) {
 func runExec(args []string) int {
 	fs := flag.NewFlagSet("exec", flag.ExitOnError)
 	cfg := task.Config{}
-	var collect stringList
+	var collect, rlimits stringList
 	fs.StringVar(&cfg.Task, "task", "", "task name (prefix of its keys in urls.json)")
 	fs.StringVar(&cfg.Spool, "spool", "", "spool directory on the node")
 	fs.StringVar(&cfg.URLs, "urls", "", "presigned URL file (urls.json)")
@@ -75,6 +75,7 @@ func runExec(args []string) int {
 	fs.DurationVar(&cfg.Timeout, "timeout", 30*time.Minute, "task timeout")
 	fs.StringVar(&cfg.VersionCmd, "version-cmd", "", "shell command whose output is the tool version (60 s cap)")
 	fs.Var(&collect, "collect", "extra file to upload, src:name (repeatable)")
+	fs.Var(&rlimits, "rlimit", "resource limit of the task, NAME=SOFT[:HARD] (repeatable; nofile, memlock, nproc, stack, core, as, fsize, data, cpu; integer or unlimited)")
 	fs.DurationVar(&cfg.Reput, "reput", 60*time.Second, "interval of re-uploading growing files")
 	fs.DurationVar(&cfg.UploadBudget, "upload-budget", 10*time.Minute, "final upload budget")
 	fs.DurationVar(&cfg.KillAfter, "kill-after", 5*time.Second, "SIGTERM to SIGKILL for the task")
@@ -83,6 +84,7 @@ func runExec(args []string) int {
 	fs.StringVar(&cfg.TermLog, "termination-log", "/dev/termination-log", "termination message path")
 	check(fs.Parse(args))
 	cfg.Collect = collect
+	cfg.Rlimits = rlimits
 	cfg.MultipartMin = *mib << 20
 	cfg.Cmd = fs.Args()
 	if cfg.Task == "" || cfg.Spool == "" || cfg.URLs == "" || len(cfg.Cmd) == 0 {

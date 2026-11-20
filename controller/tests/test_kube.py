@@ -1,0 +1,211 @@
+"""Kube against a fake API server (httpx2 MockTransport); no cluster."""
+
+import json
+
+import httpx2 as httpx
+import lightkube
+import pytest
+from lightkube.config.kubeconfig import KubeConfig
+from lightkube.config.models import Cluster, User
+
+from k8s_inspector.kube import AlreadyExists, Conflict, Kube, NotFound
+
+CRD_BASE = "/apis/inspector.sparecores.com/v1alpha1/namespaces/inspector/benchmarkruns"
+
+
+def status_body(code: int, reason: str, message: str = "boom") -> dict:
+    return {
+        "kind": "Status",
+        "apiVersion": "v1",
+        "status": "Failure",
+        "code": code,
+        "reason": reason,
+        "message": message,
+    }
+
+
+def make_kube(handler) -> Kube:
+    config = KubeConfig.from_one(
+        cluster=Cluster(server="https://fake.test"), user=User(token="test"), namespace="inspector"
+    )
+    client = lightkube.Client(config=config, transport=httpx.MockTransport(handler))
+    return Kube("inspector", client=client)
+
+
+def json_response(code: int, body: dict) -> httpx.Response:
+    return httpx.Response(code, json=body)
+
+
+def pod_list(rv: str, *names: str) -> dict:
+    return {
+        "kind": "PodList",
+        "apiVersion": "v1",
+        "metadata": {"resourceVersion": rv},
+        "items": [{"apiVersion": "v1", "kind": "Pod", "metadata": {"name": n, "resourceVersion": rv}} for n in names],
+    }
+
+
+def watch_line(event_type: str, name: str, rv: str) -> str:
+    pod = {"apiVersion": "v1", "kind": "Pod", "metadata": {"name": name, "resourceVersion": rv}}
+    return json.dumps({"type": event_type, "object": pod})
+
+
+def test_crd_group_version_plural_match_manifest():
+    seen = []
+
+    def handler(request):
+        seen.append(request.url.path)
+        return json_response(
+            200, {"apiVersion": "inspector.sparecores.com/v1alpha1", "kind": "BenchmarkRun", "metadata": {"name": "r"}}
+        )
+
+    make_kube(handler).get("benchmarkrun", "r")
+    assert seen == [f"{CRD_BASE}/r"]
+
+
+def test_get_returns_dict_and_node_is_cluster_scoped():
+    seen = []
+
+    def handler(request):
+        seen.append(request.url.path)
+        return json_response(200, {"apiVersion": "v1", "kind": "Node", "metadata": {"name": "n1"}})
+
+    assert make_kube(handler).get("node", "n1")["metadata"]["name"] == "n1"
+    assert seen == ["/api/v1/nodes/n1"]
+
+
+def test_nodeclaim_path():
+    seen = []
+
+    def handler(request):
+        seen.append(request.url.path)
+        return json_response(200, {"apiVersion": "karpenter.sh/v1", "kind": "NodeClaim", "metadata": {"name": "c"}})
+
+    make_kube(handler).get("nodeclaim", "c")
+    assert seen == ["/apis/karpenter.sh/v1/nodeclaims/c"]
+
+
+def test_not_found_is_translated():
+    kube = make_kube(lambda request: json_response(404, status_body(404, "NotFound")))
+    with pytest.raises(NotFound):
+        kube.get("pod", "x")
+
+
+def test_create_already_exists_vs_conflict():
+    kube = make_kube(lambda request: json_response(409, status_body(409, "AlreadyExists")))
+    with pytest.raises(AlreadyExists):
+        kube.create(
+            "benchmarkrun",
+            {
+                "apiVersion": "inspector.sparecores.com/v1alpha1",
+                "kind": "BenchmarkRun",
+                "metadata": {"name": "r"},
+                "spec": {},
+            },
+        )
+
+    kube = make_kube(lambda request: json_response(409, status_body(409, "Conflict")))
+    with pytest.raises(Conflict):
+        kube.merge_patch("benchmarkrun", "r", {"status": {}}, subresource_status=True)
+
+
+def test_list_passes_label_selector():
+    seen = []
+
+    def handler(request):
+        seen.append(dict(request.url.params))
+        return json_response(200, pod_list("5", "a", "b"))
+
+    pods = make_kube(handler).list("pod", labels={"inspector.sparecores.com/run": "r1"})
+    assert [p["metadata"]["name"] for p in pods] == ["a", "b"]
+    assert seen[0]["labelSelector"] == "inspector.sparecores.com/run=r1"
+
+
+def test_delete_ignores_not_found_and_sends_grace():
+    seen = []
+
+    def handler(request):
+        seen.append((request.method, request.url.path, dict(request.url.params)))
+        return json_response(404, status_body(404, "NotFound"))
+
+    make_kube(handler).delete("pod", "gone", grace_seconds=0)
+    assert seen[0][0:2] == ("DELETE", "/api/v1/namespaces/inspector/pods/gone")
+    assert seen[0][2]["gracePeriodSeconds"] == "0"
+
+
+def test_merge_patch_status_subresource_with_resource_version():
+    seen = []
+
+    def handler(request):
+        seen.append((request.method, request.url.path, request.headers["content-type"], json.loads(request.content)))
+        return json_response(
+            200, {"apiVersion": "inspector.sparecores.com/v1alpha1", "kind": "BenchmarkRun", "metadata": {"name": "r"}}
+        )
+
+    body = {"metadata": {"resourceVersion": "7"}, "status": {"phase": "Running"}}
+    make_kube(handler).merge_patch("benchmarkrun", "r", body, subresource_status=True)
+    method, path, content_type, sent = seen[0]
+    assert (method, path) == ("PATCH", f"{CRD_BASE}/r/status")
+    assert content_type == "application/merge-patch+json"
+    assert sent == body
+
+
+def test_apply_secret_replaces_when_it_exists():
+    seen = []
+    manifest = {"apiVersion": "v1", "kind": "Secret", "metadata": {"name": "run-urls"}, "stringData": {"a": "b"}}
+
+    def handler(request):
+        seen.append(request.method)
+        if request.method == "POST":
+            return json_response(409, status_body(409, "AlreadyExists"))
+        return json_response(200, manifest)
+
+    make_kube(handler).apply_secret(manifest)
+    assert seen == ["POST", "PUT"]
+
+
+def test_watch_starts_with_list_and_streams_events():
+    def handler(request):
+        if request.url.params.get("watch") == "true":
+            assert request.url.params["resourceVersion"] == "10"
+            return httpx.Response(200, text=watch_line("MODIFIED", "a", "11") + "\n")
+        return json_response(200, pod_list("10", "a"))
+
+    events = make_kube(handler).watch("pod")
+    first, second = next(events), next(events)
+    assert (first.type, first.kind, first.obj["metadata"]["name"]) == ("ADDED", "pod", "a")
+    assert (second.type, second.obj["metadata"]["resourceVersion"]) == ("MODIFIED", "11")
+
+
+def test_watch_relists_on_410_gone():
+    calls = {"list": 0, "watch": 0}
+
+    def handler(request):
+        if request.url.params.get("watch") == "true":
+            calls["watch"] += 1
+            if calls["watch"] == 1:
+                return json_response(410, status_body(410, "Expired", "too old resource version"))
+            assert request.url.params["resourceVersion"] == "20"
+            return httpx.Response(200, text=watch_line("ADDED", "c", "21") + "\n")
+        calls["list"] += 1
+        return json_response(200, pod_list("20", "a", "b"))
+
+    events = make_kube(handler).watch("pod", resource_version="5")
+    seen = [next(events) for _ in range(3)]
+    assert [(e.type, e.obj["metadata"]["name"]) for e in seen] == [("ADDED", "a"), ("ADDED", "b"), ("ADDED", "c")]
+    assert calls == {"list": 1, "watch": 2}
+
+
+def test_watch_relists_on_410_error_event_in_stream():
+    calls = {"watch": 0}
+
+    def handler(request):
+        if request.url.params.get("watch") == "true":
+            calls["watch"] += 1
+            if calls["watch"] == 1:
+                return httpx.Response(200, text=json.dumps({"type": "ERROR", "object": status_body(410, "Expired")}))
+            return httpx.Response(200, text=watch_line("MODIFIED", "a", "31") + "\n")
+        return json_response(200, pod_list("30", "a"))
+
+    events = make_kube(handler).watch("pod", resource_version="5")
+    assert [next(events).type for _ in range(2)] == ["ADDED", "MODIFIED"]

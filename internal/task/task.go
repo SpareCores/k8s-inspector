@@ -66,6 +66,7 @@ type Config struct {
 	MultipartMin int64
 	TermLog      string // termination message path
 	Cmd          []string
+	Rlimits      []string // "NAME=SOFT[:HARD]" limits for the task process only; see ParseRlimit
 }
 
 // Result is result.json and, with Upload, the termination message.
@@ -227,13 +228,23 @@ func execute(stopCtx context.Context, cfg Config) (res Result) {
 	defer stdout.Close()
 	defer stderr.Close()
 
+	var limits []Rlimit
+	for _, spec := range cfg.Rlimits {
+		l, err := ParseRlimit(spec)
+		if err != nil {
+			res.ExitCode, res.ErrorMsg = CodeHarnessError, err.Error()
+			return res
+		}
+		limits = append(limits, l)
+	}
+
 	cmd := exec.Command(cfg.Cmd[0], cfg.Cmd[1:]...)
 	cmd.Stdout = stdout
 	cmd.Stderr = stderr
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 
 	oomBefore := oomKills()
-	if err := cmd.Start(); err != nil {
+	if err := withRlimits(limits, cmd.Start); err != nil {
 		res.ExitCode, res.ErrorMsg = CodeHarnessError, "cannot start command: "+err.Error()
 		return res
 	}

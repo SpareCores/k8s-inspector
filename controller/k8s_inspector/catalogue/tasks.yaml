@@ -1,3 +1,333 @@
-# The task catalogue, ported from sc-inspector inspector/tasks.py (fields: docs/reference/tasks.md).
-# Owned by the tasks agent. Empty until ported.
-tasks: []
+# The task catalogue, ported from sc-inspector inspector/tasks.py and dbaas_tasks.py (reference: docs/reference/tasks.md).
+# Loaded by k8s_inspector/tasks.py into model.TaskDef. Keys are the TaskDef field names; an omitted key is the
+# TaskDef default; an unknown key is an error.
+#
+# Conventions
+# - `command`, `image`, `version_command`, `workload_proxy`, `durability` are the legacy values. `command`, `image`,
+#   `workload_proxy`, `durability`, `transforms` (their source) and `revision` are the hash inputs (see tasks.task_hash):
+#   change them only to rerun the task everywhere.
+# - `command` and `version_command` are arguments appended to `entrypoint`, exactly as in `docker run <image> <command>`.
+#   `entrypoint` restates the image ENTRYPOINT (Kubernetes `command` replaces it). Where `command` is null the image's
+#   default CMD is part of `entrypoint` (passmark). Probe images (dmidecode, hwinfo, virtualization, nvidia/cuda) have no
+#   ENTRYPOINT, so their command is a complete command line. The resource-tracker wrapper is part of every benchmark
+#   image's entrypoint, never of the probes (as in sc-inspector).
+# - `timeout`: `<n>s`, `<n>m` or `<n>h` (sums allowed: `1h30m`).
+# - Ordering: `priority` ascending, then `parallel: true` before serial, then name. No priority = last.
+#   `parallel: true` tasks form the probe step (one Pod, one container per task).
+# - `digest` / `images`: the image digest ("sha256:...") is set by the weekly CI pull request; until then
+#   `tasks.image_ref` raises. The vLLM ladder is `images` (in probe order); its per-image digests are under `digests`
+#   (image reference -> digest) because a ladder has one digest per image.
+# - `secrets` are keys of Secret `inspector-secrets` (sentinel = Sentinel API token, geekbench = licence passphrase,
+#   huggingface = HF_TOKEN). `env` is a map of fixed variables; TRACKER_* and the pgbench SC_DB_* connection
+#   variables are added by the Pod renderer.
+# - Conditions evaluated by the controller: `gpu: true` (precheck, exit code -3 on a node without an NVIDIA GPU),
+#   `spot: false` and the timeout (spot.spotMaxTaskMinutes, `tasks.allows_spot`). `precheck_command` and
+#   `precheck_regex` are the legacy lshw check, kept for the record: the controller decides from the accelerator
+#   labels (`NodeFacts.has_nvidia_gpu`) instead. Memory, vCPU, storage and allowlist rules are Keeper's, not
+#   the catalogue's (no legacy task sets `minimum_memory` or `maximum_cpus`). vLLM's compute-capability rule and
+#   nvbandwidth's `-b` size are adaptive and live in steps.py.
+# - DBaaS tasks are the ones with `workload_proxy` (legacy DbaasDbTask). They run only in a DBaaS run (explicit task
+#   name, see tasks.is_dbaas); an empty task list means every server task.
+# - Not ported: `timing` (publisher output, not a task).
+
+tasks:
+  # ------------------------------------------------------------------------- probe step (parallel, priority 0)
+  - name: dmidecode
+    image: ghcr.io/sparecores/dmidecode:main
+    command: dmidecode
+    version_command: dmidecode --version
+    timeout: 5m
+    priority: 0
+    parallel: true
+    parse: dmidecode
+
+  - name: lshw
+    image: ghcr.io/sparecores/hwinfo:main
+    command: lshw -json
+    version_command: lshw -version
+    timeout: 5m
+    priority: 0
+    parallel: true
+
+  - name: lscpu
+    image: ghcr.io/sparecores/hwinfo:main
+    command: bash -c 'lscpu -JB | jq'
+    version_command: |-
+      bash -c "lscpu --version | awk '{print $4}'"
+    timeout: 5m
+    priority: 0
+    parallel: true
+
+  - name: lstopo
+    image: ghcr.io/sparecores/hwinfo:main
+    command: lstopo --of xml
+    version_command: lstopo --version
+    timeout: 30s
+    priority: 0
+    parallel: true
+    parse: lstopo
+
+  - name: virtualization
+    image: ghcr.io/sparecores/virtualization:main
+    command: /usr/local/bin/check_virt.sh
+    timeout: 5m
+    priority: 0
+    parallel: true
+
+  # GPU types only. Pinned to the oldest supported CUDA version.
+  - name: nvidia_smi
+    image: nvidia/cuda:11.4.3-base-ubuntu20.04
+    command: nvidia-smi -q -x
+    version_command: |-
+      bash -c "nvidia-smi -h | head -1 | egrep -o 'v[0-9.]+'"
+    timeout: 10m
+    priority: 0
+    parallel: true
+    gpu: true
+    precheck_command: |-
+      lshw -C display -json | jq -r '.[].vendor'
+    precheck_regex: nvidia
+
+  # New (no legacy task). One line per GPU: "<VRAM MiB>, <compute capability>", for example "15360, 7.5".
+  # Replaces the GPU_VRAM_MIB / GPU_COMPUTE_CAP variables that sc-inspector's user data computed on the host.
+  - name: gpu_facts
+    image: nvidia/cuda:11.4.3-base-ubuntu20.04
+    command: nvidia-smi --query-gpu=memory.total,compute_cap --format=csv,noheader,nounits
+    timeout: 1m
+    priority: 0
+    parallel: true
+    gpu: true
+
+  # ------------------------------------------------------------------------- serial hardware listings (priority 0)
+  - name: lsblk
+    image: ghcr.io/sparecores/hwinfo:main
+    command: lsblk -O -Jdb
+    version_command: lsblk -V
+    timeout: 1m
+    priority: 0
+
+  - name: lsblk_discard
+    image: ghcr.io/sparecores/hwinfo:main
+    command: lsblk -DJdb
+    version_command: lsblk -V
+    timeout: 1m
+    priority: 0
+
+  - name: lsblk_topo
+    image: ghcr.io/sparecores/hwinfo:main
+    command: lsblk -tJdb
+    version_command: lsblk -V
+    timeout: 1m
+    priority: 0
+
+  # ------------------------------------------------------------------------- benchmarks
+  # Postgres: cached CPU-heavy read-only pgbench (ro_cpu_* script), durable. With SC_DB_HOST unset the image starts
+  # its own local Postgres server. Eligibility (memory, SKU) is Keeper's. The server log is collected as postgres.log.
+  - name: pgbench_postgres_ro_durable
+    image: ghcr.io/sparecores/benchmark-pgbench-postgres:main
+    entrypoint: [/usr/local/bin/resource-tracker, --, python3, /benchmark/benchmark.py]
+    command: null
+    timeout: 120m
+    priority: 1.02
+    privileges: [db_rlimits]
+    secrets: [sentinel]
+    env:
+      SC_DURABILITY: durable
+      SC_CDN_UPLOAD: "0"
+    collect: ["/tmp/pg-server.log:postgres.log"]
+    large_outputs: [postgres.log]
+
+  # The same benchmark against a vendor-managed database (DBaaS run; SC_DB_* come from the run's Secret).
+  - name: pgbench_postgres_dbaas_ro_durable
+    image: ghcr.io/sparecores/benchmark-pgbench-postgres:main
+    entrypoint: [/usr/local/bin/resource-tracker, --, python3, /benchmark/benchmark.py]
+    command: null
+    timeout: 120m
+    priority: 1.02
+    privileges: [db_rlimits]
+    env:
+      SC_DURABILITY: durable
+      SC_CDN_UPLOAD: "0"
+    workload_proxy: read_heavy
+    durability: durable
+
+  # The "SCore" benchmark: all stress-ng `--cpu-method`s were compared on a few instances (x86_64 and ARM, with and
+  # without HyperThreading) and `div16` scaled best.
+  - name: stressngfull
+    image: ghcr.io/sparecores/stress-ng:main
+    entrypoint: [/usr/local/bin/resource-tracker, --, sh]
+    command: |-
+      -c 'for ncpu in $(awk -f /usr/local/bin/count.awk $(nproc)); do echo -n "$ncpu,"; nice -n -20 stress-ng --metrics --cpu $ncpu --cpu-method div16 -t 10 | egrep "metrc.*cpu" | awk "{print \$9}"; done'
+    version_command: |-
+      -c "stress-ng --version | awk '{print $3}'"
+    timeout: 30m
+    priority: 2
+    secrets: [sentinel]
+
+  # Self-contained stress-ng benchmarks (no network, no disk writes), one JSON document.
+  - name: stressng_benchmarks
+    image: ghcr.io/sparecores/stress-ng:main
+    entrypoint: [/usr/local/bin/resource-tracker, --, sh]
+    command: -c 'nice -n -20 python3 /usr/local/bin/run_stressng_benchmarks.py'
+    version_command: |-
+      -c "stress-ng --version | awk '{print $3}'"
+    timeout: 20m
+    priority: 3
+    secrets: [sentinel]
+
+  - name: openssl
+    image: ghcr.io/sparecores/benchmark:main
+    entrypoint: [/usr/local/bin/resource-tracker, --]
+    command: openssl.sh
+    version_command: |-
+      bash -c "openssl version | awk '{print $2}'"
+    timeout: 1h
+    priority: 4
+    parse: openssl
+    secrets: [sentinel]
+
+  - name: geekbench
+    image: ghcr.io/sparecores/benchmark:main
+    entrypoint: [/usr/local/bin/resource-tracker, --]
+    command: nice -n -20 geekbench.sh
+    version_command: |-
+      bash -c "/usr/local/geekbench-$(uname -m)/geekbench6 --version | awk '{print $2}'"
+    timeout: 1h
+    priority: 5
+    transforms: [raw, fetch_geekbench_results]
+    memory_cap: 0.85
+    secrets: [sentinel, geekbench]
+
+  - name: compression_text
+    image: ghcr.io/sparecores/benchmark:main
+    entrypoint: [/usr/local/bin/resource-tracker, --]
+    command: nice -n -20 python /usr/local/bin/compress.py
+    timeout: 1h
+    priority: 6
+    secrets: [sentinel]
+
+  # Runs for 30 minutes at most (`-t 1800`).
+  - name: membench
+    image: ghcr.io/sparecores/membench:main
+    entrypoint: [/usr/local/bin/resource-tracker, --, nice, -n, "-20", /usr/local/bin/membench]
+    command: -Hv -t 1800
+    version_command: -V
+    timeout: 40m
+    priority: 7
+    secrets: [sentinel]
+
+  - name: bw_mem
+    image: ghcr.io/sparecores/benchmark:main
+    entrypoint: [/usr/local/bin/resource-tracker, --]
+    command: bw_mem.sh
+    timeout: 1h
+    priority: 8
+    secrets: [sentinel]
+
+  - name: static_web
+    image: ghcr.io/sparecores/benchmark-web:main
+    entrypoint: [/usr/local/bin/resource-tracker, --]
+    command: nice -n -20 python /usr/local/bin/benchmark.py
+    version_command: |-
+      bash -c "(binserve --version; wrk -v) | egrep -o '(binserve|wrk) [0-9.]+'"
+    timeout: 30m
+    priority: 9
+    secrets: [sentinel]
+
+  # The legacy version command ran without the image entrypoint; the tracker wrapper does not change its output.
+  - name: redis
+    image: ghcr.io/sparecores/benchmark-redis:main
+    entrypoint: [/usr/local/bin/resource-tracker, --]
+    command: nice -n -20 python /usr/local/bin/benchmark.py
+    version_command: redis-server -v
+    timeout: 10m
+    priority: 10
+    secrets: [sentinel]
+
+  # GPU only. The `-b <MiB>` buffer size is added from the GPU's VRAM (steps.py).
+  - name: nvbandwidth
+    image: ghcr.io/sparecores/nvbandwidth:main
+    entrypoint: [/usr/local/bin/resource-tracker, --]
+    command: nvbandwidth -j
+    version_command: |-
+      bash -c "nvbandwidth --help | head -1 | egrep -o 'v[0-9.]+'"
+    timeout: 30m
+    priority: 11
+    gpu: true
+    precheck_command: |-
+      lshw -C display -json | jq -r '.[].vendor'
+    precheck_regex: nvidia
+    secrets: [sentinel]
+
+  # Might be slow on some machines. The image's default CMD is part of the entrypoint.
+  - name: passmark
+    image: ghcr.io/sparecores/benchmark-passmark:main
+    entrypoint: [/usr/local/bin/resource-tracker, --, /usr/local/bin/passmark.sh]
+    command: null
+    timeout: 1h
+    priority: 12
+    secrets: [sentinel]
+
+  # Might be slow with large models. GPU first, CPU fallback (no `gpu: true`).
+  - name: llm
+    image: ghcr.io/sparecores/benchmark-llm:main
+    entrypoint: [/usr/local/bin/resource-tracker, --, /benchmark.py]
+    command: null
+    version_command: --version
+    timeout: 90m
+    priority: 13
+    models_cache: true
+    secrets: [sentinel, huggingface]
+
+  # Unified vLLM: probe the GPU, Hub CPU and AVX2 CPU images in order (`--probe-only`, 18 minutes each), then the
+  # GuideLLM benchmark with the first image whose probe succeeded. `image` is the three images joined with "|".
+  - name: vllm
+    images:
+      - ghcr.io/sparecores/benchmark-vllm-gpu:main
+      - ghcr.io/sparecores/benchmark-vllm-cpu:main
+      - ghcr.io/sparecores/benchmark-vllm-cpu-avx2:main
+    entrypoint: [/usr/local/bin/resource-tracker, --, python3, /benchmark.py]
+    command: null
+    version_command: --version
+    timeout: 3h
+    priority: 14
+    memory_cap: 0.85
+    shm_gib: 4
+    models_cache: true
+    secrets: [sentinel, huggingface]
+
+  - name: ffmpeg
+    image: ghcr.io/sparecores/benchmark-ffmpeg:main
+    entrypoint: [/usr/local/bin/resource-tracker, --, python3, /benchmark.py]
+    command: null
+    version_command: --version
+    timeout: 2h
+    priority: 15
+    secrets: [sentinel]
+
+  # ------------------------------------------------------------------------- last (no priority)
+  # Raw block-device fio benchmark. Runs last: it may unmount and overwrite free disks. Needs the host PID namespace
+  # to read /proc/1/mountinfo and nsenter into the host mount namespace. SKU limits are Keeper's.
+  # Does not work on Flatcar as-is: the protected mounts differ (see docs/explanation/node-profile.md).
+  - name: storage
+    image: ghcr.io/sparecores/benchmark-storage:main
+    entrypoint: [/usr/local/bin/resource-tracker, --, python3, /usr/local/bin/benchmark.py]
+    command: null
+    version_command: --version
+    timeout: 1h
+    privileges: [host_pid]
+    secrets: [sentinel]
+
+  # stress-ng for an increasing number of seconds per minute (5 s in the first hour, linearly up to 55 s from the
+  # 11th hour), then sleeping to the start of the next minute, 1440 times: a full day. SKU allowlist is Keeper's.
+  - name: stressnglongrun
+    image: ghcr.io/sparecores/stress-ng-longrun:main
+    entrypoint: [/usr/local/bin/resource-tracker, --, sh]
+    command: |-
+      -c "nice -n -20 sh -c 'for i in $(seq 1 1440); do SPM=$(($(($i / 60 + 1)) * 5)); SPM=$(( $SPM > 55 ? 55 : $SPM )); stress-ng --metrics --cpu $(nproc) --cpu-method div16 -t $SPM -Y /dev/stderr; sleep $((60 - $(date +%-S) )); done'"
+    version_command: |-
+      -c "stress-ng --version | awk '{print $3}'"
+    timeout: 26h
+    parse: stressnglongrun
+    spot: false
+    secrets: [sentinel]

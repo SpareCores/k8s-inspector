@@ -11,7 +11,36 @@ lightkube's sync `Client` is safe for that. `watch` is a blocking generator: run
 from collections.abc import Iterator
 from dataclasses import dataclass
 
+import httpx2
+import lightkube
+from lightkube import ApiError
+from lightkube.core.client import PatchType
+from lightkube.generic_resource import create_global_resource, create_namespaced_resource
+from lightkube.resources import core_v1
+
 KINDS = ("pod", "secret", "configmap", "node", "nodeclaim", "event", "benchmarkrun")
+
+# Must match deploy/crd/benchmarkruns.yaml.
+CRD_GROUP = "inspector.sparecores.com"
+CRD_VERSION = "v1alpha1"
+CRD_PLURAL = "benchmarkruns"
+
+BenchmarkRunResource = create_namespaced_resource(CRD_GROUP, CRD_VERSION, "BenchmarkRun", CRD_PLURAL)
+NodeClaimResource = create_global_resource("karpenter.sh", "v1", "NodeClaim", "nodeclaims")
+
+# kind -> (lightkube resource class, namespaced)
+_RESOURCES = {
+    "pod": (core_v1.Pod, True),
+    "secret": (core_v1.Secret, True),
+    "configmap": (core_v1.ConfigMap, True),
+    "event": (core_v1.Event, True),
+    "node": (core_v1.Node, False),
+    "nodeclaim": (NodeClaimResource, False),
+    "benchmarkrun": (BenchmarkRunResource, True),
+}
+
+WATCH_SERVER_TIMEOUT_SECONDS = 240
+EXEC_TIMEOUT_SECONDS = 30
 
 
 class NotFound(Exception):
@@ -33,41 +62,135 @@ class WatchEvent:
     obj: dict
 
 
+def _translate(error: ApiError) -> Exception:
+    """The controller's exception for an API error, or the error itself when it has no counterpart."""
+    code = error.status.code
+    if code == 404:
+        return NotFound(error.status.message)
+    if code == 409:
+        if error.status.reason == "AlreadyExists":
+            return AlreadyExists(error.status.message)
+        return Conflict(error.status.message)
+    return error
+
+
+def _is_gone(error: httpx2.HTTPStatusError) -> bool:
+    """410 Gone: the watch's resourceVersion expired. It arrives as an `ApiError` (error event in the stream)
+    or as a plain HTTP status error (refused request)."""
+    if isinstance(error, ApiError):
+        return error.status.code == 410
+    return error.response.status_code == 410
+
+
 class Kube:
-    def __init__(self, namespace: str) -> None:
-        """Create the lightkube `Client` (in-cluster config, or kubeconfig when run locally)."""
-        raise NotImplementedError
+    def __init__(self, namespace: str, client: lightkube.Client | None = None) -> None:
+        """Create the lightkube `Client` (in-cluster config, or kubeconfig when run locally). `client` is for
+        tests."""
+        self.namespace = namespace
+        self._client = client if client is not None else lightkube.Client(namespace=namespace)
+
+    def _target(self, kind: str) -> tuple[type, dict]:
+        """Resource class and the `namespace` keyword for it (none for cluster-scoped kinds)."""
+        resource, namespaced = _RESOURCES[kind]
+        return resource, ({"namespace": self.namespace} if namespaced else {})
 
     def get(self, kind: str, name: str) -> dict:
         """Namespaced kinds in `self.namespace`; node and nodeclaim are cluster-scoped. Raise `NotFound`."""
-        raise NotImplementedError
+        resource, ns = self._target(kind)
+        try:
+            return self._client.get(resource, name, **ns).to_dict()
+        except ApiError as e:
+            raise _translate(e) from e
 
     def list(self, kind: str, labels: dict[str, str] | None = None) -> list[dict]:
-        raise NotImplementedError
+        resource, ns = self._target(kind)
+        try:
+            return [obj.to_dict() for obj in self._client.list(resource, labels=labels, **ns)]
+        except ApiError as e:
+            raise _translate(e) from e
 
     def create(self, kind: str, manifest: dict) -> dict:
         """Raise `AlreadyExists`. Returns the created object."""
-        raise NotImplementedError
+        resource, ns = self._target(kind)
+        try:
+            return self._client.create(resource.from_dict(manifest), **ns).to_dict()
+        except ApiError as e:
+            raise _translate(e) from e
 
     def delete(self, kind: str, name: str, grace_seconds: int | None = None) -> None:
         """Ignore `NotFound`."""
-        raise NotImplementedError
+        resource, ns = self._target(kind)
+        try:
+            self._client.delete(resource, name, grace_period=grace_seconds, **ns)
+        except ApiError as e:
+            if e.status.code != 404:
+                raise _translate(e) from e
 
     def merge_patch(self, kind: str, name: str, body: dict, subresource_status: bool = False) -> dict:
         """JSON merge patch (`status` subresource when asked). Include `metadata.resourceVersion` in `body`
         for optimistic concurrency; raise `Conflict` when it is stale."""
-        raise NotImplementedError
+        resource, ns = self._target(kind)
+        if subresource_status:
+            resource = resource.Status
+        try:
+            return self._client.patch(resource, name, body, patch_type=PatchType.MERGE, **ns).to_dict()
+        except ApiError as e:
+            raise _translate(e) from e
 
     def apply_secret(self, manifest: dict) -> None:
         """Create or replace a Secret (urls Secret, re-signed hourly)."""
-        raise NotImplementedError
+        secret = core_v1.Secret.from_dict(manifest)
+        try:
+            self._client.create(secret, namespace=self.namespace)
+        except ApiError as e:
+            if not isinstance(_translate(e), AlreadyExists):
+                raise _translate(e) from e
+            try:
+                self._client.replace(secret, namespace=self.namespace)
+            except ApiError as e2:
+                raise _translate(e2) from e2
 
     def watch(
         self, kind: str, labels: dict[str, str] | None = None, resource_version: str | None = None
     ) -> Iterator[WatchEvent]:
-        """Blocking event stream; ends on server timeout (caller re-LISTs and re-watches)."""
-        raise NotImplementedError
+        """Blocking event stream that does not end by itself: lightkube reconnects when the server closes the
+        stream, and when the resourceVersion has expired (410 Gone) this re-LISTs and yields every current
+        object as `ADDED` before watching on. Consumers must therefore treat `ADDED` as "object seen" (level
+        triggered) and cannot rely on a `DELETED` for objects removed while the watch was gone. Without
+        `resource_version` the stream starts with that LIST. Other API errors propagate."""
+        resource, ns = self._target(kind)
+        while True:
+            if resource_version is None:
+                listing = self._client.list(resource, labels=labels, **ns)
+                for obj in listing:
+                    yield WatchEvent("ADDED", kind, obj.to_dict())
+                resource_version = listing.resourceVersion
+            try:
+                for event_type, obj in self._client.watch(
+                    resource,
+                    labels=labels,
+                    server_timeout=WATCH_SERVER_TIMEOUT_SECONDS,
+                    resource_version=resource_version,
+                    **ns,
+                ):
+                    yield WatchEvent(event_type, kind, obj.to_dict())
+            except httpx2.HTTPStatusError as e:
+                if not _is_gone(e):
+                    if isinstance(e, ApiError):
+                        raise _translate(e) from e
+                    raise
+                resource_version = None  # expired: LIST again
 
     def exec_heartbeat(self, pod: str, directory: str) -> None:
-        """`kubectl exec <anchor> -- /sc-run heartbeat <directory>` (between steps)."""
-        raise NotImplementedError
+        """`kubectl exec <anchor> -- /sc-run heartbeat <directory>` (between steps). Raise `NotFound` when the
+        Pod is gone; a failing command or a connection problem raises lightkube's own exception."""
+        try:
+            self._client.exec(
+                pod,
+                namespace=self.namespace,
+                command=["/sc-run", "heartbeat", directory],
+                raise_on_error=True,
+                timeout=EXEC_TIMEOUT_SECONDS,
+            )
+        except ApiError as e:
+            raise _translate(e) from e

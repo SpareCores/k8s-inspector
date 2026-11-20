@@ -2,10 +2,13 @@ package task
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
+	"strconv"
 	"strings"
 	"syscall"
 	"testing"
@@ -345,5 +348,64 @@ func TestTermMessageStaysWithinLimit(t *testing.T) {
 	got := termMsg(t, cfg)
 	if got.ExitCode != 3 || got.ErrorMsg != "boom" || got.Version == "" {
 		t.Fatalf("termination message = %+v", got)
+	}
+}
+
+func TestParseRlimit(t *testing.T) {
+	const inf = ^uint64(0)
+	good := map[string]Rlimit{
+		"nofile=4096":         {"nofile", 4096, 4096},
+		"nofile=1024:1048576": {"nofile", 1024, 1048576},
+		"memlock=unlimited":   {"memlock", inf, inf},
+		"core=0:unlimited":    {"core", 0, inf},
+		"cpu=10":              {"cpu", 10, 10},
+	}
+	for spec, want := range good {
+		got, err := ParseRlimit(spec)
+		if err != nil || got != want {
+			t.Errorf("%s: got %+v, %v; want %+v", spec, got, err, want)
+		}
+	}
+	for _, spec := range []string{"", "nofile", "bogus=1", "nofile=-1", "nofile=x", "nofile=", "nofile=1:", "nofile=10:5", "nofile=1:2:3"} {
+		if _, err := ParseRlimit(spec); err == nil {
+			t.Errorf("%q: want error", spec)
+		}
+	}
+}
+
+func TestInvalidRlimitIsHarnessError(t *testing.T) {
+	cfg, _ := setup(t, "true")
+	cfg.Rlimits = []string{"nofile=abc"}
+	run(cfg, make(chan os.Signal))
+	if tm := termMsg(t, cfg); tm.ExitCode != CodeHarnessError || !strings.Contains(tm.ErrorMsg, "rlimit") {
+		t.Fatalf("got %+v", tm.Result)
+	}
+}
+
+func TestRlimitAppliesToChildOnly(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("linux only")
+	}
+	var before syscall.Rlimit
+	if err := syscall.Getrlimit(syscall.RLIMIT_NOFILE, &before); err != nil {
+		t.Fatal(err)
+	}
+	cfg, _ := setup(t, "sh", "-c", "ulimit -n; ulimit -Hn")
+	// Keep the hard limit so that sc-run's soft limit can be restored.
+	cfg.Rlimits = []string{fmt.Sprintf("nofile=4096:%d", before.Max)}
+	run(cfg, make(chan os.Signal))
+	out, err := os.ReadFile(filepath.Join(cfg.Spool, "stdout"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.TrimSpace(string(out)); got != "4096\n"+strconv.FormatUint(before.Max, 10) {
+		t.Fatalf("child limits: %q", got)
+	}
+	var after syscall.Rlimit
+	if err := syscall.Getrlimit(syscall.RLIMIT_NOFILE, &after); err != nil {
+		t.Fatal(err)
+	}
+	if after.Cur != before.Cur {
+		t.Fatalf("soft nofile of the test process changed: %d -> %d", before.Cur, after.Cur)
 	}
 }
