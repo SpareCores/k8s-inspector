@@ -435,14 +435,35 @@ def test_deploy_key_is_passed_to_git_through_ssh_command(tmp_path, origin, stora
         return subprocess.CompletedProcess(cmd, 0, "", "")
 
     monkeypatch.setattr(subprocess, "run", fake_run)
-    env = EnvConfig(bucket="b", bucket_region="r", git_url="git@example.test:x/y.git", git_key_file="/keys/deploy key")
+    key = tmp_path / "deploy key"
+    key.write_text("key")
+    env = EnvConfig(bucket="b", bucket_region="r", git_url="git@example.test:x/y.git", git_key_file=str(key))
     publisher.Publisher(None, storage, env, tmp_path / "work")._git("status")
     command = seen["env"]["GIT_SSH_COMMAND"]
-    assert "-i '/keys/deploy key'" in command and "IdentitiesOnly=yes" in command
+    assert f"-i '{key}'" in command and "IdentitiesOnly=yes" in command
     assert "StrictHostKeyChecking=yes" in command and str(publisher.KNOWN_HOSTS) in command
     hosts = publisher.KNOWN_HOSTS.read_text().splitlines()
     assert len([line for line in hosts if line.startswith("github.com ")]) == 3
     assert seen["env"]["GIT_TERMINAL_PROMPT"] == "0"
+
+
+def test_absent_deploy_key_is_not_passed_and_ssh_url_fails_clearly(tmp_path, storage, monkeypatch):
+    seen = {}
+
+    def fake_run(cmd, **kwargs):
+        seen["env"] = kwargs["env"]
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.delenv("GIT_SSH_COMMAND", raising=False)
+    env = EnvConfig(
+        bucket="b", bucket_region="r", git_url="git@example.test:x/y.git", git_key_file=str(tmp_path / "absent")
+    )
+    pub = publisher.Publisher(None, storage, env, tmp_path / "work")
+    pub._git("status")
+    assert "GIT_SSH_COMMAND" not in seen["env"]
+    with pytest.raises(RuntimeError, match="SSH URL but there is no deploy key"):
+        pub._sync(["data/x"])
 
 
 # --------------------------------------------------------------------------- review fixes

@@ -196,6 +196,15 @@ def test_max_usd_per_hour_waits_for_runs_without_price(kube):
     planner.force_run(kube, no_cap, "oci", "b")  # no cap: prices do not matter
 
 
+def test_max_usd_per_hour_refuses_a_running_run_without_price(kube, caplog):
+    cfg = make_config(max_in_flight=5, max_usd_per_hour=1.0)
+    first = planner.force_run(kube, cfg, "oci", "a")
+    kube.set_status(first.name, phase="Running", node="n1")
+    with caplog.at_level("WARNING"), pytest.raises(ValueError, match=rf"node of {first.name} has no price annotation"):
+        planner.force_run(kube, cfg, "oci", "b")
+    assert [r.message for r in caplog.records if first.name in r.message]
+
+
 def test_max_in_flight_counts_live_nodeclaims_beyond_runs(kube):
     cfg = make_config(max_in_flight=2, node_pools=NodePools(cpu="bench-oci", lowmem="bench-oci-lowmem"))
     claim = lambda pool: {"metadata": {"labels": {"karpenter.sh/nodepool": pool}}}  # noqa: E731
@@ -243,6 +252,15 @@ def test_without_force_keeper_ok_and_failing_closed(kube, monkeypatch):
     monkeypatch.setattr(keeper, "block_reasons", down)
     with pytest.raises(ValueError, match="Keeper.*503"):
         planner.force_run(kube, make_config(), "oci", "other", force=False)
+
+
+def test_keeper_key_file_failure_is_a_clean_error(kube, monkeypatch):
+    def broken(*a):
+        raise PermissionError("key unreadable")
+
+    monkeypatch.setattr(keeper, "block_reasons", broken)
+    with pytest.raises(ValueError, match=r"key unreadable.*--force"):
+        planner.force_run(kube, make_config(), "oci", "sku", force=False)
 
 
 def test_force_skips_keeper(kube, monkeypatch):

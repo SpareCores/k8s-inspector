@@ -39,6 +39,7 @@ Decisions:
 import json
 import logging
 import os
+import re
 import shlex
 import subprocess
 import threading
@@ -516,10 +517,10 @@ class Publisher:
     def _run_git(self, args: tuple[str, ...], check: bool, cwd: Path | None = None) -> subprocess.CompletedProcess:
         env = {**os.environ, **AUTHOR, "GIT_TERMINAL_PROMPT": "0"}
         env["GIT_COMMITTER_NAME"], env["GIT_COMMITTER_EMAIL"] = AUTHOR["GIT_AUTHOR_NAME"], AUTHOR["GIT_AUTHOR_EMAIL"]
-        if self._env.git_key_file:
+        if self._has_deploy_key():
             # GitHub's host keys ship with the package; any other host key is refused
             env["GIT_SSH_COMMAND"] = (
-                f"ssh -i {shlex.quote(self._env.git_key_file)} -o IdentitiesOnly=yes "
+                f"ssh -i {shlex.quote(str(self._env.git_key_file))} -o IdentitiesOnly=yes "
                 f"-o StrictHostKeyChecking=yes -o UserKnownHostsFile={shlex.quote(str(KNOWN_HOSTS))}"
             )
         return subprocess.run(
@@ -531,8 +532,18 @@ class Publisher:
             check=check,
         )
 
+    def _has_deploy_key(self) -> bool:
+        """The deploy key Secret is an optional mount: the file may be absent."""
+        return bool(self._env.git_key_file) and Path(str(self._env.git_key_file)).is_file()
+
     def _sync(self, sparse_dirs: list[str]) -> None:
         """Fresh checkout of origin/<branch> restricted to `sparse_dirs` (plus the repo root files)."""
+        url = self._env.git_url
+        if (url.startswith("ssh://") or re.match(r"^[\w.-]+@[\w.-]+:", url)) and not self._has_deploy_key():
+            raise RuntimeError(
+                f"K8SI_GIT_URL {url} is an SSH URL but there is no deploy key: set K8SI_GIT_KEY_FILE "
+                f"to a mounted key file (currently {self._env.git_key_file or 'unset'})"
+            )
         branch = self._env.git_branch
         if not (self._repo / ".git").exists():
             if not self._env.git_url:

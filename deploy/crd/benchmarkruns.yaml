@@ -96,6 +96,7 @@ spec:
               region: {type: string}
               zone: {type: string}
               pricePerHour: {type: string}
+              priceIncomplete: {type: boolean}
               variant: {type: integer}
               tasks:
                 type: array

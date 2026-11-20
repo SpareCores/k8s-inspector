@@ -58,6 +58,12 @@ def test_only_blocked_tasks_are_listed(server, tmp_path):
     assert path.endswith("tasks=membench&tasks=nvidia_smi") and auth == "Bearer secret-token"
 
 
+def test_missing_key_file_means_no_key(server, tmp_path):
+    base, seen = server
+    keeper.block_reasons(env_for(base, str(tmp_path / "absent")), "oci", ["VM.A.1-2"], ["membench"])
+    assert seen[0][1] is None
+
+
 def test_unknown_sku_is_blocked_for_every_task(server):
     out = keeper.block_reasons(env_for(server[0]), "oci", ["gone"], ["membench", "stressng"])
     assert out == {"gone": {"membench": [keeper.UNKNOWN_SKU], "stressng": [keeper.UNKNOWN_SKU]}}

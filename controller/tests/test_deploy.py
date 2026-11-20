@@ -59,6 +59,7 @@ def test_every_status_key_the_controller_writes_is_in_the_crd_schema():
         region="r",
         zone="z",
         price_per_hour="0.1",
+        price_incomplete=True,
         variant=0,
         tasks=[
             TaskStatus(

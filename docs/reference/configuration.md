@@ -8,9 +8,9 @@ Values are deployment configuration of the cluster platform, not part of this re
 |---|---|
 | `K8SI_BUCKET`, `K8SI_BUCKET_REGION` | object storage bucket for outputs |
 | `K8SI_ROLE_ARN` | IAM role assumed with the ServiceAccount token (web identity); its `MaxSessionDuration` must be at least 12 h (the controller asks for 12 h sessions); it needs `s3:DeleteObject` besides read, write, list and multipart actions under the run prefix |
-| `K8SI_GIT_URL`, `K8SI_GIT_BRANCH` | sc-inspector-data remote and branch (`main`) |
-| `K8SI_GIT_KEY_FILE` | mounted deploy key |
-| `KEEPER_API_BASE`, `KEEPER_API_KEY_FILE` | Keeper API (eligibility) |
+| `K8SI_GIT_URL`, `K8SI_GIT_BRANCH` | optional: sc-inspector-data remote and branch (default `main`); without a URL nothing is published |
+| `K8SI_GIT_KEY_FILE` | optional: mounted deploy key (Secret `k8s-inspector-git-key`); when the file is absent no `-i` is passed to ssh, and publishing to an SSH URL fails with a clear message |
+| `KEEPER_API_BASE`, `KEEPER_API_KEY_FILE` | optional: Keeper API for eligibility (base default `https://keeper.sparecores.net`; key from Secret `k8s-inspector-keeper`; without the key file Keeper is called without a key) |
 | `K8SI_NAMESPACE` | namespace of runs (default `inspector`) |
 | `K8SI_SC_RUN_IMAGE` | the `sc-run` image of anchors and flush steps, digest-pinned (`ghcr.io/sparecores/k8s-inspector-sc-run@sha256:…`); `serve` and `run` refuse to start without it |
 | `K8SI_S3_ENDPOINT_URL` | optional S3-compatible endpoint, for object storage that is not AWS S3 (OCI) |
@@ -93,12 +93,16 @@ Bench NodePools have no `limits`: the goal is to benchmark every instance type o
 size or total bound. The cap on started and running instances of a vendor is `vendors.<v>.maxInFlight`
 (default `defaults.maxInFlight`, 2; 0 pauses the vendor). The count is the larger of the runs that hold or are
 acquiring a node (Pending, Provisioning, Running, Releasing, and a Failed or Cancelled run until its anchor Pod is
-deleted) and the live NodeClaims of the vendor's bench NodePools (an instance can outlive its anchor). It applies to
-forced runs; autoPlan, not implemented yet in P1, will use the same check.
+deleted) and the live NodeClaims of the vendor's bench NodePools (an instance can outlive its anchor). This is a
+lower bound ("at least" that many instances); leftover NodeClaims without a holding run count as instances but do
+not add to the spend. It applies to forced runs; autoPlan uses the same check.
 
-`maxUsdPerHour`, when set, is checked before a run starts against the node prices of the holding runs. A run still
-acquiring its node has no price yet, so while any holding run has none, a new run is refused ("wait until ... has a
-price").
+`maxUsdPerHour`, when set, is checked before a run starts against the node prices of the holding runs. A run in
+Pending or Provisioning has no node and no price yet, so while one exists a new run is refused ("wait until ... has
+a price"). A run that has a node but no `scarpenter.sparecores.com/price` annotation counts as unknown spend: the
+controller logs a warning and refuses the new run (the operator must check SCarpenter). When SCarpenter marks a
+NodeClaim `price-incomplete: "true"`, the run records `status.priceIncomplete: true`; such a price understates the
+spend, so the cap is checked against too low a sum.
 
 The check is not atomic: two concurrent `run` commands for different SKUs can both pass it and exceed the limit by one.
-The planner of `serve` will be single-threaded, so autoPlan does not add to this race.
+The planner of `serve` is single-threaded, so autoPlan does not add to this race.

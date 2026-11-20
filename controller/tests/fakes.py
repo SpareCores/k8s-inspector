@@ -238,6 +238,10 @@ class Cluster:
         self.capacity = "spot"
         self.node_labels: dict[str, str] = {}
         self.node_allocatable: dict[str, str] = {"memory": "15Gi", "cpu": "2"}
+        self.claim_annotations: dict[str, str] = {
+            "scarpenter.sparecores.com/price": "0.0337",
+            "scarpenter.sparecores.com/nodeclass-hash": "h1",
+        }
         self.nodes = 0
         self.claim_conditions: list[dict] | None = None  # override: claim with these conditions, no node
         self.provision_enabled = True
@@ -283,10 +287,7 @@ class Cluster:
                 "metadata": {
                     "name": f"claim-{name}",
                     "labels": {k: v for k, v in labels.items() if k in selector},
-                    "annotations": {
-                        "scarpenter.sparecores.com/price": "0.0337",
-                        "scarpenter.sparecores.com/nodeclass-hash": "h1",
-                    },
+                    "annotations": dict(self.claim_annotations),
                     "creationTimestamp": iso(when),
                 },
                 "status": {"nodeName": name, "conditions": conditions},

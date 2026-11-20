@@ -18,10 +18,14 @@ UNKNOWN_SKU = "KEEPER_UNKNOWN_SKU"  # reason recorded for every task of a SKU Ke
 
 
 def _read_key(env: EnvConfig) -> str | None:
+    """The API key, or None when no key file is configured or the (optional) Secret mount is absent."""
     if not env.keeper_api_key_file:
         return None
-    with open(env.keeper_api_key_file) as f:
-        return f.read().strip()
+    try:
+        with open(env.keeper_api_key_file) as f:
+            return f.read().strip()
+    except FileNotFoundError:
+        return None
 
 
 def _get(url: str, key: str | None) -> dict | None:

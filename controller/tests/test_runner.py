@@ -114,6 +114,15 @@ def in_step(step_suffix: str):
 # --------------------------------------------------------------------------- happy path
 
 
+def test_price_annotations_are_recorded_and_a_missing_price_warns(h, caplog):
+    h.cluster.claim_annotations = {"scarpenter.sparecores.com/price-incomplete": "true"}
+    h.start(["membench"])
+    with caplog.at_level("WARNING"):
+        run = h.drive(stop=lambda run: run.status.phase == RunPhase.RUNNING)
+    assert run.status.price_per_hour is None and run.status.price_incomplete is True
+    assert any("no scarpenter.sparecores.com/price annotation" in r.message for r in caplog.records)
+
+
 def test_happy_path_runs_every_step_and_publishes_state(h):
     h.start(["membench", "geekbench"])
     run = h.drive()

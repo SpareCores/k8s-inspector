@@ -9,7 +9,7 @@
 | Published results, history, retry counters, failure records | git: sc-inspector-data `meta.json` files | publisher (the only git writer) | forever |
 | Spot interruption statistics per SKU | ConfigMap `k8s-inspector-spot` | controller | best effort; losing it only means trying spot again |
 | Offerings, capacity and quota errors | SCarpenter | SCarpenter | |
-| Settings | ConfigMap `k8s-inspector` ([configuration](../reference/configuration.md)) | operator | |
+| Settings | ConfigMap `k8s-inspector` ([configuration](../reference/configuration.md)) | platform | |
 
 There is no database.
 

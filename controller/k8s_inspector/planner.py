@@ -20,6 +20,7 @@ log = logging.getLogger(__name__)
 # counts while its anchor Pod exists, until the runner deletes the anchor and releases the node.
 ACTIVE_PHASES = frozenset({RunPhase.PENDING, RunPhase.PROVISIONING, RunPhase.RUNNING, RunPhase.RELEASING})
 NODEPOOL_LABEL = "karpenter.sh/nodepool"
+PRICE_ANNOTATION = "scarpenter.sparecores.com/price"
 
 
 @dataclass(frozen=True)
@@ -64,8 +65,10 @@ def live_nodeclaims(kube: Kube, cfg: Config, vendor: str) -> int:
 
 def check_vendor_budget(kube: Kube, cfg: Config, vendor: str, runs: list[BenchmarkRun]) -> None:
     """Raise `ValueError` when one more run of `vendor` would pass `maxInFlight` (0 pauses the vendor), or when
-    `maxUsdPerHour` is set and the holding runs already cost the cap or one of them has no price yet. In flight =
-    max(`holding_runs`, live bench NodeClaims). Shared by `force_run` and (later) autoPlan. Not atomic: two
+    `maxUsdPerHour` is set and the holding runs already cost the cap, or one of them has no price (a run still in
+    Pending or Provisioning: wait; a run with a node: unknown spend, refused, with a warning). In flight =
+    max(`holding_runs`, live bench NodeClaims), a lower bound ("at least"): leftover NodeClaims without a holding
+    run add to the count but not to the spend. Shared by `force_run` and autoPlan. Not atomic: two
     concurrent callers can both pass the check."""
     settings = cfg.settings
     vendor_settings = settings.vendors[vendor]
@@ -79,10 +82,20 @@ def check_vendor_budget(kube: Kube, cfg: Config, vendor: str, runs: list[Benchma
     cap = vendor_settings.max_usd_per_hour
     if cap is None:
         return
-    unpriced = [r.name for r in active if not r.status.price_per_hour]
-    if unpriced:
+    unpriced = [r for r in active if not r.status.price_per_hour]
+    for run in unpriced:
+        if run.status.node:
+            log.warning("run %s has a node but no price annotation", run.name, extra={"run": run.name})
+    no_node_yet = [r.name for r in unpriced if r.status.phase in (RunPhase.PENDING, RunPhase.PROVISIONING)]
+    no_price = [r.name for r in unpriced if r.name not in no_node_yet]
+    if no_price:
         raise ValueError(
-            f"vendor {vendor} has maxUsdPerHour {cap}: wait until {', '.join(unpriced)} has a price "
+            f"vendor {vendor} has maxUsdPerHour {cap}: the node of {', '.join(no_price)} has no price annotation "
+            f"{PRICE_ANNOTATION} (the operator must check SCarpenter), so the spend is unknown"
+        )
+    if no_node_yet:
+        raise ValueError(
+            f"vendor {vendor} has maxUsdPerHour {cap}: wait until {', '.join(no_node_yet)} has a price "
             "before starting a run"
         )
     if spend_per_hour(active) >= cap:
@@ -147,7 +160,7 @@ def _select(names: list[str]) -> list[TaskDef]:
 def _check_keeper(cfg: Config, vendor: str, sku: str, names: list[str]) -> None:
     try:
         blocked = keeper.block_reasons(cfg.env, vendor, [sku], names)[sku]
-    except RuntimeError as e:
+    except Exception as e:  # any Keeper failure (HTTP, network, key file, bad JSON) is a clean error, not a traceback
         raise ValueError(f"cannot check eligibility with Keeper: {e} (use --force to skip the check)") from e
     if blocked:
         details = "; ".join(f"{name}: {', '.join(reasons)}" for name, reasons in sorted(blocked.items()))

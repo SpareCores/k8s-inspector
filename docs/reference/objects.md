@@ -48,6 +48,7 @@ status:
   region: eu-frankfurt-1
   zone: <zone>
   pricePerHour: "0.0337"
+  priceIncomplete: false         # true: SCarpenter marked the price incomplete, so it understates the cost
   variant: 0
   tasks:
   - {name: geekbench, state: Running, attempt: 1, start: …, end: null, exitCode: null, published: false, commit: null}   # state: Pending | Running | Done; optional: errorMsg, gpuFallback

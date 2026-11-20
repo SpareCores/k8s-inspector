@@ -112,6 +112,7 @@ INSTANCE_TYPE_LABEL = "node.kubernetes.io/instance-type"
 SCARPENTER = "scarpenter.sparecores.com"
 RELAUNCH_ANNOTATION = "inspector.sparecores.com/relaunch"  # on a step Pod recreated after a DiskPressure rejection
 PRICE_ANNOTATION = f"{SCARPENTER}/price"
+PRICE_INCOMPLETE_ANNOTATION = f"{SCARPENTER}/price-incomplete"
 NODECLASS_HASH_ANNOTATION = f"{SCARPENTER}/nodeclass-hash"
 ACCELERATOR_MANUFACTURER_LABEL = f"{SCARPENTER}/accelerator-manufacturer"
 GPU_RESOURCE = "nvidia.com/gpu"
@@ -809,11 +810,17 @@ class Runner:
         nd = self._build_node(run, node, anchor)
         self._nodes[run.name] = nd
         facts = nd.facts
+        if not facts.price_per_hour:
+            log.warning(
+                "run %s: node %s has no %s annotation; maxUsdPerHour cannot count it",
+                run.name, facts.node_name, PRICE_ANNOTATION,
+            )  # fmt: skip
 
         def mutate(status: RunStatus) -> None:
             status.phase = RunPhase.RUNNING
             status.node, status.region, status.zone = facts.node_name, facts.region, facts.zone
             status.price_per_hour = facts.price_per_hour
+            status.price_incomplete = facts.price_incomplete
             if facts.capacity_type:
                 status.capacity_type = facts.capacity_type
             for a in status.attempts:
@@ -848,6 +855,7 @@ class Runner:
             zone=labels.get("topology.kubernetes.io/zone"),
             capacity_type=CapacityType(labels[CAPACITY_LABEL]) if labels.get(CAPACITY_LABEL) else None,
             price_per_hour=annotations.get(PRICE_ANNOTATION),
+            price_incomplete=annotations.get(PRICE_INCOMPLETE_ANNOTATION) == "true",
             node_claim=_meta(claim or {}).get("name"),
             nodeclass_hash=annotations.get(NODECLASS_HASH_ANNOTATION),
             node_os=info.get("osImage"),

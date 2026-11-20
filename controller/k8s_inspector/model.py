@@ -243,6 +243,9 @@ class RunStatus:
     region: str | None = None
     zone: str | None = None
     price_per_hour: str | None = None
+    price_incomplete: bool = (
+        False  # SCarpenter's `price-incomplete` NodeClaim annotation: the price understates the cost
+    )
     variant: int | None = None
     tasks: list[TaskStatus] = field(default_factory=list)
     attempts: list[AttemptStatus] = field(default_factory=list)
@@ -281,6 +284,7 @@ class NodeFacts:
     zone: str | None = None
     capacity_type: CapacityType | None = None
     price_per_hour: str | None = None
+    price_incomplete: bool = False
     node_claim: str | None = None
     nodeclass_hash: str | None = None
     node_os: str | None = None  # Node status.nodeInfo.osImage
