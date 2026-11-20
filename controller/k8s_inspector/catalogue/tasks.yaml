@@ -1,0 +1,3 @@
+# The task catalogue, ported from sc-inspector inspector/tasks.py (fields: docs/reference/tasks.md).
+# Owned by the tasks agent. Empty until ported.
+tasks: []

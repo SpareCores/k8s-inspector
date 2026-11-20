@@ -1,0 +1,118 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: benchmarkruns.inspector.sparecores.com
+spec:
+  group: inspector.sparecores.com
+  scope: Namespaced
+  names:
+    kind: BenchmarkRun
+    listKind: BenchmarkRunList
+    plural: benchmarkruns
+    singular: benchmarkrun
+  versions:
+  - name: v1alpha1
+    served: true
+    storage: true
+    subresources:
+      status: {}
+    additionalPrinterColumns:
+    - {name: Vendor, type: string, jsonPath: .spec.vendor}
+    - {name: SKU, type: string, jsonPath: .spec.sku}
+    - {name: Phase, type: string, jsonPath: .status.phase}
+    - {name: Progress, type: string, jsonPath: .status.progress}
+    - {name: Step, type: string, jsonPath: .status.currentStep}
+    - {name: Capacity, type: string, jsonPath: .status.capacityType}
+    - {name: Attempt, type: integer, jsonPath: .status.attempt}
+    - {name: Node, type: string, jsonPath: .status.node}
+    - {name: Age, type: date, jsonPath: .metadata.creationTimestamp}
+    schema:
+      openAPIV3Schema:
+        type: object
+        required: [spec]
+        properties:
+          spec:
+            type: object
+            required: [vendor, sku, runId]
+            properties:
+              vendor: {type: string}
+              sku: {type: string}
+              runId: {type: string}
+              tasks:
+                description: Empty means every due task; otherwise exactly these.
+                type: array
+                items: {type: string}
+              force:
+                description: Skip Keeper and should_start.
+                type: boolean
+                default: false
+              capacity:
+                type: string
+                enum: [SpotFirst, OnDemand]
+              holdAfter:
+                description: Keep the node after the last step (a duration such as 2h).
+                type: string
+                default: 0s
+              database:
+                description: DBaaS runs only.
+                type: object
+                nullable: true
+                properties:
+                  vendor: {type: string}
+                  id: {type: string}
+                  engineVersion: {type: string}
+          status:
+            type: object
+            properties:
+              phase:
+                type: string
+                enum: [Pending, Provisioning, Running, Releasing, Publishing, Done, Failed, Cancelled]
+              progress: {type: string}
+              currentStep: {type: string}
+              attempt: {type: integer}
+              capacityType: {type: string}
+              node: {type: string}
+              region: {type: string}
+              zone: {type: string}
+              pricePerHour: {type: string}
+              variant: {type: integer}
+              tasks:
+                type: array
+                items:
+                  type: object
+                  required: [name]
+                  properties:
+                    name: {type: string}
+                    state: {type: string}
+                    attempt: {type: integer}
+                    start: {type: string, format: date-time, nullable: true}
+                    end: {type: string, format: date-time, nullable: true}
+                    exitCode: {type: integer, nullable: true}
+                    published: {type: boolean}
+                    commit: {type: string, nullable: true}
+              attempts:
+                type: array
+                items:
+                  type: object
+                  required: [n]
+                  properties:
+                    n: {type: integer}
+                    capacityType: {type: string}
+                    nodeClaim: {type: string}
+                    start: {type: string, format: date-time, nullable: true}
+                    end: {type: string, format: date-time, nullable: true}
+                    outcome:
+                      type: string
+                      nullable: true
+                      enum: [Completed, SpotInterrupted, NodeLost, ProvisioningFailed, Cancelled]
+              conditions:
+                type: array
+                items:
+                  type: object
+                  required: [type, status]
+                  properties:
+                    type: {type: string}
+                    status: {type: string}
+                    reason: {type: string}
+                    message: {type: string}
+                    lastTransitionTime: {type: string, format: date-time}
