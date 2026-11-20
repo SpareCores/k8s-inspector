@@ -73,6 +73,7 @@ type Config struct {
 	TermLog      string // termination message path
 	Cmd          []string
 	Rlimits      []string // "NAME=SOFT[:HARD]" limits for the task process only; see ParseRlimit
+	MirrorLogs   bool     // copy the task's stdout and stderr to sc-run's own, for `kubectl logs`
 	Nice         int      // nice value of the task process, MinNice..MaxNice (see withNice); 0 leaves it unchanged
 }
 
@@ -265,6 +266,10 @@ func execute(stopCtx context.Context, cfg Config) (res Result) {
 	}
 	protectFromOOM() // after Start: the task must not inherit oom_score_adj -1000
 	pgid := cmd.Process.Pid
+	stopMirror := func() {}
+	if cfg.MirrorLogs {
+		stopMirror = startMirror(cfg.Spool, mirrorOut, mirrorErr)
+	}
 	done := make(chan error, 1)
 	go func() { done <- cmd.Wait() }()
 
@@ -282,6 +287,7 @@ func execute(stopCtx context.Context, cfg Config) (res Result) {
 	}
 	_ = syscall.Kill(-pgid, syscall.SIGKILL) // stragglers
 	reap()
+	stopMirror() // final drain
 
 	res.OOMKills = oomKills() - oomBefore
 	res.ExitCode, res.ErrorMsg = exitStatus(waitErr, res, cfg.Timeout)

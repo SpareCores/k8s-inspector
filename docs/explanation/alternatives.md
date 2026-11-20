@@ -33,7 +33,7 @@
 | **`sc-run` spool + presigned PUT/UploadPart to final keys** | chosen ([output pipeline](outputs.md)) |
 | Inbox prefix, then copy to the archive after the git push | Two writes per object and a move step that can fail half-way; the final key can be known up front. |
 | Presigned POST policy | Single request per file, no multipart, no part-level retry. |
-| Controller reads `kubectl logs` | stdout and stderr are merged (geekbench parses stderr), log rotation keeps 10 MiB × 5, logs vanish with the node, artifact files cannot be read. |
+| Controller reads `kubectl logs` | the container log merges stdout and stderr (geekbench parses stderr) and lags the files by up to a second, log rotation keeps 10 MiB × 5, logs vanish with the node, artifact files cannot be read. |
 | Controller pulls files with `exec tar` | Binary streams through the API server and kubelet over the tailnet; fragile. |
 | Cluster ServiceAccount token or temporary STS keys on benchmark Pods | A privileged benchmark container could use the whole credential scope for hours; needs SigV4 and refresh in the wrapper. |
 | rclone, s5cmd, aws-cli, Fluent Bit | Need credentials, or (Fluent Bit) a thinly documented presigned mode in a much larger agent. |

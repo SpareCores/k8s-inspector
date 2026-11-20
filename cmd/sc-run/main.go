@@ -31,6 +31,10 @@ import (
 func main() {
 	log.SetFlags(log.LstdFlags | log.LUTC)
 	log.SetPrefix("sc-run: ")
+	// A closed stdout or stderr must make writes fail with EPIPE, not kill
+	// sc-run. Notify (unlike Ignore) keeps the tasks' SIGPIPE at its default:
+	// handlers are reset on exec, ignored signals are inherited.
+	signal.Notify(make(chan os.Signal, 1), syscall.SIGPIPE)
 	if len(os.Args) < 2 {
 		fatalf("usage: sc-run hold|exec|flush|install|ready|heartbeat ...")
 	}
@@ -81,6 +85,7 @@ func runExec(args []string) int {
 	fs.Var(&collect, "collect", "extra file to upload, src:name (repeatable)")
 	fs.Var(&rlimits, "rlimit", "resource limit of the task, NAME=SOFT[:HARD] (repeatable; nofile or memlock; integer or unlimited)")
 	fs.IntVar(&cfg.Nice, "nice", -20, "nice value of the task process, -20 to 19, else harness error 256 (0 disables; lowering below 0 needs CAP_SYS_NICE, otherwise only a warning)")
+	fs.BoolVar(&cfg.MirrorLogs, "mirror-logs", true, "copy the task's stdout and stderr to sc-run's own, so kubectl logs shows them (the spool files stay the source of truth)")
 	fs.DurationVar(&cfg.Reput, "reput", 60*time.Second, "interval of re-uploading growing files")
 	fs.DurationVar(&cfg.UploadBudget, "upload-budget", 10*time.Minute, "final upload budget")
 	fs.DurationVar(&cfg.KillAfter, "kill-after", 5*time.Second, "SIGTERM to SIGKILL for the task")

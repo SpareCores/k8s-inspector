@@ -3,6 +3,7 @@ package task
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"os/exec"
@@ -514,5 +515,139 @@ func TestNiceThatCannotBeSetIsNullInResult(t *testing.T) {
 	run(cfg, make(chan os.Signal))
 	if tm := termMsg(t, cfg); tm.ExitCode != 0 || tm.Nice != nil {
 		t.Fatalf("got %+v nice %v", tm.Result, tm.Nice)
+	}
+}
+
+func TestTailerCopiesAppendedBytesOnly(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "stdout")
+	var out strings.Builder
+	tl := &tailer{path: path, dst: &out}
+	tl.drain() // file does not exist yet: logged once, no panic
+	appendFile(t, path, "one\ntw")
+	tl.drain()
+	appendFile(t, path, "o\n")
+	tl.drain()
+	tl.drain()
+	if out.String() != "one\ntwo\n" {
+		t.Fatalf("mirrored %q", out.String())
+	}
+}
+
+func TestTailerReadsInBoundedChunks(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "stdout")
+	data := strings.Repeat("x", 3*mirrorChunk+5)
+	appendFile(t, path, data)
+	var out strings.Builder
+	(&tailer{path: path, dst: &out}).drain()
+	if out.String() != data {
+		t.Fatalf("mirrored %d bytes, want %d", out.Len(), len(data))
+	}
+}
+
+func TestStartMirrorFinalDrainOnStop(t *testing.T) {
+	spool := t.TempDir()
+	var out, errw strings.Builder
+	stop := startMirror(spool, &out, &errw)
+	appendFile(t, filepath.Join(spool, "stdout"), "o\n")
+	appendFile(t, filepath.Join(spool, "stderr"), "e\n")
+	stop() // well before the first tick: only the final drain can have copied it
+	if out.String() != "o\n" || errw.String() != "e\n" {
+		t.Fatalf("stdout %q, stderr %q", out.String(), errw.String())
+	}
+}
+
+func TestMirrorLogsFlagControlsMirroring(t *testing.T) {
+	for _, on := range []bool{true, false} {
+		cfg, _ := setup(t, "sh", "-c", "echo out; echo err >&2")
+		cfg.MirrorLogs = on
+		var out, errw strings.Builder
+		mirrorOut, mirrorErr = &out, &errw
+		Run(cfg)
+		mirrorOut, mirrorErr = os.Stdout, os.Stderr
+		want := ""
+		if on {
+			want = "out\n"
+		}
+		if out.String() != want {
+			t.Errorf("MirrorLogs=%v: stdout %q, want %q", on, out.String(), want)
+		}
+		if on && errw.String() != "err\n" {
+			t.Errorf("stderr %q", errw.String())
+		}
+	}
+}
+
+func appendFile(t *testing.T, path, s string) {
+	t.Helper()
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	if _, err := f.WriteString(s); err != nil {
+		t.Fatal(err)
+	}
+}
+
+type blockedWriter struct{ release chan struct{} }
+
+func (w blockedWriter) Write(p []byte) (int, error) { <-w.release; return len(p), nil }
+
+func TestStartMirrorStopIsBoundedByBlockedWriter(t *testing.T) {
+	old := mirrorStopWait
+	mirrorStopWait = 100 * time.Millisecond
+	defer func() { mirrorStopWait = old }()
+	spool := t.TempDir()
+	appendFile(t, filepath.Join(spool, "stdout"), "x\n")
+	w := blockedWriter{release: make(chan struct{})}
+	defer close(w.release)
+	stop := startMirror(spool, w, io.Discard)
+	start := time.Now()
+	stop()
+	if d := time.Since(start); d > 2*time.Second {
+		t.Fatalf("stop took %s", d)
+	}
+}
+
+func TestTailerSkipsAheadWithMarker(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "stdout")
+	data := strings.Repeat("a", mirrorMaxBacklog) + strings.Repeat("b", 10)
+	appendFile(t, path, data)
+	var out strings.Builder
+	(&tailer{path: path, dst: &out}).drain()
+	skipped := len(data) - mirrorKeep
+	marker := fmt.Sprintf("sc-run: mirror skipped %d bytes; full output in the spool and object storage\n", skipped)
+	if !strings.HasPrefix(out.String(), marker) || out.String()[len(marker):] != data[skipped:] {
+		t.Fatalf("got %d bytes, marker prefix %v", out.Len(), strings.HasPrefix(out.String(), marker))
+	}
+}
+
+func TestTailerStopsAtSizeWhenDrainStarted(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "stdout")
+	appendFile(t, path, "abc")
+	var out strings.Builder
+	tl := &tailer{path: path, dst: writerFunc(func(p []byte) { appendFile(t, path, "more"); out.Write(p) })}
+	tl.drain() // the writer grows the file on every write; one drain must still end
+	if out.String() != "abc" {
+		t.Fatalf("mirrored %q", out.String())
+	}
+}
+
+type writerFunc func([]byte)
+
+func (f writerFunc) Write(p []byte) (int, error) { f(p); return len(p), nil }
+
+func TestTailerRestartsAfterTruncation(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "stdout")
+	appendFile(t, path, "long first content\n")
+	var out strings.Builder
+	tl := &tailer{path: path, dst: &out}
+	tl.drain()
+	if err := os.WriteFile(path, []byte("new\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	tl.drain()
+	if want := "long first content\nnew\n"; out.String() != want {
+		t.Fatalf("mirrored %q, want %q", out.String(), want)
 	}
 }
