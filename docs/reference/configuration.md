@@ -72,6 +72,11 @@ attempt started (Karpenter creates one within seconds for any SKU it can launch)
 `-1 SCARPENTER_NO_OFFERING: <PodScheduled message>`. This reads only the Pod, no extra RBAC; the detailed Karpenter
 reason (Event `FailedScheduling`) is not used.
 
+Karpenter replaces a NodeClaim that fails to launch (`Launched` condition reason `LaunchFailed`, status Unknown or
+False) with a new one every few minutes, so the deadlines above would not fire. The controller remembers each failed
+NodeClaim of the attempt in `status.launchFailures` and, at the second distinct one, ends the remaining tasks
+`-1 SCARPENTER_LAUNCH_FAILED: <last message>` and deletes the anchor. A single transient failure is tolerated.
+
 Only vendors listed with `enabled: true` are touched, and their results reach sc-inspector-data only with
 `publish: true` or a list of SKUs (default `false`: runs and outputs happen, git stays untouched, and the runs of
 SKUs that are not published are deleted after `keepRunHours`; their outputs stay in object storage and
@@ -101,8 +106,8 @@ it is due and the vendor has room. Per vendor:
    blocked by Keeper except on its allowlist, so they run only where Keeper allows them) and its
    `data/<vendor>/<sku>/schedule/<task>/meta.json` in sc-inspector-data `main` says so: no meta yet, or a
    `task_hash` different from the catalogue's (a changed task, a bumped `revision`, a `RERUN_` prefix), or a failure
-   that is retried and whose wait has passed (`-1`: 2 h, or 24 h for `SCARPENTER_QUOTA_ZERO` and
-   `SCARPENTER_NO_OFFERING`; `-4`: 2 h after the first, 6 h after the second). Anything else with the current hash is
+   that is retried and whose wait has passed (`-1`: 2 h, or 24 h for `SCARPENTER_QUOTA_ZERO`,
+   `SCARPENTER_NO_OFFERING` and `SCARPENTER_LAUNCH_FAILED`; `-4`: 2 h after the first, 6 h after the second). Anything else with the current hash is
    final: success, a task's own exit code above 0, `-3`, `-6`, `256` and `-5` ("exceeded retries") stay until the
    hash changes ([exit codes](exit-codes.md)). GPU tasks are dropped for a SKU whose `nvidia_smi` Keeper blocks (no
    GPU), and a SKU whose due tasks are only GPU tasks is not planned.

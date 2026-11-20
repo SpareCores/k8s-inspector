@@ -233,6 +233,15 @@ class AttemptStatus:
 
 
 @dataclass
+class LaunchFailure:
+    """`status.launchFailures[]`: a NodeClaim of the current attempt that failed to launch (`LaunchFailed`)."""
+
+    node_claim: str
+    message: str
+    time: datetime
+
+
+@dataclass
 class RunStatus:
     phase: RunPhase = RunPhase.PENDING
     progress: str = "0/0"
@@ -250,6 +259,7 @@ class RunStatus:
     variant: int | None = None
     tasks: list[TaskStatus] = field(default_factory=list)
     attempts: list[AttemptStatus] = field(default_factory=list)
+    launch_failures: list[LaunchFailure] = field(default_factory=list)  # of the current attempt, last 5
     conditions: list[dict] = field(default_factory=list)
 
 

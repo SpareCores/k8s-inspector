@@ -10,6 +10,7 @@ from k8s_inspector.model import (
     AttemptOutcome,
     AttemptStatus,
     CapacityType,
+    LaunchFailure,
     RunPhase,
     RunSpec,
     RunStatus,
@@ -86,6 +87,7 @@ def test_every_status_key_the_controller_writes_is_in_the_crd_schema():
                 outcome=AttemptOutcome.COMPLETED,
             )
         ],
+        launch_failures=[LaunchFailure(node_claim="nc", message="m", time=NOW)],
         conditions=[{"type": "Published", "status": "True"}],
     )
     emitted = crd.status_to_dict(status)

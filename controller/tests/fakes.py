@@ -316,13 +316,16 @@ class Cluster:
             },
         )
 
-    def fail_launch(self, anchor: dict, message: str) -> None:
+    def fail_launch(
+        self, anchor: dict, message: str, name: str | None = None, status: str = "False", reason: str | None = None
+    ) -> None:
+        """A NodeClaim whose `Launched` condition failed (Karpenter's `LaunchFailed` is status Unknown)."""
         selector = anchor["spec"]["nodeSelector"]
         self.kube.create(
             "nodeclaim",
             {
                 "metadata": {
-                    "name": f"claim-{anchor['metadata']['name']}",
+                    "name": name or f"claim-{anchor['metadata']['name']}",
                     "labels": {
                         k: selector[k]
                         for k in (
@@ -333,7 +336,12 @@ class Cluster:
                     },
                     "creationTimestamp": iso(self.clock.now + timedelta(seconds=1)),
                 },
-                "status": {"conditions": [{"type": "Launched", "status": "False", "message": message}]},
+                "status": {
+                    "conditions": [
+                        {"type": "Launched", "status": status, "message": message}
+                        | ({"reason": reason} if reason else {})
+                    ]
+                },
             },
         )
 

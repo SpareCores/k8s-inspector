@@ -18,6 +18,7 @@ from k8s_inspector.model import (
     BenchmarkRun,
     CapacityMode,
     CapacityType,
+    LaunchFailure,
     RunKey,
     RunPhase,
     RunSpec,
@@ -181,6 +182,10 @@ def _status_from_dict(d: dict) -> RunStatus:
         variant=d.get("variant"),
         tasks=[_task_from_dict(t) for t in d.get("tasks") or []],
         attempts=[_attempt_from_dict(a) for a in d.get("attempts") or []],
+        launch_failures=[
+            LaunchFailure(f["nodeClaim"], f.get("message", ""), _parse_time(f.get("time")))
+            for f in d.get("launchFailures") or []
+        ],
         conditions=list(d.get("conditions") or []),
     )
 
@@ -262,6 +267,10 @@ def status_to_dict(status: RunStatus) -> dict:
         "variant": status.variant,
         "tasks": [_task_to_dict(t) for t in status.tasks],
         "attempts": [_attempt_to_dict(a) for a in status.attempts],
+        "launchFailures": [
+            {"nodeClaim": f.node_claim, "message": f.message, "time": _format_time(f.time)}
+            for f in status.launch_failures
+        ],
         "conditions": status.conditions,
     }
 

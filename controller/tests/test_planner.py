@@ -395,6 +395,7 @@ def test_exit_code_minus_5_is_final_until_the_hash_changes(kube, keeper_skus):
         ({"code": -1, "error_msg": "SCARPENTER_ICE: no capacity"}, timedelta(hours=1), False),
         ({"code": -1, "error_msg": "SCARPENTER_ICE: no capacity"}, timedelta(hours=3), True),
         ({"code": -1, "error_msg": "SCARPENTER_NO_OFFERING: none"}, timedelta(hours=3), False),
+        ({"code": -1, "error_msg": "SCARPENTER_LAUNCH_FAILED: x"}, timedelta(hours=3), False),
         ({"code": -1, "error_msg": "SCARPENTER_QUOTA_ZERO: none"}, timedelta(hours=25), True),
         ({"code": -4, "error_msg": "NODE_LOST", "start_retries": 1}, timedelta(hours=1), False),
         ({"code": -4, "error_msg": "NODE_LOST", "start_retries": 1}, timedelta(hours=3), True),

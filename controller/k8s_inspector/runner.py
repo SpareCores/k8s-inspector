@@ -23,7 +23,9 @@ Phases:
 - Pending: choose capacity (`spot.capacity_for_next_attempt`), create the anchor, record the attempt.
 - Provisioning: anchor Running+ready on a Node created after it -> record region, zone, capacity type, price
   and node timings, phase Running. A Node older than the anchor: delete anchor and NodeClaim, new attempt.
-  A NodeClaim capacity/quota error or the provisioning deadline: remaining tasks end `-1 SCARPENTER_*`, Failed.
+  A NodeClaim capacity/quota error, 2 distinct NodeClaims of the attempt that failed to launch
+  (`LaunchFailed`, kept in `status.launchFailures`) or the provisioning deadline: remaining tasks end
+  `-1 SCARPENTER_*`, Failed.
 - Running: no step in flight -> prechecks (`-3`), vLLM ladder failures, next step (`steps.probe_step` first,
   which always contains `lscpu`, then `steps.next_step`): sign URLs into the Secret, heartbeat, create the Pod.
   Step Pod finished -> `pods.classify`, `storage.finish_task`, a `flush` Pod (max 2) while uploads are
@@ -77,6 +79,7 @@ from k8s_inspector.model import (
     CapacityType,
     Config,
     ExitCode,
+    LaunchFailure,
     NodeFacts,
     OwnerRef,
     PodRole,
@@ -101,6 +104,9 @@ SKU_NOT_SELECTABLE = "SKU name is not a valid label value; SCarpenter cannot sel
 ACTIVE = (RunPhase.PENDING, RunPhase.PROVISIONING, RunPhase.RUNNING, RunPhase.RELEASING)
 MAX_PROVISION_RETRIES = 3  # attempts lost before a node was usable (stale node, anchor deleted)
 EXTRA_ATTEMPTS = 2  # attempts beyond `max_spot_attempts` (the on-demand one plus one spare)
+MAX_LAUNCH_FAILURES = 2  # distinct NodeClaims that failed to launch in one attempt before the run gives up
+MAX_LAUNCH_FAILURES_KEPT = 5  # entries of `status.launchFailures`
+LAUNCH_FAILED_REASON = "LaunchFailed"  # reason of a NodeClaim's `Launched` condition
 BACKOFF_SECONDS = (2, 5, 15, 30, 60)
 DISK_PRESSURE_WAIT = timedelta(minutes=10)  # how long a step waits for a node's DiskPressure to clear
 DISK_PRESSURE_RECHECK_SECONDS = 30
@@ -244,8 +250,18 @@ def _claim_error(claims: list[dict]) -> str | None:
         for condition in claim.get("status", {}).get("conditions") or []:
             if condition.get("status") != "False" or condition.get("type") not in ("Launched", "Registered"):
                 continue
+            if condition.get("reason") == LAUNCH_FAILED_REASON:
+                continue  # counted by `_launch_failures`: Karpenter retries with a new NodeClaim
             message = condition.get("message") or condition.get("reason") or "NodeClaim failed"
             return scarpenter_error(message, "BOOT_FAILURE" if condition["type"] == "Registered" else "ICE")
+    return None
+
+
+def _launch_failed_message(claim: dict) -> str | None:
+    """The message of a NodeClaim whose `Launched` condition has reason `LaunchFailed` (status False or Unknown)."""
+    for condition in claim.get("status", {}).get("conditions") or []:
+        if condition.get("type") == "Launched" and condition.get("reason") == LAUNCH_FAILED_REASON:
+            return condition.get("message") or LAUNCH_FAILED_REASON
     return None
 
 
@@ -764,6 +780,7 @@ class Runner:
             if not status.tasks:
                 status.tasks = [TaskStatus(t.name) for t in selected]
             status.attempt = attempt
+            status.launch_failures = []
             status.phase = RunPhase.PROVISIONING
             status.capacity_type = capacity[0]
             status.current_step = status.step = status.node = None
@@ -787,6 +804,9 @@ class Runner:
 
         claims = self._pending_claims(anchor)
         error = _claim_error(claims)
+        failures = self._record_launch_failures(run, claims)
+        if error is None and len(failures) >= MAX_LAUNCH_FAILURES:
+            error = f"SCARPENTER_LAUNCH_FAILED: {failures[-1].message}"
         started = self._attempt(run).start or _time(_meta(anchor).get("creationTimestamp"))
         budget = (
             timedelta(hours=cfg.settings.deadlines.provision_gpu_hours)
@@ -801,6 +821,25 @@ class Runner:
             error = scarpenter_error(f"no node after {int(budget.total_seconds() // 60)} minutes", default)
         if error:
             self._fail_run(run, error)
+
+    def _record_launch_failures(self, run: BenchmarkRun, claims: list[dict]) -> list[LaunchFailure]:
+        """Remember in `status.launchFailures` each NodeClaim that failed to launch: Karpenter deletes it and
+        creates a new one, so a failure is gone from the cluster a few minutes later."""
+        seen = {f.node_claim for f in run.status.launch_failures}
+        new = []
+        for claim in claims:
+            message = _launch_failed_message(claim)
+            if message and _meta(claim)["name"] not in seen:
+                new.append(LaunchFailure(_meta(claim)["name"], message, self._now()))
+        if not new:
+            return run.status.launch_failures
+
+        def mutate(status: RunStatus) -> None:
+            known = {f.node_claim for f in status.launch_failures}
+            status.launch_failures += [f for f in new if f.node_claim not in known]
+            status.launch_failures = status.launch_failures[-MAX_LAUNCH_FAILURES_KEPT:]
+
+        return self._update(run, mutate).status.launch_failures
 
     def _pending_claims(self, anchor: dict) -> list[dict]:
         """NodeClaims created for this anchor's pool, vendor and SKU since the anchor exists."""

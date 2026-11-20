@@ -417,6 +417,56 @@ def test_unschedulable_anchor_with_a_nodeclaim_keeps_waiting(h):
     assert h.run.status.phase == RunPhase.PROVISIONING
 
 
+def _launch_failed(h, name, message="Fatal (InvalidParameter): 400"):
+    anchor = h.kube.get("pod", f"{h.name}-a1")
+    h.cluster.fail_launch(anchor, message, name=name, status="Unknown", reason="LaunchFailed")
+
+
+def test_two_distinct_launch_failures_end_the_run_even_when_claims_are_replaced(h):
+    h.cluster.provision_enabled = False
+    h.start(["geekbench"])
+    h.runner.reconcile(h.name)
+    _launch_failed(h, "bench-aaaaa", "first")
+    h.runner.reconcile(h.name)
+    assert h.run.status.phase == RunPhase.PROVISIONING
+    assert [f.node_claim for f in h.run.status.launch_failures] == ["bench-aaaaa"]
+    h.kube.delete("nodeclaim", "bench-aaaaa")  # Karpenter removes the failed claim
+    h.clock.advance(minutes=5)
+    h.runner.reconcile(h.name)
+    assert h.run.status.phase == RunPhase.PROVISIONING
+    _launch_failed(h, "bench-bbbbb", "Fatal (InvalidParameter): Error returned by Compute Service. 400")
+    h.runner.reconcile(h.name)
+    assert h.run.status.phase == RunPhase.FAILED
+    code, message = h.codes()["geekbench"]
+    assert (
+        code == -1
+        and message == "SCARPENTER_LAUNCH_FAILED: Fatal (InvalidParameter): Error returned by Compute Service. 400"
+    )
+
+
+def test_the_same_failed_nodeclaim_counts_once(h):
+    h.cluster.provision_enabled = False
+    h.start(["geekbench"])
+    h.runner.reconcile(h.name)
+    _launch_failed(h, "bench-aaaaa")
+    h.runner.reconcile(h.name)
+    h.runner.reconcile(h.name)
+    assert h.run.status.phase == RunPhase.PROVISIONING
+    assert len(h.run.status.launch_failures) == 1
+
+
+def test_one_transient_launch_failure_then_success_proceeds(h):
+    h.cluster.provision_enabled = False
+    h.start(["geekbench"])
+    h.runner.reconcile(h.name)
+    _launch_failed(h, "bench-aaaaa")
+    h.runner.reconcile(h.name)
+    h.kube.delete("nodeclaim", "bench-aaaaa")
+    h.cluster.provision_enabled = True
+    h.drive(stop=lambda run: run.status.phase == RunPhase.RUNNING)
+    assert h.run.status.phase == RunPhase.RUNNING
+
+
 def test_node_older_than_the_anchor_is_replaced(h):
     h.start(["geekbench"])
     h.runner.reconcile(h.name)

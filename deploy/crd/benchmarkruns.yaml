@@ -130,6 +130,15 @@ spec:
                       type: string
                       nullable: true
                       enum: [Completed, SpotInterrupted, NodeLost, ProvisioningFailed, Cancelled, HarnessError]
+              launchFailures:
+                type: array
+                items:
+                  type: object
+                  required: [nodeClaim]
+                  properties:
+                    nodeClaim: {type: string}
+                    message: {type: string}
+                    time: {type: string, format: date-time}
               conditions:
                 type: array
                 items:

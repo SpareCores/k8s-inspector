@@ -207,12 +207,13 @@ class KeeperCache:
 ScheduleReader = Callable[[str], dict[str, dict[str, dict | None]]]
 
 # Wait after a failure before the task is due again (exit-codes.md "Planner retry"): a `-4` by its `start_retries`
-# (the third `-4` is `-5`, final), a `-1` flat; no capacity or quota at all (`QUOTA_ZERO`, `NO_OFFERING`) only daily.
+# (the third `-4` is `-5`, final), a `-1` flat; no capacity, quota or launch at all (`QUOTA_ZERO`, `NO_OFFERING`,
+# `LAUNCH_FAILED`) only daily.
 RETRY_AFTER_NEVER_FINISHED = (timedelta(hours=2), timedelta(hours=6))
 RETRY_AFTER_NO_NODE = timedelta(hours=2)
 RETRY_AFTER_NO_NODE_DAILY = timedelta(hours=24)
 GPU_PROBE_TASK = "nvidia_smi"  # Keeper blocks it for a SKU without an NVIDIA GPU
-DAILY_NO_NODE_REASONS = ("SCARPENTER_QUOTA_ZERO", "SCARPENTER_NO_OFFERING")
+DAILY_NO_NODE_REASONS = ("SCARPENTER_QUOTA_ZERO", "SCARPENTER_NO_OFFERING", "SCARPENTER_LAUNCH_FAILED")
 
 
 def due_reason(task: TaskDef, meta: dict | None, now: datetime) -> str | None:
