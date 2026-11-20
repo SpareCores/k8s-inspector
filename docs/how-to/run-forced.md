@@ -7,7 +7,7 @@ benchmarked while Keeper's eligibility rules do not allow inspector runs on OCI 
 
 ## Before you start
 
-- The vendor is enabled in the ConfigMap `k8s-inspector` and has a bench NodePool.
+- The vendor is enabled in the ConfigMap `k8s-inspector` (managed by the platform) and has a bench NodePool.
 - The SKU is an instance type SCarpenter offers: `kubectl get nodepools bench-oci -o yaml` shows the pool;
   the type name is the vendor's `api_reference` (for OCI flexible shapes `<shape>.<ocpus>-<gb>`).
 
@@ -39,7 +39,7 @@ benchmarked while Keeper's eligibility rules do not allow inspector runs on OCI 
   and returns; the controller then records the unfinished tasks as `-4 CANCELLED`, releases the node and keeps the
   `BenchmarkRun` (phase `Cancelled`). Check with `k8s-inspector status`. Deleting the `BenchmarkRun`
   with `kubectl` also releases the node but drops the record.
-- Pause a vendor: set `vendors.<vendor>.maxInFlight: 0` in the ConfigMap. Running runs finish.
+- Pause a vendor: set `vendors.<vendor>.maxInFlight: 0` in the ConfigMap `k8s-inspector` (key `config.yaml`, managed by the platform; applies within ~30 s without a restart). Running runs finish.
 
 ## Debug a node
 

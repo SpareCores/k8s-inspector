@@ -13,7 +13,7 @@ vendor.*
 
 ## Steps
 
-1. Add the vendor to the ConfigMap with `enabled: true`, `autoPlan: false`, `maxInFlight: 1`.
+1. Add the vendor to the platform-managed ConfigMap `k8s-inspector` (key `config.yaml`; applies within ~30 s, no restart) with `enabled: true`, `autoPlan: false`, `maxInFlight: 1`.
 2. Run 3-5 representative SKUs with forced runs ([start a forced run](run-forced.md)) and check the results in git.
 3. Compare with the legacy results of the same SKUs: the core benchmarks' medians should be within run-to-run noise
    (about ±3 %) or the difference explained.

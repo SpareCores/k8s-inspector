@@ -20,8 +20,11 @@ The controller serves Prometheus metrics on port 9090 (`/metrics`, [monitoring](
 
 ## ConfigMap `k8s-inspector`
 
-Read on every planning cycle; changes apply without a restart. The YAML is the value of key `config.yaml` of the
-ConfigMap. An unknown key is logged as a warning and ignored; an invalid value is an error.
+The platform creates and manages this ConfigMap (this repository does not ship it). The YAML is the value of key
+`config.yaml`. The controller re-reads it through the Kubernetes API about every 30 s, so changes apply within
+~30 s without a restart (the Deployment neither mounts nor hashes it, so a change never triggers a rollout). A
+missing ConfigMap or an empty `config.yaml` gives the defaults, with no vendor enabled. An unknown key is logged as a
+warning and ignored; an invalid value is an error and the controller keeps the last good settings.
 
 ```yaml
 planner:
@@ -38,7 +41,6 @@ vendors:
     nodePools: {cpu: bench-oci, lowmem: bench-oci-lowmem, gpu: null}
 defaults:
   maxInFlight: 2                 # conservative default for every vendor without its own maxInFlight
-  maxInFlightGpu: 1
 batching:                        # hourly-billed vendors: start when expected work fills enough of the billed hour
   hourlyMinFillRatio: 0.5
   hourlyMaxWaitDays: 14
@@ -88,7 +90,15 @@ Every command logs JSON lines on stderr.
 ## Running instances per vendor
 
 Bench NodePools have no `limits`: the goal is to benchmark every instance type of a vendor, so there is no pool-level
-size or total bound. The only cap on started and running instances of a vendor is `vendors.<v>.maxInFlight`
-(default `defaults.maxInFlight`, 2; 0 pauses the vendor). It counts every run that holds or is acquiring a node
-(Pending, Provisioning, Running, Releasing, and a Failed or Cancelled run until its anchor Pod is deleted) and applies
-to forced runs and to autoPlan. `maxUsdPerHour` is checked before a run starts, against the node prices of those runs.
+size or total bound. The cap on started and running instances of a vendor is `vendors.<v>.maxInFlight`
+(default `defaults.maxInFlight`, 2; 0 pauses the vendor). The count is the larger of the runs that hold or are
+acquiring a node (Pending, Provisioning, Running, Releasing, and a Failed or Cancelled run until its anchor Pod is
+deleted) and the live NodeClaims of the vendor's bench NodePools (an instance can outlive its anchor). It applies to
+forced runs; autoPlan, not implemented yet in P1, will use the same check.
+
+`maxUsdPerHour`, when set, is checked before a run starts against the node prices of the holding runs. A run still
+acquiring its node has no price yet, so while any holding run has none, a new run is refused ("wait until ... has a
+price").
+
+The check is not atomic: two concurrent `run` commands for different SKUs can both pass it and exceed the limit by one.
+The planner of `serve` will be single-threaded, so autoPlan does not add to this race.

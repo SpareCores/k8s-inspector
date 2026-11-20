@@ -89,11 +89,14 @@ def container_name(key: str) -> str:
     return re.sub(r"[^a-z0-9-]", "-", key.lower())[:63]
 
 
+LABEL_ROLE = "inspector.sparecores.com/role"
+
+
 def labels(run: BenchmarkRun, role: PodRole, attempt: int | None = None, task: str | None = None) -> dict[str, str]:
     """`inspector.sparecores.com/{run,role,vendor,attempt,task}` (objects.md "Labels")."""
     result = {
         "inspector.sparecores.com/run": run.name,
-        "inspector.sparecores.com/role": role.value,
+        LABEL_ROLE: role.value,
         "inspector.sparecores.com/vendor": run.spec.vendor,
     }
     if attempt is not None:

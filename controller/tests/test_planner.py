@@ -12,6 +12,7 @@ from k8s_inspector.model import (
     Config,
     Defaults,
     EnvConfig,
+    NodePools,
     RunPhase,
     Settings,
     VendorSettings,
@@ -27,6 +28,7 @@ class FakeKube:
     def __init__(self) -> None:
         self.objects: dict[str, dict] = {}
         self.pods: list[dict] = []
+        self.nodeclaims: list[dict] = []
 
     def create(self, kind, manifest):
         name = manifest["metadata"]["name"]
@@ -43,6 +45,8 @@ class FakeKube:
         return copy.deepcopy(self.objects[name])
 
     def list(self, kind, labels=None):
+        if kind == "nodeclaim":
+            return [c for c in self.nodeclaims if labels.items() <= c["metadata"]["labels"].items()]
         if kind == "pod":
             return [p for p in self.pods if labels.items() <= p["metadata"]["labels"].items()]
         return [copy.deepcopy(o) for o in self.objects.values()]
@@ -180,6 +184,27 @@ def test_max_usd_per_hour(kube):
     kube.set_status(first.name, pricePerHour="1.2")
     with pytest.raises(ValueError, match="maxUsdPerHour"):
         planner.force_run(kube, cfg, "oci", "c")
+
+
+def test_max_usd_per_hour_waits_for_runs_without_price(kube):
+    cfg = make_config(max_in_flight=5, max_usd_per_hour=1.0)
+    first = planner.force_run(kube, cfg, "oci", "a")
+    with pytest.raises(ValueError, match=f"wait until {first.name} has a price"):
+        planner.force_run(kube, cfg, "oci", "b")
+
+    no_cap = make_config(max_in_flight=5)
+    planner.force_run(kube, no_cap, "oci", "b")  # no cap: prices do not matter
+
+
+def test_max_in_flight_counts_live_nodeclaims_beyond_runs(kube):
+    cfg = make_config(max_in_flight=2, node_pools=NodePools(cpu="bench-oci", lowmem="bench-oci-lowmem"))
+    claim = lambda pool: {"metadata": {"labels": {"karpenter.sh/nodepool": pool}}}  # noqa: E731
+    kube.nodeclaims = [claim("bench-oci"), claim("bench-oci-lowmem"), claim("other-pool")]
+    with pytest.raises(ValueError, match="2 of 2"):  # no run holds an anchor, two instances are still up
+        planner.force_run(kube, cfg, "oci", "a")
+
+    kube.nodeclaims = kube.nodeclaims[1:]
+    planner.force_run(kube, cfg, "oci", "a")
 
 
 def test_other_vendors_do_not_count(kube):

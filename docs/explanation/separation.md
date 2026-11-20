@@ -7,7 +7,7 @@ The cluster also runs web services and applications. Benchmarks must neither dis
 | Nothing else lands on a bench node | taint `frankenscube/bench=true:NoSchedule`; only the anchor tolerates it; step Pods are bound by `nodeName`. Cluster DaemonSets with blanket tolerations get `frankenscube/pool NotIn [bench]`, so no log or metrics agent runs on bench nodes. |
 | Bench Pods land only on bench nodes | the anchor selects `karpenter.sh/nodepool: bench-<vendor>`; steps follow the anchor |
 | The controller runs with the apps | toleration `frankenscube/apps` only; never on control planes (`CriticalAddonsOnly`) |
-| Benchmarks cannot starve the cluster | per-vendor `maxInFlight` and `maxUsdPerHour` in the controller; bench NodePools have no `limits`; `ResourceQuota` (`pods: 60`) in `inspector`; PriorityClass `benchmark` (low, `preemptionPolicy: Never`) |
+| Benchmarks cannot starve the cluster | per-vendor `maxInFlight` and `maxUsdPerHour` in the controller; `ResourceQuota` (`pods: 60`) in `inspector`; PriorityClass `benchmark` (low, `preemptionPolicy: Never`) |
 | Privileged Pods only where intended | namespace `inspector` with Pod Security `privileged`; the `ValidatingAdmissionPolicy` and RBAC in [security](security.md#admission-and-rbac) |
 | Benchmark traffic does not cross the cluster network | `hostNetwork: true`; outputs go straight to object storage |
 

@@ -4,7 +4,6 @@ resources:
 - crd/benchmarkruns.yaml
 - controller/serviceaccount.yaml
 - controller/rbac.yaml
-- controller/configmap.yaml
 - controller/deployment.yaml
 - controller/priorityclass.yaml
 - controller/resourcequota.yaml

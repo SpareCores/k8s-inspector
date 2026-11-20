@@ -416,7 +416,6 @@ class VendorSettings:
 @dataclass(frozen=True)
 class Defaults:
     max_in_flight: int = 2
-    max_in_flight_gpu: int = 1
 
 
 @dataclass(frozen=True)

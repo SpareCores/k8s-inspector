@@ -134,7 +134,7 @@ def _optional(check: Callable[[Any, str], Any]) -> Callable[[Any, str], Any]:
 
 # camelCase key -> (dataclass field, check). One table per section.
 _PLANNER = {"intervalMinutes": ("planner_interval_minutes", _pos_int), "autoPlan": ("auto_plan", _bool)}
-_DEFAULTS = {"maxInFlight": ("max_in_flight", _nonneg_int), "maxInFlightGpu": ("max_in_flight_gpu", _nonneg_int)}
+_DEFAULTS = {"maxInFlight": ("max_in_flight", _nonneg_int)}
 _BATCHING = {
     "hourlyMinFillRatio": ("hourly_min_fill_ratio", _ratio),
     "hourlyMaxWaitDays": ("hourly_max_wait_days", _nonneg_int),

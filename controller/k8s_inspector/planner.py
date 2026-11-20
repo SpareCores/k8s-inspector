@@ -10,16 +10,16 @@ import threading
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
-from k8s_inspector import crd, keeper, tasks
+from k8s_inspector import crd, keeper, pods, tasks
 from k8s_inspector.kube import Kube
-from k8s_inspector.model import BenchmarkRun, CapacityMode, Config, RunPhase, RunSpec, Settings, TaskDef
+from k8s_inspector.model import BenchmarkRun, CapacityMode, Config, PodRole, RunPhase, RunSpec, TaskDef
 
 log = logging.getLogger(__name__)
 
 # Phases in which a run holds (or is about to hold) a node. A run in any other phase (Failed, Cancelled) still
 # counts while its anchor Pod exists, until the runner deletes the anchor and releases the node.
 ACTIVE_PHASES = frozenset({RunPhase.PENDING, RunPhase.PROVISIONING, RunPhase.RUNNING, RunPhase.RELEASING})
-ANCHOR_LABELS = {"inspector.sparecores.com/role": "anchor"}
+NODEPOOL_LABEL = "karpenter.sh/nodepool"
 
 
 @dataclass(frozen=True)
@@ -44,7 +44,9 @@ def spend_per_hour(runs: list[BenchmarkRun]) -> float:
 def holding_runs(kube: Kube, runs: list[BenchmarkRun], vendor: str) -> list[BenchmarkRun]:
     """Runs of `vendor` that hold or are acquiring a node: in an active phase, or (Failed, Cancelled) with an
     anchor Pod still alive."""
-    anchored = {_labels(pod).get(crd.LABEL_RUN) for pod in kube.list("pod", labels=ANCHOR_LABELS)}
+    anchored = {
+        _labels(pod).get(crd.LABEL_RUN) for pod in kube.list("pod", labels={pods.LABEL_ROLE: PodRole.ANCHOR.value})
+    }
     return [r for r in runs if r.spec.vendor == vendor and (r.status.phase in ACTIVE_PHASES or r.name in anchored)]
 
 
@@ -52,18 +54,38 @@ def _labels(pod: dict) -> dict:
     return pod.get("metadata", {}).get("labels") or {}
 
 
-def check_vendor_budget(active: list[BenchmarkRun], settings: Settings, vendor: str) -> None:
-    """Raise `ValueError` when one more run of `vendor` would pass `maxInFlight` (0 pauses the vendor) or when
-    the running nodes already cost `maxUsdPerHour`. `active` is `holding_runs`. Shared by `force_run` and
-    (later) autoPlan."""
+def live_nodeclaims(kube: Kube, cfg: Config, vendor: str) -> int:
+    """Live NodeClaims in the bench NodePools of `vendor` (cpu, lowmem, gpu when set). An instance can outlive its
+    anchor (provision deadline passed while Karpenter still launches; drain after release)."""
+    pools = cfg.settings.vendors[vendor].node_pools
+    names = {name for name in (pools.cpu, pools.lowmem, pools.gpu) if name} if pools else set()
+    return sum(len(kube.list("nodeclaim", labels={NODEPOOL_LABEL: name})) for name in sorted(names))
+
+
+def check_vendor_budget(kube: Kube, cfg: Config, vendor: str, runs: list[BenchmarkRun]) -> None:
+    """Raise `ValueError` when one more run of `vendor` would pass `maxInFlight` (0 pauses the vendor), or when
+    `maxUsdPerHour` is set and the holding runs already cost the cap or one of them has no price yet. In flight =
+    max(`holding_runs`, live bench NodeClaims). Shared by `force_run` and (later) autoPlan. Not atomic: two
+    concurrent callers can both pass the check."""
+    settings = cfg.settings
     vendor_settings = settings.vendors[vendor]
     limit = vendor_settings.max_in_flight
     if limit is None:
         limit = settings.defaults.max_in_flight
-    if len(active) >= limit:
-        raise ValueError(f"vendor {vendor} is at its maxInFlight limit ({len(active)} of {limit} runs in flight)")
+    active = holding_runs(kube, runs, vendor)
+    in_flight = max(len(active), live_nodeclaims(kube, cfg, vendor))
+    if in_flight >= limit:
+        raise ValueError(f"vendor {vendor} is at its maxInFlight limit ({in_flight} of {limit} instances in flight)")
     cap = vendor_settings.max_usd_per_hour
-    if cap is not None and spend_per_hour(active) >= cap:
+    if cap is None:
+        return
+    unpriced = [r.name for r in active if not r.status.price_per_hour]
+    if unpriced:
+        raise ValueError(
+            f"vendor {vendor} has maxUsdPerHour {cap}: wait until {', '.join(unpriced)} has a price "
+            "before starting a run"
+        )
+    if spend_per_hour(active) >= cap:
         raise ValueError(f"vendor {vendor} is at its maxUsdPerHour cap ({cap} USD/hour)")
 
 
@@ -98,7 +120,7 @@ def force_run(
     names = [task.name for task in selected]
     if not force:
         _check_keeper(cfg, vendor, sku, names)
-    check_vendor_budget(holding_runs(kube, crd.list_runs(kube), vendor), settings, vendor)
+    check_vendor_budget(kube, cfg, vendor, crd.list_runs(kube))
 
     spec = RunSpec(
         vendor=vendor,

@@ -105,13 +105,13 @@ def test_values_override_defaults():
     settings = parse_settings(
         {
             "planner": {"intervalMinutes": 10, "autoPlan": True},
-            "defaults": {"maxInFlightGpu": 0},
+            "defaults": {"maxInFlight": 3},
             "uploads": {"partMiB": 8},
             "vendors": {"aws": {"enabled": True, "maxInFlight": 0, "nodePools": {"cpu": "bench-aws"}}},
         }
     )
     assert settings.planner_interval_minutes == 10 and settings.auto_plan is True
-    assert settings.defaults.max_in_flight == 2 and settings.defaults.max_in_flight_gpu == 0
+    assert settings.defaults.max_in_flight == 3
     assert settings.uploads.part_mib == 8 and settings.uploads.max_parts == 64
     aws = settings.vendors["aws"]
     assert aws.max_in_flight == 0 and aws.node_pools == NodePools(cpu="bench-aws")

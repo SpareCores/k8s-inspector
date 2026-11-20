@@ -1,14 +1,23 @@
 # deploy
 
-Kustomize base of the controller: the CRD (`crd/`), ServiceAccount, RBAC, default ConfigMap, Deployment, the
+Kustomize base of the controller: the CRD (`crd/`), ServiceAccount, RBAC, Deployment, the
 PriorityClass `benchmark` and the ResourceQuota `pods: 60` (`controller/`). `kubectl apply -k deploy` installs it into
 the namespace `inspector`.
 
 ## Platform objects
 
 The Deployment expects objects that the cluster platform provides (listed at the top of
-`controller/deployment.yaml`): ConfigMap `k8s-inspector-platform`, Secrets `k8s-inspector-git-key` and
-`k8s-inspector-keeper`, and Secret `inspector-secrets` for the benchmark secrets.
+`controller/deployment.yaml`):
+
+- ConfigMap `k8s-inspector-platform`. Required keys: `K8SI_BUCKET`, `K8SI_BUCKET_REGION`, `K8SI_ROLE_ARN`. Optional
+  keys (the controller starts without them): `K8SI_GIT_URL`, `K8SI_GIT_BRANCH`, `KEEPER_API_BASE`, `K8SI_KEY_PREFIX`.
+- Secrets `k8s-inspector-git-key` (`ssh-privatekey`) and `k8s-inspector-keeper` (`api-key`): both optional, the
+  Pod starts without them.
+- Secret `inspector-secrets` for the benchmark secrets.
+- ConfigMap `k8s-inspector` (key `config.yaml`, the settings, see
+  [configuration](../docs/reference/configuration.md)): created and managed by the platform, not shipped here. The
+  controller reads it through the API every ~30 s, so a change applies without a restart; the Deployment does not
+  mount or hash it. Without it the defaults apply and no vendor is enabled.
 
 ## Pin the images
 
