@@ -232,6 +232,16 @@ def _claim_error(claims: list[dict]) -> str | None:
     return None
 
 
+def _unschedulable(anchor: dict) -> str | None:
+    """`SCARPENTER_NO_OFFERING: <message>` when the anchor's `PodScheduled` condition is False with a message, else
+    None. Only for an anchor that still has no NodeClaim: Karpenter creates one within seconds for any SKU it can
+    launch, so a SKU without one is not offered (the detailed Karpenter reason is only in an Event)."""
+    for condition in anchor.get("status", {}).get("conditions") or []:
+        if condition.get("type") == "PodScheduled" and condition.get("status") == "False" and condition.get("message"):
+            return f"SCARPENTER_NO_OFFERING: {condition['message']}"
+    return None
+
+
 def parse_gpu_facts(stdout: bytes) -> tuple[int | None, tuple[int, int] | None]:
     """`gpu_facts` output, one line per GPU `<VRAM MiB>, <compute capability>` -> (minimum VRAM, minimum
     capability). Unreadable lines are skipped."""
@@ -766,7 +776,10 @@ class Runner:
             if self._is_gpu(run.spec.vendor, run.spec.sku)
             else timedelta(minutes=cfg.settings.deadlines.provision_cpu_minutes)
         )
-        if error is None and self._now() - started > budget:
+        waited = self._now() - started
+        if error is None and not claims and waited > timedelta(minutes=cfg.settings.deadlines.no_offering_minutes):
+            error = _unschedulable(anchor)
+        if error is None and waited > budget:
             default = "BOOT_FAILURE" if claims else "ICE"
             error = scarpenter_error(f"no node after {int(budget.total_seconds() // 60)} minutes", default)
         if error:

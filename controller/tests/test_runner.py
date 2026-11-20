@@ -22,6 +22,7 @@ from k8s_inspector.model import (
     AttemptOutcome,
     CapacityMode,
     Config,
+    Deadlines,
     EnvConfig,
     ExitCode,
     NodeFacts,
@@ -366,6 +367,54 @@ def test_provisioning_deadline_fails_the_run(h):
     h.runner.reconcile(h.name)
     assert h.run.status.phase == RunPhase.FAILED
     assert h.task("geekbench").exit_code == -1 and "no node after 60 minutes" in h.task("geekbench").error_msg
+
+
+def _unschedulable_anchor(h, message="0/3 nodes are available: 3 node(s) didn't match Pod's node affinity/selector."):
+    h.cluster.provision_enabled = False
+    h.start(["geekbench"])
+    h.runner.reconcile(h.name)
+    condition = {"type": "PodScheduled", "status": "False", "reason": "Unschedulable", "message": message}
+    h.kube.merge_patch("pod", f"{h.name}-a1", {"status": {"conditions": [condition]}})
+
+
+def test_no_nodeclaim_and_unschedulable_anchor_fails_fast_with_no_offering(h):
+    _unschedulable_anchor(h)
+    h.clock.advance(minutes=9)
+    h.runner.reconcile(h.name)
+    assert h.run.status.phase == RunPhase.PROVISIONING
+    h.clock.advance(minutes=2)
+    h.runner.reconcile(h.name)
+    assert h.run.status.phase == RunPhase.FAILED
+    code, message = h.codes()["geekbench"]
+    assert code == -1 and message.startswith("SCARPENTER_NO_OFFERING: 0/3 nodes are available")
+
+
+def test_no_offering_wait_is_configurable(h):
+    h.cfg = make_config(deadlines=Deadlines(no_offering_minutes=3))
+    _unschedulable_anchor(h)
+    h.clock.advance(minutes=4)
+    h.runner.reconcile(h.name)
+    assert h.run.status.phase == RunPhase.FAILED
+
+
+def test_pending_anchor_without_scheduling_message_keeps_waiting(h):
+    h.cluster.provision_enabled = False
+    h.start(["geekbench"])
+    h.runner.reconcile(h.name)
+    h.clock.advance(minutes=30)
+    h.runner.reconcile(h.name)
+    assert h.run.status.phase == RunPhase.PROVISIONING
+
+
+def test_unschedulable_anchor_with_a_nodeclaim_keeps_waiting(h):
+    _unschedulable_anchor(h)
+    h.cluster.fail_launch(h.kube.get("pod", f"{h.name}-a1"), "launching")
+    h.kube.merge_patch(
+        "nodeclaim", f"claim-{h.name}-a1", {"status": {"conditions": [{"type": "Launched", "status": "Unknown"}]}}
+    )
+    h.clock.advance(minutes=30)
+    h.runner.reconcile(h.name)
+    assert h.run.status.phase == RunPhase.PROVISIONING
 
 
 def test_node_older_than_the_anchor_is_replaced(h):

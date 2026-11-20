@@ -7,6 +7,7 @@ feature-mapping.md. The lease is the BenchmarkRun name: creating a second run fo
 
 import logging
 import threading
+import time
 import zlib
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -182,14 +183,35 @@ def _check_keeper(cfg: Config, vendor: str, sku: str, names: list[str]) -> None:
         raise ValueError(f"Keeper blocks tasks for {vendor}/{sku} ({details}); use --force to skip the check")
 
 
-# `schedule/<task>/meta.json` of every SKU of a vendor: {sku: {task: meta}} (`Publisher.read_schedule_metas`)
-ScheduleReader = Callable[[str], dict[str, dict[str, dict]]]
+KEEPER_CACHE_SECONDS = 30 * 60
+
+
+class KeeperCache:
+    """The bulk Keeper answer (`keeper.active_servers_block_reasons`), kept for `KEEPER_CACHE_SECONDS`: the ACTIVE
+    server list and block reasons change rarely, a cycle runs every few minutes. `plan_cycle` without a cache
+    object asks Keeper every time."""
+
+    def __init__(self) -> None:
+        self._asked = 0.0
+        self._answer: dict | None = None
+
+    def get(self, env, task_names: list[str]) -> dict:
+        if self._answer is None or time.monotonic() - self._asked >= KEEPER_CACHE_SECONDS:
+            self._answer = keeper.active_servers_block_reasons(env, task_names)
+            self._asked = time.monotonic()
+        return self._answer
+
+
+# `schedule/<task>/meta.json` of every SKU of a vendor: {sku: {task: meta}} (`Publisher.read_schedule_metas`);
+# a meta of None is an unreadable file, its SKU is skipped
+ScheduleReader = Callable[[str], dict[str, dict[str, dict | None]]]
 
 # Wait after a failure before the task is due again (exit-codes.md "Planner retry"): a `-4` by its `start_retries`
 # (the third `-4` is `-5`, final), a `-1` flat; no capacity or quota at all (`QUOTA_ZERO`, `NO_OFFERING`) only daily.
 RETRY_AFTER_NEVER_FINISHED = (timedelta(hours=2), timedelta(hours=6))
 RETRY_AFTER_NO_NODE = timedelta(hours=2)
 RETRY_AFTER_NO_NODE_DAILY = timedelta(hours=24)
+GPU_PROBE_TASK = "nvidia_smi"  # Keeper blocks it for a SKU without an NVIDIA GPU
 DAILY_NO_NODE_REASONS = ("SCARPENTER_QUOTA_ZERO", "SCARPENTER_NO_OFFERING")
 
 
@@ -225,13 +247,23 @@ def start_order(vendor: str, sku: str) -> tuple[int, str]:
     return zlib.crc32(f"{vendor}/{sku}".encode()), sku
 
 
-def plan_cycle(kube: Kube, cfg: Config, schedule_reader: ScheduleReader, *, dry_run: bool = False) -> list[PlannedRun]:
+def plan_cycle(
+    kube: Kube,
+    cfg: Config,
+    schedule_reader: ScheduleReader,
+    *,
+    dry_run: bool = False,
+    keeper_cache: KeeperCache | None = None,
+) -> list[PlannedRun]:
     """One autoPlan cycle. For each enabled vendor with autoPlan whose results are published (`publish`; without it
     git would never record them and the SKU would be run again and again) and that is below its caps
     (`check_vendor_budget`): take the vendor's ACTIVE SKUs from Keeper in `start_order`, skip those that already
-    have a BenchmarkRun (the lease), and create a run (not forced) for the first SKU with due tasks (`due_reason`
-    on the git schedule metas) that Keeper does not block, until the caps are reached: usually one run per vendor
-    and cycle. With `dry_run` nothing is created and the first such SKU of each vendor is returned.
+    have a BenchmarkRun (the lease) and those whose names are no label values (the anchor could not select them),
+    and create a run (not forced) for the first SKU with due tasks (`due_reason` on the git schedule metas) that
+    Keeper does not block, until the caps are reached: usually one run per vendor and cycle. GPU tasks are dropped
+    for a SKU whose `nvidia_smi` Keeper blocks (no GPU); a SKU with only GPU tasks due is not planned. A vendor
+    whose publishing is stalled (`publisher.publishing_stalled`) is skipped: new runs would only pile up
+    unpublished. With `dry_run` nothing is created and the first such SKU of each vendor is returned.
 
     Fails closed: when Keeper or git cannot be read the cycle plans nothing (for git: nothing for that vendor)
     and logs why."""
@@ -244,10 +276,14 @@ def plan_cycle(kube: Kube, cfg: Config, schedule_reader: ScheduleReader, *, dry_
         if not publisher.vendor_allowed(settings, vendor):
             log.warning("autoPlan of vendor %s needs publish: results would never reach git", vendor)
             continue
+        runs = crd.list_runs(kube)
         try:
-            check_vendor_budget(kube, cfg, vendor, crd.list_runs(kube))
+            check_vendor_budget(kube, cfg, vendor, runs)
         except ValueError as e:
             log.info("autoPlan skips vendor %s: %s", vendor, e)
+            continue
+        if publisher.publishing_stalled(settings, vendor, runs):
+            log.warning("autoPlan skips vendor %s: finished tasks stay unpublished, publishing is failing", vendor)
             continue
         candidates.append(vendor)
     if not candidates:
@@ -255,7 +291,7 @@ def plan_cycle(kube: Kube, cfg: Config, schedule_reader: ScheduleReader, *, dry_
 
     server_tasks = [task for task in tasks.all_tasks() if not task.dbaas]
     try:
-        blocked = keeper.active_servers_block_reasons(cfg.env, [task.name for task in server_tasks])
+        blocked = (keeper_cache or KeeperCache()).get(cfg.env, [task.name for task in server_tasks])
     except Exception:
         log.exception("autoPlan skips the cycle: Keeper is not reachable")
         return []
@@ -271,17 +307,30 @@ def plan_cycle(kube: Kube, cfg: Config, schedule_reader: ScheduleReader, *, dry_
         runs = crd.list_runs(kube)
         leased = {run.name for run in runs}
         skus = sorted(blocked.get(vendor, {}), key=lambda sku: start_order(vendor, sku))
+        if not skus:
+            log.info("autoPlan: Keeper lists no ACTIVE servers for vendor %s", vendor)
+        bad_names = [sku for sku in skus if not pods.is_label_value(sku)]
+        if bad_names:
+            log.warning(
+                "autoPlan skips %d SKUs of vendor %s whose names are not label values, e.g. %s",
+                len(bad_names), vendor, bad_names[0],
+            )  # fmt: skip
         for sku in skus:
             if crd.run_name(vendor, sku) in leased or not publisher.publish_allowed(settings, vendor, sku):
                 continue
+            if sku in bad_names:
+                continue
+            if None in metas.get(sku, {}).values():  # unreadable meta.json: the publisher logged which
+                continue
+            no_gpu = GPU_PROBE_TASK in blocked[vendor][sku]
             due = {}
             for task in server_tasks:
-                if task.name in blocked[vendor][sku]:
+                if task.name in blocked[vendor][sku] or (task.gpu and no_gpu):
                     continue
                 reason = due_reason(task, metas.get(sku, {}).get(task.name), now)
                 if reason:
                     due[task.name] = reason
-            if not due:
+            if all(tasks.get_task(name).gpu for name in due):  # nothing due, or only GPU tasks
                 continue
             if not dry_run:
                 try:
@@ -303,12 +352,13 @@ def plan_cycle(kube: Kube, cfg: Config, schedule_reader: ScheduleReader, *, dry_
 def run_forever(kube: Kube, cfg_provider, schedule_reader: ScheduleReader, stop: threading.Event) -> None:
     """Every `planner.interval_minutes`: `plan_cycle`; exceptions are logged, never fatal. `cfg_provider` is a
     zero-argument callable returning the current `Config`."""
+    keeper_cache = KeeperCache()
     while not stop.is_set():
         interval_minutes = 5
         try:
             cfg = cfg_provider()
             interval_minutes = cfg.settings.planner_interval_minutes
-            for planned in plan_cycle(kube, cfg, schedule_reader):
+            for planned in plan_cycle(kube, cfg, schedule_reader, keeper_cache=keeper_cache):
                 log.info("planned run", extra={"vendor": planned.vendor, "sku": planned.sku, "reason": planned.reason})
         except Exception:
             log.exception("planning cycle failed")

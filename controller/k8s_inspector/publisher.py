@@ -21,7 +21,8 @@ Decisions:
 - The hardware variant comes from the lscpu stdout of the attempt that ran the task (`run.json`
   `attempts[].lscpu_stdout`, attempt = `status.json` `attempt`), matched against the `variant.json` files in
   the checkout (`variant.pick_variant`). Without a usable lscpu result a task with a negative exit code (no
-  node, never finished) goes to `schedule/<task>/meta.json` only; a task with exit code >= 0 stays unpublished
+  node, never finished), or 256 in a run that never had a node, goes to `schedule/<task>/meta.json` only (so
+  the planner does not plan it again); a task with exit code >= 0 stays unpublished
   (and is retried every cycle) rather than being filed under the wrong variant, until `publish.keep_run_hours`
   after its end: then it is marked published without a commit, logged as an error and counted in
   `PublishResult.unpublishable` (`k8s_inspector_unpublishable_tasks_total`), so the run frees its lease. A forced
@@ -41,6 +42,7 @@ import logging
 import os
 import re
 import shlex
+import shutil
 import subprocess
 import threading
 import time
@@ -57,6 +59,7 @@ from k8s_inspector.kube import Kube, NotFound
 from k8s_inspector.model import (
     BenchmarkRun,
     EnvConfig,
+    ExitCode,
     RunKey,
     RunPhase,
     RunStatus,
@@ -68,6 +71,8 @@ from k8s_inspector.storage import Storage
 
 log = logging.getLogger(__name__)
 
+GIT_TIMEOUT_SECONDS = 600  # one git command; a hung network fails the cycle instead of the thread
+SSH_OPTIONS = "-o ConnectTimeout=30 -o ServerAliveInterval=15 -o ServerAliveCountMax=4"
 MAX_PUSH_ATTEMPTS = 5
 MAX_RENDER_FAILURES = 12  # cycles a task may fail to render before it is published without parser output
 DONE_PHASES = (RunPhase.PUBLISHING, RunPhase.DONE, RunPhase.FAILED, RunPhase.CANCELLED)
@@ -162,6 +167,21 @@ def _finished_at(run: BenchmarkRun) -> datetime:
     """When the run's last task ended (the run's creation when none did)."""
     ends = [_utc(t.end) for t in run.status.tasks if t.end]
     return max(ends, default=_utc(run.created))
+
+
+def publishing_stalled(settings: Settings, vendor: str, runs: list[BenchmarkRun]) -> bool:
+    """A run of `vendor` in phase Publishing (publishable) has a finished task that stayed unpublished for more
+    than two publish intervals: pushes keep failing, so the planner starts no new run for the vendor."""
+    limit = timedelta(minutes=2 * settings.publish.interval_minutes)
+    now = datetime.now(UTC)
+    return any(
+        run.spec.vendor == vendor
+        and run.status.phase == RunPhase.PUBLISHING
+        and _publishable(settings, run)
+        and any(t.state == TaskState.DONE and not t.published and t.end and now - _utc(t.end) > limit
+                for t in run.status.tasks)
+        for run in runs
+    )  # fmt: skip
 
 
 def _published_at(run: BenchmarkRun) -> datetime | None:
@@ -440,7 +460,7 @@ class Publisher:
         if one.lscpu is not None:
             fields = variants.parse_lscpu_stdout(one.lscpu)
             variant = variants.pick_variant(self._existing_variants(run.vendor, run.sku), fields)
-        elif inp.status.get("exit_code", 0) >= 0:
+        elif inp.status.get("exit_code", 0) >= 0 and not _harness_error_without_node(inp.status, one.run_json):
             log.warning("%s/%s: no lscpu result for the run, cannot pick a variant yet", run.run_id, item.key)
             return _SKIPPED
         elif item.forced and not (self._repo / "data" / run.vendor / run.sku).exists():
@@ -521,16 +541,20 @@ class Publisher:
             # GitHub's host keys ship with the package; any other host key is refused
             env["GIT_SSH_COMMAND"] = (
                 f"ssh -i {shlex.quote(str(self._private_key()))} -o IdentitiesOnly=yes "
-                f"-o StrictHostKeyChecking=yes -o UserKnownHostsFile={shlex.quote(str(KNOWN_HOSTS))}"
+                f"-o StrictHostKeyChecking=yes -o UserKnownHostsFile={shlex.quote(str(KNOWN_HOSTS))} {SSH_OPTIONS}"
             )
-        return subprocess.run(
-            ["git", "-c", "commit.gpgsign=false", *args],
-            cwd=cwd or self._repo,
-            env=env,
-            capture_output=True,
-            text=True,
-            check=check,
-        )
+        try:
+            return subprocess.run(
+                ["git", "-c", "commit.gpgsign=false", *args],
+                cwd=cwd or self._repo,
+                env=env,
+                capture_output=True,
+                text=True,
+                check=check,
+                timeout=GIT_TIMEOUT_SECONDS,
+            )
+        except subprocess.TimeoutExpired as e:  # fails the cycle; the next one starts from a fresh fetch
+            raise RuntimeError(f"git {args[0]} timed out after {GIT_TIMEOUT_SECONDS} s") from e
 
     def _private_key(self) -> Path:
         """Copy of the deploy key in the workdir, mode 0600 and owned by this process: a Secret mount is root-owned
@@ -560,29 +584,54 @@ class Publisher:
                 f"to a mounted key file (currently {self._env.git_key_file or 'unset'})"
             )
         branch = self._env.git_branch
-        if not (self._repo / ".git").exists():
+        if not self._checkout_usable():
             if not self._env.git_url:
                 raise RuntimeError("K8SI_GIT_URL is not set")
+            shutil.rmtree(self._repo, ignore_errors=True)  # a broken or half-cloned checkout
             self._repo.parent.mkdir(parents=True, exist_ok=True)
-            self._git(
-                "clone", "--filter=blob:none", "--depth", "1", "--branch", branch, "--sparse",
-                self._env.git_url, str(self._repo), cwd=self._repo.parent,
-            )  # fmt: skip
+            try:
+                self._git(
+                    "clone", "--filter=blob:none", "--depth", "1", "--branch", branch, "--sparse",
+                    self._env.git_url, str(self._repo), cwd=self._repo.parent,
+                )  # fmt: skip
+            except Exception:  # failed or timed out: leave no partial checkout behind
+                shutil.rmtree(self._repo, ignore_errors=True)
+                raise
         self._git("fetch", "--depth", "1", "origin", branch)
         self._git("reset", "--hard", f"origin/{branch}")
         self._git("clean", "-fd")
         self._git("sparse-checkout", "set", "--cone" if cone else "--no-cone", *sparse)
 
-    def read_schedule_metas(self, vendor: str) -> dict[str, dict[str, dict]]:
+    def _checkout_usable(self) -> bool:
+        """The checkout exists and git can resolve its `HEAD`."""
+        if not (self._repo / ".git").exists():
+            return False
+        try:
+            return all(
+                self._run_git(args, False).returncode == 0
+                for args in (("rev-parse", "--git-dir"), ("rev-parse", "--verify", "-q", "HEAD"))
+            )
+        except RuntimeError:  # timeout
+            return False
+
+    def read_schedule_metas(self, vendor: str) -> dict[str, dict[str, dict | None]]:
         """`{sku: {task: meta}}` from the `data/<vendor>/<sku>/schedule/<task>/meta.json` files of origin/<branch>,
         for the planner. Only those files are checked out (the other outputs are never downloaded), in the
-        publisher's checkout, under its lock."""
+        publisher's checkout, under its lock. A malformed file is logged and its meta is None: the planner then
+        skips that SKU (reading it as "never run" would plan the task again)."""
         _safe_part(vendor)
         with self._lock:
             self._sync([f"/data/{vendor}/*/schedule/*/meta.json"], cone=False)
-            found: dict[str, dict[str, dict]] = {}
+            found: dict[str, dict[str, dict | None]] = {}
             for path in (self._repo / "data" / vendor).glob("*/schedule/*/meta.json"):
-                found.setdefault(path.parts[-4], {})[path.parts[-2]] = json.loads(path.read_text())
+                try:
+                    meta = json.loads(path.read_text())
+                    if not isinstance(meta, dict):
+                        raise ValueError("not a JSON object")
+                except ValueError as e:  # includes JSONDecodeError and UnicodeDecodeError
+                    log.warning("malformed %s: %s", path.relative_to(self._repo), e)
+                    meta = None
+                found.setdefault(path.parts[-4], {})[path.parts[-2]] = meta
             return found
 
     def _git_names(self, path: str) -> list[str]:
@@ -640,6 +689,13 @@ def _lscpu_of(status: dict, run_json: dict | None, legacy_status: dict | None):
         same = legacy_status and legacy_status.get("attempt") == n
         return entry["lscpu_stdout"].encode(), legacy_status if same else None
     return None, None
+
+
+def _harness_error_without_node(status: dict, run_json: dict | None) -> bool:
+    """A `256` of a run that never had a node: no lscpu will ever come, so it is filed like a negative code
+    (meta only) and git records it."""
+    attempts = (run_json or {}).get("attempts") or []
+    return status.get("exit_code") == ExitCode.HARNESS_ERROR and not any(a.get("node") for a in attempts)
 
 
 def _timing_attempt(run_json: dict | None) -> dict | None:

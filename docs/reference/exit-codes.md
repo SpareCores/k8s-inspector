@@ -6,8 +6,8 @@
 |---|---|---|---|
 | `0` | task succeeded | | none |
 | `> 0` | the task's own exit code; `137` with `OOMKilled` when the container's cgroup recorded an OOM kill during the task and the task failed | `OOMKilled` if applicable | none until the task hash or `revision` changes |
-| `256` | harness error: `sc-run` could not start the command, or the controller failed handling the step; also every unfinished task of a run whose reconciles kept failing for 30 minutes | message | none |
-| `-1` | no node: capacity, quota, no offering, boot failure, provisioning budget passed | `SCARPENTER_<ICE\|QUOTA\|QUOTA_ZERO\|NO_OFFERING\|BOOT_FAILURE>: <NodeClaim message>` | retried after 2 h; `QUOTA_ZERO` and `NO_OFFERING` only after 24 h |
+| `256` | harness error: `sc-run` could not start the command, or the controller failed handling the step; also every unfinished task of a run whose reconciles kept failing for 30 minutes (in a run that never had a node it is written to `schedule/` only, like a negative code) | message | none |
+| `-1` | no node: capacity, quota, no offering (also an anchor that stays unschedulable without a NodeClaim for `deadlines.noOfferingMinutes`), boot failure, provisioning budget passed | `SCARPENTER_<ICE\|QUOTA\|QUOTA_ZERO\|NO_OFFERING\|BOOT_FAILURE>: <NodeClaim message>` | retried after 2 h; `QUOTA_ZERO` and `NO_OFFERING` only after 24 h |
 | `-3` | precheck contradicts the node (for example a GPU task on a node without an NVIDIA GPU) | reason | none |
 | `-4` | the task never finished: node lost, spot interruption, image pull timeout, eviction, step or anchor deadline, run cancelled, outputs lost | `SPOT_INTERRUPTED`, `NODE_LOST`, `IMAGE_PULL_TIMEOUT`, `EVICTED`, `DEADLINE_EXCEEDED`, `CANCELLED`, `OUTPUTS_LOST` | `start_retries += 1`; retried after 2 h (first), 6 h (second); a spot interruption is handled within the run first ([spot](../explanation/spot.md)) |
 | `-5` | three `-4` in a row | `exceeded 3 start retries` | never again until the hash or `revision` changes |
@@ -35,6 +35,10 @@ mean `sc-run` died.
 container runtime is wedged the Pod can stay `Running` past its deadline; the controller's watchdog force-deletes it
 and records `-4 DEADLINE_EXCEEDED`, unless the uploads verify and `result.json` has an exit code
 ([run model](../explanation/run-model.md#wedged-step-pods)).
+
+Planner retry: a retry starts at the later of the backoff in the table (counted from the task's end) and the deletion
+of the run that recorded the failure, because a SKU with a `BenchmarkRun` is never planned again; the run is deleted
+`publish.keepRunHours` after publishing, so a retry waits at least `keepRunHours`.
 
 DBaaS tasks follow the same rules (no endless retry).
 

@@ -323,6 +323,28 @@ def test_finished_task_without_lscpu_is_given_up_after_keep_run_hours(tmp_path, 
     assert "not publishable" in caplog.text
 
 
+def test_harness_error_of_a_run_without_a_node_goes_to_schedule_only(tmp_path, origin, cluster):
+    storage = FakeStorage()
+    status = {"start": "2026-10-01T10:00:00", "end": "2026-10-01T10:01:00", "exit_code": 256, "error_msg": "x",
+              "task_hash": "h", "run_id": RUN_ID, "attempt": 1}  # fmt: skip
+    storage.put_task("geekbench", status)
+    run = cluster.add_run(["geekbench"])
+    make_publisher(tmp_path, origin, storage).publish_once(ENABLED)
+    inst = clone(origin, tmp_path) / "data/hcloud/cax31"
+    assert json.loads((inst / "schedule/geekbench/meta.json").read_text())["exit_code"] == 256
+    assert [p.name for p in inst.iterdir()] == ["schedule"] and run.status.tasks[0].published
+
+
+def test_harness_error_of_a_run_with_a_node_still_waits_for_lscpu(tmp_path, origin, cluster):
+    storage = FakeStorage()
+    status = golden_status("openssl") | {"exit_code": 256, "end": datetime.now(UTC).replace(tzinfo=None).isoformat()}
+    storage.put_task("openssl", status)
+    storage.objects[okey(KEY, "run.json")] = json.dumps({"attempts": [{"attempt": 1, "node": "n1"}]}).encode()
+    run = cluster.add_run(["openssl"])
+    result = make_publisher(tmp_path, origin, storage).publish_once(ENABLED)
+    assert result.tasks_published == 0 and not run.status.tasks[0].published
+
+
 def test_new_hardware_gets_the_next_variant_and_a_known_one_is_reused(tmp_path, origin, storage, cluster):
     pub = make_publisher(tmp_path, origin, storage)
     cluster.add_run(["lscpu"])
@@ -452,6 +474,83 @@ def test_read_schedule_metas_checks_out_only_the_schedule_metas_and_leaves_the_p
     assert pub.read_schedule_metas("nothing") == {}
     pub._sync(["data/hcloud/a"])  # the publisher's cone checkout still works afterwards
     assert (tmp_path / "work" / "repo" / "data" / "hcloud" / "a" / "0" / "lscpu" / "stdout").exists()
+
+
+def test_read_schedule_metas_marks_a_malformed_meta_as_none(tmp_path, origin, storage, caplog):
+    seed = clone(origin, tmp_path, "seed2")
+    for sku, text in (("a", "{not json"), ("a2", "[1]"), ("b", json.dumps({"exit_code": 0}))):
+        (seed / "data" / "hcloud" / sku / "schedule" / "lscpu").mkdir(parents=True)
+        (seed / "data" / "hcloud" / sku / "schedule" / "lscpu" / "meta.json").write_text(text)
+    git(seed, "add", "-A")
+    git(seed, "commit", "-m", "more")
+    git(seed, "push", "origin", "HEAD:main")
+    env = EnvConfig(bucket="b", bucket_region="r", git_url=origin.as_uri())
+    metas = publisher.Publisher(None, storage, env, tmp_path / "work").read_schedule_metas("hcloud")
+    assert metas == {"a": {"lscpu": None}, "a2": {"lscpu": None}, "b": {"lscpu": {"exit_code": 0}}}
+    assert "malformed data/hcloud/a/schedule/lscpu/meta.json" in caplog.text
+
+
+def test_git_command_times_out_into_a_failed_cycle_and_ssh_has_timeouts(tmp_path, storage, monkeypatch):
+    seen = {}
+
+    def fake_run(cmd, **kwargs):
+        seen.update(kwargs)
+        raise subprocess.TimeoutExpired(cmd, kwargs["timeout"])
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    key = tmp_path / "key"
+    key.write_text("key")
+    env = EnvConfig(bucket="b", bucket_region="r", git_url="git@example.test:x/y.git", git_key_file=str(key))
+    with pytest.raises(RuntimeError, match="git fetch timed out after 600 s"):
+        publisher.Publisher(None, storage, env, tmp_path / "work")._git("fetch")
+    assert seen["timeout"] == 600
+    command = seen["env"]["GIT_SSH_COMMAND"]
+    assert "ConnectTimeout=30" in command and "ServerAliveInterval=15" in command and "ServerAliveCountMax=4" in command
+
+
+def _stalled_cluster(cluster, minutes_ago: int, vendor="hcloud"):
+    run = cluster.add_run(["lscpu"], vendor=vendor)
+    ended = datetime.now(UTC) - timedelta(minutes=minutes_ago)
+    run.status.tasks[0].end = ended
+    return run
+
+
+def test_publishing_stalled_after_two_publish_intervals(cluster):
+    runs = list(cluster.runs.values())
+    assert not publisher.publishing_stalled(ENABLED, "hcloud", runs)
+    _stalled_cluster(cluster, 9)
+    assert not publisher.publishing_stalled(ENABLED, "hcloud", list(cluster.runs.values()))  # 2 x 5 min = 10
+    cluster.runs.clear()
+    run = _stalled_cluster(cluster, 11)
+    runs = list(cluster.runs.values())
+    assert publisher.publishing_stalled(ENABLED, "hcloud", runs)
+    assert not publisher.publishing_stalled(ENABLED, "oci", runs)
+    run.status.tasks[0].published = True
+    assert not publisher.publishing_stalled(ENABLED, "hcloud", runs)
+    run.status.tasks[0].published = False
+    run.status.phase = RunPhase.RUNNING
+    assert not publisher.publishing_stalled(ENABLED, "hcloud", runs)
+
+
+def test_broken_or_half_cloned_checkout_is_cloned_again(tmp_path, origin, storage):
+    pub = make_publisher(tmp_path, origin, storage)
+    repo = tmp_path / "work" / "repo"
+    pub._sync([])
+    (repo / ".git" / "HEAD").write_text("ref: refs/heads/nowhere\n")  # HEAD cannot be resolved
+    (repo / "stale").write_text("x")
+    pub._sync([])
+    assert git(repo, "rev-parse", "HEAD").strip() and not (repo / "stale").exists()
+    shutil.rmtree(repo / ".git" / "objects")  # not a repository any more
+    pub._sync([])
+    assert git(repo, "rev-parse", "HEAD").strip()
+
+
+def test_failed_clone_leaves_no_partial_checkout(tmp_path, storage):
+    env = EnvConfig(bucket="b", bucket_region="r", git_url=(tmp_path / "missing.git").as_uri())
+    pub = publisher.Publisher(None, storage, env, tmp_path / "work")
+    with pytest.raises(subprocess.CalledProcessError):
+        pub._sync([])
+    assert not (tmp_path / "work" / "repo").exists()
 
 
 def test_deploy_key_is_passed_to_git_through_ssh_command(tmp_path, origin, storage, monkeypatch):

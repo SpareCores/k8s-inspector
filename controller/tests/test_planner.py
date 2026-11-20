@@ -494,6 +494,72 @@ def test_only_published_skus_of_enabled_auto_plan_vendors(kube, keeper_skus):
     assert plan(kube, cfg, {}) == []  # autoPlan off
 
 
+def test_gpu_tasks_are_dropped_for_a_sku_without_a_gpu(kube, keeper_skus):
+    keeper_skus["oci"]["s1"] = {"nvidia_smi": ["KEEPER_NO_GPU"]}
+    gpu = {t.name for t in all_tasks() if t.gpu}
+    (planned,) = plan(kube, auto_config(), {}, dry_run=True)
+    assert gpu and not gpu & set(planned.tasks) and "lscpu" in planned.tasks
+    keeper_skus["oci"]["s1"] = {}  # a GPU SKU keeps them
+    (planned,) = plan(kube, auto_config(), {}, dry_run=True)
+    assert gpu <= set(planned.tasks)
+
+
+def test_a_sku_with_only_gpu_tasks_due_is_not_planned(kube, keeper_skus):
+    keeper_skus["oci"] = {"s1": {"nvidia_smi": ["KEEPER_NO_GPU"]}, "s2": {}}
+    cpu_done = {name: done_meta(name) for name in DEFAULT_TASKS if not get_task(name).gpu}
+    assert [p.sku for p in plan(kube, auto_config(), {"s1": cpu_done, "s2": cpu_done})] == ["s2"]
+
+
+def test_sku_names_that_are_no_label_values_are_skipped_with_one_warning(kube, keeper_skus, caplog):
+    keeper_skus["oci"] = {"bad sku": {}, "bad/two": {}, "good": {}}
+    assert [p.sku for p in plan(kube, auto_config(), {})] == ["good"]
+    warnings = [r.message for r in caplog.records if "not label values" in r.message]
+    assert len(warnings) == 1 and "skips 2 SKUs of vendor oci" in warnings[0]
+
+
+def test_unreadable_meta_skips_only_that_sku(kube, keeper_skus):
+    keeper_skus["oci"] = {"s1": {}, "s2": {}}
+    metas = {"s1": {"lscpu": None}, "s2": {}}
+    assert [p.sku for p in plan(kube, auto_config(max_in_flight=2), metas)] == ["s2"]
+
+
+def test_vendor_with_stalled_publishing_gets_no_new_run(kube, keeper_skus, caplog):
+    run = RunSpec("oci", "old", "r1", ["lscpu"])
+    kube.create("benchmarkrun", crd.to_manifest(run, "inspector"))
+    ended = (datetime.now(UTC) - timedelta(minutes=11)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    kube.objects[crd.run_name("oci", "old")]["status"] = {
+        "phase": "Publishing",
+        "tasks": [{"name": "lscpu", "state": "Done", "attempt": 1, "end": ended, "published": False}],
+    }
+    assert plan(kube, auto_config(max_in_flight=2), {}) == []
+    assert "publishing is failing" in caplog.text
+    kube.objects[crd.run_name("oci", "old")]["status"]["tasks"][0]["published"] = True
+    assert len(plan(kube, auto_config(max_in_flight=2), {})) == 1
+
+
+def test_no_active_servers_for_an_enabled_vendor_is_logged(kube, keeper_skus, caplog):
+    keeper_skus["oci"] = {}
+    caplog.set_level("INFO")
+    assert plan(kube, auto_config(), {}) == []
+    assert "no ACTIVE servers for vendor oci" in caplog.text
+
+
+def test_keeper_answer_is_cached_for_30_minutes(kube, monkeypatch):
+    calls = []
+    monkeypatch.setattr(keeper, "active_servers_block_reasons", lambda env, names: calls.append(1) or {"oci": {}})
+    clock = [1000.0]
+    monkeypatch.setattr(planner.time, "monotonic", lambda: clock[0])
+    cache = planner.KeeperCache()
+    for _ in range(2):
+        planner.plan_cycle(kube, auto_config(), lambda vendor: {}, keeper_cache=cache)
+    assert len(calls) == 1
+    clock[0] += 31 * 60
+    planner.plan_cycle(kube, auto_config(), lambda vendor: {}, keeper_cache=cache)
+    assert len(calls) == 2
+    planner.plan_cycle(kube, auto_config(), lambda vendor: {})  # no cache object: asks every time
+    assert len(calls) == 3
+
+
 def test_due_reason_without_a_result_or_for_a_current_success():
     task = get_task("lscpu")
     assert planner.due_reason(task, None, NOW) == "never run"
