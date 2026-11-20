@@ -15,8 +15,9 @@ The cluster also runs web services and applications. Benchmarks must neither dis
 
 The controller is a long-running Deployment (1 replica, `strategy: Recreate`) on the `apps` NodePool (decision K2).
 It is not a CronJob: the `apps` pool scales from zero, and a job every few minutes would launch and remove a node each
-time. The Pod carries `karpenter.sh/do-not-disrupt: "true"`, because the `apps` pool consolidates underutilized nodes
-and a restart in the middle of a git push is wasted work.
+time. The Pod does not carry `karpenter.sh/do-not-disrupt`: the `apps` pool consolidates only empty nodes, and drift
+or upgrade replacements must be able to move the controller. A restart resumes every run from its `status.step`, and a
+git push interrupted mid-way is retried on the next publish cycle.
 
 The `apps` pool should run on UpCloud, where the project has the most credits. UpCloud bills by the hour with a
 monthly cap, so one always-on small node costs a fixed amount, while launching and removing nodes within an hour

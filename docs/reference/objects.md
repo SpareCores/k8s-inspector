@@ -12,7 +12,7 @@ All namespaced objects live in namespace `inspector`. API group of the custom re
 | `inspector.sparecores.com/attempt` | anchor, steps | attempt number |
 | `inspector.sparecores.com/task` | steps | task name (`probe` for the probe step) |
 | `inspector.sparecores.com/cancel: "true"` | BenchmarkRun | cancel request (`k8s-inspector cancel`); the controller ends the run |
-| `karpenter.sh/do-not-disrupt: "true"` | anchor, controller Pod | blocks voluntary disruption |
+| `karpenter.sh/do-not-disrupt: "true"` | anchor | blocks voluntary disruption of the bench node |
 
 ## BenchmarkRun
 

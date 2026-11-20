@@ -18,8 +18,6 @@ spec:
   template:
     metadata:
       labels: {app.kubernetes.io/name: k8s-inspector}
-      annotations:
-        karpenter.sh/do-not-disrupt: "true"
     spec:
       serviceAccountName: k8s-inspector
       automountServiceAccountToken: true     # Kubernetes API access
