@@ -1,7 +1,7 @@
 # k8s-inspector controller
 
 The Python controller (`k8s-inspector serve | plan | run | status | cancel | publish`). Design:
-[docs](../docs/index.md); package layout and module interfaces: `INTERFACES.md` (temporary).
+[docs](../docs/index.md); each module's docstring says which document it implements.
 
 Requires Python >= 3.15 and [uv](https://docs.astral.sh/uv/).
 

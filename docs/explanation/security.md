@@ -52,7 +52,7 @@ are switched over ([roadmap](../roadmap.md)).
   steps is a websocket upgrade), Secrets (create, get, update, delete; no list or watch, so it cannot enumerate
   `inspector-secrets` or the platform Secrets), ConfigMaps (get, create, patch; `k8s-inspector-spot` is created on first
   use), `benchmarkruns` (create, get, list, watch, patch, delete) and `benchmarkruns/status` (patch). Cluster-wide:
-  get Nodes; get, list and delete NodeClaims (orphan cleanup). Nothing else.
+  get Nodes; get, list and delete NodeClaims (the stale node of an attempt). Nothing else.
 
 ## Public repository
 

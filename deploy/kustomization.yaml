@@ -6,3 +6,5 @@ resources:
 - controller/rbac.yaml
 - controller/configmap.yaml
 - controller/deployment.yaml
+- controller/priorityclass.yaml
+- controller/resourcequota.yaml

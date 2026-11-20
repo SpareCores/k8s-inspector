@@ -32,13 +32,15 @@ stays in the spool and is listed as missing in the manifest.
 ## In the controller
 
 The controller is the only component with object storage credentials (cluster OIDC → cloud IAM role, decision K4).
+Its credentials refresh `resignEveryMinutes` + 15 minutes before they expire, so a presigned URL never outlives the
+credentials that signed it.
 
 | When | What |
 |---|---|
-| Before creating a step | Starts a multipart upload (`CreateMultipartUpload`) for each large-capable file, presigns the PUT URLs and the UploadPart URLs (16 MiB × 64 parts per large file, up to 1 GiB), writes them into the run's Secret, which the step mounts. |
+| Before creating a step | Starts a multipart upload (`CreateMultipartUpload`) for each large-capable file, presigns the PUT URLs and the UploadPart URLs (16 MiB parts: 16 for `stdout` and `stderr`, `uploads.maxParts` for `resource_tracker.jsonl` and the task's `large_outputs`), writes them into the run's Secret, which the step mounts. Only serial tasks have large-capable standard files; the parallel hardware probes run without a resource tracker and upload every file with a single PUT. The URL file stays below 700 KiB (a Secret holds 1 MiB): a step that exceeds it is not started and its tasks end `256`. |
 | Every hour while a step runs | Re-signs the URLs (signatures live at most 12 h, the role session limit). The kubelet refreshes the mounted Secret within about a minute; `sc-run` re-reads it before each request. A 26-hour task therefore uploads directly. |
 | When a step ends | Reads `manifest.json`, completes each multipart upload with the reported ETags (`CompleteMultipartUpload`), checks every object's size with `HEAD`, aborts unused multipart uploads, then writes the task's `status.json` next to the outputs. **`status.json` is the task's commit point.** |
-| If anything is missing | Creates a `flush` step on the same node (the `sc-run` image, fresh URLs, same spool) and checks again. After two failed flushes the task is recorded with `outputs lost`. |
+| If anything is missing | Creates a `flush` step on the same node (the `sc-run` image, fresh URLs, same spool) and checks again. After two failed flushes the controller completes what the uploaded parts allow (salvage) and records the task with `outputs lost` when it had exited 0. |
 | Only then | Moves on to the next step, or releases the node by deleting the anchor. |
 
 Presigning of `CreateMultipartUpload`, `CompleteMultipartUpload` and `AbortMultipartUpload` is technically possible but
@@ -54,9 +56,11 @@ not something AWS documents; the controller calls them itself, and only `PutObje
 | Controller down | nothing for finished steps; uploads continue with URLs valid up to 12 h | the anchor idle timeout releases the node 45 min after the last heartbeat |
 | Spot reclaim, `expireAfter`, manual node delete | at most the in-flight task (≤60 s of its log tail is in storage) | `do-not-disrupt` stops only voluntary disruption; notices are 30 s-5 min ([vendors](../reference/vendors.md)) |
 
-For the node-loss case the controller salvages what it can: it completes the in-flight multipart uploads from
-`ListParts` (normally only `sc-run`'s ETags are used), keeps the last re-PUT of the small logs, and records the task as
-`-4` with the reason. Previous tasks of that run are untouched, because each was confirmed before the next began.
+For the node-loss case the controller first deletes the step Pods and waits until none can still upload (while the
+node exists), then salvages: it completes the in-flight multipart uploads from `ListParts`, keeps the last re-PUT of the
+small logs, and records the task as `-4` with the reason. Previous tasks of that run are untouched, because each was
+confirmed before the next began. Nothing is salvaged when the task runs again (a spot interruption with another
+attempt left) or when the run is cancelled: the open uploads are aborted, as nobody reads the partial output.
 
 A bucket lifecycle rule `AbortIncompleteMultipartUpload` (7 days) on the output prefix removes parts of uploads that
 were never completed.
@@ -72,19 +76,27 @@ The publisher runs in the controller every 5 minutes and on demand. It never mov
    sc-inspector does: variant dir, `meta.json`, `stdout`/`stderr` (the `raw` transform), geekbench `results.json`,
    the parsers (`dmidecode`, `openssl`, `stressnglongrun` → `parsed.*`, `lstopo` → `lstopo.svg`), timing files, the
    `schedule/` union. A task whose `start` is older than the meta already in git is skipped (stale duplicate).
-   - The **variant** is picked per run from that run's own `lscpu` task output (`tasks/lscpu/stdout`) and the
+   - The **variant** is picked from the `lscpu` output of the attempt that ran the task (`run.json`
+     `attempts[].lscpu_stdout`, an attempt being the one in the task's `status.json`) and the
      `variant.json` files in the checkout; the publisher assigns a new number when the hardware is new. A task with
      a negative exit code and no usable `lscpu` result goes to `schedule/<task>/meta.json` only; one with exit code
      0 or above waits for the next cycle rather than land in the wrong variant.
-   - The **timing** files come from the `timing` map of the run's `run.json` (`api_end`, `machine_start`,
-     `node_registered`, `node_ready`, written by the controller as the run progresses), plus `api_start` (run
-     created) and `inspector_start`/`inspector_end` (first task start, last task end).
+   - The **timing** files come from the attempt of the task: the latest `run.json` `attempts[]` entry with an lscpu
+     result (else its `timing` map) gives `api_start` (the attempt's anchor created), `api_end`, `machine_start`,
+     `node_registered` and `node_ready`; the publisher adds `inspector_start`/`inspector_end` (first task start, last
+     task end). They go to the variant of that attempt.
    - **Transforms and parsers run only for tasks with exit code 0**; `stdout` and `stderr` are written for every
      exit code except the harness error `256`.
    - **`-5`** is created here, not by the runner: the runner records `-4`, and the publisher, which sees the
-     previous `meta.json` in git, counts consecutive `-4` in `start_retries` and writes the third as `-5`
-     ([exit codes](../reference/exit-codes.md)).
-   - A vendor is published only with `publish: true` ([configuration](../reference/configuration.md)).
+     previous `meta.json` in git, counts consecutive `-4` of the same task hash in `start_retries` and writes the
+     third as `-5` ([exit codes](../reference/exit-codes.md)). Any other exit code, or a changed hash, resets the
+     count.
+   - A SKU is published only when its vendor is enabled with `publish: true` or a list that names it
+     ([configuration](../reference/configuration.md)); the runs of other SKUs are deleted after `keepRunHours`, their
+     outputs stay in object storage, and `publish --rescan --sku` can publish them later.
+   - A forced run of a SKU that git does not know and that has no `lscpu` result (a typo) publishes nothing.
+   - A task whose rendering fails 12 cycles in a row is published without parser output.
+   - Git over SSH pins GitHub's published host keys (`StrictHostKeyChecking=yes`); the deploy key is the only secret.
 4. One commit per cycle, push. On a non-fast-forward, start again at step 2: rendering is a pure function of object
    storage plus the tree, so there is no rebase or conflict handling.
 5. After the push, set `published: true` (with the commit SHA) on those tasks. A crash between push and patch

@@ -22,13 +22,30 @@ logs/inspect/<vendor>/<sku>/<Y>/<m>/<d>/<run_id>/tasks/<task>/stdout
 | `<Y>/<m>/<d>` | the run's creation date (UTC), fixed for all attempts of the run |
 | `run_id` | `r<UTC yyyymmdd>t<hhmm>-<4 hex>`, lowercase `t`, for example `r20261120t0930-3f9c`; also the `timing/<run_id>/` directory in git and `TRACKER_EXTERNAL_RUN_ID` |
 | `<task>` | task name; vLLM probes as `vllm-probe-<image>`; a task repeated in a later attempt overwrites its keys |
-| `run.json` | controller: vendor, SKU, plan, attempts (capacity type, node, NodeClaim, region, zone, price, node timings, outcome), variant |
+| `run.json` | controller, see [run.json](#runjson) |
 | `status.json` | controller, after uploads are verified: the final `meta.json` content plus Kubernetes facts (Pod, reason, image digest, node) |
 | Bucket rules | `AbortIncompleteMultipartUpload` after 7 days on `logs/inspect/`; the existing retention otherwise |
 
 Access: the controller's IAM role may create, complete, abort and list multipart uploads, put, get, head and list under
 `logs/inspect/`. Nothing else, and no write access to the CDN dataset prefix: the pgbench dataset is read from the
 CDN and never uploaded by benchmark runs (`SC_CDN_UPLOAD=0`).
+
+## run.json
+
+Written by the controller whenever the node, the probe step or the end of an attempt adds facts; earlier attempts'
+entries are kept.
+
+```json
+{"vendor": "oci", "sku": "VM.Standard.E5.Flex.2-16", "run_id": "r20261120t0930-3f9c",
+ "plan": ["lscpu", "stressngfull"], "variant": 0, "database": null,
+ "timing": {"api_start": "…", "api_end": "…", "machine_start": "…", "node_registered": "…", "node_ready": "…"},
+ "attempts": [{"attempt": 1, "api_start": "…", "api_end": "…", "machine_start": "…", "node_registered": "…",
+               "node_ready": "…", "lscpu_stdout": "…", "capacity_type": "spot", "node": "…", "node_claim": "…",
+               "end": "…", "outcome": "SpotInterrupted", "region": "…", "zone": "…", "price": "0.0337"}]}
+```
+
+`timing` repeats the latest attempt's timings. `api_start` of an attempt is the creation of its anchor. Each attempt's
+`lscpu_stdout` is what picks the [variant](#sc-inspector-data) of the tasks that ran in it.
 
 ## sc-inspector-data
 
@@ -48,11 +65,12 @@ the contract to keep.
 | `dbaas/<vendor>/<id>/postgres/<ver>/standalone/<task>/{meta.json,stdout}` | DBaaS results | yes |
 | not carried over to git | `resource_tracker.jsonl`, `postgres.log`, `result.json`, `manifest.json`, `status.json`, `version`: object storage only | — |
 
-Timing files (from `run.json` `timing`): `api_start` = run created, `api_end` = NodeClaim launched, `machine_start` = kernel boot time from
-`sc-run`, plus `node_registered`, `node_ready`, `inspector_start`/`inspector_end` (first and last step).
+Timing files (from the task's attempt in `run.json`): `api_start` = the attempt's anchor created, `api_end` =
+NodeClaim launched, `machine_start` = kernel boot time from `sc-run`, plus `node_registered`, `node_ready`,
+`inspector_start`/`inspector_end` (first task start and last task end).
 
-Variant dirs `<N>` are integers; a run picks its variant after the probe step with the ported `variant_id.py`
-(`ID_VERSION=1`).
+Variant dirs `<N>` are integers; the publisher picks the variant of a task from the `lscpu` output of its attempt with
+the ported `variant_id.py` (`ID_VERSION=1`).
 
 sc-crawler supports OCI, and the published data already has OCI servers, so results under `data/oci/...` on `main` flow
 into sc-crawler and the published data. A SKU is published only after its outputs are checked to parse correctly and to

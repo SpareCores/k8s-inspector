@@ -1,0 +1,8 @@
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: benchmark-pods
+  namespace: inspector
+spec:
+  hard:
+    pods: "60"

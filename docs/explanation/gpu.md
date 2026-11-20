@@ -46,10 +46,12 @@ vendor, region, Flatcar version and branch; it is not planned.
 
 ## k8s-inspector side
 
-- **GPU first, then CPU.** On GPU types every step uses `runtimeClassName: nvidia`. If the container cannot start
-  (`StartError`, `CreateContainerError`, `RunContainerError`), the step is recreated once without the runtime class,
-  except tasks that need the GPU. A non-zero exit is final, as today.
+- **GPU first, then CPU.** On GPU types every step uses `runtimeClassName: nvidia`. If a container never ran its task
+  (a container start error, `sc-run` failing itself with exit `256`, or an image pull timeout), the step is
+  recreated once without the runtime class, except when a failed container's task needs the GPU or is the vLLM GPU
+  image (the ladder moves on to the CPU images). A non-zero exit of a task that ran is final, as today.
 - **GPU facts.** A `gpu_facts` container in the probe step reports VRAM and compute capability; they drive the vLLM
-  image ladder (skip the GPU image below compute capability 8.0) and the nvbandwidth buffer size.
+  image ladder (skip the GPU image below compute capability 8.0) and the nvbandwidth buffer size (512 MiB, 256 MiB
+  up to 2 GiB of VRAM or when the VRAM is unknown).
 - **Precheck.** A GPU task planned on a node without an NVIDIA accelerator label or lshw entry ends as `-3`.
 - vLLM gets `/dev/shm` of 4 GiB; llm and vllm share a per-node model cache (hostPath).

@@ -36,7 +36,6 @@ data:
       provisionGpuHours: 6
       imagePullMinutes: 15
       holdIdleMinutes: 45
-      orphanNodeClaimMinutes: 30
     publish:
       intervalMinutes: 5
       keepRunHours: 24

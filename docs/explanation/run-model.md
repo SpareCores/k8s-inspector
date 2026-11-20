@@ -6,7 +6,7 @@
 
 A benchmark needs the whole machine and a clean state, so a node is never shared between runs or reused after one.
 Bench NodePools have billing retention off, and the controller checks that the anchor's node was created after the
-anchor (otherwise it deletes the anchor and that NodeClaim and tries again).
+anchor (otherwise it deletes the anchor and that NodeClaim and tries again; the third failed attempt ends the run).
 
 ## Anchor
 
@@ -38,6 +38,9 @@ The anchor is the only Pod the scheduler and SCarpenter ever see for a run.
   `hostPID` (storage only) and runtime class (GPU only).
 - The controller sequences steps and makes the adaptive decisions that need earlier results: hardware variant after
   the probe step, GPU-first-then-CPU retry, vLLM image ladder, nvbandwidth buffer size (ported from sc-inspector).
+- The step in flight (containers, images, commands, GPU runtime) is stored in `status.step` before its Pod is created.
+  A restarted controller creates or watches exactly that step; it never plans it again, so a changed catalogue or
+  an adaptive decision cannot alter what a Pod already runs.
 
 Pod specs: [Kubernetes objects](../reference/objects.md).
 
@@ -90,12 +93,17 @@ stateDiagram-v2
   Provisioning --> Failed: budget passed / ICE / quota (-1)
   Running --> Running: next step
   Running --> Releasing: all tasks done, uploads confirmed
-  Running --> Interrupted: node or anchor gone (spot, expiry, cancel)
+  Running --> Interrupted: node or anchor gone (spot, expiry, manual delete)
   Releasing --> [*]: anchor deleted, node removed
   Interrupted --> [*]: remaining tasks go to the next attempt or end as -4
 ```
 
-A run has one or more attempts. Only the [spot strategy](spot.md) and node loss create more than one.
+A run has one or more attempts. Only the [spot strategy](spot.md) and a failed provisioning (a node older than its
+anchor, a vanished anchor) create more than one. An anchor that ends while its node is healthy is a `NODE_LOST` attempt without a spot
+record.
+
+A run whose reconciles fail 10 times in a row, or for 30 minutes, ends `Failed`: its unfinished tasks are `256`
+(harness error), and the anchor and the urls Secret are deleted, so the SKU lease is released.
 
 ## Teardown layers
 
@@ -104,9 +112,8 @@ A run has one or more attempts. Only the [spot strategy](spot.md) and node loss 
 | 1 | Controller deletes the anchor → empty node → `WhenEmpty` | normal path |
 | 2 | Step `activeDeadlineSeconds` (kubelet) and the `sc-run` timeout | hung task, stuck upload |
 | 3 | Anchor `activeDeadlineSeconds` and the `sc-run hold` idle timeout | dead or stuck controller; enforced on the node |
-| 4 | Controller: bench NodeClaims without an anchor for 30 min → delete | controller-level leaks |
-| 5 | NodePool `expireAfter: 48h` (the longest run, with the 26 h `stressnglongrun`, needs up to ~44 h) + `terminationGracePeriod: 1h` | an anchor held forever |
-| 6 | SCarpenter garbage collection of tagged instances without a NodeClaim | controller crash during launch |
-| 7 | Alert "bench node running too long" ([monitoring](monitoring.md)) | everything above failed, cluster or SCarpenter bug |
+| 4 | NodePool `expireAfter: 48h` (the longest run, with the 26 h `stressnglongrun`, needs up to ~44 h) + `terminationGracePeriod: 1h` | an anchor held forever |
+| 5 | SCarpenter garbage collection of tagged instances without a NodeClaim | controller crash during launch |
+| 6 | Alert "bench node running too long" ([monitoring](monitoring.md)) | everything above failed, cluster or SCarpenter bug |
 
 There is no out-of-cluster force-deleter (decision K22): an alert and a human come first.

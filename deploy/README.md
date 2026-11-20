@@ -1,7 +1,8 @@
 # deploy
 
-Kustomize base of the controller: the CRD (`crd/`), ServiceAccount, RBAC, default ConfigMap and Deployment
-(`controller/`). `kubectl apply -k deploy` installs it into the namespace `inspector`.
+Kustomize base of the controller: the CRD (`crd/`), ServiceAccount, RBAC, default ConfigMap, Deployment, the
+PriorityClass `benchmark` and the ResourceQuota `pods: 60` (`controller/`). `kubectl apply -k deploy` installs it into
+the namespace `inspector`.
 
 ## Platform objects
 
@@ -32,6 +33,12 @@ patches:
 ```
 
 The `sc-run` image is an environment variable, not a container image, so the `images:` transformer does not reach it.
+
+## Priority and quota
+
+Benchmark Pods reference the PriorityClass `benchmark` (`value: -10`, `preemptionPolicy: Never`, not the global default):
+they rank below every default Pod and never evict anything. The ResourceQuota `benchmark-pods` caps the namespace at 60
+Pods. The controller's ClusterRole needs no PriorityClass rights, because Pods only name the class.
 
 ## RBAC
 

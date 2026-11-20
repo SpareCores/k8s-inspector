@@ -33,7 +33,7 @@ vendors:
     maxInFlight: 2               # 0 pauses the vendor
     maxUsdPerHour: 2.0
     capacity: SpotFirst          # SpotFirst (the default) | OnDemand
-    publish: false               # true: the publisher pushes this vendor's results to sc-inspector-data
+    publish: false               # true, or a list of SKUs: the publisher pushes these results to sc-inspector-data
     nodePools: {cpu: bench-oci, lowmem: bench-oci-lowmem, gpu: null}
 defaults:
   maxInFlight: 2
@@ -54,7 +54,6 @@ deadlines:
   provisionGpuHours: 6
   imagePullMinutes: 15
   holdIdleMinutes: 45
-  orphanNodeClaimMinutes: 30
 publish:
   intervalMinutes: 5
   keepRunHours: 24
@@ -68,7 +67,9 @@ uploads:
 ```
 
 Only vendors listed with `enabled: true` are touched, and their results reach sc-inspector-data only with
-`publish: true` (default `false`: runs and outputs happen, git stays untouched). A vendor is enabled here when it is
+`publish: true` or a list of SKUs (default `false`: runs and outputs happen, git stays untouched, and the runs of
+SKUs that are not published are deleted after `keepRunHours`; their outputs stay in object storage and
+`publish --rescan --sku` can publish them later). A vendor is enabled here when it is
 removed from the legacy pipeline ([roadmap](../roadmap.md)); there is no shared routing file.
 
 ## CLI

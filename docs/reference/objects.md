@@ -37,7 +37,10 @@ spec:
 status:
   phase: Running            # Pending | Provisioning | Running | Releasing | Publishing | Done | Failed | Cancelled
   progress: "7/19"          # tasks finished / planned
-  currentStep: geekbench
+  currentStep: 07-geekbench      # name of the step Pod created last
+  step:                          # the step in flight, read back after a restart, never planned again
+    {index: 7, name: 07-geekbench, gpuRuntime: false,
+     containers: [{key: geekbench, image: …, command: …, timeoutSeconds: 3600, env: {…}}]}
   attempt: 1
   capacityType: spot
   node: <node name>
@@ -129,7 +132,8 @@ spec:
 ```
 
 - Step deadline = image pull (`deadlines.imagePullMinutes`, 15 m) + version 1 m + the longest container timeout +
-  upload 10 m + slack 5 m. The anchor deadline is the sum of the step deadlines plus 1 h.
+  upload 10 m + slack 5 m. The anchor deadline is the sum of the step deadlines (the probe step, every serial task,
+  one more probe step per vLLM image) plus two flush Pods (15 m each) per step, `holdAfter` and 1 h.
 - `--version-cmd` is `entrypoint` + the catalogue's `version_command`, shell-quoted: `sc-run` runs it with `sh -c`,
   while the catalogue value is, as `command`, arguments of the image (`--version`).
 - The vLLM probe containers carry their own 18 min timeout (`--probe-only` waits for the server).
@@ -184,4 +188,5 @@ what is left.
 | ConfigMap `k8s-inspector-spot` | per-SKU interruption counts ([spot](../explanation/spot.md)) |
 | Secret `inspector-secrets` | benchmark secrets (External Secrets) |
 | Jobs `dbaas-up-<run>`, `dbaas-down-<run>` | DBaaS provisioning ([DBaaS](../explanation/dbaas.md)) |
-| PriorityClass `benchmark` | low value, `preemptionPolicy: Never` |
+| PriorityClass `benchmark` | value `-10`, `preemptionPolicy: Never`, not the global default; shipped in `deploy/` |
+| ResourceQuota `benchmark-pods` | `pods: 60` in `inspector`; shipped in `deploy/` |
