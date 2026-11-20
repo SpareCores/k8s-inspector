@@ -69,7 +69,7 @@ from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 
 from k8s_inspector import crd, pods, render, spot, steps, tasks, variant
-from k8s_inspector.kube import AlreadyExists, Kube, NotFound
+from k8s_inspector.kube import AlreadyExists, Kube, NotFound, backoff_delay, retry_until_ok
 from k8s_inspector.model import (
     AttemptOutcome,
     AttemptStatus,
@@ -352,7 +352,7 @@ class Runner:
         for kind, labels in watches:
             threading.Thread(target=self._watch, args=(kind, labels, stop), daemon=True, name=f"watch-{kind}").start()
         threading.Thread(target=self._resync_loop, args=(stop,), daemon=True, name="resync").start()
-        self._resync()
+        retry_until_ok("initial LIST of runs", self._resync, stop)
         while not stop.is_set():
             try:
                 name = self._queue.get(timeout=1.0)
@@ -399,11 +399,14 @@ class Runner:
             self._end_run(run, ExitCode.HARNESS_ERROR, message, AttemptOutcome.HARNESS_ERROR)
 
     def _watch(self, kind: str, labels: dict | None, stop: threading.Event) -> None:
+        """Watch until `stop`; any error (429, 5xx, the CRD not established yet) restarts it with backoff."""
+        failures = 0
         while not stop.is_set():
             try:
                 for event in self.kube.watch(kind, labels=labels):
                     if stop.is_set():
                         return
+                    failures = 0
                     name = (
                         _meta(event.obj).get("name")
                         if kind == "benchmarkrun"
@@ -413,9 +416,13 @@ class Runner:
                         if kind == "benchmarkrun":
                             self._known.add(name)
                         self.enqueue(name)
-            except Exception:
-                log.warning("watch of %s ended, restarting", kind, exc_info=True)
-            stop.wait(5.0)
+                error = None
+            except Exception as e:
+                error = e
+            failures += 1
+            delay = backoff_delay(failures, error)
+            log.warning("watch of %s ended, restarting in %.0fs", kind, delay, exc_info=error)
+            stop.wait(delay)
 
     def _resync_loop(self, stop: threading.Event) -> None:
         while not stop.wait(RESYNC_SECONDS):

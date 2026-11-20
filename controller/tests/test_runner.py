@@ -9,11 +9,15 @@ import json
 import threading
 from datetime import UTC, datetime, timedelta
 
+import httpx2 as httpx
 import pytest
 from fakes import Clock, Cluster, FakeKube, FakeStorage, iso
+from lightkube import ApiError
 
 from k8s_inspector import crd, pods, steps, tasks
+from k8s_inspector import kube as kube_mod
 from k8s_inspector import runner as runner_mod
+from k8s_inspector.kube import WatchEvent
 from k8s_inspector.model import (
     AttemptOutcome,
     CapacityMode,
@@ -677,6 +681,78 @@ def test_run_forever_drives_a_run_from_a_resync(h):
         stop.set()
         thread.join(5)
     assert not thread.is_alive()
+
+
+def api_error(code: int, headers: dict | None = None) -> ApiError:
+    body = {"kind": "Status", "status": "Failure", "code": code, "message": "transient"}
+    return ApiError(response=httpx.Response(code, json=body, headers=headers))
+
+
+@pytest.fixture
+def fast_backoff(monkeypatch):
+    monkeypatch.setattr(runner_mod, "backoff_delay", lambda failures, error=None: 0.01)
+    monkeypatch.setattr("k8s_inspector.kube.backoff_delay", lambda failures, error=None: 0.01)
+
+
+def test_run_forever_survives_a_failing_initial_list(h, fast_backoff):
+    """429 while the CRD is being established: retried, then the run is processed."""
+    h.start(["geekbench"])
+    real_list, failures = h.kube.list, [0]
+
+    def flaky_list(kind, labels=None):
+        if kind == "benchmarkrun" and failures[0] < 3:
+            failures[0] += 1
+            raise api_error(429, {"Retry-After": "1"})
+        return real_list(kind, labels)
+
+    h.kube.list = flaky_list
+    stop = threading.Event()
+    thread = threading.Thread(target=h.runner.run_forever, args=(stop,))
+    thread.start()
+    try:
+        for _ in range(200):
+            if h.kube.objects.get("pod"):
+                break
+            stop.wait(0.05)
+        assert thread.is_alive()
+        assert failures[0] == 3
+        assert h.pod_names("anchor") == [f"{h.name}-a1"]
+    finally:
+        stop.set()
+        thread.join(5)
+    assert not thread.is_alive()
+
+
+def test_watch_restarts_after_a_transient_error(h, fast_backoff):
+    h.start(["geekbench"])
+    calls = [0]
+
+    def flaky_watch(kind, labels=None, resource_version=None):
+        calls[0] += 1
+        if calls[0] == 1:
+            raise api_error(503)
+        yield WatchEvent("ADDED", kind, h.kube.list(kind)[0])
+        stop.wait()
+
+    h.kube.watch = flaky_watch
+    stop = threading.Event()
+    thread = threading.Thread(target=h.runner._watch, args=("benchmarkrun", None, stop))
+    thread.start()
+    try:
+        assert h.runner._queue.get(timeout=5) == h.name
+        assert calls[0] == 2
+    finally:
+        stop.set()
+        thread.join(5)
+    assert not thread.is_alive()
+
+
+def test_backoff_delay_grows_is_capped_and_honours_retry_after():
+    assert 0.7 <= kube_mod.backoff_delay(1) <= 1.3
+    assert 2.9 <= kube_mod.backoff_delay(3) <= 5.1
+    assert kube_mod.backoff_delay(30) <= 75
+    assert kube_mod.backoff_delay(1, api_error(429, {"Retry-After": "20"})) == 20
+    assert kube_mod.backoff_delay(1, api_error(429, {"Retry-After": "soon"})) < 2
 
 
 def test_helpers():

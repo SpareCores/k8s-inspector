@@ -5,9 +5,15 @@ import threading
 import urllib.request
 from datetime import UTC, datetime, timedelta
 
+import httpx2 as httpx
 import pytest
+from fakes import Clock
+from fakes import FakeKube as ClusterKube
+from lightkube import ApiError
 
 from k8s_inspector import cli, crd, planner
+from k8s_inspector import kube as kube_mod
+from k8s_inspector import runner as runner_mod
 from k8s_inspector.kube import NotFound
 from k8s_inspector.model import (
     BenchmarkRun,
@@ -475,6 +481,43 @@ def test_serve_starts_everything_and_stops_on_event(controller):
     assert not thread.is_alive()
     assert result == [0]
     assert sorted(stopped) == ["planner", "publisher", "runner"]
+
+
+def test_serve_keeps_running_while_the_api_is_throttled(controller, monkeypatch):
+    """The real Runner meets 429s on its first LIST (CRD not established yet): serve must not exit."""
+    clock = Clock(datetime(2026, 11, 20, tzinfo=UTC))
+    fake = ClusterKube(clock)
+    failures = [0]
+    real_list = fake.list
+
+    def throttled(kind, labels=None):
+        if kind == "benchmarkrun" and failures[0] < 2:
+            failures[0] += 1
+            body = {"kind": "Status", "status": "Failure", "code": 429, "message": "too many"}
+            raise ApiError(response=httpx.Response(429, json=body))
+        return real_list(kind, labels)
+
+    fake.list = throttled
+    monkeypatch.setattr(cli, "Runner", runner_mod.Runner)
+    monkeypatch.setattr(kube_mod, "backoff_delay", lambda failures, error=None: 0.01)
+    monkeypatch.setattr(runner_mod, "backoff_delay", lambda failures, error=None: 0.01)
+    stop = threading.Event()
+    result = []
+    provider = cli.ConfigProvider(FakeKube(), ENV)
+    thread = threading.Thread(target=lambda: result.append(cli.serve(fake, provider, stop, free_port())))
+    thread.start()
+    try:
+        for _ in range(100):
+            if failures[0] == 2:
+                break
+            stop.wait(0.05)
+        stop.wait(0.3)
+        assert failures[0] == 2
+        assert thread.is_alive() and not stop.is_set()
+    finally:
+        stop.set()
+        thread.join(10)
+    assert result == [0]
 
 
 def test_serve_exits_1_when_a_component_dies(controller, monkeypatch):

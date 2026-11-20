@@ -8,7 +8,10 @@ Threading: `Kube` is used from several threads (watch threads, the reconciler, p
 lightkube's sync `Client` is safe for that. `watch` is a blocking generator: run it in its own thread.
 """
 
-from collections.abc import Iterator
+import logging
+import random
+import threading
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 
 import httpx2
@@ -17,6 +20,8 @@ from lightkube import ApiError
 from lightkube.core.client import PatchType
 from lightkube.generic_resource import create_global_resource, create_namespaced_resource
 from lightkube.resources import core_v1
+
+log = logging.getLogger(__name__)
 
 KINDS = ("pod", "secret", "configmap", "node", "nodeclaim", "event", "benchmarkrun")
 
@@ -80,6 +85,39 @@ def _is_gone(error: httpx2.HTTPStatusError) -> bool:
     if isinstance(error, ApiError):
         return error.status.code == 410
     return error.response.status_code == 410
+
+
+BACKOFF_START_SECONDS = 1.0
+BACKOFF_MAX_SECONDS = 60.0
+
+
+def backoff_delay(failures: int, error: Exception | None = None) -> float:
+    """Seconds to wait after the `failures`-th failure in a row (1, 2, 4 ... 60, with jitter). A 429 or 503
+    with a numeric `Retry-After` header waits at least that long."""
+    delay = min(BACKOFF_START_SECONDS * 2 ** max(failures - 1, 0), BACKOFF_MAX_SECONDS)
+    delay *= random.uniform(0.75, 1.25)  # noqa: S311 - jitter, not security
+    response = getattr(error, "response", None)
+    retry_after = response.headers.get("Retry-After", "") if response is not None else ""
+    if retry_after.isdigit():
+        delay = max(delay, min(float(retry_after), BACKOFF_MAX_SECONDS))
+    return delay
+
+
+def retry_until_ok(what: str, action: Callable[[], None], stop: threading.Event) -> bool:
+    """Call `action` until it returns without raising, waiting with `backoff_delay` between attempts and
+    logging each failure as a warning (API errors while the cluster or the CRD settles are transient).
+    False when `stop` was set first."""
+    failures = 0
+    while not stop.is_set():
+        try:
+            action()
+            return True
+        except Exception as error:
+            failures += 1
+            delay = backoff_delay(failures, error)
+            log.warning("%s failed (%d in a row), retrying in %.0fs", what, failures, delay, exc_info=True)
+            stop.wait(delay)
+    return False
 
 
 class Kube:
