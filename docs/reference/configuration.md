@@ -93,7 +93,7 @@ The bench NodePool has no `limits`: the goal is to benchmark every instance type
 size or total bound. The cap on started and running instances of a vendor is `vendors.<v>.maxInFlight`
 (default `defaults.maxInFlight`, 2; 0 pauses the vendor). The count is the larger of the runs that hold or are
 acquiring a node (Pending, Provisioning, Running, Releasing, and a Failed or Cancelled run until its anchor Pod is
-deleted) and the live NodeClaims of the vendor in the bench NodePool (NodeClaims carry the label `scarpenter.sparecores.com/vendor`; an instance can outlive its anchor). This is a
+deleted) and the live NodeClaims of the vendor in the bench NodePool (NodeClaims carry the vendor in `spec.requirements` from creation and as the label `scarpenter.sparecores.com/vendor` after launch; an instance can outlive its anchor). This is a
 lower bound ("at least" that many instances); leftover NodeClaims without a holding run count as instances but do
 not add to the spend. It applies to forced runs; autoPlan uses the same check.
 

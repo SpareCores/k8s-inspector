@@ -19,8 +19,6 @@ log = logging.getLogger(__name__)
 # Phases in which a run holds (or is about to hold) a node. A run in any other phase (Failed, Cancelled) still
 # counts while its anchor Pod exists, until the runner deletes the anchor and releases the node.
 ACTIVE_PHASES = frozenset({RunPhase.PENDING, RunPhase.PROVISIONING, RunPhase.RUNNING, RunPhase.RELEASING})
-NODEPOOL_LABEL = "karpenter.sh/nodepool"
-VENDOR_LABEL = "scarpenter.sparecores.com/vendor"
 PRICE_ANNOTATION = "scarpenter.sparecores.com/price"
 
 
@@ -57,10 +55,11 @@ def _labels(pod: dict) -> dict:
 
 
 def live_nodeclaims(kube: Kube, cfg: Config, vendor: str) -> int:
-    """Live NodeClaims of `vendor` in the bench NodePool (the NodeClaim carries the vendor label). An instance can
+    """Live NodeClaims of `vendor` in the bench NodePool. Only the pool label is there from creation: the vendor
+    comes from the label after launch, before it from `spec.requirements` (`pods.claim_vendor`). An instance can
     outlive its anchor (provision deadline passed while Karpenter still launches; drain after release)."""
-    labels = {NODEPOOL_LABEL: cfg.settings.bench_pool, VENDOR_LABEL: vendor}
-    return len(kube.list("nodeclaim", labels=labels))
+    claims = kube.list("nodeclaim", labels={pods.NODEPOOL_LABEL: cfg.settings.bench_pool})
+    return sum(1 for claim in claims if pods.claim_vendor(claim) == vendor)
 
 
 def check_vendor_budget(kube: Kube, cfg: Config, vendor: str, runs: list[BenchmarkRun]) -> None:

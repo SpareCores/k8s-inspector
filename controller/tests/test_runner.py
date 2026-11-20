@@ -204,6 +204,36 @@ def test_timeout_step_is_minus_six(h):
     assert h.codes()["geekbench"] == (-6, "Execution timed out after 3600s")
 
 
+def test_unlaunched_nodeclaim_at_the_deadline_is_boot_failure_not_ice(h):
+    h.cluster.provision_enabled = False
+    h.start(["geekbench"])
+    h.runner.reconcile(h.name)
+    anchor = h.kube.get("pod", f"{h.name}-a1")
+    selector = anchor["spec"]["nodeSelector"]
+    h.kube.create(  # as Karpenter creates it: pool label only, the instance type in spec.requirements
+        "nodeclaim",
+        {
+            "metadata": {
+                "name": "claim-unlaunched",
+                "labels": {"karpenter.sh/nodepool": selector["karpenter.sh/nodepool"]},
+                "creationTimestamp": iso(h.clock.now + timedelta(seconds=1)),
+            },
+            "spec": {
+                "requirements": [
+                    {
+                        "key": "node.kubernetes.io/instance-type",
+                        "operator": "In",
+                        "values": [selector["node.kubernetes.io/instance-type"]],
+                    }
+                ]
+            },
+        },
+    )
+    h.clock.advance(hours=3)
+    h.runner.reconcile(h.name)
+    assert h.codes()["geekbench"][1].startswith("SCARPENTER_BOOT_FAILURE")
+
+
 def test_image_pull_stuck_becomes_minus_four_and_the_run_continues(h):
     h.cluster.behaviour["geekbench"] = [{"pull_stuck": True}]
     h.start(["membench", "geekbench"])

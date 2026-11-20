@@ -29,6 +29,10 @@ from k8s_inspector.model import (
 )
 from k8s_inspector.steps import VLLM_PROBE_TIMEOUT
 
+NODEPOOL_LABEL = "karpenter.sh/nodepool"
+VENDOR_LABEL = "scarpenter.sparecores.com/vendor"
+INSTANCE_TYPE_LABEL = "node.kubernetes.io/instance-type"
+
 NODE_DIR = "/var/lib/k8s-inspector"  # hostPath on the node; mounted at /k8si in every Pod
 MOUNT_DIR = "/k8si"
 URLS_MOUNT = "/k8si-urls"
@@ -726,3 +730,28 @@ def classify(pod: dict, containers: Sequence[StepContainer]) -> dict[str, TaskOu
         else:
             result[container.key] = _outcome_from_state(container.key, status, pod)
     return result
+
+
+def _claim_requirement(claim: dict, key: str) -> str | None:
+    """The single value of an `In` requirement in `spec.requirements` (copied from the anchor's nodeSelector)."""
+    for req in claim.get("spec", {}).get("requirements") or []:
+        if req.get("key") == key and req.get("operator") == "In" and len(req.get("values") or []) == 1:
+            return req["values"][0]
+    return None
+
+
+def claim_instance_type(claim: dict) -> str | None:
+    """A NodeClaim's instance type: the label (after launch), else the `spec.requirements` entry (from creation)."""
+    labels = claim.get("metadata", {}).get("labels") or {}
+    return labels.get(INSTANCE_TYPE_LABEL) or _claim_requirement(claim, INSTANCE_TYPE_LABEL)
+
+
+def claim_vendor(claim: dict) -> str | None:
+    """A NodeClaim's vendor: the label (after launch), else the vendor requirement, else the prefix of the
+    `<vendor>.<sku>` instance type (before launch only `spec.requirements` carries them)."""
+    labels = claim.get("metadata", {}).get("labels") or {}
+    vendor = labels.get(VENDOR_LABEL) or _claim_requirement(claim, VENDOR_LABEL)
+    if vendor:
+        return vendor
+    instance_type = claim_instance_type(claim)
+    return instance_type.partition(".")[0] if instance_type and "." in instance_type else None

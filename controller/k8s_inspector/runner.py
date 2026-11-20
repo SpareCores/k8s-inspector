@@ -106,9 +106,9 @@ DISK_PRESSURE_RECHECK_SECONDS = 30
 DISK_PRESSURE_TAINT = "node.kubernetes.io/disk-pressure"
 
 # Kubernetes and SCarpenter names read from Node and NodeClaim.
-NODEPOOL_LABEL = "karpenter.sh/nodepool"
+NODEPOOL_LABEL = pods.NODEPOOL_LABEL
 CAPACITY_LABEL = "karpenter.sh/capacity-type"
-INSTANCE_TYPE_LABEL = "node.kubernetes.io/instance-type"
+INSTANCE_TYPE_LABEL = pods.INSTANCE_TYPE_LABEL
 SCARPENTER = "scarpenter.sparecores.com"
 RELAUNCH_ANNOTATION = "inspector.sparecores.com/relaunch"  # on a step Pod recreated after a DiskPressure rejection
 PRICE_ANNOTATION = f"{SCARPENTER}/price"
@@ -766,12 +766,13 @@ class Runner:
         """NodeClaims created for this anchor's pool and instance type since the anchor exists."""
         selector = anchor["spec"]["nodeSelector"]
         created = _time(_meta(anchor).get("creationTimestamp"))
-        claims = self.kube.list(
-            "nodeclaim",
-            labels={NODEPOOL_LABEL: selector[NODEPOOL_LABEL], INSTANCE_TYPE_LABEL: selector[INSTANCE_TYPE_LABEL]},
-        )
+        # Before launch a NodeClaim has only the pool label; its instance type is in `spec.requirements`.
+        claims = self.kube.list("nodeclaim", labels={NODEPOOL_LABEL: selector[NODEPOOL_LABEL]})
         return [
-            c for c in claims if created is None or (_time(_meta(c).get("creationTimestamp")) or created) >= created
+            c
+            for c in claims
+            if pods.claim_instance_type(c) == selector[INSTANCE_TYPE_LABEL]
+            and (created is None or (_time(_meta(c).get("creationTimestamp")) or created) >= created)
         ]
 
     def _retry_provisioning(self, run: BenchmarkRun, cfg: Config, live: dict[str, dict], why: str) -> None:
@@ -861,9 +862,11 @@ class Runner:
 
     def _claim_of(self, node: dict, anchor: dict) -> dict | None:
         """The NodeClaim that produced the node (`status.nodeName`)."""
-        pool = anchor["spec"]["nodeSelector"][NODEPOOL_LABEL]
-        for claim in self.kube.list("nodeclaim", labels={NODEPOOL_LABEL: pool}):
-            if claim.get("status", {}).get("nodeName") == _meta(node)["name"]:
+        selector = anchor["spec"]["nodeSelector"]
+        for claim in self.kube.list("nodeclaim", labels={NODEPOOL_LABEL: selector[NODEPOOL_LABEL]}):
+            if pods.claim_vendor(claim) == selector[pods.VENDOR_LABEL] and (
+                claim.get("status", {}).get("nodeName") == _meta(node)["name"]
+            ):
                 return claim
         return None
 

@@ -13,8 +13,8 @@ anchor (otherwise it deletes the anchor and that NodeClaim and tries again; the 
 The anchor is the only Pod the scheduler and SCarpenter ever see for a run.
 
 - `nodeSelector`: `karpenter.sh/nodepool: <benchPool>` (`bench`),
-  `node.kubernetes.io/instance-type: <vendor>.<sku>` and `scarpenter.sparecores.com/vendor: <vendor>` (so a SKU name
-  shared by two vendors cannot land on the wrong one), plus a `karpenter.sh/capacity-type` requirement set by the
+  `node.kubernetes.io/instance-type: <vendor>.<sku>` and `scarpenter.sparecores.com/vendor: <vendor>` (the vendor selector
+  keeps the per-vendor NodeClaim count and the intent clear; instance types are vendor-prefixed, so SKU names do not collide), plus a `karpenter.sh/capacity-type` requirement set by the
   [spot strategy](spot.md).
 - It holds the node: a Running Pod keeps the node non-empty, and `karpenter.sh/do-not-disrupt: "true"` blocks
   consolidation and drift. It does **not** block spot reclaim, `expireAfter` or a manual delete.
