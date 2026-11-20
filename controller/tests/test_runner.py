@@ -33,7 +33,7 @@ from k8s_inspector.model import (
     UploadSettings,
     VendorSettings,
 )
-from k8s_inspector.runner import RELAUNCH_ANNOTATION, SKU_NOT_SELECTABLE, SMALL_CPU_ANNOTATION, Runner
+from k8s_inspector.runner import CPU_REFUSALS_ANNOTATION, RELAUNCH_ANNOTATION, SKU_NOT_SELECTABLE, Runner
 from k8s_inspector.storage import Storage, object_key, render_urls_json
 
 START = datetime(2026, 11, 20, 10, 0, tzinfo=UTC)
@@ -1328,29 +1328,51 @@ def test_step_pod_requests_the_cpu_the_other_pods_leave_on_the_node(h):
     h.kube.foreign_pods.append(node_pod("flannel", f"node-{h.name}-a1", "500m"))
     h.kube.foreign_pods.append(node_pod("elsewhere", "other-node", "1"))
     h.drive(stop=lambda run: any(n.endswith("geekbench") for n in h.pod_names("step")))
-    # allocatable cpu 2 (the fake node) minus flannel's 500m, the anchor's 1m and the 10m margin
-    assert set(step_cpu_requests(h)) == {"1489m"}
+    # allocatable cpu 2 (the fake node) minus flannel's 500m, the anchor's 1m and the margin (the largest Pod, 500m)
+    assert set(step_cpu_requests(h)) == {"999m"}
     assert [c.get("limits", {}).get("cpu") for c in h.kube.get("pod", geekbench_pod(h))["spec"]["containers"]] == [None]
 
 
-def test_step_rejected_for_cpu_is_recreated_once_with_the_minimal_request(h):
-    h.cluster.behaviour["geekbench"] = [{"out_of_cpu": True}]
+def test_step_pod_requests_the_floor_when_the_node_pods_cannot_be_listed(h):
+    h.kube.node_pods_forbidden = True
     h.start(["geekbench"])
     h.drive(stop=lambda run: any(n.endswith("geekbench") for n in h.pod_names("step")))
-    h.cluster.react()  # the kubelet rejects it
-    name = geekbench_pod(h)
-    assert h.kube.get("pod", name)["spec"]["containers"][0]["resources"]["requests"]["cpu"] == "1989m"
+    assert set(step_cpu_requests(h)) == {"10m"}
+
+
+def refused_cpu_pod(h) -> dict:
+    h.drive(stop=lambda run: any(n.endswith("geekbench") for n in h.pod_names("step")))
+    h.cluster.react()  # the kubelet refuses it
+    return h.kube.get("pod", geekbench_pod(h))
+
+
+def cpu_of(pod: dict) -> str:
+    return pod["spec"]["containers"][0]["resources"]["requests"]["cpu"]
+
+
+def test_step_refused_for_cpu_is_recomputed_once_then_gets_the_floor(h):
+    h.cluster.behaviour["geekbench"] = [{"out_of_cpu": True}, {"out_of_cpu": True}]
+    h.start(["geekbench"])
+    pod = refused_cpu_pod(h)
+    name = pod["metadata"]["name"]
+    assert cpu_of(pod) == "1899m"
+    h.kube.foreign_pods.append(node_pod("newcomer", f"node-{h.name}-a1", "300m"))  # appeared since
     h.runner.reconcile(h.name)
     pod = h.kube.get("pod", name)
-    assert pod["metadata"]["annotations"][SMALL_CPU_ANNOTATION] == "1"  # read back after a restart
-    assert pod["spec"]["containers"][0]["resources"]["requests"]["cpu"] == "10m"
+    assert pod["metadata"]["annotations"][CPU_REFUSALS_ANNOTATION] == "1"  # read back after a restart
+    assert cpu_of(pod) == "1399m"  # recomputed: 2000 - anchor 1m - newcomer 300m - margin 300m (the largest Pod)
+    h.cluster.react()  # refused again
+    h.runner.reconcile(h.name)
+    pod = h.kube.get("pod", name)
+    assert pod["metadata"]["annotations"][CPU_REFUSALS_ANNOTATION] == "2"
+    assert cpu_of(pod) == "10m"
     run = h.drive()
     assert h.codes()["geekbench"] == (0, None)
     assert run.status.phase == RunPhase.PUBLISHING
 
 
-def test_step_rejected_for_cpu_twice_ends_minus_four_with_the_rejection_message(h):
-    h.cluster.behaviour["geekbench"] = [{"out_of_cpu": True}, {"out_of_cpu": True}]
+def test_step_rejected_for_cpu_three_times_ends_minus_four_with_the_rejection_message(h):
+    h.cluster.behaviour["geekbench"] = [{"out_of_cpu": True}] * 3
     h.storage.lost.add("geekbench")
     h.start(["geekbench"])
     h.drive()
@@ -1362,3 +1384,16 @@ def test_nice_of_the_task_reaches_status_json_and_meta(h):
     h.start(["geekbench"])
     h.drive()
     assert h.storage.status["geekbench"]["nice"] == -20
+
+
+def test_relaunch_markers_carry_over_so_mixed_refusals_stay_bounded(h):
+    h.cluster.behaviour["geekbench"] = [{"out_of_cpu": True}, {"rejected": True}, {"out_of_cpu": True}] + [
+        {"rejected": True}
+    ] * 10
+    h.storage.lost.add("geekbench")
+    h.start(["geekbench"])
+    h.drive()
+    pods_created = [n for k, n in h.kube.created if k == "pod" and n.endswith("geekbench")]
+    # CPU refusal, DiskPressure rejection (keeps the CPU count), CPU refusal (floor), DiskPressure again: no more
+    assert len(pods_created) == 4
+    assert h.codes()["geekbench"][0] == -4

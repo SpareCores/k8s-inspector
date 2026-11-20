@@ -9,7 +9,7 @@ from lightkube import ApiError
 from lightkube.config.kubeconfig import KubeConfig
 from lightkube.config.models import Cluster, User
 
-from k8s_inspector.kube import AlreadyExists, Conflict, Kube, NotFound, is_transient
+from k8s_inspector.kube import AlreadyExists, Conflict, Forbidden, Kube, NotFound, is_transient
 
 CRD_BASE = "/apis/inspector.sparecores.com/v1alpha1/namespaces/inspector/benchmarkruns"
 
@@ -243,3 +243,9 @@ def test_list_node_pods_selects_by_node_across_namespaces():
     found = make_kube(handler).list_node_pods("node-1")
     assert [p["metadata"]["name"] for p in found] == ["flannel", "anchor"]
     assert seen == [("/api/v1/pods", "spec.nodeName=node-1")]
+
+
+def test_list_node_pods_forbidden_is_translated():
+    kube = make_kube(lambda request: json_response(403, status_body(403, "Forbidden")))
+    with pytest.raises(Forbidden):
+        kube.list_node_pods("node-1")

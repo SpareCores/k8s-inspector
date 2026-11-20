@@ -161,13 +161,47 @@ def pod_requesting(*cpus, init=(), phase="Running"):
 
 
 def test_cpu_millicores_quantities():
-    assert [pods.cpu_millicores(q) for q in ("2", "0.5", "3920m", 4, "100m")] == [2000, 500, 3920, 4000, 100]
+    assert [pods.cpu_millicores(q) for q in ("2", "0.5", "3920m", 4, "100m", "2k")] == [
+        2000,
+        500,
+        3920,
+        4000,
+        100,
+        2_000_000,
+    ]
+    # sub-millicore values: others' requests round up, our own down
+    assert [pods.cpu_millicores(q) for q in ("100n", "1500u", "1001u", "2500000n")] == [1, 2, 2, 3]
+    assert [pods.cpu_millicores(q, round_up=False) for q in ("1500u", "1001u", "2500000n", "3920m", "0.5")] == [
+        1,
+        1,
+        2,
+        3920,
+        500,
+    ]
 
 
 def test_pod_cpu_request_is_containers_sum_or_biggest_init():
     assert pods.pod_cpu_request_millicores(pod_requesting("100m", "250m", None)) == 350
     assert pods.pod_cpu_request_millicores(pod_requesting("100m", init=("1",))) == 1000
     assert pods.pod_cpu_request_millicores({"spec": {"containers": [{}]}}) == 0
+
+
+def test_pod_cpu_request_counts_sidecars_overhead_and_pod_level_requests():
+    def sidecar(cpu):
+        return {"restartPolicy": "Always", "resources": {"requests": {"cpu": cpu}}}
+
+    def init(cpu):
+        return {"resources": {"requests": {"cpu": cpu}}}
+
+    pod = pod_requesting("100m")
+    pod["spec"]["initContainers"] = [sidecar("200m"), init("50m")]
+    assert pods.pod_cpu_request_millicores(pod) == 300  # steady: container + sidecar
+    pod["spec"]["initContainers"] = [sidecar("200m"), init("500m")]
+    assert pods.pod_cpu_request_millicores(pod) == 700  # init peak: sidecar already running + the init container
+    pod["spec"]["overhead"] = {"cpu": "50m"}
+    assert pods.pod_cpu_request_millicores(pod) == 750
+    pod["spec"]["resources"] = {"requests": {"cpu": "2"}}  # Pod-level requests override the container sums
+    assert pods.pod_cpu_request_millicores(pod) == 2050
 
 
 def test_step_cpu_is_what_the_other_pods_leave():
@@ -178,8 +212,11 @@ def test_step_cpu_is_what_the_other_pods_leave():
         pod_requesting("1", phase="Failed"),
         pod_requesting(None),  # no request
     ]
-    assert pods.step_cpu_millicores(4000, node_pods) == 4000 - 350 - pods.CPU_MARGIN_M
-    assert pods.step_cpu_millicores(3920, []) == 3920 - pods.CPU_MARGIN_M
+    # margin: the largest other Pod (250m) beats 100m and 5% of 4000
+    assert pods.cpu_margin_millicores(4000, node_pods) == 250
+    assert pods.step_cpu_millicores(4000, node_pods) == 4000 - 350 - 250
+    assert pods.step_cpu_millicores(3920, []) == 3920 - 196  # 5% of the allocatable
+    assert pods.step_cpu_millicores(1000, [pod_requesting("1m")]) == 1000 - 1 - 100  # the 100m minimum
 
 
 def test_step_cpu_never_drops_below_the_floor():
@@ -196,7 +233,12 @@ def test_step_pod_requests_the_given_cpu_split_over_containers_without_limit(run
     pod = pods.render_step(run, 1, step(container(a), container(b)), cfg, cpu_millicores=3900, **kw)
     assert [c["resources"]["requests"]["cpu"] for c in pod["spec"]["containers"]] == ["1950m", "1950m"]
     pod = pods.render_step(run, 1, step(container(a), container(b)), cfg, cpu_millicores=15, **kw)
-    assert [c["resources"]["requests"]["cpu"] for c in pod["spec"]["containers"]] == ["10m", "10m"]
+    assert [c["resources"]["requests"]["cpu"] for c in pod["spec"]["containers"]] == ["7m", "7m"]
+    pod = pods.render_step(run, 1, step(container(a), container(b)), cfg, cpu_millicores=3, **kw)  # 10m for the Pod
+    assert [c["resources"]["requests"]["cpu"] for c in pod["spec"]["containers"]] == ["5m", "5m"]
+    three = step(container(a), container(b), container(task("lsmem", parallel=True)))
+    pod = pods.render_step(run, 1, three, cfg, cpu_millicores=10, **kw)  # at least 1m each
+    assert [c["resources"]["requests"]["cpu"] for c in pod["spec"]["containers"]] == ["3m", "3m", "3m"]
     assert all("cpu" not in c["resources"].get("limits", {}) for c in pod["spec"]["containers"])
 
 

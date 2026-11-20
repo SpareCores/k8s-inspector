@@ -69,7 +69,7 @@ from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 
 from k8s_inspector import crd, pods, render, spot, steps, tasks, variant
-from k8s_inspector.kube import AlreadyExists, Kube, NotFound, backoff_delay, retry_until_ok
+from k8s_inspector.kube import AlreadyExists, Forbidden, Kube, NotFound, backoff_delay, retry_until_ok
 from k8s_inspector.model import (
     AttemptOutcome,
     AttemptStatus,
@@ -111,13 +111,29 @@ NODEPOOL_LABEL = pods.NODEPOOL_LABEL
 CAPACITY_LABEL = "karpenter.sh/capacity-type"
 INSTANCE_TYPE_LABEL = "node.kubernetes.io/instance-type"  # the node's label, recorded as the instance type
 SCARPENTER = "scarpenter.sparecores.com"
-SMALL_CPU_ANNOTATION = "inspector.sparecores.com/small-cpu"  # on a step Pod recreated after an OutOfcpu rejection
-RELAUNCH_ANNOTATION = "inspector.sparecores.com/relaunch"  # on a step Pod recreated after a DiskPressure rejection
+MARKER_PREFIX = "inspector.sparecores.com/"  # the relaunch markers below; a relaunch carries all of them over
+CPU_REFUSALS_ANNOTATION = f"{MARKER_PREFIX}cpu-refusals"  # on a recreated step Pod: OutOfcpu refusals so far
+RELAUNCH_ANNOTATION = f"{MARKER_PREFIX}relaunch"  # on a step Pod recreated after a DiskPressure rejection
+CPU_REFUSALS_FLOOR = 2  # after this many OutOfcpu refusals the step Pod requests the floor
+CPU_REFUSALS_MAX = 3  # the refusal after the floor request ends the step
 PRICE_ANNOTATION = f"{SCARPENTER}/price"
 PRICE_INCOMPLETE_ANNOTATION = f"{SCARPENTER}/price-incomplete"
 NODECLASS_HASH_ANNOTATION = f"{SCARPENTER}/nodeclass-hash"
 ACCELERATOR_MANUFACTURER_LABEL = f"{SCARPENTER}/accelerator-manufacturer"
 GPU_RESOURCE = "nvidia.com/gpu"
+
+
+def _markers(pod: dict) -> dict[str, str]:
+    """The inspector annotations of the Pod: the relaunch markers a recreated Pod carries over."""
+    return {k: v for k, v in (_meta(pod).get("annotations") or {}).items() if k.startswith(MARKER_PREFIX)}
+
+
+def _cpu_refusals(annotations: dict[str, str] | None) -> int:
+    try:
+        return int((annotations or {}).get(CPU_REFUSALS_ANNOTATION, 0))
+    except ValueError:
+        return CPU_REFUSALS_MAX  # garbled marker: stop retrying
+
 
 _UNITS = {
     "Ki": 2**10,
@@ -867,7 +883,7 @@ class Runner:
             arch=labels.get("kubernetes.io/arch", "amd64"),
             created=_time(meta["creationTimestamp"]),
             allocatable_memory_bytes=_quantity(allocatable.get("memory", 0)),
-            allocatable_cpu_millicores=pods.cpu_millicores(allocatable.get("cpu", 0)),
+            allocatable_cpu_millicores=pods.cpu_millicores(allocatable.get("cpu", 0), round_up=False),
             vcpus=_quantity(capacity["cpu"]) if "cpu" in capacity else None,
             memory_bytes=_quantity(capacity["memory"]) if "memory" in capacity else None,
             region=labels.get("topology.kubernetes.io/region"),
@@ -1001,7 +1017,7 @@ class Runner:
         if nd.disk_pressure:
             return False
         self.kube.delete("pod", name, grace_seconds=0)
-        self._launch(run, cfg, live, nd, step, annotations={RELAUNCH_ANNOTATION: "1"})
+        self._launch(run, cfg, live, nd, step, annotations={**_markers(pod), RELAUNCH_ANNOTATION: "1"})
         return True
 
     def _probe_tasks(self, run: BenchmarkRun, nd: _Node) -> list[TaskDef]:
@@ -1099,19 +1115,26 @@ class Runner:
             node_allocatable_memory_bytes=nd.facts.allocatable_memory_bytes,
             owner=self._anchor_owner(run, live),
             gpu_count=nd.gpu_count,
-            cpu_millicores=self._step_cpu_millicores(nd, small=SMALL_CPU_ANNOTATION in (annotations or {})),
+            cpu_millicores=self._step_cpu_millicores(nd, floor=_cpu_refusals(annotations) >= CPU_REFUSALS_FLOOR),
         )
         if annotations:
             _meta(pod).setdefault("annotations", {}).update(annotations)
         self._create("pod", pod)
 
-    def _step_cpu_millicores(self, nd: _Node, *, small: bool) -> int:
+    def _step_cpu_millicores(self, nd: _Node, *, floor: bool) -> int:
         """The step Pod's CPU request: the node's allocatable CPU minus what the Pods on it request, so the
         benchmark gets nearly all of the CPU weight kubelet derives from requests (see `pods.step_cpu_millicores`).
-        `small`: the floor, after the kubelet refused the big request."""
-        if small or not nd.facts.allocatable_cpu_millicores:
+        `floor`: the floor, after the kubelet refused the computed request twice; also when the node's Pods
+        cannot be listed (RBAC): the launch is never blocked."""
+        if floor or not nd.facts.allocatable_cpu_millicores:
             return pods.CPU_FLOOR_M
-        node_pods = self.kube.list_node_pods(nd.facts.node_name)
+        try:
+            node_pods = self.kube.list_node_pods(nd.facts.node_name)
+        except Forbidden:
+            log.warning(
+                "node %s: the Pods on it cannot be listed (forbidden), step Pod requests the floor", nd.facts.node_name
+            )
+            return pods.CPU_FLOOR_M
         return pods.step_cpu_millicores(nd.facts.allocatable_cpu_millicores, node_pods)
 
     def _relaunch_refused(
@@ -1126,15 +1149,17 @@ class Runner:
     def _relaunch_out_of_cpu(
         self, run: BenchmarkRun, cfg: Config, live: dict[str, dict], nd: _Node, step: Step, pod: dict
     ) -> bool:
-        """The kubelet refused the step Pod for its CPU request (Pods appeared on the node since the request
-        was computed): create it once more with the floor request. False when it already was that small one
-        (the marker lives on the recreated Pod, so it survives a controller restart)."""
+        """The kubelet refused the step Pod for its CPU request (Pods appeared on the node since it was computed):
+        create it again with the request recomputed from the node's current Pods; a second refusal gives the floor
+        request, a third is final (False). The count lives in one annotation of the recreated Pod, so it survives
+        a controller restart."""
         name = _meta(pod)["name"]
-        if (_meta(pod).get("annotations") or {}).get(SMALL_CPU_ANNOTATION):
+        refusals = _cpu_refusals(_meta(pod).get("annotations")) + 1
+        if refusals >= CPU_REFUSALS_MAX:
             return False
-        log.warning("run %s: step Pod %s refused for its CPU request, recreating it with the floor", run.name, name)
+        log.warning("run %s: step Pod %s refused for its CPU request (%d), recreating it", run.name, name, refusals)
         self.kube.delete("pod", name, grace_seconds=0)
-        self._launch(run, cfg, live, nd, step, annotations={SMALL_CPU_ANNOTATION: "1"})
+        self._launch(run, cfg, live, nd, step, annotations={**_markers(pod), CPU_REFUSALS_ANNOTATION: str(refusals)})
         return True
 
     def _watch_step(self, run: BenchmarkRun, cfg: Config, live: dict[str, dict], nd: _Node, draining: bool) -> None:

@@ -12,7 +12,7 @@ from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 
 from k8s_inspector import crd, pods
-from k8s_inspector.kube import AlreadyExists, Conflict, NotFound, WatchEvent
+from k8s_inspector.kube import AlreadyExists, Conflict, Forbidden, NotFound, WatchEvent
 from k8s_inspector.model import Manifest, ManifestObject, UploadPlan, Verification
 from k8s_inspector.storage import LARGE_STANDARD_FILES, STANDARD_FILES, Storage, object_key, run_json_key
 
@@ -52,6 +52,7 @@ class FakeKube:
         self.heartbeats: list[tuple[str, str]] = []
         self.created: list[tuple[str, str]] = []  # (kind, name) in order
         self.deleted: list[tuple[str, str]] = []
+        self.node_pods_forbidden = False  # `list_node_pods` raises Forbidden (no RBAC for the cluster-wide list)
         self.foreign_pods: list[dict] = []  # Pods of other namespaces (kube-system ...), seen by `list_node_pods` only
         self.force_deleted: list[str] = []  # Pods deleted with grace period 0
         self.secret_writes = 0
@@ -80,6 +81,8 @@ class FakeKube:
 
     def list_node_pods(self, node_name: str) -> list[dict]:
         """The Pods bound to the node: stored ones plus `foreign_pods` (other namespaces, written by tests)."""
+        if self.node_pods_forbidden:
+            raise Forbidden(node_name)
         pods = [*self._store("pod").values(), *self.foreign_pods]
         return [copy.deepcopy(p) for p in pods if p["spec"].get("nodeName") == node_name]
 

@@ -53,6 +53,10 @@ class NotFound(Exception):
     """404 from the API server."""
 
 
+class Forbidden(Exception):
+    """403 from the API server (RBAC)."""
+
+
 class AlreadyExists(Exception):
     """409 AlreadyExists on create: for BenchmarkRun it is the lease being held."""
 
@@ -73,6 +77,8 @@ def _translate(error: ApiError) -> Exception:
     code = error.status.code
     if code == 404:
         return NotFound(error.status.message)
+    if code == 403:
+        return Forbidden(error.status.message)
     if code == 409:
         if error.status.reason == "AlreadyExists":
             return AlreadyExists(error.status.message)

@@ -13,6 +13,9 @@ import re
 import shlex
 from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
+from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
+
+from lightkube.utils.quantity import parse_quantity
 
 from k8s_inspector.model import (
     BenchmarkRun,
@@ -55,8 +58,12 @@ STEP_VERSION = timedelta(minutes=1)
 STEP_UPLOAD = timedelta(minutes=10)
 ANCHOR_EXTRA = timedelta(hours=1)
 DB_RLIMITS = ("nofile=1048576", "memlock=unlimited")  # docker era: nofile 1048576, memlock -1
-CPU_FLOOR_M = 10  # smallest CPU request in millicores: the lowest cgroup weight, and the flush/fallback request
-CPU_MARGIN_M = 10  # left unrequested on the node, so the request never reaches the allocatable total
+CPU_FLOOR_M = (
+    10  # smallest CPU request of a whole Pod in millicores: the lowest cgroup weight, and the flush/fallback request
+)
+CONTAINER_FLOOR_M = 1  # smallest CPU request of one container of a multi-container step Pod
+CPU_MARGIN_MIN_M = 100  # smallest CPU left unrequested on the node (see `cpu_margin_millicores`)
+CPU_MARGIN_FRACTION = 20  # ... or 1/20 (5%) of the node's allocatable CPU
 TASK_NICE = -20  # generic rule: every benchmark gets as much CPU as possible (sc-run exec --nice)
 # `inspector-secrets` key -> environment variable of the container.
 SECRET_ENV = {
@@ -408,7 +415,7 @@ def render_step(
     image `container.image`, `command: [/k8si/bin/sc-run, exec, --task <key>, --timeout <t>, --spool
     /k8si/runs/<run_id>/<key>, --urls /k8si-urls/urls.json, --version-cmd ..., --collect ..., --, <entrypoint
     + resource-tracker/nice wrapper + command>]`, `privileged` + `seccompProfile: Unconfined`, requests
-    `cpu <cpu_millicores split evenly over the containers, each at least 10m>, memory 64Mi`, memory limit =
+    `cpu <cpu_millicores split evenly over the containers>, memory 64Mi`, memory limit =
     `task.memory_cap * node_allocatable_memory_bytes` when set (no CPU limits ever), `terminationMessagePolicy:
     File`, env: `TRACKER_*` (project, job name, external run id
     = `run_id`, output path in the spool) + `HF_TOKEN` for llm/vllm only + secrets from `inspector-secrets`
@@ -419,8 +426,8 @@ def render_step(
     `gpu_count` (extra keyword, default 0): the node's GPU count; a single-container GPU step then also
     requests all `nvidia.com/gpu`. Every GPU step exposes the GPUs through `NVIDIA_VISIBLE_DEVICES=all`.
 
-    `cpu_millicores` (extra keyword, default the 10m floor): the whole Pod's CPU request, see
-    `step_cpu_millicores`. Never a CPU limit."""
+    `cpu_millicores` (extra keyword, default the 10m floor): the whole Pod's CPU request (at least 10m for the
+    whole Pod, split over the containers with at least 1m each), see `step_cpu_millicores`. Never a CPU limit."""
     run_id = run.spec.run_id
     single = len(step.containers) == 1
     return {
@@ -453,7 +460,7 @@ def render_step(
                     gpu_count=gpu_count,
                     single=single,
                     allocatable=node_allocatable_memory_bytes,
-                    cpu_millicores=max(CPU_FLOOR_M, cpu_millicores // len(step.containers)),
+                    cpu_millicores=max(CONTAINER_FLOOR_M, max(CPU_FLOOR_M, cpu_millicores) // len(step.containers)),
                 )
                 for c in step.containers
             ],
@@ -620,39 +627,65 @@ def terminating_overdue(pod: dict, now: datetime) -> bool:
     return deleted is not None and now > deleted + WATCHDOG_MARGIN
 
 
-def cpu_millicores(quantity) -> int:
-    """A Kubernetes CPU quantity ("2", "0.5", "3920m") in millicores, rounded down."""
-    text = str(quantity)
-    if text.endswith("m"):
-        return int(float(text[:-1]))
-    return int(float(text) * 1000)
+def cpu_millicores(quantity, *, round_up: bool = True) -> int:
+    """A Kubernetes CPU quantity ("2", "0.5", "3920m", "1500u", "100n", "2k") in millicores, rounded up (other
+    Pods' requests: never undercount) or down (`round_up=False`: our own request). Values below a millicore are
+    already rounded up to 0.001 millicore by lightkube."""
+    text = str(quantity).strip()
+    match = re.fullmatch(r"([+-]?(?:\d+\.?\d*|\.\d+)(?:e[+-]?\d+)?)(.*)", text)
+    if not match:
+        raise ValueError(f"invalid CPU quantity: {text!r}")
+    number, suffix = Decimal(match.group(1)) * 1000, match.group(2)
+    if suffix in ("n", "u"):  # not known to lightkube
+        number, suffix = Decimal(f"{number:f}e{-9 if suffix == 'n' else -6}"), ""
+    millicores = parse_quantity(f"{number:f}{suffix}")  # millicores: the number was scaled by 1000 above
+    return int(millicores.to_integral_value(ROUND_CEILING if round_up else ROUND_FLOOR))
 
 
 def pod_cpu_request_millicores(pod: dict) -> int:
-    """What the scheduler counts for the Pod: the sum of its containers' requests, or the largest init
-    container when that is more (pod overhead is ignored)."""
+    """What the scheduler counts for the Pod: the Pod-level `spec.resources.requests.cpu` when set, else the
+    larger of the steady sum (containers plus native sidecars: init containers with `restartPolicy: Always`) and
+    the peak while the init containers run (each plus the sidecars started before it); plus `spec.overhead.cpu`."""
     spec = pod.get("spec", {})
 
     def request(container: dict) -> int:
         return cpu_millicores(container.get("resources", {}).get("requests", {}).get("cpu", 0))
 
-    return max(
-        sum(request(c) for c in spec.get("containers") or []),
-        max((request(c) for c in spec.get("initContainers") or []), default=0),
-    )
+    pod_level = (spec.get("resources") or {}).get("requests", {}).get("cpu")
+    if pod_level is not None:
+        total = cpu_millicores(pod_level)
+    else:
+        sidecars = 0
+        init_peak = 0
+        for c in spec.get("initContainers") or []:
+            if c.get("restartPolicy") == "Always":
+                sidecars += request(c)
+            else:
+                init_peak = max(init_peak, sidecars + request(c))
+        total = max(sum(request(c) for c in spec.get("containers") or []) + sidecars, init_peak)
+    return total + cpu_millicores((spec.get("overhead") or {}).get("cpu", 0))
+
+
+def _active(pods: Sequence[dict]) -> list[dict]:
+    return [p for p in pods if p.get("status", {}).get("phase") not in ("Succeeded", "Failed")]
+
+
+def cpu_margin_millicores(allocatable_millicores: int, node_pods: Sequence[dict]) -> int:
+    """CPU left unrequested on the node: the most of 100m, the largest other Pod's request and 5% of the
+    allocatable CPU. A replaced or new DaemonSet Pod (or any Pod of that size) then still fits without the
+    scheduler having to preempt the running benchmark."""
+    largest = max((pod_cpu_request_millicores(p) for p in _active(node_pods)), default=0)
+    return max(CPU_MARGIN_MIN_M, largest, allocatable_millicores // CPU_MARGIN_FRACTION)
 
 
 def step_cpu_millicores(allocatable_millicores: int, node_pods: Sequence[dict]) -> int:
     """CPU request of a step Pod: what the node has left after the Pods already on it (finished ones do not
-    count), minus `CPU_MARGIN_M`, but at least `CPU_FLOOR_M`. Under cgroup v2 the kubelet derives the Pod's
-    `cpu.weight` from this request, so this is what gives the benchmark nearly all of kubepods' weight. 0
-    allocatable (unknown) gives the floor."""
-    others = sum(
-        pod_cpu_request_millicores(p)
-        for p in node_pods
-        if p.get("status", {}).get("phase") not in ("Succeeded", "Failed")
-    )
-    return max(CPU_FLOOR_M, allocatable_millicores - others - CPU_MARGIN_M)
+    count), minus `cpu_margin_millicores`, but at least `CPU_FLOOR_M`. Under cgroup v2 the kubelet derives the
+    Pod's `cpu.weight` from this request, so this is what gives the benchmark nearly all of the weight of
+    kubepods/burstable. 0 allocatable (unknown) gives the floor."""
+    others = sum(pod_cpu_request_millicores(p) for p in _active(node_pods))
+    margin = cpu_margin_millicores(allocatable_millicores, node_pods)
+    return max(CPU_FLOOR_M, allocatable_millicores - others - margin)
 
 
 def is_out_of_cpu(pod: dict) -> bool:

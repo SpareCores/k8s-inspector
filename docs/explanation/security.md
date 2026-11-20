@@ -53,6 +53,9 @@ are switched over ([roadmap](../roadmap.md)).
   `inspector-secrets` or the platform Secrets), ConfigMaps (get, create, patch; `k8s-inspector-spot` is created on first
   use), `benchmarkruns` (create, get, list, watch, patch, delete) and `benchmarkruns/status` (patch). Cluster-wide:
   get Nodes; list Pods (the CPU requests of the Pods on the benchmark node, see [CPU weight](node-profile.md#cpu-weight)); get, list and delete NodeClaims (the stale node of an attempt). Nothing else.
+  The cluster-wide `pods list` lets the controller read every Pod spec in the cluster, including inline `env`
+  values. This is accepted: the field-selected list per node is needed to see the kube-system, flannel and debug
+  Pods, and RBAC cannot restrict a list by field (only by namespace or name).
 
 ## Public repository
 

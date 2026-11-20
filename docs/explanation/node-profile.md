@@ -92,26 +92,37 @@ storage image (last phase, [roadmap](../roadmap.md)), a storage failure is accep
 
 Under cgroup v2, `nice` only orders threads inside one cgroup. Between cgroups the CPU share is the cgroup weight, and
 the kubelet derives a Pod's weight from its CPU request. The weight of `kubepods.slice` against `system.slice` is fixed
-by the kubelet. Inside `kubepods.slice` the weights of the Pods are proportional to their requests, so a step Pod
-requesting `cpu: 10m` would get the lowest weight there, whatever its nice value.
+by the kubelet. A step Pod is Burstable (it has a request but no limit), so it competes under
+`kubepods.slice/kubepods-burstable.slice` with the other Burstable Pods. There the weights increase with the requests
+(the kubelet converts requests to cgroup v1 shares, and shares to a v2 weight, a non-linear conversion), so a step Pod
+requesting `cpu: 10m` would get the lowest weight, whatever its nice value.
 
 The controller therefore sizes the request of each step Pod (not the flush Pod, which stays at 10m) at launch:
 
 ```
-request = max(10m, node allocatable cpu − CPU requests of the other Pods on the node − 10m)
+request = max(10m, node allocatable cpu − CPU requests of the other Pods on the node − headroom)
+headroom = max(100m, the largest other Pod's request, 5% of the node allocatable cpu)
 ```
 
 The other Pods are listed with the `spec.nodeName` field selector over all namespaces (anchor, flannel, kube-proxy,
-debug Pods; finished Pods do not count; the controller's ClusterRole may `list` Pods for this). The result is in whole
-millicores, so it never reaches the allocatable total that the kubelet checks at admission. The benchmark Pod then holds
-nearly all of the weight inside `kubepods.slice`, and inside the Pod `sc-run` runs the task at nice -20, so
-the task is first in line for CPU in every cgroup. A step with several containers (the probe step) splits the request
-evenly. There is still no CPU limit, so no CFS quota.
+debug Pods; finished Pods do not count; the controller's ClusterRole may `list` Pods for this). A Pod's request is
+what the scheduler counts: container requests plus native sidecars, the larger init container peak, Pod overhead, or
+the Pod-level request when set. Other Pods' requests are rounded up to whole millicores, ours down. The headroom
+keeps the request below the allocatable total that the kubelet checks at admission, and leaves room for a replaced
+or new DaemonSet Pod (as large as the largest Pod already there) to be scheduled without preempting a running
+benchmark. The benchmark Pod then holds most of the weight inside `kubepods-burstable.slice`, and inside the Pod
+`sc-run` runs the task at nice -20, so the task is first in line for CPU in every cgroup. A step with several
+containers (the probe step) splits the request evenly (at least 1m each, 10m for the whole Pod). There is still no
+CPU limit, so no CFS quota.
 
 If a Pod appears on the node after the request was computed, the kubelet can refuse the step Pod
-(`Failed`, reason `OutOfcpu`). The controller then creates it once more with the 10m request (annotation
-`inspector.sparecores.com/small-cpu`) and logs a warning; a second refusal is recorded like any other rejection (`-4`
-with the message). Memory requests stay at 64Mi.
+(`Failed`, reason `OutOfcpu`). The controller then lists the node's Pods again and creates the step Pod once more with
+the recomputed request; a second refusal gives the 10m floor request; a third is recorded like any other rejection
+(`-4` with the message). The number of refusals is kept in the annotation `inspector.sparecores.com/cpu-refusals` of
+the recreated Pod, and every relaunch (also after a DiskPressure rejection) carries over the Pod's
+`inspector.sparecores.com/*` annotations, so the relaunches are bounded. When the Pods of the node cannot be listed
+(RBAC: Forbidden), the controller logs a warning and requests the floor; the launch is never blocked. Memory requests
+stay at 64Mi.
 
 ## Comparability with the VM era
 
