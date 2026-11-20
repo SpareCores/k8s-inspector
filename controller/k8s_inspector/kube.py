@@ -194,6 +194,14 @@ class Kube:
         except ApiError as e:
             raise _translate(e) from e
 
+    def list_pod_events(self, pod_name: str, uid: str) -> list[dict]:
+        """Events of one Pod (by name and UID, so a same-named earlier Pod's are excluded) in `self.namespace`."""
+        fields = {"involvedObject.name": pod_name, "involvedObject.kind": "Pod", "involvedObject.uid": uid}
+        try:
+            return [e.to_dict() for e in self._client.list(core_v1.Event, namespace=self.namespace, fields=fields)]
+        except ApiError as e:
+            raise _translate(e) from e
+
     def list_node_pods(self, node_name: str) -> list[dict]:
         """Every Pod of every namespace that is bound to the node (`spec.nodeName` field selector)."""
         try:

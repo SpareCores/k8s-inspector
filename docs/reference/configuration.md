@@ -51,6 +51,7 @@ deadlines:
   provisionCpuMinutes: 60
   provisionGpuHours: 6
   noOfferingMinutes: 10          # unschedulable anchor with no NodeClaim this long: -1 SCARPENTER_NO_OFFERING
+  noOfferingFastMinutes: 2       # ... the same when Karpenter's FailedScheduling event says the bench pool is incompatible
   imagePullMinutes: 15
   holdIdleMinutes: 45
 publish:
@@ -69,8 +70,9 @@ uploads:
 hold the vendor's slot for that whole time, so the controller ends it early: when the anchor Pod is still Pending
 with `PodScheduled` False and a message, and no NodeClaim for its vendor and SKU exists `noOfferingMinutes` after the
 attempt started (Karpenter creates one within seconds for any SKU it can launch), the remaining tasks end
-`-1 SCARPENTER_NO_OFFERING: <PodScheduled message>`. This reads only the Pod, no extra RBAC; the detailed Karpenter
-reason (Event `FailedScheduling`) is not used.
+`-1 SCARPENTER_NO_OFFERING: <PodScheduled message>`. When the most recent Karpenter `FailedScheduling` Event of the anchor already has
+a `no instance type met all requirements` clause for `karpenter.sh/nodepool In [<benchPool>]` (and the attempt has no launch failure), the run ends the same way (`no instance type met all requirements for <SKU> in nodepool <benchPool>`)
+after `noOfferingFastMinutes`; this needs `list` on `events`.
 
 Karpenter replaces a NodeClaim that fails to launch (`Launched` condition reason `LaunchFailed`, status Unknown or
 False) with a new one every few minutes, so the deadlines above would not fire. The controller remembers each failed

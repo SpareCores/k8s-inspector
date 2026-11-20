@@ -9,6 +9,9 @@ rules:
   resources: [pods]
   verbs: [create, list, watch, delete]
 - apiGroups: [""]
+  resources: [events]
+  verbs: [list]                 # Karpenter's FailedScheduling event of the anchor (fast NO_OFFERING)
+- apiGroups: [""]
   resources: [pods/exec]
   verbs: [get, create]          # exec is a websocket upgrade: a GET, then the create
 - apiGroups: [""]

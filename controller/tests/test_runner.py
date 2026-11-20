@@ -389,6 +389,125 @@ def test_no_nodeclaim_and_unschedulable_anchor_fails_fast_with_no_offering(h):
     assert code == -1 and message.startswith("SCARPENTER_NO_OFFERING: 0/3 nodes are available")
 
 
+def _karpenter_event(h, message, reporter="karpenter", name="ev1", uid=None, **times):
+    anchor = f"{h.name}-a1"
+    h.kube.create(
+        "event",
+        {
+            "metadata": {"name": name},
+            "involvedObject": {
+                "kind": "Pod",
+                "name": anchor,
+                "uid": uid or h.kube.get("pod", anchor)["metadata"]["uid"],
+            },
+            "reason": "FailedScheduling",
+            "reportingController": reporter,
+            "message": message,
+            **times,
+        },
+    )
+
+
+BENCH_CLAUSE = (
+    "no instance type met all requirements, requirements=frankenscube/pool In [bench], "
+    "karpenter.sh/capacity-type In [on-demand spot], karpenter.sh/nodepool In [bench], "
+    "scarpenter.sparecores.com/api-reference In [VM.Standard4.Ax.Flex.32-256]"
+)
+OTHER_CLAUSE = "no instance type met all requirements, requirements=karpenter.sh/nodepool In [other]"
+BENCH_MESSAGE = (
+    "Failed to schedule pod, did not tolerate taint (taint=frankenscube/web=true:NoSchedule); "
+    f"{BENCH_CLAUSE}; did not tolerate taint (taint=frankenscube/apps=true:NoSchedule)"
+)
+
+
+def test_karpenter_event_for_bench_pool_fails_after_fast_deadline(h):
+    _unschedulable_anchor(h)
+    _karpenter_event(h, BENCH_MESSAGE)
+    h.clock.advance(minutes=1)
+    h.runner.reconcile(h.name)
+    assert h.run.status.phase == RunPhase.PROVISIONING
+    h.clock.advance(minutes=1)
+    h.runner.reconcile(h.name)
+    assert h.run.status.phase == RunPhase.FAILED
+    assert h.codes()["geekbench"] == (
+        -1,
+        "SCARPENTER_NO_OFFERING: no instance type met all requirements for VM.Standard4.Ax.Flex.32-256"
+        " in nodepool bench",
+    )
+
+
+def test_bench_clause_in_the_first_position_is_found(h):
+    _unschedulable_anchor(h)
+    _karpenter_event(h, f"Failed to schedule pod, {BENCH_CLAUSE}; {OTHER_CLAUSE}")
+    h.clock.advance(minutes=2)
+    h.runner.reconcile(h.name)
+    assert h.run.status.phase == RunPhase.FAILED
+
+
+def test_event_of_an_earlier_pod_with_the_same_name_is_ignored(h):
+    _unschedulable_anchor(h)
+    _karpenter_event(h, BENCH_MESSAGE, uid="uid-of-the-previous-anchor")
+    h.clock.advance(minutes=5)
+    h.runner.reconcile(h.name)
+    assert h.run.status.phase == RunPhase.PROVISIONING
+
+
+def test_event_from_before_the_attempt_started_is_ignored(h):
+    _unschedulable_anchor(h)
+    _karpenter_event(h, BENCH_MESSAGE, lastTimestamp=iso(h.clock.now - timedelta(hours=1)))
+    h.clock.advance(minutes=5)
+    h.runner.reconcile(h.name)
+    assert h.run.status.phase == RunPhase.PROVISIONING
+
+
+def test_newest_event_wins_by_parsed_time_not_by_text(h):
+    _unschedulable_anchor(h)
+    now = h.clock.now
+    _karpenter_event(h, BENCH_MESSAGE, name="old", lastTimestamp=iso(now + timedelta(seconds=10)))
+    newer = (now + timedelta(seconds=40)).isoformat()  # "+00:00" sorts before "Z" as text
+    _karpenter_event(h, f"Failed to schedule pod, {OTHER_CLAUSE}", name="new", eventTime=newer)
+    h.clock.advance(minutes=5)
+    h.runner.reconcile(h.name)
+    assert h.run.status.phase == RunPhase.PROVISIONING
+
+
+def test_launch_failure_of_the_attempt_disables_the_fast_path(h):
+    _unschedulable_anchor(h)
+    _karpenter_event(h, BENCH_MESSAGE)
+    _launch_failed(h, "bench-aaaaa", "first")
+    h.clock.advance(minutes=5)
+    h.runner.reconcile(h.name)
+    assert h.run.status.phase == RunPhase.PROVISIONING
+
+
+def test_karpenter_event_for_other_pool_only_keeps_waiting(h):
+    _unschedulable_anchor(h)
+    _karpenter_event(h, f"Failed to schedule pod, did not tolerate taint (taint=x:NoSchedule); {OTHER_CLAUSE}")
+    h.clock.advance(minutes=5)
+    h.runner.reconcile(h.name)
+    assert h.run.status.phase == RunPhase.PROVISIONING
+
+
+def test_event_not_from_karpenter_is_ignored(h):
+    _unschedulable_anchor(h)
+    _karpenter_event(h, BENCH_MESSAGE, reporter="default-scheduler")
+    h.clock.advance(minutes=5)
+    h.runner.reconcile(h.name)
+    assert h.run.status.phase == RunPhase.PROVISIONING
+
+
+def test_events_api_error_falls_back_to_the_long_deadline(h):
+    _unschedulable_anchor(h)
+    _karpenter_event(h, BENCH_MESSAGE)
+    h.kube.events_forbidden = True
+    h.clock.advance(minutes=5)
+    h.runner.reconcile(h.name)
+    assert h.run.status.phase == RunPhase.PROVISIONING
+    h.clock.advance(minutes=6)
+    h.runner.reconcile(h.name)
+    assert h.run.status.phase == RunPhase.FAILED
+
+
 def test_no_offering_wait_is_configurable(h):
     h.cfg = make_config(deadlines=Deadlines(no_offering_minutes=3))
     _unschedulable_anchor(h)

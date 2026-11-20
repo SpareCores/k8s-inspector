@@ -125,4 +125,5 @@ def test_rbac_is_least_privilege_for_what_the_controller_calls():
     }
     assert cluster[("", "pods")] == {"list"}  # the Pods on the benchmark node (cpu requests), any namespace
     assert cluster[("", "nodes")] == {"get"}
-    assert ("", "events") not in granted and ("batch", "jobs") not in granted
+    assert granted[("", "events")] == {"list"}  # Karpenter FailedScheduling event of the anchor
+    assert ("batch", "jobs") not in granted

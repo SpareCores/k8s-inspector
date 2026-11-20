@@ -53,6 +53,7 @@ class FakeKube:
         self.created: list[tuple[str, str]] = []  # (kind, name) in order
         self.deleted: list[tuple[str, str]] = []
         self.node_pods_forbidden = False  # `list_node_pods` raises Forbidden (no RBAC for the cluster-wide list)
+        self.events_forbidden = False  # `list_pod_events` raises Forbidden
         self.foreign_pods: list[dict] = []  # Pods of other namespaces (kube-system ...), seen by `list_node_pods` only
         self.force_deleted: list[str] = []  # Pods deleted with grace period 0
         self.secret_writes = 0
@@ -78,6 +79,15 @@ class FakeKube:
             if all(k in have and (v is None or have[k] == v) for k, v in (labels or {}).items()):
                 found.append(copy.deepcopy(obj))
         return found
+
+    def list_pod_events(self, pod_name: str, uid: str) -> list[dict]:
+        if self.events_forbidden:
+            raise Forbidden("events")
+        return [
+            copy.deepcopy(e)
+            for e in self._store("event").values()
+            if e["involvedObject"]["name"] == pod_name and e["involvedObject"].get("uid") == uid
+        ]
 
     def list_node_pods(self, node_name: str) -> list[dict]:
         """The Pods bound to the node: stored ones plus `foreign_pods` (other namespaces, written by tests)."""

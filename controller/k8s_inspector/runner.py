@@ -275,6 +275,37 @@ def _unschedulable(anchor: dict) -> str | None:
     return None
 
 
+def _event_time(event: dict) -> datetime | None:
+    for key in ("lastTimestamp", "eventTime", "firstTimestamp"):
+        if event.get(key):
+            return _time(event[key])
+    return _time(event["metadata"].get("creationTimestamp"))
+
+
+def _bench_pool_message(events: list[dict], bench_pool: str, since: datetime) -> str | None:
+    """`no instance type met all requirements for <api-reference> in nodepool <bench_pool>` when the most recent
+    Karpenter `FailedScheduling` event since `since` has such a clause for the bench pool (Karpenter lists one
+    `; `-separated clause per pool)."""
+    recent = [
+        (time, e)
+        for e in events
+        if e.get("reason") == "FailedScheduling"
+        and "karpenter"
+        in (e.get("reportingComponent"), e.get("reportingController"), (e.get("source") or {}).get("component"))
+        and (time := _event_time(e)) is not None
+        and time >= since
+    ]
+    if not recent:
+        return None
+    message = max(recent, key=lambda item: item[0])[1].get("message", "").removeprefix("Failed to schedule pod, ")
+    for clause in message.split("; "):
+        if "no instance type met all requirements" in clause and f"karpenter.sh/nodepool In [{bench_pool}]" in clause:
+            found = re.search(r"scarpenter\.sparecores\.com/api-reference In \[([^\]]*)\]", clause)
+            sku = f" for {found.group(1)}" if found else ""
+            return f"no instance type met all requirements{sku} in nodepool {bench_pool}"
+    return None
+
+
 def parse_gpu_facts(stdout: bytes) -> tuple[int | None, tuple[int, int] | None]:
     """`gpu_facts` output, one line per GPU `<VRAM MiB>, <compute capability>` -> (minimum VRAM, minimum
     capability). Unreadable lines are skipped."""
@@ -816,11 +847,28 @@ class Runner:
         waited = self._now() - started
         if error is None and not claims and waited > timedelta(minutes=cfg.settings.deadlines.no_offering_minutes):
             error = _unschedulable(anchor)
+        if (
+            error is None
+            and not claims
+            and not failures  # a launch failure is a transient ICE, not a missing offering
+            and waited >= timedelta(minutes=cfg.settings.deadlines.no_offering_fast_minutes)
+        ):
+            message = self._bench_pool_event(anchor, cfg.settings.bench_pool, started)
+            error = f"SCARPENTER_NO_OFFERING: {message}" if message else None
         if error is None and waited > budget:
             default = "BOOT_FAILURE" if claims else "ICE"
             error = scarpenter_error(f"no node after {int(budget.total_seconds() // 60)} minutes", default)
         if error:
             self._fail_run(run, error)
+
+    def _bench_pool_event(self, anchor: dict, bench_pool: str, since: datetime) -> str | None:
+        """`_bench_pool_message` of the anchor's Events; an API error counts as no event."""
+        try:
+            events = self.kube.list_pod_events(_meta(anchor)["name"], _meta(anchor)["uid"])
+            return _bench_pool_message(events, bench_pool, since)
+        except Exception:
+            log.warning("listing events of %s failed", _meta(anchor)["name"], exc_info=True)
+            return None
 
     def _record_launch_failures(self, run: BenchmarkRun, claims: list[dict]) -> list[LaunchFailure]:
         """Remember in `status.launchFailures` each NodeClaim that failed to launch: Karpenter deletes it and

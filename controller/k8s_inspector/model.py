@@ -441,6 +441,7 @@ class Deadlines:
     provision_cpu_minutes: int = 60
     provision_gpu_hours: int = 6
     no_offering_minutes: int = 10  # an unschedulable anchor without a NodeClaim this long ends -1 NO_OFFERING
+    no_offering_fast_minutes: int = 2  # ... or this long when Karpenter's event says the bench pool cannot fit it
     image_pull_minutes: int = 15
     hold_idle_minutes: int = 45
 

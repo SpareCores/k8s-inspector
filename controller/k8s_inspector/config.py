@@ -138,6 +138,7 @@ _DEADLINES = {
     "provisionCpuMinutes": ("provision_cpu_minutes", _pos_int),
     "provisionGpuHours": ("provision_gpu_hours", _pos_int),
     "noOfferingMinutes": ("no_offering_minutes", _pos_int),
+    "noOfferingFastMinutes": ("no_offering_fast_minutes", _pos_int),
     "imagePullMinutes": ("image_pull_minutes", _pos_int),
     "holdIdleMinutes": ("hold_idle_minutes", _pos_int),
 }
