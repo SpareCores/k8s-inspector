@@ -32,5 +32,5 @@ def setup_logging(level: str = "INFO") -> None:
     handler.setFormatter(JsonFormatter())
     logging.basicConfig(level=level, handlers=[handler], force=True)
     # lightkube's HTTP client logs every request at info; that is noise at controller scale.
-    for noisy in ("httpx2", "httpcore"):
+    for noisy in ("httpx2", "httpcore2"):
         logging.getLogger(noisy).setLevel(logging.WARNING)

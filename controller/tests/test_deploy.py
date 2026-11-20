@@ -105,7 +105,7 @@ def test_rbac_is_least_privilege_for_what_the_controller_calls():
     granted = {
         (rule["apiGroups"][0], resource): set(rule["verbs"])
         for doc in docs
-        if doc["kind"] in ("Role", "ClusterRole")
+        if doc["kind"] == "Role"
         for rule in doc["rules"]
         for resource in rule["resources"]
     }
@@ -114,5 +114,13 @@ def test_rbac_is_least_privilege_for_what_the_controller_calls():
     assert granted[("", "secrets")] == {"create", "get", "update", "delete"}  # no list/watch of other Secrets
     assert granted[("", "pods")] == {"create", "list", "watch", "delete"}
     assert granted[("inspector.sparecores.com", "benchmarkruns/status")] == {"patch"}
-    assert granted[("", "nodes")] == {"get"}
+    cluster = {
+        (rule["apiGroups"][0], resource): set(rule["verbs"])
+        for doc in yaml.safe_load_all((CRD_PATH.parents[1] / "controller" / "rbac.yaml").read_text())
+        if doc["kind"] == "ClusterRole"
+        for rule in doc["rules"]
+        for resource in rule["resources"]
+    }
+    assert cluster[("", "pods")] == {"list"}  # the Pods on the benchmark node (cpu requests), any namespace
+    assert cluster[("", "nodes")] == {"get"}
     assert ("", "events") not in granted and ("batch", "jobs") not in granted

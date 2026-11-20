@@ -52,7 +52,7 @@ are switched over ([roadmap](../roadmap.md)).
   steps is a websocket upgrade), Secrets (create, get, update, delete; no list or watch, so it cannot enumerate
   `inspector-secrets` or the platform Secrets), ConfigMaps (get, create, patch; `k8s-inspector-spot` is created on first
   use), `benchmarkruns` (create, get, list, watch, patch, delete) and `benchmarkruns/status` (patch). Cluster-wide:
-  get Nodes; get, list and delete NodeClaims (the stale node of an attempt). Nothing else.
+  get Nodes; list Pods (the CPU requests of the Pods on the benchmark node, see [CPU weight](node-profile.md#cpu-weight)); get, list and delete NodeClaims (the stale node of an attempt). Nothing else.
 
 ## Public repository
 

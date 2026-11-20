@@ -33,6 +33,12 @@ const (
 	CodeTimeout      = -6
 )
 
+// Range of the Config.Nice value.
+const (
+	MinNice = -20
+	MaxNice = 19
+)
+
 const (
 	versionTimeout  = 60 * time.Second
 	heartbeatPeriod = 10 * time.Second
@@ -67,7 +73,7 @@ type Config struct {
 	TermLog      string // termination message path
 	Cmd          []string
 	Rlimits      []string // "NAME=SOFT[:HARD]" limits for the task process only; see ParseRlimit
-	Nice         int      // nice value of the task process (see withNice); 0 leaves it unchanged
+	Nice         int      // nice value of the task process, MinNice..MaxNice (see withNice); 0 leaves it unchanged
 }
 
 // Result is result.json and, with Upload, the termination message.
@@ -83,6 +89,7 @@ type Result struct {
 	Version       string `json:"version,omitempty"`
 	KernelVersion string `json:"kernel_version,omitempty"`
 	BootTime      int64  `json:"btime,omitempty"`
+	Nice          *int   `json:"nice"` // nice the task process runs at; null when disabled or it could not be set
 }
 
 type termMessage struct {
@@ -237,13 +244,21 @@ func execute(stopCtx context.Context, cfg Config) (res Result) {
 		limits = append(limits, l)
 	}
 
+	if cfg.Nice < MinNice || cfg.Nice > MaxNice {
+		res.ExitCode, res.ErrorMsg = CodeHarnessError, fmt.Sprintf("nice %d: want %d to %d", cfg.Nice, MinNice, MaxNice)
+		return res
+	}
+
 	cmd := exec.Command(cfg.Cmd[0], cfg.Cmd[1:]...)
 	cmd.Stdout = stdout
 	cmd.Stderr = stderr
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 
 	oomBefore := oomKills()
-	startNiced := func() error { return withNice(cfg.Nice, cmd.Start) }
+	startNiced := func() (err error) {
+		res.Nice, err = withNice(cfg.Nice, cmd.Start)
+		return err
+	}
 	if err := withRlimits(limits, startNiced); err != nil {
 		res.ExitCode, res.ErrorMsg = CodeHarnessError, "cannot start command: "+err.Error()
 		return res

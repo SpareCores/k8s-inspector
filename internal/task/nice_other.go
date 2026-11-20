@@ -2,4 +2,4 @@
 
 package task
 
-func withNice(nice int, start func() error) error { return start() }
+func withNice(nice int, start func() error) (*int, error) { return nil, start() }

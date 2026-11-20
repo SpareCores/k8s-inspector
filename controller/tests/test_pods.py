@@ -153,6 +153,63 @@ def test_step_pod_like_spike(run, cfg):
     assert spec["volumes"][1]["secret"]["secretName"] == f"{run.name}-urls"
 
 
+def pod_requesting(*cpus, init=(), phase="Running"):
+    def containers(values):
+        return [{"resources": {"requests": {"cpu": c} if c else {}}} for c in values]
+
+    return {"spec": {"containers": containers(cpus), "initContainers": containers(init)}, "status": {"phase": phase}}
+
+
+def test_cpu_millicores_quantities():
+    assert [pods.cpu_millicores(q) for q in ("2", "0.5", "3920m", 4, "100m")] == [2000, 500, 3920, 4000, 100]
+
+
+def test_pod_cpu_request_is_containers_sum_or_biggest_init():
+    assert pods.pod_cpu_request_millicores(pod_requesting("100m", "250m", None)) == 350
+    assert pods.pod_cpu_request_millicores(pod_requesting("100m", init=("1",))) == 1000
+    assert pods.pod_cpu_request_millicores({"spec": {"containers": [{}]}}) == 0
+
+
+def test_step_cpu_is_what_the_other_pods_leave():
+    node_pods = [
+        pod_requesting("100m"),  # flannel
+        pod_requesting("200m", "50m"),  # anchor and friends
+        pod_requesting("1", phase="Succeeded"),  # finished: does not count
+        pod_requesting("1", phase="Failed"),
+        pod_requesting(None),  # no request
+    ]
+    assert pods.step_cpu_millicores(4000, node_pods) == 4000 - 350 - pods.CPU_MARGIN_M
+    assert pods.step_cpu_millicores(3920, []) == 3920 - pods.CPU_MARGIN_M
+
+
+def test_step_cpu_never_drops_below_the_floor():
+    assert pods.step_cpu_millicores(1000, [pod_requesting("995m")]) == pods.CPU_FLOOR_M
+    assert pods.step_cpu_millicores(1000, [pod_requesting("5")]) == pods.CPU_FLOOR_M
+    assert pods.step_cpu_millicores(0, []) == pods.CPU_FLOOR_M  # allocatable unknown
+
+
+def test_step_pod_requests_the_given_cpu_split_over_containers_without_limit(run, cfg):
+    kw = {"node_name": "n", "node_allocatable_memory_bytes": 1, "owner": OWNER}
+    pod = pods.render_step(run, 1, step(container(task())), cfg, cpu_millicores=3900, **kw)
+    assert pod["spec"]["containers"][0]["resources"] == {"requests": {"cpu": "3900m", "memory": "64Mi"}}
+    a, b = task("lscpu", parallel=True), task("lstopo", parallel=True)
+    pod = pods.render_step(run, 1, step(container(a), container(b)), cfg, cpu_millicores=3900, **kw)
+    assert [c["resources"]["requests"]["cpu"] for c in pod["spec"]["containers"]] == ["1950m", "1950m"]
+    pod = pods.render_step(run, 1, step(container(a), container(b)), cfg, cpu_millicores=15, **kw)
+    assert [c["resources"]["requests"]["cpu"] for c in pod["spec"]["containers"]] == ["10m", "10m"]
+    assert all("cpu" not in c["resources"].get("limits", {}) for c in pod["spec"]["containers"])
+
+
+def test_out_of_cpu_rejection_is_recognised_and_classified_with_its_message():
+    message = "Pod was rejected: Node didn't have enough resource: cpu, requested: 3000, used: 100, capacity: 2000"
+    rejected = {"status": {"phase": "Failed", "reason": "OutOfcpu", "message": message}}
+    assert pods.is_out_of_cpu(rejected) and not pods.is_rejected(rejected)
+    out = pods.classify(rejected, [container(task())])["membench"]
+    assert (out.exit_code, out.error_msg, out.container_start_error) == (-4, message, True)
+    ran = finished_pod({"name": "membench", "state": {"running": {}}}, reason="OutOfcpu")
+    assert not pods.is_out_of_cpu(ran)
+
+
 def test_memory_cap_models_shm_secrets_rlimits_hostpid(run, cfg):
     t = task(
         "vllm",
@@ -308,6 +365,12 @@ def test_classify_success_and_message_fields():
     )
     assert (out.exit_code, out.from_sc_run, out.version, out.upload_complete) == (0, True, "1.2", True)
     assert out.start == datetime(2026, 11, 20, 9, 0, tzinfo=UTC)
+
+
+def test_classify_records_the_applied_nice():
+    assert classify_one(terminated("membench", msg(nice=-20)), phase="Succeeded").nice == -20
+    assert classify_one(terminated("membench", msg(nice=None)), phase="Succeeded").nice is None
+    assert classify_one(terminated("membench", msg()), phase="Succeeded").nice is None
 
 
 def test_classify_task_exit_timeout_oom_cancel():

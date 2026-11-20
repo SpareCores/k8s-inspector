@@ -55,6 +55,8 @@ STEP_VERSION = timedelta(minutes=1)
 STEP_UPLOAD = timedelta(minutes=10)
 ANCHOR_EXTRA = timedelta(hours=1)
 DB_RLIMITS = ("nofile=1048576", "memlock=unlimited")  # docker era: nofile 1048576, memlock -1
+CPU_FLOOR_M = 10  # smallest CPU request in millicores: the lowest cgroup weight, and the flush/fallback request
+CPU_MARGIN_M = 10  # left unrequested on the node, so the request never reaches the allocatable total
 TASK_NICE = -20  # generic rule: every benchmark gets as much CPU as possible (sc-run exec --nice)
 # `inspector-secrets` key -> environment variable of the container.
 SECRET_ENV = {
@@ -314,6 +316,7 @@ def _step_container(
     gpu_count: int,
     single: bool,
     allocatable: int,
+    cpu_millicores: int,
 ) -> dict:
     task = container.task
     spool = f"{HEARTBEAT_ROOT}/{run_id}/{container.key}"
@@ -354,7 +357,7 @@ def _step_container(
         mounts.append({"name": "models", "mountPath": "/models"})
     if task.shm_gib:
         mounts.append({"name": "dshm", "mountPath": "/dev/shm"})
-    resources: dict = {"requests": {"cpu": "10m", "memory": "64Mi"}}
+    resources: dict = {"requests": {"cpu": f"{cpu_millicores}m", "memory": "64Mi"}}
     if task.memory_cap is not None:
         resources["limits"] = {"memory": str(int(task.memory_cap * allocatable))}
     if gpu_runtime and gpu_count and single:
@@ -396,6 +399,7 @@ def render_step(
     node_allocatable_memory_bytes: int,
     owner: OwnerRef,
     gpu_count: int = 0,
+    cpu_millicores: int = CPU_FLOOR_M,
 ) -> dict:
     """A step Pod (objects.md "Step Pod"): `nodeName`, bare Pod, `hostNetwork`, `dnsPolicy: Default`,
     `hostPID` iff any task has `host_pid`, `runtimeClassName: nvidia` iff `step.gpu_runtime`, tolerations
@@ -404,15 +408,19 @@ def render_step(
     image `container.image`, `command: [/k8si/bin/sc-run, exec, --task <key>, --timeout <t>, --spool
     /k8si/runs/<run_id>/<key>, --urls /k8si-urls/urls.json, --version-cmd ..., --collect ..., --, <entrypoint
     + resource-tracker/nice wrapper + command>]`, `privileged` + `seccompProfile: Unconfined`, requests
-    `cpu 10m, memory 64Mi`, memory limit = `task.memory_cap * node_allocatable_memory_bytes` when set (no
-    CPU limits ever), `terminationMessagePolicy: File`, env: `TRACKER_*` (project, job name, external run id
+    `cpu <cpu_millicores split evenly over the containers, each at least 10m>, memory 64Mi`, memory limit =
+    `task.memory_cap * node_allocatable_memory_bytes` when set (no CPU limits ever), `terminationMessagePolicy:
+    File`, env: `TRACKER_*` (project, job name, external run id
     = `run_id`, output path in the spool) + `HF_TOKEN` for llm/vllm only + secrets from `inspector-secrets`
     (`task.secrets`) + `task.env` + `container.env`. Volumes: hostPath `/var/lib/k8s-inspector`, the urls
     Secret, `/models` hostPath when `task.models_cache`, memory emptyDir at /dev/shm when `task.shm_gib`.
     DB tasks (`db_rlimits`) add the sc-run `--rlimit` flags.
 
     `gpu_count` (extra keyword, default 0): the node's GPU count; a single-container GPU step then also
-    requests all `nvidia.com/gpu`. Every GPU step exposes the GPUs through `NVIDIA_VISIBLE_DEVICES=all`."""
+    requests all `nvidia.com/gpu`. Every GPU step exposes the GPUs through `NVIDIA_VISIBLE_DEVICES=all`.
+
+    `cpu_millicores` (extra keyword, default the 10m floor): the whole Pod's CPU request, see
+    `step_cpu_millicores`. Never a CPU limit."""
     run_id = run.spec.run_id
     single = len(step.containers) == 1
     return {
@@ -445,6 +453,7 @@ def render_step(
                     gpu_count=gpu_count,
                     single=single,
                     allocatable=node_allocatable_memory_bytes,
+                    cpu_millicores=max(CPU_FLOOR_M, cpu_millicores // len(step.containers)),
                 )
                 for c in step.containers
             ],
@@ -611,6 +620,54 @@ def terminating_overdue(pod: dict, now: datetime) -> bool:
     return deleted is not None and now > deleted + WATCHDOG_MARGIN
 
 
+def cpu_millicores(quantity) -> int:
+    """A Kubernetes CPU quantity ("2", "0.5", "3920m") in millicores, rounded down."""
+    text = str(quantity)
+    if text.endswith("m"):
+        return int(float(text[:-1]))
+    return int(float(text) * 1000)
+
+
+def pod_cpu_request_millicores(pod: dict) -> int:
+    """What the scheduler counts for the Pod: the sum of its containers' requests, or the largest init
+    container when that is more (pod overhead is ignored)."""
+    spec = pod.get("spec", {})
+
+    def request(container: dict) -> int:
+        return cpu_millicores(container.get("resources", {}).get("requests", {}).get("cpu", 0))
+
+    return max(
+        sum(request(c) for c in spec.get("containers") or []),
+        max((request(c) for c in spec.get("initContainers") or []), default=0),
+    )
+
+
+def step_cpu_millicores(allocatable_millicores: int, node_pods: Sequence[dict]) -> int:
+    """CPU request of a step Pod: what the node has left after the Pods already on it (finished ones do not
+    count), minus `CPU_MARGIN_M`, but at least `CPU_FLOOR_M`. Under cgroup v2 the kubelet derives the Pod's
+    `cpu.weight` from this request, so this is what gives the benchmark nearly all of kubepods' weight. 0
+    allocatable (unknown) gives the floor."""
+    others = sum(
+        pod_cpu_request_millicores(p)
+        for p in node_pods
+        if p.get("status", {}).get("phase") not in ("Succeeded", "Failed")
+    )
+    return max(CPU_FLOOR_M, allocatable_millicores - others - CPU_MARGIN_M)
+
+
+def is_out_of_cpu(pod: dict) -> bool:
+    """The kubelet refused the Pod because its CPU request does not fit the node (`Failed`, reason
+    `OutOfcpu`): no container ever started."""
+    status = pod.get("status", {})
+    return (
+        status.get("phase") == "Failed"
+        and status.get("reason") == "OutOfcpu"
+        and not any(
+            "running" in s.get("state", {}) or "terminated" in s.get("state", {}) for s in _container_statuses(pod)
+        )
+    )
+
+
 def is_rejected(pod: dict) -> bool:
     """The kubelet refused the Pod at admission (`Failed`, reason `Evicted`, "Pod was rejected: ...", e.g. while
     the node has DiskPressure): no container ever started."""
@@ -673,6 +730,7 @@ def outcome_from_message(key: str, msg: dict, container: StepContainer, pod_reas
         timed_out=bool(msg.get("timed_out")),
         cancelled=bool(msg.get("cancelled")),
         oom_kills=int(msg.get("oom_kills", 0)),
+        nice=msg.get("nice"),
         upload_complete=msg.get("upload_complete"),
         missing_files=int(msg.get("missing", 0)),
     )
@@ -699,7 +757,7 @@ def _outcome_from_state(key: str, status: dict | None, pod: dict) -> TaskOutcome
         outcome.error_msg, outcome.container_start_error = detail, True
     elif pod_reason == "DeadlineExceeded":
         outcome.exit_code, outcome.error_msg = ExitCode.NEVER_FINISHED, Reason.DEADLINE_EXCEEDED.value
-    elif is_rejected(pod):
+    elif is_rejected(pod) or is_out_of_cpu(pod):
         outcome.exit_code, outcome.error_msg = ExitCode.NEVER_FINISHED, pod["status"]["message"]
         outcome.container_start_error = True  # never started: nothing to flush
     elif pod_reason == "Evicted":
@@ -718,7 +776,7 @@ def classify(pod: dict, containers: Sequence[StepContainer]) -> dict[str, TaskOu
 
     Source order, per container (exit-codes.md):
     1. the termination message (JSON written by sc-run, see `internal/task`: `task, exit_code, error_msg,
-       timed_out, cancelled, oom_kills, start, end, version, kernel_version, btime, upload_complete,
+       timed_out, cancelled, oom_kills, start, end, version, kernel_version, btime, nice, upload_complete,
        missing`) -> `from_sc_run=True`; `timed_out` -> exit -6 with `Execution timed out after <N>s`;
        `oom_kills > 0` and non-zero exit -> 137 + `OOMKilled`; `cancelled` -> -4 `CANCELLED`.
     2. no message: container state `OOMKilled` -> 137 `OOMKilled`; `StartError`/`CreateContainerError`/

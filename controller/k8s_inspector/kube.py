@@ -17,7 +17,7 @@ from dataclasses import dataclass
 
 import httpx2
 import lightkube
-from lightkube import ApiError
+from lightkube import ALL_NS, ApiError
 from lightkube.core.client import PatchType
 from lightkube.generic_resource import create_global_resource, create_namespaced_resource
 from lightkube.resources import core_v1
@@ -185,6 +185,14 @@ class Kube:
         resource, ns = self._target(kind)
         try:
             return [obj.to_dict() for obj in self._client.list(resource, labels=labels, **ns)]
+        except ApiError as e:
+            raise _translate(e) from e
+
+    def list_node_pods(self, node_name: str) -> list[dict]:
+        """Every Pod of every namespace that is bound to the node (`spec.nodeName` field selector)."""
+        try:
+            pods = self._client.list(core_v1.Pod, namespace=ALL_NS, fields={"spec.nodeName": node_name})
+            return [pod.to_dict() for pod in pods]
         except ApiError as e:
             raise _translate(e) from e
 

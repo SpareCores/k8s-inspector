@@ -231,3 +231,15 @@ def test_is_transient_transport_errors():
     assert is_transient(httpx.ConnectError("refused"))
     assert not is_transient(httpx.UnsupportedProtocol("no scheme"))
     assert not is_transient(ValueError("x"))
+
+
+def test_list_node_pods_selects_by_node_across_namespaces():
+    seen = []
+
+    def handler(request):
+        seen.append((request.url.path, request.url.params.get("fieldSelector")))
+        return json_response(200, pod_list("1", "flannel", "anchor"))
+
+    found = make_kube(handler).list_node_pods("node-1")
+    assert [p["metadata"]["name"] for p in found] == ["flannel", "anchor"]
+    assert seen == [("/api/v1/pods", "spec.nodeName=node-1")]

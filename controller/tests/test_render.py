@@ -125,7 +125,7 @@ def test_build_status():
         run,
         task,
         task_hash="h",
-        outcome=TaskOutcome("geekbench", -4, version="6.7", kernel_version="6.8"),
+        outcome=TaskOutcome("geekbench", -4, version="6.7", kernel_version="6.8", nice=-20),
         verification=Verification("geekbench", True, manifest),
         node=node,
         attempt=run.status.attempts[0],
@@ -140,8 +140,10 @@ def test_build_status():
         "node-1", "SPOT_INTERRUPTED", True, "p-a1-07-geekbench",
     )  # fmt: skip
     assert status["runtime"] == "containerd://2.1" and status["image"].endswith("sha256:1")
+    assert status["nice"] == -20
     meta = render.meta_from_status(status)
     assert meta["run_id"] == "r20261120t0930-3f9c" and "pod" not in meta and meta["exit_code"] == -4
+    assert meta["nice"] == -20
     json.dumps(status)  # JSON-serialisable
 
 

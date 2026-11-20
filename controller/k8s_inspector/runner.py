@@ -111,6 +111,7 @@ NODEPOOL_LABEL = pods.NODEPOOL_LABEL
 CAPACITY_LABEL = "karpenter.sh/capacity-type"
 INSTANCE_TYPE_LABEL = "node.kubernetes.io/instance-type"  # the node's label, recorded as the instance type
 SCARPENTER = "scarpenter.sparecores.com"
+SMALL_CPU_ANNOTATION = "inspector.sparecores.com/small-cpu"  # on a step Pod recreated after an OutOfcpu rejection
 RELAUNCH_ANNOTATION = "inspector.sparecores.com/relaunch"  # on a step Pod recreated after a DiskPressure rejection
 PRICE_ANNOTATION = f"{SCARPENTER}/price"
 PRICE_INCOMPLETE_ANNOTATION = f"{SCARPENTER}/price-incomplete"
@@ -866,6 +867,7 @@ class Runner:
             arch=labels.get("kubernetes.io/arch", "amd64"),
             created=_time(meta["creationTimestamp"]),
             allocatable_memory_bytes=_quantity(allocatable.get("memory", 0)),
+            allocatable_cpu_millicores=pods.cpu_millicores(allocatable.get("cpu", 0)),
             vcpus=_quantity(capacity["cpu"]) if "cpu" in capacity else None,
             memory_bytes=_quantity(capacity["memory"]) if "memory" in capacity else None,
             region=labels.get("topology.kubernetes.io/region"),
@@ -1097,10 +1099,43 @@ class Runner:
             node_allocatable_memory_bytes=nd.facts.allocatable_memory_bytes,
             owner=self._anchor_owner(run, live),
             gpu_count=nd.gpu_count,
+            cpu_millicores=self._step_cpu_millicores(nd, small=SMALL_CPU_ANNOTATION in (annotations or {})),
         )
         if annotations:
             _meta(pod).setdefault("annotations", {}).update(annotations)
         self._create("pod", pod)
+
+    def _step_cpu_millicores(self, nd: _Node, *, small: bool) -> int:
+        """The step Pod's CPU request: the node's allocatable CPU minus what the Pods on it request, so the
+        benchmark gets nearly all of the CPU weight kubelet derives from requests (see `pods.step_cpu_millicores`).
+        `small`: the floor, after the kubelet refused the big request."""
+        if small or not nd.facts.allocatable_cpu_millicores:
+            return pods.CPU_FLOOR_M
+        node_pods = self.kube.list_node_pods(nd.facts.node_name)
+        return pods.step_cpu_millicores(nd.facts.allocatable_cpu_millicores, node_pods)
+
+    def _relaunch_refused(
+        self, run: BenchmarkRun, cfg: Config, live: dict[str, dict], nd: _Node, step: Step, pod: dict
+    ) -> bool:
+        """The kubelet refused the step Pod at admission (CPU request, DiskPressure): True when it was handled
+        by creating it again (or waiting for that)."""
+        if pods.is_out_of_cpu(pod):
+            return self._relaunch_out_of_cpu(run, cfg, live, nd, step, pod)
+        return pods.is_rejected(pod) and self._relaunch_rejected(run, cfg, live, nd, step, pod)
+
+    def _relaunch_out_of_cpu(
+        self, run: BenchmarkRun, cfg: Config, live: dict[str, dict], nd: _Node, step: Step, pod: dict
+    ) -> bool:
+        """The kubelet refused the step Pod for its CPU request (Pods appeared on the node since the request
+        was computed): create it once more with the floor request. False when it already was that small one
+        (the marker lives on the recreated Pod, so it survives a controller restart)."""
+        name = _meta(pod)["name"]
+        if (_meta(pod).get("annotations") or {}).get(SMALL_CPU_ANNOTATION):
+            return False
+        log.warning("run %s: step Pod %s refused for its CPU request, recreating it with the floor", run.name, name)
+        self.kube.delete("pod", name, grace_seconds=0)
+        self._launch(run, cfg, live, nd, step, annotations={SMALL_CPU_ANNOTATION: "1"})
+        return True
 
     def _watch_step(self, run: BenchmarkRun, cfg: Config, live: dict[str, dict], nd: _Node, draining: bool) -> None:
         step = steps.from_status(run.status.step)
@@ -1116,7 +1151,7 @@ class Runner:
         elif {s["name"] for s in pod["spec"]["containers"]} != {pods.container_name(c.key) for c in step.containers}:
             log.error("run %s: Pod %s does not match the stored step", run.name, _meta(pod)["name"])
             self._fail_running(run, nd, live, "the step Pod does not match the stored step")
-        elif pods.is_rejected(pod) and self._relaunch_rejected(run, cfg, live, nd, step, pod):
+        elif self._relaunch_refused(run, cfg, live, nd, step, pod):
             return
         elif pods.is_finished(pod):
             self._finish_step(run, cfg, live, nd, step, pod, draining)

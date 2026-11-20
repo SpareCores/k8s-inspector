@@ -52,6 +52,7 @@ class FakeKube:
         self.heartbeats: list[tuple[str, str]] = []
         self.created: list[tuple[str, str]] = []  # (kind, name) in order
         self.deleted: list[tuple[str, str]] = []
+        self.foreign_pods: list[dict] = []  # Pods of other namespaces (kube-system ...), seen by `list_node_pods` only
         self.force_deleted: list[str] = []  # Pods deleted with grace period 0
         self.secret_writes = 0
         self._counter = 0
@@ -76,6 +77,11 @@ class FakeKube:
             if all(k in have and (v is None or have[k] == v) for k, v in (labels or {}).items()):
                 found.append(copy.deepcopy(obj))
         return found
+
+    def list_node_pods(self, node_name: str) -> list[dict]:
+        """The Pods bound to the node: stored ones plus `foreign_pods` (other namespaces, written by tests)."""
+        pods = [*self._store("pod").values(), *self.foreign_pods]
+        return [copy.deepcopy(p) for p in pods if p["spec"].get("nodeName") == node_name]
 
     def create(self, kind: str, manifest: dict) -> dict:
         obj = copy.deepcopy(manifest)
@@ -348,6 +354,7 @@ class Cluster:
             "timed_out": spec.get("timed_out", False),
             "cancelled": spec.get("cancelled", False),
             "oom_kills": spec.get("oom_kills", 0),
+            "nice": spec.get("nice", -20),
             "upload_complete": True,
             "missing": 0,
             "btime": spec.get("btime", int(self.clock.now.timestamp()) - 120),
@@ -356,7 +363,13 @@ class Cluster:
 
     def _stay(self, pod: dict, spec: dict) -> bool:
         name = pod["metadata"]["name"]
-        if spec.get("rejected"):
+        if spec.get("out_of_cpu"):
+            status = {
+                "phase": "Failed",
+                "reason": "OutOfcpu",
+                "message": "Pod was rejected: Node didn't have enough resource: cpu, requested: 3000, used: 1",
+            }
+        elif spec.get("rejected"):
             status = {
                 "phase": "Failed",
                 "reason": "Evicted",
@@ -374,7 +387,7 @@ class Cluster:
         for name, key in self.container_keys(pod):
             queue = self.behaviour.get(key, [])
             spec = queue.pop(0) if queue else {}
-            if spec.get("wedged") or spec.get("rejected"):
+            if spec.get("wedged") or spec.get("rejected") or spec.get("out_of_cpu"):
                 return self._stay(pod, spec)
             if spec.get("pull_stuck"):
                 stuck = True

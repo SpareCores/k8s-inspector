@@ -13,7 +13,7 @@ controller signs every request). It:
 1. runs the version command (60 s cap), then the task command through the image's resource-tracker entrypoint;
 2. writes stdout and stderr to files in the **spool**, a hostPath directory on the node's boot disk
    (`/var/lib/k8s-inspector/runs/<run_id>/<task>/`), directly as the task's stdout and stderr (no pipes, so a background process that keeps them open cannot fail the task; the container log stays empty, read the spool or the uploaded objects);
-3. enforces the task timeout (SIGTERM, SIGKILL after 5 s), forwards signals, reaps children, runs the task at nice -20 (`--nice`), sets rlimits for the DB
+3. enforces the task timeout (SIGTERM, SIGKILL after 5 s), forwards signals, reaps children, runs the task at nice -20 (`--nice`, -20 to 19, else harness error 256; the applied value or null goes to `result.json`), sets rlimits for the DB
    tasks, touches a heartbeat file for the anchor;
 4. uploads in a separate goroutine, so the task never waits on the network:
    - **growing logs** (stdout, stderr, `resource_tracker.jsonl`): re-PUT the whole file every 60 s when it changed,

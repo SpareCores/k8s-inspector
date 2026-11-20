@@ -33,7 +33,7 @@ from k8s_inspector.model import (
     UploadSettings,
     VendorSettings,
 )
-from k8s_inspector.runner import RELAUNCH_ANNOTATION, SKU_NOT_SELECTABLE, Runner
+from k8s_inspector.runner import RELAUNCH_ANNOTATION, SKU_NOT_SELECTABLE, SMALL_CPU_ANNOTATION, Runner
 from k8s_inspector.storage import Storage, object_key, render_urls_json
 
 START = datetime(2026, 11, 20, 10, 0, tzinfo=UTC)
@@ -1305,3 +1305,60 @@ def test_old_manifest_status_and_result_are_cleared_before_every_launch(h):
     h.drive()
     assert h.storage.cleared.count("geekbench") == 1 and "lscpu" in h.storage.cleared
     assert h.storage.cleared.index("lscpu") < h.storage.cleared.index("geekbench")
+
+
+def node_pod(name: str, node: str, cpu: str) -> dict:
+    return {
+        "metadata": {"name": name, "namespace": "kube-system"},
+        "spec": {"nodeName": node, "containers": [{"resources": {"requests": {"cpu": cpu}}}]},
+        "status": {"phase": "Running"},
+    }
+
+
+def step_cpu_requests(h) -> list[str]:
+    return [
+        c["resources"]["requests"]["cpu"]
+        for n in h.pod_names("step")
+        for c in h.kube.get("pod", n)["spec"]["containers"]
+    ]
+
+
+def test_step_pod_requests_the_cpu_the_other_pods_leave_on_the_node(h):
+    h.start(["geekbench"])
+    h.kube.foreign_pods.append(node_pod("flannel", f"node-{h.name}-a1", "500m"))
+    h.kube.foreign_pods.append(node_pod("elsewhere", "other-node", "1"))
+    h.drive(stop=lambda run: any(n.endswith("geekbench") for n in h.pod_names("step")))
+    # allocatable cpu 2 (the fake node) minus flannel's 500m, the anchor's 1m and the 10m margin
+    assert set(step_cpu_requests(h)) == {"1489m"}
+    assert [c.get("limits", {}).get("cpu") for c in h.kube.get("pod", geekbench_pod(h))["spec"]["containers"]] == [None]
+
+
+def test_step_rejected_for_cpu_is_recreated_once_with_the_minimal_request(h):
+    h.cluster.behaviour["geekbench"] = [{"out_of_cpu": True}]
+    h.start(["geekbench"])
+    h.drive(stop=lambda run: any(n.endswith("geekbench") for n in h.pod_names("step")))
+    h.cluster.react()  # the kubelet rejects it
+    name = geekbench_pod(h)
+    assert h.kube.get("pod", name)["spec"]["containers"][0]["resources"]["requests"]["cpu"] == "1989m"
+    h.runner.reconcile(h.name)
+    pod = h.kube.get("pod", name)
+    assert pod["metadata"]["annotations"][SMALL_CPU_ANNOTATION] == "1"  # read back after a restart
+    assert pod["spec"]["containers"][0]["resources"]["requests"]["cpu"] == "10m"
+    run = h.drive()
+    assert h.codes()["geekbench"] == (0, None)
+    assert run.status.phase == RunPhase.PUBLISHING
+
+
+def test_step_rejected_for_cpu_twice_ends_minus_four_with_the_rejection_message(h):
+    h.cluster.behaviour["geekbench"] = [{"out_of_cpu": True}, {"out_of_cpu": True}]
+    h.storage.lost.add("geekbench")
+    h.start(["geekbench"])
+    h.drive()
+    code, message = h.codes()["geekbench"]
+    assert code == -4 and message.startswith("Pod was rejected: Node didn't have enough resource: cpu")
+
+
+def test_nice_of_the_task_reaches_status_json_and_meta(h):
+    h.start(["geekbench"])
+    h.drive()
+    assert h.storage.status["geekbench"]["nice"] == -20

@@ -279,6 +279,7 @@ class NodeFacts:
     arch: str  # amd64 | arm64
     created: datetime  # Node creationTimestamp (must be after the anchor was created)
     allocatable_memory_bytes: int
+    allocatable_cpu_millicores: int = 0  # 0: unknown
     vcpus: int | None = None
     memory_bytes: int | None = None
     region: str | None = None
@@ -314,6 +315,7 @@ class TaskOutcome:
     timed_out: bool = False
     cancelled: bool = False
     oom_kills: int = 0
+    nice: int | None = None  # nice the task ran at (sc-run result.json `nice`); None: disabled, not settable or unknown
     upload_complete: bool | None = None  # None: unknown (no termination message)
     missing_files: int = 0
     container_start_error: bool = False  # StartError / CreateContainerError / RunContainerError

@@ -35,7 +35,9 @@ The anchor is the only Pod the scheduler and SCarpenter ever see for a run.
 
 - Each step is a bare Pod with `spec.nodeName` set to the anchor's node: no scheduler, no SCarpenter involvement. The
   kubelet still admits it on resources and `maxPods`. Step Pods are owned by the anchor, so deleting the anchor
-  removes them.
+  removes them. A step Pod requests the node's CPU minus what the other Pods on the node request, which gives it
+  nearly all the cgroup weight in `kubepods.slice` ([CPU weight](node-profile.md#cpu-weight)); if the kubelet refuses
+  that request (`OutOfcpu`), the controller creates the Pod once more with `cpu: 10m`.
 - A step is one serial task, or the parallel hardware-probe group (dmidecode, lshw, lscpu, lstopo, virtualization,
   nvidia_smi, gpu_facts) as one Pod with several containers. This is today's priority-0 parallel group.
 - Before launching a step the controller waits while the node has DiskPressure (see

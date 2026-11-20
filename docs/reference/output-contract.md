@@ -10,7 +10,7 @@ logs/inspect/<vendor>/<sku>/<Y>/<m>/<d>/<run_id>/run.json
 logs/inspect/<vendor>/<sku>/<Y>/<m>/<d>/<run_id>/tasks/<task>/stdout
                                                          .../stderr
                                                          .../version
-                                                         .../result.json              # sc-run: exit, timing, OOM, kernel, btime
+                                                         .../result.json              # sc-run: exit, timing, OOM, kernel, btime, nice
                                                          .../resource_tracker.jsonl
                                                          .../postgres.log             # pgbench tasks
                                                          .../manifest.json            # sc-run: written last
@@ -85,7 +85,8 @@ Unchanged fields and semantics, naive UTC timestamps, no trailing newline:
 start_retries, spot, region`. `spot` and `region` are always written (`null` when unknown).
 
 Added fields (sc-crawler reads `meta.json` as a dict and ignores unknown keys):
-`run_id, image, zone, capacity_type, price, spot_attempts, node_os, kubelet, runtime, nodeclass_hash`.
+`run_id, image, zone, capacity_type, price, spot_attempts, node_os, kubelet, runtime, nodeclass_hash, nice` (`nice`: the nice
+value the task ran at, from `sc-run`'s `result.json`; null when nice was disabled or could not be set).
 
 Exit codes: [exit codes](exit-codes.md).
 

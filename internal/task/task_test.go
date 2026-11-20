@@ -451,6 +451,9 @@ func TestNiceAppliesToChildOnly(t *testing.T) {
 	if got := strings.TrimSpace(string(out)); got != "-20" {
 		t.Fatalf("child nice: %q", got)
 	}
+	if tm := termMsg(t, cfg); tm.Nice == nil || *tm.Nice != -20 {
+		t.Fatalf("result nice: %v, want -20", tm.Nice)
+	}
 	after, err := syscall.Getpriority(syscall.PRIO_PROCESS, 0)
 	if err != nil {
 		t.Fatal(err)
@@ -474,5 +477,42 @@ func TestNiceZeroLeavesChildAlone(t *testing.T) {
 	want := strconv.Itoa(20 - func() int { p, _ := syscall.Getpriority(syscall.PRIO_PROCESS, 0); return p }())
 	if got := strings.TrimSpace(string(out)); got != want {
 		t.Fatalf("child nice: %q, want %q", got, want)
+	}
+	if tm := termMsg(t, cfg); tm.Nice != nil {
+		t.Fatalf("result nice: %d, want null", *tm.Nice)
+	}
+	data, err := os.ReadFile(filepath.Join(cfg.Spool, "result.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), `"nice": null`) {
+		t.Fatalf("result.json lacks an explicit null nice:\n%s", data)
+	}
+}
+
+func TestInvalidNiceIsHarnessError(t *testing.T) {
+	for _, nice := range []int{-21, 20} {
+		cfg, _ := setup(t, "true")
+		cfg.Nice = nice
+		run(cfg, make(chan os.Signal))
+		tm := termMsg(t, cfg)
+		if tm.ExitCode != CodeHarnessError || !strings.Contains(tm.ErrorMsg, "nice") || tm.Nice != nil {
+			t.Fatalf("nice %d: got %+v", nice, tm.Result)
+		}
+	}
+}
+
+func TestNiceThatCannotBeSetIsNullInResult(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("linux only")
+	}
+	if syscall.Geteuid() == 0 {
+		t.Skip("root can lower nice")
+	}
+	cfg, _ := setup(t, "true")
+	cfg.Nice = -20
+	run(cfg, make(chan os.Signal))
+	if tm := termMsg(t, cfg); tm.ExitCode != 0 || tm.Nice != nil {
+		t.Fatalf("got %+v nice %v", tm.Result, tm.Nice)
 	}
 }

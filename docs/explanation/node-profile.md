@@ -79,7 +79,7 @@ Measured on the `Lean` E5.Flex.2-8 node.
 | `--privileged --network=host` | `privileged: true`, `hostNetwork: true`, `dnsPolicy: Default` |
 | `seccomp=unconfined`, `nofile=1048576`, `memlock=-1` for DB tasks | `seccompProfile: Unconfined` for all; rlimits set by `sc-run` |
 | `--pid=host` for storage | `hostPID: true` on the storage step only |
-| no CPU limits | no CPU limits (no CFS quota, so `nproc` and cgroup-aware tools see the whole node) |
+| no CPU limits | no CPU limits (no CFS quota, so `nproc` and cgroup-aware tools see the whole node); the step Pod's CPU **request** is what the other Pods leave ([CPU weight](#cpu-weight)) |
 | memory cap 0.85 × available for geekbench and vLLM | `limits.memory` = 0.85 × Node allocatable for those two (decision K9); everything else under the `kubepods.slice` limit |
 | `shm_size=4g` for vLLM | emptyDir `medium: Memory`, `sizeLimit: 4Gi` at `/dev/shm`, vLLM only |
 | `nice -n -20` in commands and images | unchanged, and every task also runs at nice -20 via `sc-run exec --nice -20` (generic rule: benchmarks get as much CPU as possible; the legacy per-command `nice` stays, as nice clamps at -20) |
@@ -88,12 +88,37 @@ Measured on the `Lean` E5.Flex.2-8 node.
 the storage benchmark treats as protected (it holds `/`). Until the Flatcar-specific protected mounts land in the
 storage image (last phase, [roadmap](../roadmap.md)), a storage failure is accepted and recorded like any other.
 
+## CPU weight
+
+Under cgroup v2, `nice` only orders threads inside one cgroup. Between cgroups the CPU share is the cgroup weight, and
+the kubelet derives a Pod's weight from its CPU request. The weight of `kubepods.slice` against `system.slice` is fixed
+by the kubelet. Inside `kubepods.slice` the weights of the Pods are proportional to their requests, so a step Pod
+requesting `cpu: 10m` would get the lowest weight there, whatever its nice value.
+
+The controller therefore sizes the request of each step Pod (not the flush Pod, which stays at 10m) at launch:
+
+```
+request = max(10m, node allocatable cpu − CPU requests of the other Pods on the node − 10m)
+```
+
+The other Pods are listed with the `spec.nodeName` field selector over all namespaces (anchor, flannel, kube-proxy,
+debug Pods; finished Pods do not count; the controller's ClusterRole may `list` Pods for this). The result is in whole
+millicores, so it never reaches the allocatable total that the kubelet checks at admission. The benchmark Pod then holds
+nearly all of the weight inside `kubepods.slice`, and inside the Pod `sc-run` runs the task at nice -20, so
+the task is first in line for CPU in every cgroup. A step with several containers (the probe step) splits the request
+evenly. There is still no CPU limit, so no CFS quota.
+
+If a Pod appears on the node after the request was computed, the kubelet can refuse the step Pod
+(`Failed`, reason `OutOfcpu`). The controller then creates it once more with the 10m request (annotation
+`inspector.sparecores.com/small-cpu`) and logs a warning; a second refusal is recorded like any other rejection (`-4`
+with the message). Memory requests stay at 64Mi.
+
 ## Comparability with the VM era
 
 | Aspect | Docker era (Ubuntu VM) | k8s-inspector | Effect |
 |---|---|---|---|
 | Runtime | dockerd → containerd → runc | kubelet → containerd 2 → runc | same runc path |
-| cgroup | `system.slice/docker-<id>.scope` | `kubepods.slice/…/cri-containerd-<id>.scope`, `kubepods.slice` cpu weight ~76 | matters only under contention from daemons that use ~2 % CPU |
+| cgroup | `system.slice/docker-<id>.scope` | `kubepods.slice/…/cri-containerd-<id>.scope`, `kubepods.slice` cpu weight ~76 | `kubepods.slice` against `system.slice` is fixed by the kubelet and matters only under contention from daemons that use ~2 % CPU; inside `kubepods.slice` the step Pod has nearly all the weight ([CPU weight](#cpu-weight)) |
 | Memory | no cap except vLLM/geekbench | `kubepods.slice` capped at allocatable | slightly less headroom on small types |
 | Network | host | host | identical (the pod network over the tailnet is never used by benchmarks) |
 | OS, kernel | Ubuntu 24.04, kernel 6.8, services stopped | Flatcar, kernel 6.12, kubelet, tailscaled, flannel, kube-proxy | the main source of differences |

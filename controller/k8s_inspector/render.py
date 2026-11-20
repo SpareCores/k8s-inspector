@@ -71,6 +71,7 @@ ADDED_META_FIELDS = (
     "kubelet",
     "runtime",
     "nodeclass_hash",
+    "nice",
 )
 _META_DEFAULTS = {"outputs": [], "start_retries": 0}
 
@@ -135,7 +136,7 @@ def build_status(
       (`node.region`, else `run.status.region`), `run_id` (`run.spec.run_id`), `image` (Pod image reference with
       digest), `zone`, `capacity_type` (`spot` | `on-demand`), `price` (hourly price string), `spot_attempts`
       (spot attempts up to and including this task's attempt), `node_os`, `kubelet`, `runtime`, `nodeclass_hash`
-      (from `node`).
+      (from `node`), `nice` (from `outcome`, else null).
     Kubernetes facts (ignored by `meta_from_status`):
       `vendor, sku, key` (the output prefix = `task.name`), `pod`, `node` (node name), `node_claim`, `attempt`
       (attempt number), `reason` (`error_msg` when it is a `model.Reason` value, else null), `gpu_fallback`,
@@ -176,6 +177,7 @@ def build_status(
         "kubelet": node.kubelet if node else None,
         "runtime": node.runtime if node else None,
         "nodeclass_hash": node.nodeclass_hash if node else None,
+        "nice": outcome.nice if outcome else None,
         "vendor": run.spec.vendor,
         "sku": run.spec.sku,
         "key": task.name,
@@ -206,7 +208,7 @@ def meta_from_status(status: dict) -> dict:
     """The `meta.json` dict: unchanged legacy fields (`start, end, exit_code, error_msg, task_hash,
     version, kernel_version, stdout_bytes, stderr_bytes, outputs, start_retries, spot, region`) plus the
     added `run_id, image, zone, capacity_type, price, spot_attempts, node_os, kubelet, runtime,
-    nodeclass_hash`. Everything else in `status` (the Kubernetes facts, see `build_status`) is dropped; a
+    nodeclass_hash, nice`. Everything else in `status` (the Kubernetes facts, see `build_status`) is dropped; a
     missing key is null (`outputs` []; `start_retries` 0)."""
     return _canonical_meta(status, with_added=True)
 

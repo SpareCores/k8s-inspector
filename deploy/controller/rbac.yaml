@@ -46,6 +46,9 @@ rules:
 - apiGroups: [""]
   resources: [nodes]
   verbs: [get]
+- apiGroups: [""]
+  resources: [pods]
+  verbs: [list]                 # Pods of every namespace on the benchmark node: their CPU requests (step Pod request)
 - apiGroups: [karpenter.sh]
   resources: [nodeclaims]
   verbs: [get, list, delete]

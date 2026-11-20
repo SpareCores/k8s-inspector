@@ -21,12 +21,16 @@ import (
 //
 // Failing to set the nice value (no CAP_SYS_NICE) is only a warning: the
 // benchmark still runs, just without the priority boost. 0 disables nice.
-func withNice(nice int, start func() error) error {
+// It returns the nice value actually applied, nil when it was disabled or failed.
+//
+// If putting the thread's nice back fails, the thread is NOT unlocked: unlocked,
+// the Go scheduler would hand the -20 thread to arbitrary goroutines. A locked
+// goroutine that ends takes its thread with it.
+func withNice(nice int, start func() error) (applied *int, err error) {
 	if nice == 0 {
-		return start()
+		return nil, start()
 	}
 	runtime.LockOSThread()
-	defer runtime.UnlockOSThread()
 	old, err := syscall.Getpriority(syscall.PRIO_PROCESS, 0)
 	if err == nil {
 		// The raw syscall returns 20-nice; convert back.
@@ -34,13 +38,16 @@ func withNice(nice int, start func() error) error {
 		err = syscall.Setpriority(syscall.PRIO_PROCESS, 0, nice)
 	}
 	if err != nil {
+		runtime.UnlockOSThread() // the thread's nice is unchanged
 		log.Printf("warning: cannot set nice %d for the task: %v", nice, err)
-		return start()
+		return nil, start()
 	}
 	defer func() {
 		if err := syscall.Setpriority(syscall.PRIO_PROCESS, 0, old); err != nil {
-			log.Printf("warning: cannot restore nice %d: %v (this sc-run thread stays at %d)", old, err, nice)
+			log.Printf("warning: cannot restore nice %d: %v (this sc-run thread stays at %d and stays locked to its goroutine)", old, err, nice)
+			return
 		}
+		runtime.UnlockOSThread()
 	}()
-	return start()
+	return &nice, start()
 }
