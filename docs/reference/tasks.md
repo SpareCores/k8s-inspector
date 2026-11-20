@@ -29,6 +29,7 @@ and `dbaas_tasks.py`; the task list, images, commands, timeouts and priorities a
 | `large_outputs` | list | files that get multipart upload slots from the start |
 | `workload_proxy`, `durability` | strings | as in sc-inspector; **hashed** |
 | `dbaas` | bool, default false | DBaaS task: runs only in a DBaaS run (named explicitly), never in the default selection |
+| `keeper_gated` | bool, default false | Keeper allows the task only on an SKU allowlist (`stressnglongrun`); not hashed. A default selection (no `--tasks`) never includes it; naming it in `--tasks` does, and without `--force` Keeper still checks it |
 | `revision` | int, default 0 | deliberate rerun; hashed only when > 0, so existing hashes stay equal |
 | `spot` | bool, default true | false forces on-demand for runs containing the task (`stressnglongrun`) |
 | `models_cache` | bool | mount the per-node model cache at `/models` (llm, vllm) |

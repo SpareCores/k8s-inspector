@@ -117,10 +117,11 @@ def force_run(
     SKU already has a run.
 
     Validation: the vendor is `enabled`; every task name is in the catalogue (`tasks.select_tasks`; empty =
-    every server task; DBaaS tasks need a database and are refused); the vendor is below `maxInFlight` and
-    `maxUsdPerHour`. Without `force` Keeper must also find every task eligible (`keeper.block_reasons`; an
-    unknown SKU is blocked, an unreachable Keeper fails closed). With `force` the SKU is not checked here: a
-    SKU SCarpenter cannot offer ends in `-1 SCARPENTER_NO_OFFERING` (Keeper does not know OCI SKUs)."""
+    every server task, except the `keeper_gated` ones, which run only when named; DBaaS tasks need a database
+    and are refused); the vendor is below `maxInFlight` and `maxUsdPerHour`. Without `force` Keeper must also find
+    every task eligible (`keeper.block_reasons`; an unknown SKU is blocked, an unreachable Keeper fails closed).
+    With `force` the SKU is not checked here: a SKU SCarpenter cannot offer ends in `-1 SCARPENTER_NO_OFFERING`
+    (Keeper does not know OCI SKUs)."""
     settings = cfg.settings
     vendor_settings = settings.vendors.get(vendor)
     if vendor_settings is None or not vendor_settings.enabled:
@@ -144,7 +145,7 @@ def force_run(
         hold_after=hold_after,
     )
     run = crd.create_run(kube, spec)
-    log.info("created run", extra={"run": run.name, "vendor": vendor, "sku": sku, "tasks": len(names)})
+    log.info("created run", extra={"run": run.name, "vendor": vendor, "sku": sku, "tasks": ",".join(names)})
     return run
 
 

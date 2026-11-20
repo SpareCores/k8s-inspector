@@ -20,6 +20,11 @@ benchmarked while Keeper's eligibility rules do not allow inspector runs on OCI 
      k8s-inspector run oci VM.Standard.E5.Flex.2-16 --force
    ```
 
+   Without `--tasks`, a run benchmarks every server task except the DBaaS tasks and the Keeper-gated ones
+   (`keeper_gated` in the catalogue: today `stressnglongrun`, which Keeper only allows on a short SKU allowlist). The command prints the selected task list before the run name.
+   To include it, name it: `--tasks stressnglongrun` (or add it to a longer list). It runs 26 hours and is always
+   on demand (no spot), so it costs a day of the node: use it deliberately.
+
    Add `--tasks lscpu,stressngfull` to run only some tasks, `--on-demand` to skip spot, `--hold 2h` to keep the node
    after the last step for debugging.
 

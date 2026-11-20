@@ -3,10 +3,13 @@ import re
 import zlib
 from datetime import UTC, date, datetime, timedelta, timezone
 
+import httpx2 as httpx
 import pytest
+from lightkube import ApiError
 
 from k8s_inspector import crd
-from k8s_inspector.kube import AlreadyExists, Conflict, NotFound
+from k8s_inspector import kube as kube_mod
+from k8s_inspector.kube import AlreadyExists, Conflict, NotFound, TransientApiError
 from k8s_inspector.model import (
     AttemptOutcome,
     AttemptStatus,
@@ -264,6 +267,60 @@ def test_create_run_sets_pending_status_and_second_create_raises_run_exists():
     assert kube.objects[run.name]["status"]["phase"] == "Pending"
     with pytest.raises(crd.RunExists):
         crd.create_run(kube, spec(run_id="r20261120t1000-aaaa"))
+
+
+def sleepless(monkeypatch):
+    monkeypatch.setattr(kube_mod.time, "sleep", lambda seconds: None)
+
+
+def transient_error():
+    return ApiError(response=httpx.Response(503, json={"error": "x"}))
+
+
+def test_create_run_survives_a_lost_create_response(monkeypatch):
+    sleepless(monkeypatch)
+
+    class LostResponse(FakeKube):
+        lost = True
+
+        def create(self, kind, manifest):
+            created = super().create(kind, manifest)
+            if self.lost:
+                self.lost = False
+                raise transient_error()
+            return created
+
+    kube = LostResponse()
+    run = crd.create_run(kube, spec())
+    assert run.name == crd.run_name("oci", "VM.Standard.E5.Flex.2-16")
+    assert kube.objects[run.name]["status"]["phase"] == "Pending"
+
+
+def test_create_run_retries_the_initial_status_update(monkeypatch):
+    sleepless(monkeypatch)
+
+    class FlakyPatch(FakeKube):
+        failures = 1
+
+        def merge_patch(self, *args, **kwargs):
+            if self.failures:
+                self.failures -= 1
+                raise transient_error()
+            return super().merge_patch(*args, **kwargs)
+
+    kube = FlakyPatch()
+    assert crd.create_run(kube, spec()).status.phase == RunPhase.PENDING
+
+
+def test_create_run_gives_up_after_repeated_transient_errors(monkeypatch):
+    sleepless(monkeypatch)
+
+    class Down(FakeKube):
+        def create(self, kind, manifest):
+            raise transient_error()
+
+    with pytest.raises(TransientApiError):
+        crd.create_run(Down(), spec())
 
 
 def test_get_list_delete():

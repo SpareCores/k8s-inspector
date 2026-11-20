@@ -92,6 +92,13 @@ def test_select_tasks():
         tasks.select_tasks(["openssl", "nope"])
 
 
+def test_keeper_gated_tasks_are_selected_only_by_name():
+    assert [t.name for t in tasks.all_tasks() if t.keeper_gated] == ["stressnglongrun"]
+    assert "stressnglongrun" not in [t.name for t in tasks.select_tasks([])]
+    named = tasks.select_tasks(["lscpu", "stressnglongrun"])
+    assert [t.name for t in named] == ["lscpu", "stressnglongrun"]
+
+
 def test_get_task_unknown():
     with pytest.raises(KeyError):
         tasks.get_task("nope")

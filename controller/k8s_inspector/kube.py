@@ -11,6 +11,7 @@ lightkube's sync `Client` is safe for that. `watch` is a blocking generator: run
 import logging
 import random
 import threading
+import time
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 
@@ -118,6 +119,46 @@ def retry_until_ok(what: str, action: Callable[[], None], stop: threading.Event)
             log.warning("%s failed (%d in a row), retrying in %.0fs", what, failures, delay, exc_info=True)
             stop.wait(delay)
     return False
+
+
+ONE_SHOT_ATTEMPTS = 5
+
+
+def is_transient(error: Exception) -> bool:
+    """429, 5xx, "storage is (re)initializing" (the API server right after a CRD update) and connection errors."""
+    if isinstance(error, ApiError):
+        # `status.code` is None when the body is not a Status (or has no code): fall back to the HTTP status.
+        code = error.status.code or error.response.status_code
+        return code == 429 or code >= 500 or "initializing" in str(error.status.message)
+    return isinstance(error, httpx2.TransportError) and not isinstance(error, httpx2.UnsupportedProtocol)
+
+
+class TransientApiError(Exception):
+    """The Kubernetes API kept failing transiently through every attempt; `__cause__` is the last error."""
+
+    def __init__(self, attempts: int) -> None:
+        super().__init__(f"Kubernetes API unavailable after {attempts} attempts")
+        self.attempts = attempts
+
+
+def call_with_retries[T](
+    what: str, action: Callable[[], T], attempts: int = ONE_SHOT_ATTEMPTS, sleep: Callable[[float], None] = time.sleep
+) -> T:
+    """`action()`, retried up to `attempts` times in total after a transient API error, waiting with
+    `backoff_delay` between attempts. Other errors are raised as they are; after the last transient one
+    `TransientApiError` is raised from it."""
+    for failures in range(1, attempts + 1):
+        try:
+            return action()
+        except Exception as error:
+            if not is_transient(error):
+                raise
+            if failures == attempts:
+                raise TransientApiError(attempts) from error
+            delay = backoff_delay(failures, error)
+            log.warning("%s failed (%d of %d), retrying in %.0fs: %s", what, failures, attempts, delay, error)
+            sleep(delay)
+    raise AssertionError("unreachable")  # attempts < 1
 
 
 class Kube:

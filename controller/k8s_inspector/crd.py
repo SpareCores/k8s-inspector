@@ -11,7 +11,7 @@ import zlib
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 
-from k8s_inspector.kube import AlreadyExists, Conflict, Kube
+from k8s_inspector.kube import AlreadyExists, Conflict, Kube, call_with_retries
 from k8s_inspector.model import (
     AttemptOutcome,
     AttemptStatus,
@@ -274,13 +274,18 @@ def _progress(status: RunStatus) -> str:
 
 
 def create_run(kube: Kube, spec: RunSpec) -> BenchmarkRun:
-    """Create with `status.phase=Pending`. Raise `RunExists` on `AlreadyExists`."""
+    """Create with `status.phase=Pending`. Raise `RunExists` on `AlreadyExists`. Transient API errors are retried
+    here step by step: when a create's response was lost, the retry finds the run with our `run_id` and carries on."""
+    name = run_name(spec.vendor, spec.sku)
+    manifest = to_manifest(spec, kube.namespace)
     try:
-        created = kube.create("benchmarkrun", to_manifest(spec, kube.namespace))
+        call_with_retries("create run", lambda: kube.create("benchmarkrun", manifest))
     except AlreadyExists as e:
-        raise RunExists(run_name(spec.vendor, spec.sku)) from e
-    # The status subresource ignores `status` on create, so write the initial status separately.
-    return update_status(kube, created["metadata"]["name"], lambda status: None)
+        existing = get_run(kube, name)
+        if existing.spec.run_id != spec.run_id:
+            raise RunExists(name) from e
+    # The status subresource ignores `status` on create, so write the initial status separately (idempotent).
+    return call_with_retries("initialise run status", lambda: update_status(kube, name, lambda status: None))
 
 
 def get_run(kube: Kube, name: str) -> BenchmarkRun:

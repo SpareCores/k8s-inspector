@@ -28,7 +28,7 @@ from pathlib import Path
 
 from k8s_inspector import config as config_loader
 from k8s_inspector import crd, planner
-from k8s_inspector.kube import Kube, NotFound
+from k8s_inspector.kube import Kube, NotFound, TransientApiError, call_with_retries
 from k8s_inspector.log import setup_logging
 from k8s_inspector.metrics import PORT as METRICS_PORT
 from k8s_inspector.metrics import Metrics, make_server
@@ -271,6 +271,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         ) from None
     except ValueError as e:
         raise CliError(str(e)) from e
+    print(f"tasks ({len(run.spec.tasks)}): {', '.join(run.spec.tasks)}", file=sys.stderr)
     print(run.name)
     return 0
 
@@ -360,6 +361,11 @@ def cmd_publish(args: argparse.Namespace) -> int:
     return 0
 
 
+# One-shot commands retry transient API errors (a 429, a 5xx, the API server (re)initializing storage after a CRD
+# update, a dropped connection) a few times; `serve` and `plan` have their own loops. `run` retries inside
+# `crd.create_run` and `publish` is never re-run.
+RETRIED_COMMANDS = {"status", "cancel"}
+
 COMMANDS = {
     "serve": cmd_serve,
     "plan": cmd_plan,
@@ -374,7 +380,13 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     setup_logging()
     try:
-        return COMMANDS[args.command](args)
+        command = COMMANDS[args.command]
+        if args.command in RETRIED_COMMANDS:
+            return call_with_retries(args.command, lambda: command(args))
+        return command(args)
+    except TransientApiError as e:
+        print(f"error: Kubernetes API unavailable after {e.attempts} attempts: {e.__cause__}", file=sys.stderr)
+        return 1
     except CliError as e:
         print(f"error: {e}", file=sys.stderr)
         return e.exit_code

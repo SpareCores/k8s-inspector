@@ -138,6 +138,7 @@ class TaskDef:
     dbaas: bool = False  # DBaaS task: runs only in a DBaaS run, never in the default server selection
     durability: str | None = None  # HASHED when set
     revision: int = 0  # deliberate rerun; hashed only when > 0
+    keeper_gated: bool = False  # Keeper-allowlisted (stressnglongrun): only when named, never in a default selection
     spot: bool = True  # False: runs containing this task are on-demand (stressnglongrun)
     models_cache: bool = False  # mount the per-node model hostPath at /models (llm, vllm)
 

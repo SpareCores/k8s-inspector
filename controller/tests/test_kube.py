@@ -5,10 +5,11 @@ import json
 import httpx2 as httpx
 import lightkube
 import pytest
+from lightkube import ApiError
 from lightkube.config.kubeconfig import KubeConfig
 from lightkube.config.models import Cluster, User
 
-from k8s_inspector.kube import AlreadyExists, Conflict, Kube, NotFound
+from k8s_inspector.kube import AlreadyExists, Conflict, Kube, NotFound, is_transient
 
 CRD_BASE = "/apis/inspector.sparecores.com/v1alpha1/namespaces/inspector/benchmarkruns"
 
@@ -209,3 +210,24 @@ def test_watch_relists_on_410_error_event_in_stream():
 
     events = make_kube(handler).watch("pod", resource_version="5")
     assert [next(events).type for _ in range(2)] == ["ADDED", "MODIFIED"]
+
+
+@pytest.mark.parametrize(
+    ("response", "transient"),
+    [
+        (httpx.Response(429, json={"kind": "Status", "code": 429}), True),
+        (httpx.Response(503, json={"error": "x"}), True),  # a body without a Status code
+        (httpx.Response(503, json={"kind": "Status", "message": "no code"}), True),
+        (httpx.Response(500, json={"kind": "Status", "code": 500, "message": "storage is (re)initializing"}), True),
+        (httpx.Response(403, json={"kind": "Status", "code": 403}), False),
+        (httpx.Response(404, json={"error": "x"}), False),
+    ],
+)
+def test_is_transient_api_errors(response, transient):
+    assert is_transient(ApiError(response=response)) is transient
+
+
+def test_is_transient_transport_errors():
+    assert is_transient(httpx.ConnectError("refused"))
+    assert not is_transient(httpx.UnsupportedProtocol("no scheme"))
+    assert not is_transient(ValueError("x"))

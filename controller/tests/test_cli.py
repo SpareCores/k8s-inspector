@@ -215,7 +215,9 @@ def test_run_prints_run_name(env, monkeypatch, capsys):
     code = cli.main(["run", "oci", "sku", "--tasks", "lscpu", "--force", "--on-demand", "--hold", "2h"])
 
     assert code == 0
-    assert capsys.readouterr().out == "oci-sku\n"
+    captured = capsys.readouterr()
+    assert captured.out == "oci-sku\n"
+    assert captured.err == "tasks (0): \n"
     assert seen == {
         "vendor": "oci",
         "sku": "sku",
@@ -224,6 +226,82 @@ def test_run_prints_run_name(env, monkeypatch, capsys):
         "capacity": CapacityMode.ON_DEMAND,
         "hold_after": timedelta(hours=2),
     }
+
+
+def test_run_prints_the_selected_tasks(env, monkeypatch, capsys):
+    run = make_run("sku", RunPhase.PENDING)
+    run.spec.tasks = ["lscpu", "openssl"]
+    monkeypatch.setattr(planner, "force_run", lambda *a, **kw: run)
+    assert cli.main(["run", "oci", "sku"]) == 0
+    assert "tasks (2): lscpu, openssl" in capsys.readouterr().err
+
+
+def api_error(code, message="boom"):
+    return ApiError(response=httpx.Response(code, json={"kind": "Status", "code": code, "message": message}))
+
+
+@pytest.mark.parametrize(
+    "error",
+    [api_error(429), api_error(503), api_error(500, "storage is (re)initializing"), httpx.ConnectError("refused")],
+)
+def test_one_shot_commands_retry_transient_errors(env, monkeypatch, capsys, error):
+    calls = []
+
+    def list_runs(kube):
+        calls.append(1)
+        if len(calls) < 3:
+            raise error
+        return [make_run("a", RunPhase.RUNNING)]
+
+    monkeypatch.setattr(crd, "list_runs", list_runs)
+    monkeypatch.setattr(kube_mod.time, "sleep", lambda seconds: None)
+    assert cli.main(["status"]) == 0
+    assert len(calls) == 3
+    assert "oci-a" in capsys.readouterr().out
+
+
+def test_run_whose_create_response_is_lost_still_prints_the_run_name(env, monkeypatch, capsys):
+    class LostResponse(ClusterKube):
+        lost = True
+
+        def create(self, kind, manifest):
+            created = super().create(kind, manifest)
+            if self.lost:
+                self.lost = False
+                raise api_error(503)
+            return created
+
+    monkeypatch.setattr(cli, "Kube", lambda namespace: LostResponse(Clock(NOW)))
+    monkeypatch.setattr(kube_mod.time, "sleep", lambda seconds: None)
+    assert cli.main(["run", "oci", "sku", "--tasks", "lscpu", "--force"]) == 0
+    assert capsys.readouterr().out == f"{crd.run_name('oci', 'sku')}\n"
+
+
+def test_one_shot_commands_give_up_after_five_attempts(env, monkeypatch, capsys):
+    calls = []
+
+    def list_runs(kube):
+        calls.append(1)
+        raise api_error(503)
+
+    monkeypatch.setattr(crd, "list_runs", list_runs)
+    monkeypatch.setattr(kube_mod.time, "sleep", lambda seconds: None)
+    assert cli.main(["status"]) == 1
+    assert len(calls) == 5
+    assert "error: Kubernetes API unavailable after 5 attempts: boom" in capsys.readouterr().err
+
+
+def test_one_shot_commands_do_not_retry_other_errors(env, monkeypatch):
+    calls = []
+
+    def list_runs(kube):
+        calls.append(1)
+        raise api_error(403)
+
+    monkeypatch.setattr(crd, "list_runs", list_runs)
+    with pytest.raises(ApiError):
+        cli.main(["status"])
+    assert calls == [1]
 
 
 def test_run_without_on_demand_leaves_capacity_to_vendor_setting(env, monkeypatch):

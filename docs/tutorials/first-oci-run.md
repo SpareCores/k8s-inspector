@@ -14,6 +14,10 @@ You will benchmark one small OCI instance type end to end and find its results i
    kubectl -n inspector exec deploy/k8s-inspector -- \
      k8s-inspector run oci VM.Standard.E5.Flex.1-8 --force --on-demand --tasks lscpu,stressngfull
    ```
+
+   Without `--tasks`, a run covers all server tasks except `stressnglongrun` (Keeper allows it only on an SKU
+   allowlist; it runs 26 h on demand, so name it in `--tasks` only when you want it). The command prints the
+   selected tasks.
 4. **Watch the node arrive.** `kubectl get benchmarkruns,nodeclaims -w`: Provisioning → Running, the node's labels.
 5. **Watch a step.** `kubectl logs -f` on the step Pod; the spool on the node; objects appearing in storage.
 6. **See the release.** Phase Releasing → the node and NodeClaim disappear.

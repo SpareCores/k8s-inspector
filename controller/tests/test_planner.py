@@ -76,9 +76,28 @@ def test_force_run_defaults_to_all_server_tasks(kube):
     assert run.spec.force is True
     assert run.spec.capacity == CapacityMode.SPOT_FIRST
     assert run.spec.hold_after == timedelta(0)
-    assert run.spec.tasks == [t.name for t in all_tasks() if not t.dbaas]
+    assert run.spec.tasks == [t.name for t in all_tasks() if not t.dbaas and not t.keeper_gated]
+    assert "stressnglongrun" not in run.spec.tasks
     assert run.spec.run_id.startswith("r")
     assert run.name in kube.objects
+
+
+def test_force_run_runs_a_keeper_gated_task_when_named(kube):
+    run = planner.force_run(kube, make_config(), "oci", "sku", tasks=["lscpu", "stressnglongrun"])
+    assert run.spec.tasks == ["lscpu", "stressnglongrun"]
+
+
+def test_run_without_force_leaves_keeper_gated_tasks_out_of_the_default(kube, monkeypatch):
+    monkeypatch.setattr(keeper, "block_reasons", lambda *a: {"sku": {}})
+    run = planner.force_run(kube, make_config(), "oci", "sku", force=False)
+    assert run.spec.tasks == [t.name for t in all_tasks() if not t.dbaas and not t.keeper_gated]
+
+
+def test_run_without_force_asks_keeper_about_a_named_keeper_gated_task(kube, monkeypatch):
+    asked = []
+    monkeypatch.setattr(keeper, "block_reasons", lambda cfg, vendor, sku, names: asked.append(names) or {"sku": {}})
+    planner.force_run(kube, make_config(), "oci", "sku", tasks=["stressnglongrun"], force=False)
+    assert asked == [["stressnglongrun"]]
 
 
 def test_force_run_options(kube):

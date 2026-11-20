@@ -27,6 +27,8 @@
 #   labels (`NodeFacts.has_nvidia_gpu`) instead. Memory, vCPU, storage and allowlist rules are Keeper's, not
 #   the catalogue's (no legacy task sets `minimum_memory` or `maximum_cpus`). vLLM's compute-capability rule and
 #   nvbandwidth's `-b` size are adaptive and live in steps.py.
+# - `keeper_gated: true`: Keeper allows the task only on an SKU allowlist (stressnglongrun). Not hashed. A run without
+#   `--tasks` never includes these; naming them in `--tasks` does (without `--force` Keeper still checks them).
 # - DBaaS tasks have `dbaas: true` (the legacy DbaasDbTask, which also sets `workload_proxy`). They run only in a DBaaS
 #   run (explicit task name); an empty task list means every server task.
 # - Not ported: `timing` (publisher output, not a task).
@@ -363,4 +365,5 @@ tasks:
     timeout: 26h
     parse: stressnglongrun
     spot: false
+    keeper_gated: true
     secrets: [sentinel]

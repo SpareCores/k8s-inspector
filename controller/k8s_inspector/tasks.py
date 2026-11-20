@@ -93,6 +93,7 @@ _PLAIN_KEYS = {
     "precheck_regex",
     "workload_proxy",
     "dbaas",
+    "keeper_gated",
     "durability",
     "revision",
     "spot",
@@ -226,15 +227,15 @@ def image_ref(task: TaskDef, image: str | None = None) -> str:
 
 
 def select_tasks(names: list[str]) -> list[TaskDef]:
-    """The tasks of a run: `names` (empty = every server task of the catalogue, DBaaS tasks only when named),
-    ordered like `all_tasks()`. Raise `ValueError` on unknown names. Eligibility (Keeper block reasons,
-    due-ness) is the planner's job."""
+    """The tasks of a run: `names` (empty = every server task of the catalogue, except the DBaaS and `keeper_gated`
+    tasks, which only run when named), ordered like `all_tasks()`. Raise `ValueError` on unknown names.
+    Eligibility (Keeper block reasons, due-ness) is the planner's job."""
     known = {task.name for task in _catalogue()}
     unknown = sorted(set(names) - known)
     if unknown:
         raise ValueError(f"unknown tasks: {unknown}")
     if not names:
-        return [task for task in _catalogue() if not task.dbaas]
+        return [task for task in _catalogue() if not task.dbaas and not task.keeper_gated]
     return [task for task in _catalogue() if task.name in names]
 
 
