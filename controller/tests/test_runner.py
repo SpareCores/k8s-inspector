@@ -529,7 +529,8 @@ def test_crash_between_status_json_and_status_patch_is_repeated_safely(h):
 def test_cancel_records_minus_four_cancelled_and_releases_the_node(h):
     h.start(["membench", "geekbench"])
     h.drive(stop=in_step("02-geekbench"))
-    h.runner.cancel(h.name)
+    crd.request_cancel(h.kube, h.name)
+    h.runner.reconcile(h.name)
     run = h.run
     assert run.status.phase == RunPhase.CANCELLED
     assert h.codes()["geekbench"] == (-4, "CANCELLED") and h.codes()["membench"] == (-4, "CANCELLED")
@@ -803,7 +804,7 @@ class _Presigner:
 
 def test_urls_secret_of_the_largest_step_stays_far_below_the_object_limit(h):
     storage = Storage.__new__(Storage)
-    storage.bucket, storage.uploads, storage.s3 = "b", UploadSettings(), _Presigner()
+    storage.bucket, storage.uploads, storage.s3, storage._prefix = "b", UploadSettings(), _Presigner(), ""
     probes = [t for t in tasks.all_tasks() if t.parallel]
     step = steps.probe_step(probes, index=1)
     assert len(step.containers) == 7 and step.gpu_runtime  # the GPU node's probe step
@@ -819,7 +820,7 @@ def test_urls_secret_of_the_largest_step_stays_far_below_the_object_limit(h):
 def test_urls_secret_of_the_pgbench_step_stays_far_below_the_object_limit(h):
     """pgbench has the most multipart slots: resource tracker and the collected server log with `max_parts` parts."""
     storage = Storage.__new__(Storage)
-    storage.bucket, storage.uploads, storage.s3 = "b", UploadSettings(), _Presigner()
+    storage.bucket, storage.uploads, storage.s3, storage._prefix = "b", UploadSettings(), _Presigner(), ""
     facts = NodeFacts("n", "oci.x", "amd64", START, 1)
     step = steps.next_step([tasks.get_task("pgbench_postgres_ro_durable")], {}, facts, index=2)
     h.start(["pgbench_postgres_ro_durable"])
@@ -862,6 +863,7 @@ def test_stuck_pull_with_a_flush_neither_relaunches_the_step_nor_deletes_it_earl
     h.runner.reconcile(h.name)
     probe = f"{h.name}-a1-01-probes"
     assert {probe, f"{probe}-flush1"} <= set(h.pod_names())  # the stuck Pod stays until the flush is over
+    assert "dmidecode" not in h.storage.aborted  # the image may still arrive during the flush
     h.runner.reconcile(h.name)  # the flush is still going
     assert h.task("dmidecode").state == TaskState.RUNNING
     h.cluster.react()
@@ -869,6 +871,7 @@ def test_stuck_pull_with_a_flush_neither_relaunches_the_step_nor_deletes_it_earl
     assert h.codes()["dmidecode"] == (-4, "IMAGE_PULL_TIMEOUT") and h.codes()["lscpu"] == (0, None)
     assert probe not in h.pod_names()
     assert [n for k, n in h.kube.created if k == "pod"].count(probe) == 1
+    assert "dmidecode" in h.storage.aborted  # aborted when the Pod is deleted and the result recorded
 
 
 def test_container_waiting_on_a_bad_config_fails_after_the_pull_budget_with_its_message(h):
@@ -946,3 +949,52 @@ def test_gpu_count_follows_the_node(h):
     h.kube.patch_obj("node", f"node-{h.name}-a1", {"status": {"allocatable": {"nvidia.com/gpu": "2"}}})
     h.runner.reconcile(h.name)
     assert h.runner._nodes[h.name].gpu_count == 2
+
+
+def gpu_node(h) -> None:
+    h.cluster.node_labels = {"scarpenter.sparecores.com/accelerator-manufacturer": "nvidia"}
+    h.cluster.node_allocatable = {"memory": "15Gi", "cpu": "2", "nvidia.com/gpu": "1"}
+
+
+def test_gpu_fallback_is_one_status_update_so_a_failed_patch_never_relaunches_the_gpu_step(h):
+    gpu_node(h)
+    h.cluster.behaviour["dmidecode"] = [{"start_error": True}]
+    h.start(["dmidecode"])
+    h.drive(stop=lambda run: probe_pod_exists(h))
+    h.cluster.react()
+    probe = f"{h.name}-a1-01-probes"
+
+    real_patch = h.kube.merge_patch
+    patches = []
+
+    def failing_second_patch(kind, name, body, subresource_status=False):
+        if subresource_status:
+            patches.append(body)
+            if len(patches) > 1:
+                raise RuntimeError("API server unavailable")
+        return real_patch(kind, name, body, subresource_status)
+
+    h.kube.merge_patch = failing_second_patch
+    try:
+        h.runner.reconcile(h.name)  # one patch: records the others, switches to the CPU step
+    finally:
+        h.kube.merge_patch = real_patch
+    assert len(patches) == 1
+    run = h.run
+    assert run.status.step["name"] == "01-probes-cpu" and run.status.current_step == "01-probes-cpu"
+    assert h.task("dmidecode").state == TaskState.RUNNING and h.task("dmidecode").gpu_fallback
+    assert h.task("lscpu").state == TaskState.DONE
+
+    run = h.drive(runner=h.new_runner())  # the CPU Pod is launched by the next pass
+    assert h.task("dmidecode").exit_code == 0 and run.status.phase == RunPhase.PUBLISHING
+    assert [n for k, n in h.kube.created if k == "pod"].count(probe) == 1
+
+
+def test_probe_facts_are_learned_after_the_cpu_fallback_of_the_probe_step(h):
+    gpu_node(h)
+    h.cluster.behaviour["lscpu"] = [{"start_error": True}]
+    h.start(["membench"])
+    h.storage.objects[object_key(h.run_key(), "gpu_facts", "stdout")] = b"16384, 8.0\n"
+    h.drive(stop=in_step("02-membench"))
+    nd = h.runner._nodes[h.name]
+    assert nd.lscpu_stdout == LSCPU and nd.facts.lscpu["Model name:"] == "AMD EPYC 9R14"

@@ -26,7 +26,9 @@ DBaaS tasks follow the same rules (no endless retry).
 
 `IMAGE_PULL_TIMEOUT` applies to the containers of a step Pod that are still pulling (or creating) after
 `imagePullMinutes`; the others of the Pod keep their results. Containers waiting with `CreateContainerConfigError`,
-`InvalidImageName` or `ErrImageNeverPull` count as stuck pulling: they cannot recover, but get the same deadline.
+`InvalidImageName` or `ErrImageNeverPull` count as stuck, with the same deadline: they cannot recover. Their tasks
+record the kubelet's waiting message as `error_msg` (not `IMAGE_PULL_TIMEOUT`), and unlike a stuck pull they get no
+CPU fallback.
 
 Where the controller gets the facts: `sc-run`'s `result.json` and termination message (exit code, timeout, OOM),
 container state and reason, Pod `DeadlineExceeded`, NodeClaim conditions and Events (capacity errors), the anchor's

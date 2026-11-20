@@ -37,7 +37,6 @@ from k8s_inspector.model import (
     CapacityMode,
     Config,
     EnvConfig,
-    RunPhase,
     Settings,
     TaskState,
 )
@@ -336,8 +335,8 @@ def cmd_cancel(args: argparse.Namespace) -> int:
         run = crd.get_run(kube, args.run)
     except NotFound:
         raise CliError(f"no such run: {args.run}") from None
-    if run.status.phase in (RunPhase.DONE, RunPhase.FAILED, RunPhase.CANCELLED):
-        print(f"{run.name} is already {run.status.phase.value}; nothing to do")
+    if run.status.phase not in planner.ACTIVE_PHASES:
+        print(f"{run.name} is not active (phase {run.status.phase.value}); nothing to cancel")
         return 0
     crd.request_cancel(kube, run.name)
     print(f"cancel requested for {run.name}; the serve process performs it")

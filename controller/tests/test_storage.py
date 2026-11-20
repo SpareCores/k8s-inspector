@@ -268,12 +268,23 @@ def test_write_and_list_status_and_run_json(store):
     assert len(store.list_status_keys(storage.run_prefix(other))) == 1
 
 
-def test_key_prefix_is_prepended_to_every_key(store, monkeypatch):
-    monkeypatch.setattr(storage, "_key_prefix", "")  # restored after the test; Storage() sets it
-    Storage(EnvConfig(bucket=BUCKET, bucket_region="eu-west-1", key_prefix="k8s-inspector/spikes"), UploadSettings())
-    prefix = "k8s-inspector/spikes/logs/inspect/aws/m5.large/2026/03/07/"
-    assert storage.day_prefix("aws", "m5.large", RUN.day) == prefix
-    assert storage.object_key(RUN, "membench", "stdout") == f"{prefix}{RUN.run_id}/tasks/membench/stdout"
-    store.write_status_json(RUN, "membench", {"exit_code": 0})
-    assert store.list_status_keys(prefix) == [storage.object_key(RUN, "membench", "status.json")]
-    assert store.list_status_keys("logs/inspect/") == []
+def test_key_prefix_applies_to_put_presign_and_list(store):
+    env = EnvConfig(bucket=BUCKET, bucket_region="eu-west-1", key_prefix="k8s-inspector/spikes")
+    prefixed = Storage(env, UploadSettings(part_mib=5, max_parts=3))
+    logical = storage.object_key(RUN, "membench", "status.json")
+    assert logical.startswith("logs/inspect/")  # key functions stay logical
+
+    prefixed.write_status_json(RUN, "membench", {"exit_code": 0})
+    store.write_status_json(RUN, "other", {})  # same run, no prefix
+    assert prefixed.s3.get_object(Bucket=BUCKET, Key=f"k8s-inspector/spikes/{logical}")
+    assert prefixed.read_json(RUN, "membench", "status.json") == {"exit_code": 0}
+    day = storage.day_prefix("aws", "m5.large", RUN.day)
+    assert prefixed.list_status_keys(day) == [logical]  # prefix stripped, unprefixed object not listed
+    assert prefixed.list_status_keys("elsewhere/") == []
+
+    plans = prefixed.presign(prefixed.plan_uploads(RUN, [container()]))
+    stdout = next(p for p in plans if p.urls_key == "membench/stdout")
+    assert urlparse(stdout.put_url).path.endswith(f"/k8s-inspector/spikes/{stdout.object_key}")
+    http_put(stdout.put_url, b"hello")
+    assert prefixed.read_bytes(stdout.object_key) == b"hello"
+    assert prefixed.s3.head_object(Bucket=BUCKET, Key=f"k8s-inspector/spikes/{stdout.object_key}")

@@ -104,7 +104,7 @@ record.
 
 A run whose reconciles keep failing for 30 minutes (a time window, not a count: a short API or S3 outage does not
 end a run) ends `Failed` with the attempt outcome `HarnessError`: its unfinished tasks are `256` (harness error) and
-the status is recorded first. No Pod is deleted at that moment; the next pass removes the anchor and the urls Secret,
+the status is recorded first. The urls Secret is deleted at that moment; no Pod is: the next pass removes the anchor,
 so the SKU lease is released.
 
 An attempt that is lost after every task is done goes to `Publishing` without a retry.

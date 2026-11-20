@@ -44,10 +44,10 @@ Phases:
 
 A reconcile that keeps failing for `MAX_FAILING` ends the run: unfinished tasks `256 HARNESS_ERROR`, open
 uploads aborted, phase Failed (attempt outcome `HarnessError`). Nothing is deleted there: the Failed phase
-removes the anchor (and with it the step Pods) on the next pass, and the Secret goes with the run.
+removes the anchor (and with it the step Pods) on the next pass; the Secret is deleted at once.
 
 Cancel: the CLI sets the annotation `inspector.sparecores.com/cancel: "true"` (`crd.request_cancel`); the runner
-sees it and `cancel()` records `-4 CANCELLED` for every unfinished task, deletes the Pods and sets phase
+sees it and `_cancel` records `-4 CANCELLED` for every unfinished task, deletes the Pods and sets phase
 Cancelled. The BenchmarkRun is kept for the publisher: the CRD has no finalizer, so a plain `kubectl delete`
 leaves no object to record anything on (leftover Pods are still deleted).
 """
@@ -318,15 +318,6 @@ class Runner:
         except _Stale:
             log.info("run %s changed under the reconcile, dropping the pass", run.name)
 
-    def cancel(self, run_name: str) -> None:
-        """Cancel the run: unfinished tasks end `-4 CANCELLED`, Pods are deleted, phase Cancelled. Synchronous. The
-        CLI does not call it: it sets the cancel annotation and `reconcile` calls this. Does nothing for a run
-        that is already over."""
-        run = crd.get_run(self.kube, run_name)
-        if run.status.phase in ACTIVE:
-            live = {_meta(p)["name"]: p for p in self.kube.list("pod", labels={LABEL_RUN: run.name})}
-            self._cancel(run, self._cfg(), live)
-
     def run_forever(self, stop: threading.Event) -> None:
         """Start the watch threads (BenchmarkRuns, labelled Pods), the resync timer and the worker loop in this
         thread until `stop` is set. On start and after every watch end: LIST, enqueue all runs."""
@@ -511,11 +502,20 @@ class Runner:
     # ----------------------------------------------------------------------- helpers: recording results
 
     def _record(
-        self, run: BenchmarkRun, nd: _Node | None, results: list[_Result], *, end_step: bool = False
+        self,
+        run: BenchmarkRun,
+        nd: _Node | None,
+        results: list[_Result],
+        *,
+        end_step: bool = False,
+        next_step: Step | None = None,
+        fallback: bool = False,
     ) -> BenchmarkRun:
         """Write `status.json` (the commit point) of each task, then mark them Done in `status.tasks` (not yet
-        published). `end_step`: they were the step in flight, which is over."""
-        if not results:
+        published). `end_step`: they were the step in flight, which is over. `next_step` replaces it in the
+        same patch, its tasks Running (`fallback`: the GPU fallback), so no pass sees the step half switched;
+        the caller launches it afterwards."""
+        if not results and next_step is None:
             return run
         now = self._now()
         attempt = self._attempt(run)
@@ -557,7 +557,9 @@ class Runner:
                     status.tasks.append(ts)
                 else:
                     status.tasks = [ts if t.name == ts.name else t for t in status.tasks]
-            if end_step:
+            if next_step is not None:
+                self._mark_running(status, next_step, now, fallback)
+            elif end_step:
                 status.step = None
 
         return self._update(run, mutate)
@@ -590,7 +592,7 @@ class Runner:
 
     def _end_run(self, run: BenchmarkRun, code: int, message: str, outcome: AttemptOutcome) -> None:
         """The run cannot go on: unfinished tasks end with `code` (open uploads of the running ones aborted),
-        the Secret goes, phase Failed. The Pods stay: the Failed phase deletes the anchor on the next pass, and
+        the Secret is deleted, phase Failed. The Pods stay: the Failed phase deletes the anchor on the next pass, and
         recording first means a failing cluster API cannot leave a run without a record."""
         log.warning("run %s failed: %s", run.name, message)
         run = self._ensure_tasks(run)
@@ -765,9 +767,8 @@ class Runner:
         self._update(run, mutate)
 
     def _node_ready(self, run: BenchmarkRun, cfg: Config, live: dict[str, dict], anchor: dict) -> None:
-        try:
-            node = self.kube.get("node", pods.pod_node(anchor))
-        except NotFound:
+        node = self._get_node(pods.pod_node(anchor))
+        if node is None:
             return
         anchor_created = _time(_meta(anchor)["creationTimestamp"])
         if _time(_meta(node)["creationTimestamp"]) < anchor_created:
@@ -965,20 +966,20 @@ class Runner:
     ) -> None:
         """Store the step in the status with its tasks Running (one patch), then launch it."""
         now = self._now()
-
-        def mutate(status: RunStatus) -> None:
-            status.current_step, status.step = step.name, steps.to_status(step)
-            for c in step.containers:
-                found = _find(status, c.key)
-                if found is None:
-                    found = TaskStatus(c.key)
-                    status.tasks.append(found)
-                found.state, found.attempt, found.start, found.end = TaskState.RUNNING, status.attempt, now, None
-                found.exit_code = found.error_msg = found.commit = None
-                found.published, found.gpu_fallback = False, fallback
-
-        run = self._update(run, mutate)
+        run = self._update(run, lambda status: self._mark_running(status, step, now, fallback))
         self._launch(run, cfg, live, nd, step)
+
+    @staticmethod
+    def _mark_running(status: RunStatus, step: Step, now: datetime, fallback: bool) -> None:
+        status.current_step, status.step = step.name, steps.to_status(step)
+        for c in step.containers:
+            found = _find(status, c.key)
+            if found is None:
+                found = TaskStatus(c.key)
+                status.tasks.append(found)
+            found.state, found.attempt, found.start, found.end = TaskState.RUNNING, status.attempt, now, None
+            found.exit_code = found.error_msg = found.commit = None
+            found.published, found.gpu_fallback = False, fallback
 
     def _launch(self, run: BenchmarkRun, cfg: Config, live: dict[str, dict], nd: _Node, step: Step) -> None:
         """Sign URLs, heartbeat, create the Pod. Every part is repeatable. URLs that do not fit a Secret cannot
@@ -1075,7 +1076,9 @@ class Runner:
         for c in step.containers:
             if c.key in retried:
                 verdicts[c.key] = None  # its uploads are reused by the new Pod
-            elif outcomes[c.key].container_start_error or c.key in stuck:
+            elif c.key in stuck:
+                verdicts[c.key] = None  # aborted with the Pod's deletion: the image may still arrive in a flush
+            elif outcomes[c.key].container_start_error:
                 self.storage.abort_open(key, c.key)  # nothing ran: nothing to verify
                 verdicts[c.key] = None
             else:
@@ -1111,14 +1114,18 @@ class Runner:
             results.append(_Result(c.task, c.key, code, message, outcome, verdict, c.image, pod_name))
         if stuck or retry:
             self.kube.delete("pod", pod_name)  # right before recording: nothing may flush from it before that
-        if step.name == steps.PROBE_STEP_NAME:
+            for stuck_key in stuck:
+                self.storage.abort_open(key, stuck_key)
+        is_probe = step.index == 1  # also the `-cpu` fallback of the probe step
+        if is_probe:
             nd.facts.boot_time = next((o.btime for o in outcomes.values() if o.btime), nd.facts.boot_time)
-        run = self._record(run, nd, results, end_step=retry is None)
-        if step.name == steps.PROBE_STEP_NAME:
+        fallback_step = replace(retry, name=f"{step.name}-cpu") if retry else None
+        run = self._record(run, nd, results, end_step=retry is None, next_step=fallback_step, fallback=True)
+        if is_probe:
             self._learn_probe_facts(run, nd)
             self._write_run_json(run, nd)
-        if retry:
-            return self._start_step(run, cfg, live, nd, replace(retry, name=f"{step.name}-cpu"), fallback=True)
+        if fallback_step:
+            return self._launch(run, cfg, live, nd, fallback_step)
         self._heartbeat(run)
         self._running(run, cfg, live)
 

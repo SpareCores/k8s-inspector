@@ -293,7 +293,11 @@ def test_plan_command(env, monkeypatch, capsys):
 
 
 def test_cancel_requests_the_cancel_with_an_annotation(env, monkeypatch, capsys):
-    runs = {"oci-a": make_run("a", RunPhase.RUNNING), "oci-d": make_run("d", RunPhase.DONE)}
+    runs = {
+        "oci-a": make_run("a", RunPhase.RUNNING),
+        "oci-d": make_run("d", RunPhase.DONE),
+        "oci-p": make_run("p", RunPhase.PUBLISHING),
+    }
     patches = []
 
     def get_run(kube, name):
@@ -313,7 +317,9 @@ def test_cancel_requests_the_cancel_with_an_annotation(env, monkeypatch, capsys)
     assert patches == [
         ("benchmarkrun", "oci-a", {"metadata": {"annotations": {"inspector.sparecores.com/cancel": "true"}}}, False)
     ]
-    assert cli.main(["cancel", "oci-d"]) == 0  # finished: nothing to cancel
+    for name in ("oci-d", "oci-p"):  # not active: nothing to cancel, no annotation
+        assert cli.main(["cancel", name]) == 0
+        assert "not active" in capsys.readouterr().out
     assert len(patches) == 1
     assert cli.main(["cancel", "nope"]) == 1
     assert "no such run" in capsys.readouterr().err

@@ -61,12 +61,9 @@ class UrlsTooLarge(ValueError):
 # --------------------------------------------------------------------------- key layout (pure)
 
 
-_key_prefix = ""  # K8SI_KEY_PREFIX, set once by `Storage.__init__`; "" or ending in "/"
-
-
 def day_prefix(vendor: str, sku: str, day: date) -> str:
-    """`<key prefix>logs/inspect/<vendor>/<sku>/<Y>/<m>/<d>/` (with trailing slash)."""
-    return f"{_key_prefix}logs/inspect/{vendor}/{sku}/{day:%Y/%m/%d}/"
+    """`logs/inspect/<vendor>/<sku>/<Y>/<m>/<d>/` (with trailing slash)."""
+    return f"logs/inspect/{vendor}/{sku}/{day:%Y/%m/%d}/"
 
 
 def run_prefix(run: RunKey) -> str:
@@ -145,11 +142,15 @@ class Storage:
         """Build the boto3 client for `env.bucket_region` (and `env.s3_endpoint_url`), using the web identity
         role when `env.role_arn` is set (token file: `AWS_WEB_IDENTITY_TOKEN_FILE`, default the ServiceAccount
         token). No network call here."""
-        global _key_prefix
-        _key_prefix = f"{env.key_prefix.strip('/')}/" if env.key_prefix.strip("/") else ""
+        stripped = env.key_prefix.strip("/")
+        self._prefix = f"{stripped}/" if stripped else ""  # K8SI_KEY_PREFIX: "" or ending in "/"
         self.bucket = env.bucket
         self.uploads = uploads
         self.s3 = _s3_client(env, uploads)
+
+    def _k(self, key: str) -> str:
+        """The S3 key of a logical key (the key functions above know nothing of `K8SI_KEY_PREFIX`)."""
+        return f"{self._prefix}{key}"
 
     # ---- planning and signing
 
@@ -172,7 +173,7 @@ class Storage:
                 okey = object_key(run, c.key, name)
                 plan = UploadPlan(urls_key=f"{c.key}/{name}", object_key=okey)
                 if name in large:
-                    upload_id = self.s3.create_multipart_upload(Bucket=self.bucket, Key=okey)["UploadId"]
+                    upload_id = self.s3.create_multipart_upload(Bucket=self.bucket, Key=self._k(okey))["UploadId"]
                     plan = replace(
                         plan,
                         upload_id=upload_id,
@@ -194,11 +195,11 @@ class Storage:
         signed = []
         for p in plans:
             part_urls = tuple(
-                self._sign("upload_part", Key=p.object_key, UploadId=p.upload_id, PartNumber=n)
+                self._sign("upload_part", Key=self._k(p.object_key), UploadId=p.upload_id, PartNumber=n)
                 for n in range(1, p.n_parts + 1)
                 if p.upload_id
             )
-            signed.append(replace(p, put_url=self._sign("put_object", Key=p.object_key), part_urls=part_urls))
+            signed.append(replace(p, put_url=self._sign("put_object", Key=self._k(p.object_key)), part_urls=part_urls))
         return signed
 
     def plans_from_urls_json(self, run: RunKey, urls_json: str) -> list[UploadPlan]:
@@ -224,7 +225,7 @@ class Storage:
     def read_bytes(self, object_key: str) -> bytes | None:
         """GET any object (publisher: stdout, stderr, version...); None if absent."""
         try:
-            return self.s3.get_object(Bucket=self.bucket, Key=object_key)["Body"].read()
+            return self.s3.get_object(Bucket=self.bucket, Key=self._k(object_key))["Body"].read()
         except ClientError as e:
             if _is_missing(e):
                 return None
@@ -267,7 +268,7 @@ class Storage:
         try:
             self.s3.complete_multipart_upload(
                 Bucket=self.bucket,
-                Key=okey,
+                Key=self._k(okey),
                 UploadId=upload_id,
                 MultipartUpload={"Parts": [{"PartNumber": n, "ETag": f'"{_etag(e)}"'} for n, e in parts]},
             )
@@ -277,7 +278,7 @@ class Storage:
 
     def _head(self, okey: str) -> dict | None:
         try:
-            return self.s3.head_object(Bucket=self.bucket, Key=okey)
+            return self.s3.head_object(Bucket=self.bucket, Key=self._k(okey))
         except ClientError as e:
             if _is_missing(e):
                 return None
@@ -346,7 +347,9 @@ class Storage:
 
     def _list_parts(self, okey: str, upload_id: str) -> list[tuple[int, str]]:
         try:
-            pages = self.s3.get_paginator("list_parts").paginate(Bucket=self.bucket, Key=okey, UploadId=upload_id)
+            pages = self.s3.get_paginator("list_parts").paginate(
+                Bucket=self.bucket, Key=self._k(okey), UploadId=upload_id
+            )
             return [(p["PartNumber"], p["ETag"]) for page in pages for p in page.get("Parts", [])]
         except ClientError as e:
             if e.response["Error"]["Code"] == "NoSuchUpload":
@@ -355,7 +358,7 @@ class Storage:
 
     def abort_open(self, run: RunKey, key: str) -> int:
         """Abort every open multipart upload under `tasks/<key>/`; returns how many."""
-        prefix = f"{run_prefix(run)}tasks/{key}/"
+        prefix = self._k(f"{run_prefix(run)}tasks/{key}/")
         count = 0
         pages = self.s3.get_paginator("list_multipart_uploads").paginate(Bucket=self.bucket, Prefix=prefix)
         for page in pages:
@@ -368,7 +371,7 @@ class Storage:
 
     def _put_json(self, okey: str, doc: dict) -> None:
         body = json.dumps(doc, indent=1).encode()
-        self.s3.put_object(Bucket=self.bucket, Key=okey, Body=body, ContentType="application/json")
+        self.s3.put_object(Bucket=self.bucket, Key=self._k(okey), Body=body, ContentType="application/json")
 
     def write_status_json(self, run: RunKey, key: str, doc: dict) -> None:
         """PUT `tasks/<key>/status.json`: the task's commit point. Written only after `finish_task` ok or
@@ -382,9 +385,11 @@ class Storage:
     # ---- discovery (publisher rescan, DR)
 
     def list_status_keys(self, run_prefix_or_day_prefix: str) -> list[str]:
-        """Object keys of `status.json` objects under a prefix (rescan: `day_prefix()`)."""
-        pages = self.s3.get_paginator("list_objects_v2").paginate(Bucket=self.bucket, Prefix=run_prefix_or_day_prefix)
-        keys = (o["Key"] for page in pages for o in page.get("Contents", []))
+        """Logical keys of `status.json` objects under a logical prefix (rescan: `day_prefix()`)."""
+        pages = self.s3.get_paginator("list_objects_v2").paginate(
+            Bucket=self.bucket, Prefix=self._k(run_prefix_or_day_prefix)
+        )
+        keys = (o["Key"].removeprefix(self._prefix) for page in pages for o in page.get("Contents", []))
         return [k for k in keys if k.endswith("/status.json") and "/tasks/" in k]
 
 
