@@ -1,8 +1,11 @@
 package upload
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
+	"log"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -326,5 +329,50 @@ func TestPartWithoutETagIsRejected(t *testing.T) {
 	}
 	if st := u.state["big"]; len(st.Parts) != 0 {
 		t.Fatalf("empty ETag recorded: %+v", st.Parts)
+	}
+}
+
+// A server that stalls must not hold Finalize past its budget, manifest included.
+func TestFinalizeWithinIsAHardBound(t *testing.T) {
+	s := s3fake.New(t)
+	u, spool := newUploader(t, s, nil, 0)
+	write(t, filepath.Join(spool, "stdout"), "x")
+	s.Fail = func(r *http.Request) int {
+		time.Sleep(time.Second) // every request, manifest too
+		return 0
+	}
+	start := time.Now()
+	m, err := u.FinalizeWithin(context.Background(), context.Background(), 400*time.Millisecond)
+	if took := time.Since(start); took > 700*time.Millisecond {
+		t.Fatalf("FinalizeWithin took %s, budget 400ms", took)
+	}
+	if err == nil || m.Complete {
+		t.Fatalf("want a failed manifest upload and an incomplete manifest, got %v %+v", err, m)
+	}
+}
+
+// Each distinct retry error is logged, repeats only every logEvery-th time.
+func TestRetryLogsEveryDistinctError(t *testing.T) {
+	var buf bytes.Buffer
+	log.SetOutput(&buf)
+	t.Cleanup(func() { log.SetOutput(os.Stderr) })
+	u := &Uploader{Backoff: time.Millisecond, MaxBackoff: time.Millisecond}
+	codes := []string{"403", "403", "403", "500", "500", "403"}
+	i := 0
+	err := u.retry(context.Background(), "obj", len(codes), func() error {
+		i++
+		return errors.New("PUT: " + codes[i-1])
+	})
+	if err == nil {
+		t.Fatal("want an error")
+	}
+	got := buf.String()
+	for _, want := range []string{"attempt 1 (1 with this error): PUT: 403", "attempt 4 (1 with this error): PUT: 500", "attempt 6 (1 with this error): PUT: 403"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("log lacks %q:\n%s", want, got)
+		}
+	}
+	if n := strings.Count(got, "\n"); n != 3 {
+		t.Errorf("%d log lines, want 3 (repeats suppressed):\n%s", n, got)
 	}
 }

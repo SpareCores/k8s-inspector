@@ -7,7 +7,7 @@ Values are deployment configuration of the cluster platform, not part of this re
 | Variable | Meaning |
 |---|---|
 | `K8SI_BUCKET`, `K8SI_BUCKET_REGION` | object storage bucket for outputs |
-| `K8SI_ROLE_ARN` | IAM role assumed with the ServiceAccount token (web identity); its `MaxSessionDuration` must be at least 12 h (the controller asks for 12 h sessions) |
+| `K8SI_ROLE_ARN` | IAM role assumed with the ServiceAccount token (web identity); its `MaxSessionDuration` must be at least 12 h (the controller asks for 12 h sessions); it needs `s3:DeleteObject` besides read, write, list and multipart actions under the run prefix |
 | `K8SI_GIT_URL`, `K8SI_GIT_BRANCH` | sc-inspector-data remote and branch (`main`) |
 | `K8SI_GIT_KEY_FILE` | mounted deploy key |
 | `KEEPER_API_BASE`, `KEEPER_API_KEY_FILE` | Keeper API (eligibility) |

@@ -85,7 +85,7 @@ spec:
     image: ghcr.io/sparecores/sc-run@sha256:…          # FROM scratch, a few MB
     args: [hold, --install, /k8si/bin, --heartbeat-dir, /k8si/runs/<run_id>, --idle-timeout, 45m]
     readinessProbe: {exec: {command: [/sc-run, ready, /k8si/bin]}}
-    resources: {requests: {cpu: 1m, memory: 8Mi}}
+    resources: {requests: {cpu: 1m, memory: 16Mi}}
     volumeMounts: [{name: k8si, mountPath: /k8si}]
   volumes: [{name: k8si, hostPath: {path: /var/lib/k8s-inspector, type: DirectoryOrCreate}}]
 ```
@@ -132,6 +132,11 @@ spec:
   # vllm:     emptyDir {medium: Memory, sizeLimit: 4Gi} → /dev/shm
 ```
 
+- How the API reports the end of a step Pod: normal end and OOM are `Succeeded` with the compact result in
+  `containerStatuses[].state.terminated.message` (an OOM shows `exitCode: 0`, reason `OOMKilled`); a deadline is
+  `Failed` with `status.reason: DeadlineExceeded` and the `sc-run` container `Completed`, exit code 0 and
+  `exit_code: 143` in the message; a Pod refused at admission under `DiskPressure` is `Failed` with reason `Evicted`
+  and no containers ([exit codes](exit-codes.md#exit-codes)).
 - Step deadline = image pull (`deadlines.imagePullMinutes`, 15 m) + version 1 m + the longest container timeout +
   upload 10 m + slack 5 m. The anchor deadline is the sum of the step deadlines (the probe step, every serial task,
   one more probe step per vLLM image) plus two flush Pods (15 m each) per step, `holdAfter` and 1 h.

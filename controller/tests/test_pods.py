@@ -114,6 +114,7 @@ def test_anchor(run, cfg):
     c = spec["containers"][0]
     assert c["args"] == ["hold", "--install", "/k8si/bin", "--heartbeat-dir", "/k8si/runs/r1", "--idle-timeout", "45m"]
     assert c["readinessProbe"]["exec"]["command"] == ["/sc-run", "ready", "/k8si/bin"]
+    assert c["resources"] == {"requests": {"cpu": "1m", "memory": "16Mi"}}  # measured working set 8.5 MiB
 
 
 def test_deadlines(cfg):
@@ -361,3 +362,46 @@ def test_classify_every_key_present_even_without_status():
     assert (out["b"].exit_code, out["b"].error_msg) == (-4, "DEADLINE_EXCEEDED")
     out = pods.classify({"status": {"phase": "Failed", "message": "gone"}}, [a])
     assert (out["a"].exit_code, out["a"].error_msg) == (256, "gone")
+
+
+def test_classify_oom_survived_by_sc_run_is_trusted_from_the_message():
+    # P0 (memhog): Pod Succeeded, container exitCode 0 with reason OOMKilled, sc-run's message says 137.
+    survived = msg(exit_code=137, error_msg="OOMKilled", oom_kills=3, upload_complete=False, missing=3)
+    out = classify_one(terminated("membench", survived, reason="OOMKilled"), phase="Succeeded")
+    assert (out.exit_code, out.error_msg, out.from_sc_run, out.oom_kills) == (137, "OOMKilled", True, 3)
+    # P0 (oomcheck): stress-ng handled the kills itself, sc-run reported exit 0: reason OOMKilled changes nothing.
+    clean = msg(exit_code=0, oom_kills=620, upload_complete=False, missing=3)
+    out = classify_one(terminated("membench", clean, reason="OOMKilled"), phase="Succeeded")
+    assert (out.exit_code, out.error_msg, out.from_sc_run) == (0, None, True)
+
+
+def test_overdue_and_terminating_overdue():
+    def running(deadline=100, grace=20, **meta):
+        return {
+            "metadata": meta,
+            "spec": {"activeDeadlineSeconds": deadline, "terminationGracePeriodSeconds": grace},
+            "status": {"phase": "Running", "startTime": "2026-11-20T10:00:00Z"},
+        }
+
+    t0 = datetime(2026, 11, 20, 10, 0, tzinfo=UTC)
+    limit = timedelta(seconds=100 + 20) + pods.WATCHDOG_MARGIN
+    assert not pods.overdue(running(), t0 + limit)
+    assert pods.overdue(running(), t0 + limit + timedelta(seconds=1))
+    assert not pods.overdue({**running(), "status": {"phase": "Failed", "startTime": "2026-11-20T10:00:00Z"}}, NOW)
+    assert not pods.overdue(running(deletionTimestamp="2026-11-20T10:00:20Z"), NOW)  # terminating: other rule
+    assert not pods.overdue({"spec": {}, "status": {"phase": "Pending"}}, NOW)
+    gone = {"metadata": {"deletionTimestamp": "2026-11-20T10:00:20Z"}}
+    assert not pods.terminating_overdue(gone, t0 + timedelta(seconds=20) + pods.WATCHDOG_MARGIN)
+    assert pods.terminating_overdue(gone, t0 + timedelta(seconds=21) + pods.WATCHDOG_MARGIN)
+    assert not pods.terminating_overdue({"metadata": {}}, NOW)
+
+
+def test_rejected_pod_is_recognised_and_classified_with_its_message():
+    message = "Pod was rejected: The node had condition: [DiskPressure]."
+    rejected = {"status": {"phase": "Failed", "reason": "Evicted", "message": message}}
+    assert pods.is_rejected(rejected)
+    out = pods.classify(rejected, [container(task())])["membench"]
+    assert (out.exit_code, out.error_msg) == (-4, message)
+    evicted_later = finished_pod({"name": "membench", "state": {"running": {}}}, reason="Evicted")
+    evicted_later["status"]["message"] = message
+    assert not pods.is_rejected(evicted_later)  # a container ran: a real eviction

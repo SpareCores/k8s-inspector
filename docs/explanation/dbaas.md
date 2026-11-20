@@ -49,3 +49,11 @@ monitoring alerts on managed databases older than 8 h ([monitoring](monitoring.m
 
 Billing note: UpCloud and OVHcloud bill databases by the hour, AWS RDS has a 10-minute minimum, so a failed attempt
 costs that minimum; creating the database only after the client node is up avoids the common failure.
+
+## Quota pre-flight
+
+Before creating a database on Azure, the provisioner checks that the subscription has vCPU headroom in the SKU's quota
+family. The family key comes from the vendor API (Azure ARM Resource SKUs `family`, for example `standardDADSv6Family`),
+never from sc-data `family` or `series`: those are catalogue classifications (workload class and normalized hardware
+line), not quota keys. A family the usages API does not list (Flexible Server lists only some families, none for v6
+SKUs) is not an error: it is logged at info level and only the regional cores quota is checked.

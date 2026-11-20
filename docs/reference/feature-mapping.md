@@ -71,3 +71,4 @@ Legend: **P** planner, **R** run loop, **C** classification, **Pub** publisher, 
 | `start-dbaas`: one Pulumi stack = managed DB + private network + client VM | Job running Pulumi for the DB only; networks pre-created; the client is a bench node ([DBaaS](../explanation/dbaas.md)) |
 | `cleanup-dbaas`, absolute timeout cleanup | controller `down` on every path + stack sweep + alert |
 | retry any failure every 2 h forever | normal backoff with the cap of three |
+| Azure pre-flight quota check: vCPUs per quota family for the Flexible Server SKU and the client VM | provisioner Job (Flexible Server, quota family from the ARM Resource SKUs API, [DBaaS](../explanation/dbaas.md#quota-pre-flight)); the client VM's quota is SCarpenter's (`QUOTA` / `QUOTA_ZERO`, [exit codes](exit-codes.md)) |

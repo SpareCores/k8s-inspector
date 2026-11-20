@@ -52,6 +52,7 @@ class FakeKube:
         self.heartbeats: list[tuple[str, str]] = []
         self.created: list[tuple[str, str]] = []  # (kind, name) in order
         self.deleted: list[tuple[str, str]] = []
+        self.force_deleted: list[str] = []  # Pods deleted with grace period 0
         self.secret_writes = 0
         self._counter = 0
 
@@ -95,6 +96,8 @@ class FakeKube:
         obj = self._store(kind).pop(name, None)
         if obj is None:
             return
+        if grace_seconds == 0:
+            self.force_deleted.append(name)
         self.deleted.append((kind, name))
         for child_kind, children in self.objects.items():
             for child in list(children.values()):
@@ -162,6 +165,7 @@ class FakeStorage(Storage):
         self.planned: list[str] = []  # keys passed to plan_uploads, in order
         self.salvaged: list[str] = []
         self.aborted: list[str] = []
+        self.cleared: list[str] = []  # keys passed to clear_task, in order
         self.signed = 0
         self.crash_after_status_json = False  # the process dies right after the next status.json
 
@@ -199,6 +203,9 @@ class FakeStorage(Storage):
         manifest = Manifest(key, True, (ManifestObject("stdout", "put", 10), ManifestObject("stderr", "put", 5)))
         return Verification(key, True, manifest)
 
+    def clear_task(self, run, key):
+        self.cleared.append(key)
+
     def salvage(self, run, key, plans):
         self.salvaged.append(key)
         return Verification(key, True, None)
@@ -222,7 +229,8 @@ class Cluster:
     """Karpenter and the kubelet. `behaviour[key]` is a list of scripted results for that container key, used
     in order (default: success). Result dict keys: `exit_code`, `oom_kills`, `timed_out`, `cancelled`,
     `start_error`, `pull_stuck` (the Pod stays Pending in ErrImagePull, or in the waiting reason given as a string,
-    with `message`), `btime`."""
+    with `message`), `btime`, `wedged` (the Pod stays Running: containerd does not report the exit), `rejected` (the
+    kubelet refuses the Pod: DiskPressure)."""
 
     def __init__(self, kube: FakeKube, clock: Clock) -> None:
         self.kube, self.clock = kube, clock
@@ -335,12 +343,28 @@ class Cluster:
         }
         return {"state": {"terminated": {"exitCode": 0, "message": json.dumps(message)}}}
 
+    def _stay(self, pod: dict, spec: dict) -> bool:
+        name = pod["metadata"]["name"]
+        if spec.get("rejected"):
+            status = {
+                "phase": "Failed",
+                "reason": "Evicted",
+                "message": "Pod was rejected: The node had condition: [DiskPressure].",
+            }
+        else:
+            statuses = [{"name": n, "state": {"running": {}}} for n, _ in self.container_keys(pod)]
+            status = {"phase": "Running", "startTime": iso(self.clock.now), "containerStatuses": statuses}
+        self.kube.set_status("pod", name, status)
+        return True
+
     def finish(self, pod: dict) -> bool:
         """Script the end of one step or flush Pod. False when it stays Pending (`pull_stuck`)."""
         statuses, stuck = [], False
         for name, key in self.container_keys(pod):
             queue = self.behaviour.get(key, [])
             spec = queue.pop(0) if queue else {}
+            if spec.get("wedged") or spec.get("rejected"):
+                return self._stay(pod, spec)
             if spec.get("pull_stuck"):
                 stuck = True
                 waiting = {"reason": spec["pull_stuck"] if isinstance(spec["pull_stuck"], str) else "ErrImagePull"}

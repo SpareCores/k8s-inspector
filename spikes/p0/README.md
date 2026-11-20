@@ -16,7 +16,8 @@ Variables used below:
 
 ```sh
 export RUN_ID=p0                      # also the Secret and spool directory name
-export BUCKET=<bucket> PREFIX=spikes/p0 AWS_PROFILE=<profile> REGION=<bucket region>
+# PREFIX must sit under the bucket rule's k8s-inspector/ prefix
+export BUCKET=<bucket> PREFIX=k8s-inspector/spikes/p0 AWS_PROFILE=<profile> REGION=<bucket region>
 TASKS="--task dmidecode --task lshw --task lscpu --task lstopo --task virtualization --task stressngfull --task membench --task llm"
 ```
 
@@ -75,6 +76,9 @@ kubectl -n inspector get pod p0-anchor -w          # Pending -> Running
 NODE=$(kubectl -n inspector get pod p0-anchor -o jsonpath='{.spec.nodeName}')
 kubectl -n inspector get pod p0-anchor -o jsonpath='{.status.conditions}'   # Ready means sc-run is installed
 ```
+
+The bench pools allow 1-8 GiB only (no 16 GiB types), and no 1 GiB type exists on OCI: the sizes to compare are
+`A1.Flex.1-2`, `E5.Flex.1-4`, `E5.Flex.2-8`.
 
 ## 4. Steps
 
@@ -140,14 +144,18 @@ kubectl get --raw "/api/v1/nodes/$NODE/proxy/stats/summary" > summary-$(date +%s
 kubectl get node $NODE -o jsonpath='{range .status.conditions[*]}{.type}={.status} {end}{"\n"}'   # MemoryPressure, DiskPressure
 kubectl -n inspector get events --sort-by=.lastTimestamp
 kubectl -n inspector get pod p0-membench -o jsonpath='{.status.phase}{" "}{.status.reason}{" "}{.status.message}{"\n"}'
-kubectl -n inspector exec p0-membench -- sh -c 'cat /proc/self/cgroup; cat /sys/fs/cgroup/memory.max /sys/fs/cgroup/memory.events'
+kubectl -n inspector exec p0-membench -- cat /proc/self/cgroup   # memory.max is not readable here: a privileged container sees the host root cgroup
+# from the host (debug Pod with the host mounted): cat /sys/fs/cgroup/kubepods.slice/memory.max /sys/fs/cgroup/kubepods.slice/memory.events
 ```
 
-Take the summary every minute during membench and llm (`while sleep 60; do ...; done`). The `kubepods.slice` limit equals
-the allocatable memory: confirm with a privileged `kubectl debug node/$NODE` where the admission policy allows it, or by
-the peak of `resource_tracker.jsonl`. Record: peak memory, whether the kernel OOM killer hit the task (`oom_kills` in
+Take the summary every minute during membench and llm (`while sleep 60; do ...; done`). The `kubepods.slice` limit is capacity
+minus kube-reserved and system-reserved (50 MiB above allocatable): read `memory.max` and `memory.events` of
+`/sys/fs/cgroup/kubepods.slice` from the host, not from inside a step container. Record: peak memory, whether the kernel OOM killer hit the task (`oom_kills` in
 `result.json`) or the kubelet evicted the Pod (phase `Failed`, reason `Evicted`), and free disk (`nodefs.available`
-in the summary) while llm fills it to about 10 %.
+in the summary) while llm runs (it does not come near 1 %: it downloads about 15 GB on an 8 GiB node).
+
+`membench` itself peaks at about 130 MiB here, so it neither evicts nor OOMs: `step-memhog.yaml` (`tail /dev/zero` under
+`sc-run`, add a `limits.memory` with `sed` for the limited variant) drives the memory-limit observations instead.
 
 ### Hold idle timeout
 
@@ -171,7 +179,7 @@ CLAIM=$(kubectl get nodeclaim -l karpenter.sh/nodepool=bench-oci -o name | head 
 while kubectl get $CLAIM >/dev/null 2>&1; do sleep 5; done; date -u +%T              # NodeClaim gone
 ```
 
-Measured earlier on OCI: about 1 minute to Node removal, 4-8 minutes to NodeClaim removal.
+Measured on OCI: the Node is gone 79-91 s after T0, the NodeClaim 0-1 s after the Node.
 
 ### `node_overhead`: Standard vs Lean on three sizes
 
@@ -207,15 +215,15 @@ Run these last: they reuse the task names, so they overwrite those tasks' object
 sed 's/activeDeadlineSeconds: 4260/activeDeadlineSeconds: 60/; s/p0-membench/p0-deadline/' step-membench.yaml | ./step.sh - $NODE
 kubectl -n inspector get pod p0-deadline -o jsonpath='{.status.phase}{" "}{.status.reason}{" "}{.status.containerStatuses[0].state.terminated}{"\n"}'
 
-# OOM: a 256 Mi memory limit on membench
-sed 's/p0-membench/p0-oom/; s/resources: {requests: {cpu: 10m, memory: 64Mi}}/resources: {requests: {cpu: 10m, memory: 64Mi}, limits: {memory: 256Mi}}/' \
-  step-membench.yaml | ./step.sh - $NODE
+# OOM: a 256 Mi memory limit on memhog (membench peaks at ~134 MiB and cannot OOM at 256 Mi)
+sed 's/p0-memhog/p0-oom/; s/resources: {requests: {cpu: 10m, memory: 64Mi}}/resources: {requests: {cpu: 10m, memory: 64Mi}, limits: {memory: 256Mi}}/' \
+  step-memhog.yaml | ./step.sh - $NODE
 kubectl -n inspector get pod p0-oom -o jsonpath='{.status.containerStatuses[0].state.terminated}{" "}{.status.containerStatuses[0].lastState}{"\n"}'
 ```
 
 Record: the Pod phase and reason, the container `reason` (`Completed`, `OOMKilled`, `Error`), the exit code and the
-`message`. Expected: `sc-run` survives (it sets `oom_score_adj=-1000`, which the kernel's group kill skips; the other processes of the task are killed together, which is expected), the Pod shows
-`Completed` with `exit_code: 137` and `error_msg: OOMKilled` in the message and `result.json`, and `oom_kills` is above 0.
+`message`. Expected: `sc-run` survives (it sets `oom_score_adj=-1000`, which the kernel's group kill skips; the other processes of the task are killed together, which is expected). The Pod is `Succeeded` and the container shows exit code 0 with reason
+`OOMKilled` (not `Completed`); the message and `result.json` have `exit_code: 137`, `error_msg: OOMKilled` and `oom_kills` above 0.
 If `sc-run` is killed too (no `result.json`, container reason `OOMKilled`), the controller falls back to the reason: check
 `kubectl logs` for the `warning: oom_score_adj` line. `cat /sys/fs/cgroup/memory.oom.group` inside the container
 stays `1` (the kubelet's default), which is expected.
@@ -227,11 +235,11 @@ installed by the anchor):
 
 ```sh
 kubectl -n inspector run p0-oomcheck --image=ghcr.io/sparecores/stress-ng:main --restart=Never --overrides='{"spec":{"nodeName":"'$NODE'","hostNetwork":true,"tolerations":[{"operator":"Exists"}],"containers":[{"name":"c","image":"ghcr.io/sparecores/stress-ng:main","securityContext":{"privileged":true},"resources":{"limits":{"memory":"256Mi"}},"terminationMessagePolicy":"File","command":["/k8si/bin/sc-run","exec","--task","oomcheck","--spool","/k8si/runs/oomcheck","--urls","/nonexistent","--upload-budget","5s","--timeout","2m","--","stress-ng","--vm","1","--vm-bytes","1G","--vm-keep","-t","60s"],"volumeMounts":[{"name":"k8si","mountPath":"/k8si"}]}],"volumes":[{"name":"k8si","hostPath":{"path":"/var/lib/k8s-inspector"}}]}}'
-kubectl -n inspector get pod p0-oomcheck -o jsonpath='{.status.containerStatuses[0].state.terminated.message}{"\n"}'   # exit_code 137, error_msg OOMKilled, oom_kills >= 1
+kubectl -n inspector get pod p0-oomcheck -o jsonpath='{.status.containerStatuses[0].state.terminated.message}{"\n"}'   # oom_kills >= 1; exit_code is 0 here because stress-ng handles its worker kills itself (137 with memhog)
 ```
 
 The upload fails (no `/nonexistent`), which is fine: only the termination message and `/var/lib/k8s-inspector/runs/oomcheck/result.json` matter.
-Delete the Pod afterwards. The membench step with its 256 Mi limit variant below is the real check.
+Delete the Pod afterwards. The memhog variant with a 256 Mi limit (above) is the real check.
 Also check that the `DeadlineExceeded` Pod still uploaded: `sc-run` gets SIGTERM and has `--grace` (15 s from the signal, covering task stop, upload and manifest) within the Pod's
 `terminationGracePeriodSeconds` (20 s); `result.json` and the termination message come first. If `manifest.json` is
 missing, run `flush`.

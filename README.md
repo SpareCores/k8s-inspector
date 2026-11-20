@@ -22,8 +22,8 @@ object storage, and commits the results to git. Benchmark nodes run no agent, no
 | Component | Language | Runs where |
 |---|---|---|
 | `k8s-inspector` controller (plan, run, publish) | Python (latest stable CPython) | one Deployment replica on the cluster's `apps` NodePool |
-| `sc-run` wrapper and uploader | Go, static, standard library only | inside every benchmark container on the benchmark node |
+| `sc-run` wrapper and uploader | Go, static, standard library plus embedded CA roots | inside every benchmark container on the benchmark node |
 | `k8s-inspector-dbaas` provisioner | Python + Pulumi | short-lived Jobs, only for managed-database benchmarks |
 
-The Go version is pinned in `go.mod` (`go 1.22`); CI reads it from there and the Dockerfile builder is `golang:1.22`.
+The Go version is pinned in `go.mod` (`go 1.27.4`); CI reads it from there and the Dockerfile builder is `golang:1.27.4` (digest-pinned).
 Bumping Go means bumping `go.mod` and the Dockerfile together.

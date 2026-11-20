@@ -43,6 +43,8 @@ MODELS_DIR = f"{NODE_DIR}/models"
 SECRETS_NAME = "inspector-secrets"
 FLUSH_DEADLINE_SECONDS = 900  # upload budget 10 min plus 5 min
 FLUSH_STEPS = 2  # flush Pods per step before its outputs are given up
+WATCHDOG_MARGIN = timedelta(minutes=2)  # a Pod this long past deadline + grace is wedged (containerd), not slow
+DEFAULT_GRACE_SECONDS = 30  # Kubernetes' terminationGracePeriodSeconds when the spec has none
 STEP_SLACK = timedelta(minutes=5)
 STEP_VERSION = timedelta(minutes=1)
 STEP_UPLOAD = timedelta(minutes=10)
@@ -214,7 +216,7 @@ def render_anchor(
                         "exec": {"command": ["/sc-run", "ready", f"{MOUNT_DIR}/bin"]},
                         "periodSeconds": 2,
                     },
-                    "resources": {"requests": {"cpu": "1m", "memory": "8Mi"}},
+                    "resources": {"requests": {"cpu": "1m", "memory": "16Mi"}},
                     "volumeMounts": [{"name": "k8si", "mountPath": MOUNT_DIR}],
                 }
             ],
@@ -584,6 +586,43 @@ def stuck_containers(pod: dict, now: datetime, limit_minutes: int) -> dict[str, 
     return stuck
 
 
+def overdue(pod: dict, now: datetime) -> bool:
+    """A Pod that is not finished although `activeDeadlineSeconds` + its grace period + `WATCHDOG_MARGIN` have
+    passed since `startTime`: the kubelet should have failed it long ago (P0: a wedged containerd left it
+    `Running` for 10 minutes). Not for Pods that are being deleted (`terminating_overdue`)."""
+    started = _parse_time(pod.get("status", {}).get("startTime"))
+    deadline = pod.get("spec", {}).get("activeDeadlineSeconds")
+    if started is None or deadline is None or is_finished(pod) or terminating(pod):
+        return False
+    grace = pod["spec"].get("terminationGracePeriodSeconds", DEFAULT_GRACE_SECONDS)
+    return now > started + timedelta(seconds=deadline + grace) + WATCHDOG_MARGIN
+
+
+def terminating(pod: dict) -> bool:
+    return bool(pod.get("metadata", {}).get("deletionTimestamp"))
+
+
+def terminating_overdue(pod: dict, now: datetime) -> bool:
+    """Deleted, but still there `WATCHDOG_MARGIN` after the end of its grace period (`deletionTimestamp` is the
+    request time plus the grace period)."""
+    deleted = _parse_time(pod.get("metadata", {}).get("deletionTimestamp"))
+    return deleted is not None and now > deleted + WATCHDOG_MARGIN
+
+
+def is_rejected(pod: dict) -> bool:
+    """The kubelet refused the Pod at admission (`Failed`, reason `Evicted`, "Pod was rejected: ...", e.g. while
+    the node has DiskPressure): no container ever started."""
+    status = pod.get("status", {})
+    return (
+        status.get("phase") == "Failed"
+        and status.get("reason") == "Evicted"
+        and str(status.get("message", "")).startswith("Pod was rejected")
+        and not any(
+            "running" in s.get("state", {}) or "terminated" in s.get("state", {}) for s in _container_statuses(pod)
+        )
+    )
+
+
 def unfinished_containers(pod: dict) -> set[str]:
     """Names of the containers that have not terminated."""
     return {s["name"] for s in _container_statuses(pod) if "terminated" not in s.get("state", {})}
@@ -606,7 +645,7 @@ def _termination_message(status: dict) -> dict | None:
     return message if isinstance(message, dict) and "exit_code" in message else None
 
 
-def _outcome_from_message(key: str, msg: dict, container: StepContainer, pod_reason: str | None) -> TaskOutcome:
+def outcome_from_message(key: str, msg: dict, container: StepContainer, pod_reason: str | None) -> TaskOutcome:
     exit_code = int(msg["exit_code"])
     error_msg = msg.get("error_msg") or None
     if msg.get("timed_out"):
@@ -658,6 +697,8 @@ def _outcome_from_state(key: str, status: dict | None, pod: dict) -> TaskOutcome
         outcome.error_msg, outcome.container_start_error = detail, True
     elif pod_reason == "DeadlineExceeded":
         outcome.exit_code, outcome.error_msg = ExitCode.NEVER_FINISHED, Reason.DEADLINE_EXCEEDED.value
+    elif is_rejected(pod):
+        outcome.exit_code, outcome.error_msg = ExitCode.NEVER_FINISHED, pod["status"]["message"]
     elif pod_reason == "Evicted":
         outcome.exit_code, outcome.error_msg = ExitCode.NEVER_FINISHED, Reason.EVICTED.value
     elif terminated and terminated.get("exitCode") == 0:
@@ -690,7 +731,7 @@ def classify(pod: dict, containers: Sequence[StepContainer]) -> dict[str, TaskOu
         status = by_name.get(container_name(container.key))
         message = _termination_message(status) if status else None
         if message is not None:
-            result[container.key] = _outcome_from_message(container.key, message, container, pod_reason)
+            result[container.key] = outcome_from_message(container.key, message, container, pod_reason)
         else:
             result[container.key] = _outcome_from_state(container.key, status, pod)
     return result

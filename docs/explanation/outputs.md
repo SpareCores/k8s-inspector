@@ -7,7 +7,7 @@ There is no inbox and no archive move: the key an output is uploaded to is the k
 
 ## On the node: `sc-run`
 
-`sc-run` is the wrapper in every step container (Go, static, standard library only; it needs no AWS SDK because the
+`sc-run` is the wrapper in every step container (Go 1.27.4, static, standard library plus embedded CA roots; it needs no AWS SDK because the
 controller signs every request). It:
 
 1. runs the version command (60 s cap), then the task command through the image's resource-tracker entrypoint;
@@ -26,8 +26,23 @@ controller signs every request). It:
 5. writes a short summary (exit code, timed out, OOM kills, upload state) to the termination message and exits 0; the
    task's own exit code is in the result, never in the Pod phase.
 
-Retries: exponential backoff per request, bounded by the step's upload budget (10 min). A file that cannot be uploaded
-stays in the spool and is listed as missing in the manifest.
+Retries: exponential backoff per request. `--upload-budget` (10 min) is a hard bound on the whole final upload,
+`manifest.json` included: the file uploads get the first three quarters, the manifest the rest. A file that cannot be
+uploaded stays in the spool and is listed as missing in the manifest. Each distinct retry error of an object is logged
+at once; a repeated one only every few attempts.
+
+`sc-run` embeds the root CA certificates in the binary (`golang.org/x/crypto/x509roots/fallback`): the benchmark images carry no CA bundle (some have no
+`/etc/ssl` at all) and the `sc-run` image is `FROM scratch`, so HTTPS to object storage would fail with `unknown
+authority` otherwise.
+
+Measured on OCI (Frankfurt) against S3 in us-east-1:
+
+| Mechanism | Result |
+|---|---|
+| Growing log re-PUT | objects replaced about 60 s apart; `resource_tracker.jsonl` grows about 220 KB/min (13 MB/h), so it passes 32 MiB after about 2.4 h and only the 26 h `stressnglongrun` needs multipart for it |
+| Multipart part retry | a part with a bad signature returned 403 `SignatureDoesNotMatch` and was retried with backoff; after the corrected Secret was applied, the part succeeded within 100 s (the kubelet mount refresh) and `ListParts` showed all 4 parts |
+| URL re-sign during a step | URLs expired after 600 s; the first re-PUT after expiry got 403. After the re-signed Secret was applied the next re-PUT succeeded within 4 s; the gap was 2 minutes with no data loss, because whole files are re-PUT |
+| Flush | a step with missing URLs ended `upload_complete: false, missing: 5`; after the Secret was restored, a `flush` step (started 6 s after the update) uploaded everything and `verify` passed |
 
 ## In the controller
 
@@ -42,6 +57,10 @@ credentials that signed it.
 | When a step ends | Reads `manifest.json`, completes each multipart upload with the reported ETags (`CompleteMultipartUpload`), checks every object's size with `HEAD`, aborts unused multipart uploads, then writes the task's `status.json` next to the outputs. **`status.json` is the task's commit point.** |
 | If anything is missing | Creates a `flush` step on the same node (the `sc-run` image, fresh URLs, same spool) and checks again. After two failed flushes the controller completes what the uploaded parts allow (salvage) and records the task with `outputs lost` when it had exited 0. |
 | Only then | Moves on to the next step, or releases the node by deleting the anchor. |
+
+Before every launch of a task (a retry in the same run writes the same keys) the controller deletes the task's
+`manifest.json`, `result.json` and `status.json`, so `verify` only sees the manifest of the current attempt. The
+controller's bucket role therefore needs `s3:DeleteObject` under the run prefix.
 
 Presigning of `CreateMultipartUpload`, `CompleteMultipartUpload` and `AbortMultipartUpload` is technically possible but
 not something AWS documents; the controller calls them itself, and only `PutObject` and `UploadPart` are presigned.

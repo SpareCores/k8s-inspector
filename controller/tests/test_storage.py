@@ -288,3 +288,15 @@ def test_key_prefix_applies_to_put_presign_and_list(store):
     http_put(stdout.put_url, b"hello")
     assert prefixed.read_bytes(stdout.object_key) == b"hello"
     assert prefixed.s3.head_object(Bucket=BUCKET, Key=f"k8s-inspector/spikes/{stdout.object_key}")
+
+
+def test_clear_task_removes_only_the_attempt_files_of_that_task(store):
+    for key in ("membench", "geekbench"):
+        for name in (*storage.ATTEMPT_FILES, "stdout"):
+            store.s3.put_object(Bucket=BUCKET, Key=storage.object_key(RUN, key, name), Body=b"x")
+    store.clear_task(RUN, "membench")
+    assert store.read_manifest(RUN, "membench") is None
+    assert store.read_bytes(storage.object_key(RUN, "membench", "status.json")) is None
+    assert store.read_bytes(storage.object_key(RUN, "membench", "stdout")) == b"x"
+    assert store.read_bytes(storage.object_key(RUN, "geekbench", "manifest.json")) == b"x"
+    store.clear_task(RUN, "membench")  # nothing left: not an error

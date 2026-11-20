@@ -18,6 +18,10 @@ import (
 	"syscall"
 	"time"
 
+	// Embedded CA roots, used only when the system has none: sc-run runs in
+	// benchmark images without ca-certificates, and its own image is FROM scratch.
+	_ "golang.org/x/crypto/x509roots/fallback"
+
 	"github.com/sparecores/k8s-inspector/internal/heartbeat"
 	"github.com/sparecores/k8s-inspector/internal/hold"
 	"github.com/sparecores/k8s-inspector/internal/task"
@@ -104,9 +108,8 @@ func runFlush(args []string) {
 	if *taskName == "" || *spool == "" || *urls == "" {
 		fatalf("flush: --task, --spool and --urls are required")
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), *budget)
-	defer cancel()
-	m, err := upload.New(*taskName, *spool, *urls, *mib<<20).Finalize(ctx, context.Background())
+	ctx := context.Background()
+	m, err := upload.New(*taskName, *spool, *urls, *mib<<20).FinalizeWithin(ctx, ctx, *budget)
 	check(err)
 	if !m.Complete {
 		fatalf("flush: %d file(s) still missing: %s", len(m.Missing), strings.Join(m.Missing, ", "))

@@ -43,9 +43,19 @@ type Uploader struct {
 	MaxBackoff         time.Duration
 	ManifestTimeout    time.Duration // budget for the manifest, counted from the end of the sync phase
 
-	mu    sync.Mutex
-	state map[string]fileState
+	mu     sync.Mutex
+	state  map[string]fileState
+	logged map[string]retryLog // last retry error logged per object
 }
+
+// retryLog remembers what was last logged for an object, to rate-limit the
+// retry log: a new error is always logged, a repeated one every logEvery-th time.
+type retryLog struct {
+	msg   string
+	count int
+}
+
+const logEvery = 10
 
 // fileState records what is confirmed uploaded for one file. It is persisted
 // in the spool so a later `flush` step knows what is still missing.
@@ -159,8 +169,20 @@ func (u *Uploader) Finalize(syncCtx, hardCtx context.Context) (Manifest, error) 
 	}
 	u.mu.Lock()
 	defer u.mu.Unlock()
-	err = u.retry(manifestCtx, 5, func() error { return u.putFile(manifestCtx, manifestFile) })
+	err = u.retry(manifestCtx, manifestFile, 5, func() error { return u.putFile(manifestCtx, manifestFile) })
 	return m, err
+}
+
+// FinalizeWithin is Finalize with a hard bound: the whole call, manifest
+// included, ends within budget. The sync phase gets the first three quarters,
+// the manifest the rest. Every request carries the context, so a slow server
+// cannot hold it past the budget.
+func (u *Uploader) FinalizeWithin(syncCtx, hardCtx context.Context, budget time.Duration) (Manifest, error) {
+	hardCtx, cancelHard := context.WithTimeout(hardCtx, budget)
+	defer cancelHard()
+	syncCtx, cancelSync := context.WithTimeout(syncCtx, budget*3/4)
+	defer cancelSync()
+	return u.Finalize(syncCtx, hardCtx)
 }
 
 func (u *Uploader) files() ([]string, error) {
@@ -196,7 +218,7 @@ func (u *Uploader) syncFile(ctx context.Context, name string, attempts int) erro
 	if st.Mode == "put" && st.Size == size && st.MtimeNS == info.ModTime().UnixNano() {
 		return nil
 	}
-	return u.retry(ctx, attempts, func() error { return u.putFile(ctx, name) })
+	return u.retry(ctx, name, attempts, func() error { return u.putFile(ctx, name) })
 }
 
 // putFile uploads the whole file to its presigned PUT URL and records it.
@@ -262,7 +284,7 @@ func (u *Uploader) syncMultipart(ctx context.Context, name string, size int64, a
 			continue
 		}
 		var etag string
-		err := u.retry(ctx, attempts, func() error {
+		err := u.retry(ctx, fmt.Sprintf("%s part %d", name, i+1), attempts, func() error {
 			e, err := u.entry(name) // URLs may have been re-signed
 			if err != nil {
 				return err
@@ -355,13 +377,34 @@ func (u *Uploader) entry(name string) (urls.Entry, error) {
 	return e, nil
 }
 
-func (u *Uploader) retry(ctx context.Context, attempts int, op func() error) error {
+// logRetry logs a failed attempt when its error differs from the last one
+// logged for the object, and otherwise every logEvery-th time.
+func (u *Uploader) logRetry(what string, attempt int, err error) {
+	if u.logged == nil {
+		u.logged = map[string]retryLog{}
+	}
+	l := u.logged[what]
+	if l.msg == err.Error() {
+		l.count++
+		if l.count%logEvery != 0 {
+			u.logged[what] = l
+			return
+		}
+	} else {
+		l = retryLog{msg: err.Error(), count: 1}
+	}
+	u.logged[what] = l
+	log.Printf("upload %s: attempt %d (%d with this error): %v", what, attempt, l.count, err)
+}
+
+func (u *Uploader) retry(ctx context.Context, what string, attempts int, op func() error) error {
 	delay := u.Backoff
 	for i := 1; ; i++ {
 		err := op()
 		if err == nil || errors.Is(err, errPermanent) {
 			return err
 		}
+		u.logRetry(what, i, err)
 		if ctx.Err() != nil {
 			return errors.Join(err, ctx.Err())
 		}

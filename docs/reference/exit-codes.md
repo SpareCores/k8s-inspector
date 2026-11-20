@@ -22,6 +22,20 @@ started, so the task does not inherit it) and survives; it logs a warning if the
 `result.json`; the controller then uses the container's own `OOMKilled` termination reason and records `137` with
 `OOMKilled`.
 
+As the API shows an OOM (measured with `sc-run` surviving): the Pod is `Succeeded`, the container is `terminated` with
+`exitCode: 0` and reason `OOMKilled` (the runtime marks a container `OOMKilled` whenever its cgroup recorded an OOM
+kill, even though `sc-run` exited 0), and the truth is in the termination message: `exit_code: 137`,
+`error_msg: OOMKilled`, `oom_kills` above 0. The controller uses the termination message (137); the container reason alone does not
+mean `sc-run` died.
+
+`DeadlineExceeded` on an idle node: the Pod is `Failed` with `status.reason: DeadlineExceeded` and message
+`Pod was active on the node longer than the specified deadline`. The `sc-run` container is `terminated` with
+`exitCode: 0`, reason `Completed`, ending 15 s after the SIGTERM (`--grace`); its message has `exit_code: 143`,
+`error_msg: cancelled`, `cancelled: true`. A container without the wrapper ends 137 with reason `Error`. If the
+container runtime is wedged the Pod can stay `Running` past its deadline; the controller's watchdog force-deletes it
+and records `-4 DEADLINE_EXCEEDED`, unless the uploads verify and `result.json` has an exit code
+([run model](../explanation/run-model.md#wedged-step-pods)).
+
 DBaaS tasks follow the same rules (no endless retry).
 
 `IMAGE_PULL_TIMEOUT` applies to the containers of a step Pod that are still pulling (or creating) after

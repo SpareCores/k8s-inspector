@@ -10,7 +10,7 @@ import threading
 from datetime import UTC, datetime, timedelta
 
 import pytest
-from fakes import Clock, Cluster, FakeKube, FakeStorage
+from fakes import Clock, Cluster, FakeKube, FakeStorage, iso
 
 from k8s_inspector import crd, pods, steps, tasks
 from k8s_inspector import runner as runner_mod
@@ -998,3 +998,145 @@ def test_probe_facts_are_learned_after_the_cpu_fallback_of_the_probe_step(h):
     h.drive(stop=in_step("02-membench"))
     nd = h.runner._nodes[h.name]
     assert nd.lscpu_stdout == LSCPU and nd.facts.lscpu["Model name:"] == "AMD EPYC 9R14"
+
+
+# --------------------------------------------------------------------------- P0 findings
+
+
+def geekbench_pod(h) -> str:
+    return next(n for n in h.pod_names("step") if n.endswith("geekbench"))
+
+
+def wedge_geekbench(h) -> str:
+    """Run until the geekbench step Pod stays Running past its deadline + grace + margin."""
+    h.cluster.behaviour["geekbench"] = [{"wedged": True}]
+    h.start(["geekbench"])
+    h.drive(stop=lambda run: any(n.endswith("geekbench") for n in h.pod_names("step")))
+    h.cluster.react()
+    pod = h.kube.get("pod", geekbench_pod(h))
+    limit = pod["spec"]["activeDeadlineSeconds"] + pod["spec"]["terminationGracePeriodSeconds"]
+    h.runner.reconcile(h.name)
+    h.clock.advance(seconds=limit + 60)
+    h.runner.reconcile(h.name)
+    assert h.task("geekbench").state == TaskState.RUNNING  # inside the margin: still waiting
+    h.clock.advance(seconds=120)
+    return pod["metadata"]["name"]
+
+
+def test_wedged_step_pod_is_force_deleted_and_recorded_as_deadline_exceeded(h):
+    name = wedge_geekbench(h)
+    h.runner.reconcile(h.name)
+    assert name in h.kube.force_deleted
+    assert h.codes()["geekbench"] == (-4, "DEADLINE_EXCEEDED")
+    assert h.storage.status["geekbench"]["reason"] == "DEADLINE_EXCEEDED"
+
+
+def test_wedged_step_pod_with_an_uploaded_result_records_that_result(h):
+    name = wedge_geekbench(h)
+    h.storage.objects[object_key(h.run_key(), "geekbench", "result.json")] = json.dumps(
+        {"task": "geekbench", "exit_code": 143, "cancelled": True, "error_msg": "cancelled"}
+    ).encode()
+    h.runner.reconcile(h.name)
+    assert name in h.kube.force_deleted
+    assert h.codes()["geekbench"] == (-4, "DEADLINE_EXCEEDED")
+
+
+def test_wedged_step_pod_whose_task_finished_keeps_its_exit_code(h):
+    name = wedge_geekbench(h)
+    h.storage.objects[object_key(h.run_key(), "geekbench", "result.json")] = json.dumps(
+        {"task": "geekbench", "exit_code": 0}
+    ).encode()
+    h.runner.reconcile(h.name)
+    assert name in h.kube.force_deleted
+    assert h.codes()["geekbench"] == (0, None)
+
+
+def test_wedged_step_pod_without_uploads_is_flushed_before_it_is_given_up(h):
+    h.storage.incomplete["geekbench"] = 1
+    name = wedge_geekbench(h)
+    h.runner.reconcile(h.name)
+    assert f"{name}-flush1" in h.pod_names() and name not in h.kube.force_deleted  # the step Pod stays for now
+    h.cluster.react()
+    h.runner.reconcile(h.name)
+    assert name in h.kube.force_deleted and h.task("geekbench").state == TaskState.DONE
+
+
+def test_pod_stuck_terminating_is_force_deleted_after_grace_plus_margin(h):
+    h.start(["geekbench"])
+    h.drive(stop=lambda run: run.status.phase == RunPhase.RUNNING)
+    anchor = h.pod_names("anchor")[0]
+    h.kube.patch_obj("pod", anchor, {"metadata": {"deletionTimestamp": iso(h.clock.now + timedelta(seconds=20))}})
+    h.clock.advance(seconds=20 + 100)
+    h.runner.reconcile(h.name)
+    assert anchor not in h.kube.force_deleted
+    h.clock.advance(seconds=30)
+    h.runner.reconcile(h.name)
+    assert anchor in h.kube.force_deleted
+
+
+def set_disk_pressure(h, on: bool) -> None:
+    for node in h.kube.list("node"):
+        status = "True" if on else "False"
+        h.kube.patch_obj(
+            "node", node["metadata"]["name"], {"status": {"conditions": [{"type": "DiskPressure", "status": status}]}}
+        )
+
+
+def node_with_pressure(h) -> None:
+    """The anchor's node comes up with DiskPressure, before the first step."""
+    h.runner.reconcile(h.name)
+    h.cluster.react()
+    set_disk_pressure(h, True)
+
+
+def test_step_waits_while_the_node_has_disk_pressure_and_launches_when_it_clears(h):
+    h.start(["geekbench"])
+    node_with_pressure(h)
+    for _ in range(3):
+        h.runner.reconcile(h.name)
+        h.clock.advance(minutes=3)
+    assert h.pod_names("step") == []
+    set_disk_pressure(h, False)
+    h.runner.reconcile(h.name)
+    assert h.pod_names("step") != []
+
+
+def test_step_is_launched_anyway_when_the_pressure_outlasts_the_wait(h):
+    h.start(["geekbench"])
+    node_with_pressure(h)
+    h.runner.reconcile(h.name)
+    assert h.pod_names("step") == []
+    h.clock.advance(minutes=11)
+    h.runner.reconcile(h.name)
+    assert h.pod_names("step") != []
+
+
+def test_step_rejected_for_disk_pressure_is_relaunched_once_after_it_clears(h):
+    h.cluster.behaviour["geekbench"] = [{"rejected": True}]
+    h.start(["geekbench"])
+    h.drive(stop=lambda run: any(n.endswith("geekbench") for n in h.pod_names("step")))
+    h.cluster.react()  # the kubelet rejects it
+    geekbench_name = geekbench_pod(h)
+    set_disk_pressure(h, True)
+    h.runner.reconcile(h.name)
+    assert h.task("geekbench").state == TaskState.RUNNING  # waits: nothing recorded
+    set_disk_pressure(h, False)
+    run = h.drive()
+    assert h.codes()["geekbench"] == (0, None)
+    assert [n for k, n in h.kube.created if k == "pod" and n.endswith("geekbench")].count(geekbench_name) == 2
+    assert run.status.phase == RunPhase.PUBLISHING
+
+
+def test_step_rejected_twice_ends_minus_four_with_the_rejection_message(h):
+    h.cluster.behaviour["geekbench"] = [{"rejected": True}, {"rejected": True}]
+    h.start(["geekbench"])
+    h.drive()
+    assert h.codes()["geekbench"] == (-4, "Pod was rejected: The node had condition: [DiskPressure].")
+
+
+def test_old_manifest_status_and_result_are_cleared_before_every_launch(h):
+    h.cluster.behaviour["geekbench"] = [{"exit_code": 1}]
+    h.start(["geekbench"])
+    h.drive()
+    assert h.storage.cleared.count("geekbench") == 1 and "lscpu" in h.storage.cleared
+    assert h.storage.cleared.index("lscpu") < h.storage.cleared.index("geekbench")

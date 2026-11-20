@@ -149,9 +149,7 @@ func run(cfg Config, sigs <-chan os.Signal) int {
 	// What is known goes out first; the upload outcome updates it if time allows.
 	writeTermMessage(cfg.TermLog, termMessage{Result: res})
 
-	uploadCtx, cancel := context.WithTimeout(syncCtx, cfg.UploadBudget)
-	defer cancel()
-	m, err := up.Finalize(uploadCtx, hardCtx)
+	m, err := up.FinalizeWithin(syncCtx, hardCtx, cfg.UploadBudget)
 	if err != nil {
 		log.Printf("finalize: %v", err)
 	}

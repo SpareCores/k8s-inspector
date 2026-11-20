@@ -50,6 +50,7 @@ STANDARD_FILES = ("stdout", "stderr", "version", "result.json", "resource_tracke
 # Parallel (probe) tasks get none of them: they run without resource-tracker and their logs are small, and
 # the urls Secret must stay far below the 1 MiB object limit.
 LARGE_STANDARD_FILES = ("stdout", "stderr", "resource_tracker.jsonl")
+ATTEMPT_FILES = ("manifest.json", "result.json", "status.json")  # what verification and recording read back
 LOG_MAX_PARTS = 16  # stdout/stderr never need `uploads.max_parts` parts (16 x 16 MiB = 256 MiB)
 MAX_URLS_BYTES = 700 * 1024  # urls.json size above which the Secret (base64: x 4/3) gets near 1 MiB
 
@@ -368,6 +369,13 @@ class Storage:
         return count
 
     # ---- writes
+
+    def clear_task(self, run: RunKey, key: str) -> None:
+        """DELETE the task's `manifest.json`, `result.json` and `status.json` before its container (re)starts,
+        so `finish_task` can only see the manifest of this attempt (a retry in the same run writes the same
+        keys). Deleting an absent object is not an error."""
+        for name in ATTEMPT_FILES:
+            self.s3.delete_object(Bucket=self.bucket, Key=self._k(object_key(run, key, name)))
 
     def _put_json(self, okey: str, doc: dict) -> None:
         body = json.dumps(doc, indent=1).encode()

@@ -1,0 +1,37 @@
+# memhog: allocates memory without bound (`tail /dev/zero`) under sc-run, with no memory limit, to observe what the
+# kubepods.slice limit does: kernel OOM kill of the task (sc-run survives) or kubelet eviction (membench itself only
+# uses ~130 MiB). The task name has no URLs in urls.json, so its outputs stay in the spool (result.json, stdout).
+apiVersion: v1
+kind: Pod
+metadata:
+  name: p0-memhog
+  namespace: inspector
+  labels:
+    inspector.sparecores.com/run: __RUN_ID__
+    inspector.sparecores.com/role: step
+    inspector.sparecores.com/task: memhog
+spec:
+  nodeName: __NODE_NAME__
+  restartPolicy: Never
+  activeDeadlineSeconds: 600
+  terminationGracePeriodSeconds: 20
+  hostNetwork: true
+  dnsPolicy: Default
+  automountServiceAccountToken: false
+  enableServiceLinks: false
+  tolerations: [{operator: Exists}]
+  containers:
+  - name: memhog
+    image: ghcr.io/sparecores/stress-ng:main
+    command: [/k8si/bin/sc-run, exec, --task, memhog, --timeout, 3m, --upload-budget, 5s,
+              --spool, /k8si/runs/__RUN_ID__/memhog, --urls, /k8si-urls/urls.json,
+              --, sh, -c, "tail /dev/zero"]
+    securityContext: {privileged: true, seccompProfile: {type: Unconfined}}
+    resources: {requests: {cpu: 10m, memory: 64Mi}}
+    terminationMessagePolicy: File
+    volumeMounts:
+    - {name: k8si, mountPath: /k8si}
+    - {name: urls, mountPath: /k8si-urls, readOnly: true}
+  volumes:
+  - {name: k8si, hostPath: {path: /var/lib/k8s-inspector, type: Directory}}
+  - {name: urls, secret: {secretName: p0-urls}}

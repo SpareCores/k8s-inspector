@@ -30,7 +30,12 @@ Phases:
   incomplete, then `status.json` per task (the commit point) and `status.tasks`. The containers of a step that
   cannot start their GPU runtime are recreated once without it (the others keep their results). Containers stuck
   pulling their image -> `-4 IMAGE_PULL_TIMEOUT`, or stuck in a waiting state that never resolves (bad image
-  name, missing Secret key) -> `-4` with the waiting message (the others of the Pod keep their results). Every
+  name, missing Secret key) -> `-4` with the waiting message (the others of the Pod keep their results). A
+  Pod still unfinished at `activeDeadlineSeconds` + grace + 2 min (wedged containerd) is force-deleted and recorded
+  (`_wedged_outcome`); a Pod stuck terminating 2 min past its grace is force-deleted. While the node has
+  DiskPressure no step is launched (up to 10 min); a step Pod the kubelet rejected for it is created once more
+  after the pressure clears, else `-4` with the rejection message. Before a step is launched the tasks' old
+  `manifest.json`, `result.json` and `status.json` are deleted from object storage. Every
   `uploads.resign_every_minutes` the Secret is re-signed. No step
   left -> Releasing.
 - Anchor, Node or NodeClaim lost (or draining) while Running: close the attempt (an anchor that ended on a
@@ -96,6 +101,9 @@ ACTIVE = (RunPhase.PENDING, RunPhase.PROVISIONING, RunPhase.RUNNING, RunPhase.RE
 MAX_PROVISION_RETRIES = 3  # attempts lost before a node was usable (stale node, anchor deleted)
 EXTRA_ATTEMPTS = 2  # attempts beyond `max_spot_attempts` (the on-demand one plus one spare)
 BACKOFF_SECONDS = (2, 5, 15, 30, 60)
+DISK_PRESSURE_WAIT = timedelta(minutes=10)  # how long a step waits for a node's DiskPressure to clear
+DISK_PRESSURE_RECHECK_SECONDS = 30
+DISK_PRESSURE_TAINT = "node.kubernetes.io/disk-pressure"
 
 # Kubernetes and SCarpenter names read from Node and NodeClaim.
 NODEPOOL_LABEL = "karpenter.sh/nodepool"
@@ -132,6 +140,7 @@ class _Node:
     facts: NodeFacts
     gpu_count: int = 0
     claim: dict | None = None
+    disk_pressure: bool = False  # the kubelet rejects new Pods while it is set
     lscpu_stdout: str | None = None  # raw output of the attempt's lscpu task, for `run.json`
 
 
@@ -239,6 +248,15 @@ def _find(status: RunStatus, name: str) -> TaskStatus | None:
     return next((t for t in status.tasks if t.name == name), None)
 
 
+def _disk_pressure(node: dict) -> bool:
+    """Condition `DiskPressure` True or the `disk-pressure` taint."""
+    conditions = node.get("status", {}).get("conditions") or []
+    taints = node.get("spec", {}).get("taints") or []
+    return any(c.get("type") == "DiskPressure" and c.get("status") == "True" for c in conditions) or any(
+        t.get("key") == DISK_PRESSURE_TAINT for t in taints
+    )
+
+
 def _outcome_of(status: TaskStatus) -> TaskOutcome:
     """What `steps.next_step` needs of a finished task."""
     return TaskOutcome(key=status.name, exit_code=status.exit_code or 0, error_msg=status.error_msg)
@@ -276,6 +294,8 @@ class Runner:
         self._failing: dict[str, tuple[int, datetime]] = {}  # run -> (reconciles failed in a row, since when)
         self._nodes: dict[str, _Node] = {}  # cache per run
         self._signed_at: dict[str, datetime] = {}  # when the urls Secret was last signed, per run
+        self._disk_wait: dict[str, datetime] = {}  # run -> since when its node has had DiskPressure
+        self._relaunched: set[str] = set()  # step Pods already relaunched once after a DiskPressure rejection
 
     def check_config(self) -> None:
         """Fail fast when `K8SI_SC_RUN_IMAGE` is empty (anchor and flush Pods could not be created)."""
@@ -302,6 +322,10 @@ class Runner:
             return
         cfg = self._cfg()
         live = {_meta(p)["name"]: p for p in self.kube.list("pod", labels={LABEL_RUN: run.name})}
+        for name, pod in live.items():  # a Pod wedged in Terminating keeps the node busy
+            if pods.terminating_overdue(pod, self._now()):
+                log.warning("run %s: Pod %s is stuck terminating, force-deleting it", run.name, name)
+                self.kube.delete("pod", name, grace_seconds=0)
         handlers = {
             RunPhase.PENDING: self._pending,
             RunPhase.PROVISIONING: self._provisioning,
@@ -355,9 +379,12 @@ class Runner:
                     log.exception("ending run %s failed, retrying", name)
             delay = BACKOFF_SECONDS[min(failures, len(BACKOFF_SECONDS) - 1)]
             log.warning("reconcile of %s failed, retrying in %ds", name, delay, exc_info=True)
-            timer = threading.Timer(delay, self.enqueue, [name])
-            timer.daemon = True
-            timer.start()
+            self._enqueue_later(name, delay)
+
+    def _enqueue_later(self, name: str, delay: float) -> None:
+        timer = threading.Timer(delay, self.enqueue, [name])
+        timer.daemon = True
+        timer.start()
 
     def _give_up(self, name: str, error: Exception) -> None:
         """The run cannot be reconciled: its unfinished tasks end 256 so the lease can be released."""
@@ -407,6 +434,8 @@ class Runner:
         """The BenchmarkRun is gone: drop caches and delete the Pods that outlived it."""
         self._nodes.pop(name, None)
         self._signed_at.pop(name, None)
+        self._disk_wait.pop(name, None)
+        self._relaunched = {n for n in self._relaunched if not n.startswith(name)}
         self._known.discard(name)
         for pod in self.kube.list("pod", labels={LABEL_RUN: name}):
             self.kube.delete("pod", _meta(pod)["name"])
@@ -894,6 +923,7 @@ class Runner:
         nd.gpu_count = _quantity(
             node.get("status", {}).get("allocatable", {}).get(GPU_RESOURCE, 0)
         )  # the plugin may register late
+        nd.disk_pressure = _disk_pressure(node)
         return nd, self._draining(node, nd.claim)
 
     # ----------------------------------------------------------------------- Running
@@ -912,7 +942,39 @@ class Runner:
         step = self._plan(run, nd, _step_index(run.status.current_step) + 1)
         if step is None:
             return self._to_releasing(run, cfg, live)
+        if self._wait_for_disk(run, nd):
+            return
         self._start_step(run, cfg, live, nd, step)
+
+    def _wait_for_disk(self, run: BenchmarkRun, nd: _Node) -> bool:
+        """True while the node has DiskPressure (the kubelet would reject the Pod) and the wait of at most
+        `DISK_PRESSURE_WAIT` is not used up; the run is looked at again soon."""
+        if not nd.disk_pressure:
+            self._disk_wait.pop(run.name, None)
+            return False
+        since = self._disk_wait.setdefault(run.name, self._now())
+        if self._now() - since >= DISK_PRESSURE_WAIT:
+            return False
+        self._enqueue_later(run.name, DISK_PRESSURE_RECHECK_SECONDS)
+        return True
+
+    def _relaunch_rejected(
+        self, run: BenchmarkRun, cfg: Config, live: dict[str, dict], nd: _Node, step: Step, pod: dict
+    ) -> bool:
+        """The kubelet rejected the step Pod (DiskPressure): wait for the pressure to clear, then create it once
+        more. True when handled; False when it is time to record the rejection (already relaunched once, or the
+        pressure outlasted the wait)."""
+        name = _meta(pod)["name"]
+        if name in self._relaunched:
+            return False
+        if self._wait_for_disk(run, nd):
+            return True
+        if nd.disk_pressure:
+            return False
+        self._relaunched.add(name)
+        self.kube.delete("pod", name, grace_seconds=0)
+        self._launch(run, cfg, live, nd, step)
+        return True
 
     def _probe_tasks(self, run: BenchmarkRun, nd: _Node) -> list[TaskDef]:
         """The probe step's tasks: the selected parallel tasks plus `lscpu` (always: the variant comes from it)
@@ -989,6 +1051,8 @@ class Runner:
         except UrlsTooLarge as e:
             log.error("run %s step %s: %s", run.name, step.name, e)
             return self._fail_running(run, nd, live, f"cannot sign the upload URLs of the step: {e}")
+        for c in step.containers:  # only this attempt's manifest may count at the end
+            self.storage.clear_task(crd.run_key(run), c.key)
         self._heartbeat(run)
         pod = pods.render_step(
             run,
@@ -1016,8 +1080,14 @@ class Runner:
         elif {s["name"] for s in pod["spec"]["containers"]} != {pods.container_name(c.key) for c in step.containers}:
             log.error("run %s: Pod %s does not match the stored step", run.name, _meta(pod)["name"])
             self._fail_running(run, nd, live, "the step Pod does not match the stored step")
+        elif pods.is_rejected(pod) and self._relaunch_rejected(run, cfg, live, nd, step, pod):
+            return
         elif pods.is_finished(pod):
             self._finish_step(run, cfg, live, nd, step, pod, draining)
+        elif pods.overdue(pod, self._now()):
+            log.warning("run %s: step Pod %s outlived its deadline, force-deleting it", run.name, _meta(pod)["name"])
+            wedged = {c.key for c in step.containers if pods.container_name(c.key) in pods.unfinished_containers(pod)}
+            self._finish_step(run, cfg, live, nd, step, pod, draining, wedged=wedged)
         elif stuck := pods.stuck_containers(pod, self._now(), cfg.settings.deadlines.image_pull_minutes):
             if pods.unfinished_containers(pod) <= stuck.keys():  # the others are done: nothing left to wait for
                 messages = {
@@ -1052,11 +1122,13 @@ class Runner:
         pod: dict,
         draining: bool,
         stuck: dict[str, str] | None = None,
+        wedged: set[str] | None = None,
     ) -> None:
         """The step Pod ended (or, with `stuck`, only containers stuck waiting are left: their keys and the
-        `error_msg` of their tasks)."""
+        `error_msg` of their tasks; with `wedged`, the Pod outlived its deadline and these containers never
+        ended: sc-run's uploaded result counts when it verifies, else they are `-4 DEADLINE_EXCEEDED`)."""
         pod_name = _meta(pod)["name"]
-        stuck = stuck or {}
+        stuck, wedged = stuck or {}, wedged or set()
         outcomes = pods.classify(pod, step.containers)
         for key, message in stuck.items():
             outcomes[key] = TaskOutcome(key, ExitCode.NEVER_FINISHED, message, from_sc_run=False)
@@ -1069,7 +1141,8 @@ class Runner:
         retried = {c.key for c in retry.containers} if retry else set()  # run again below, not recorded now
 
         flushes = sorted(n for n in live if n.startswith(f"{pod_name}-flush"))
-        if flushes and not pods.is_finished(live[flushes[-1]]):
+        flush_wedged = bool(flushes) and pods.overdue(live[flushes[-1]], self._now())
+        if flushes and not pods.is_finished(live[flushes[-1]]) and not flush_wedged:
             return  # a flush Pod is still uploading
         key = crd.run_key(run)
         verdicts: dict[str, Verification | None] = {}
@@ -1083,8 +1156,11 @@ class Runner:
                 verdicts[c.key] = None
             else:
                 verdicts[c.key] = self.storage.finish_task(key, c.key)
+        for c in step.containers:
+            if c.key in wedged:
+                outcomes[c.key] = self._wedged_outcome(key, c, verdicts[c.key])
         failing = [c for c in step.containers if verdicts[c.key] is not None and not verdicts[c.key].ok]
-        if failing and len(flushes) < pods.FLUSH_STEPS:
+        if failing and len(flushes) < pods.FLUSH_STEPS and not flush_wedged:
             self._apply_urls(run, self._current_plans(run))  # fresh URLs for the flush
             self._heartbeat(run)
             flush = pods.render_flush_step(
@@ -1116,6 +1192,10 @@ class Runner:
             self.kube.delete("pod", pod_name)  # right before recording: nothing may flush from it before that
             for stuck_key in stuck:
                 self.storage.abort_open(key, stuck_key)
+        if wedged:
+            self.kube.delete("pod", pod_name, grace_seconds=0)
+        if flush_wedged:
+            self.kube.delete("pod", flushes[-1], grace_seconds=0)
         is_probe = step.index == 1  # also the `-cpu` fallback of the probe step
         if is_probe:
             nd.facts.boot_time = next((o.btime for o in outcomes.values() if o.btime), nd.facts.boot_time)
@@ -1128,6 +1208,13 @@ class Runner:
             return self._launch(run, cfg, live, nd, fallback_step)
         self._heartbeat(run)
         self._running(run, cfg, live)
+
+    def _wedged_outcome(self, key, container, verdict: Verification | None) -> TaskOutcome:
+        """A container that never ended: its `result.json` when the uploads verify, else `-4`."""
+        doc = self.storage.read_json(key, container.key, "result.json") if verdict and verdict.ok else None
+        if doc and "exit_code" in doc:
+            return pods.outcome_from_message(container.key, doc, container, "DeadlineExceeded")
+        return TaskOutcome(container.key, ExitCode.NEVER_FINISHED, Reason.DEADLINE_EXCEEDED.value, from_sc_run=False)
 
     # ----------------------------------------------------------------------- losing the node
 

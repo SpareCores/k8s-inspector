@@ -8,7 +8,7 @@ benchmark nodes away from everything else ([separation](separation.md)).
 
 | Credential | Where it lives | Who can use it |
 |---|---|---|
-| Object storage (write and read the output prefix) | none stored: the controller's ServiceAccount token is exchanged for a cloud IAM role session through the cluster's OIDC issuer | the controller only |
+| Object storage (write and read the output prefix) | none stored: the controller's ServiceAccount token is exchanged for a cloud IAM role session through the cluster's OIDC issuer; the role needs `s3:GetObject`, `PutObject`, `DeleteObject` (stale task files before a launch), `ListBucket` and the multipart actions under the run prefix | the controller only |
 | Output upload URLs | the run's Secret, mounted into step Pods | anyone holding the URL, for that one key and method, until it expires (≤ 12 h) |
 | Git deploy key (write to sc-inspector-data) | Secret mounted only into the controller | the controller only |
 | Keeper API key (if required) | controller Secret | the controller only |
