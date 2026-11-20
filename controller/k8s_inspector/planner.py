@@ -1,18 +1,20 @@
-"""Planner: which SKUs get a BenchmarkRun. P1 = forced runs only; autoPlan is a stub for later.
+"""Planner: which SKUs get a BenchmarkRun, forced (`force_run`) or by itself (`plan_cycle`, autoPlan).
 
 Owner: planner agent. Implements docs/how-to/run-forced.md, docs/reference/configuration.md (planner,
-vendors, batching), state.md "What git still records", exit-codes.md "Planner retry" and the planning rows of
+vendors), state.md "What git still records", exit-codes.md "Planner retry" and the planning rows of
 feature-mapping.md. The lease is the BenchmarkRun name: creating a second run for a SKU raises `RunExists`.
 """
 
 import logging
 import threading
+import zlib
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
-from k8s_inspector import crd, keeper, pods, tasks
+from k8s_inspector import crd, keeper, pods, publisher, tasks
 from k8s_inspector.kube import Kube
-from k8s_inspector.model import BenchmarkRun, CapacityMode, Config, PodRole, RunPhase, RunSpec, TaskDef
+from k8s_inspector.model import BenchmarkRun, CapacityMode, Config, ExitCode, PodRole, RunPhase, RunSpec, TaskDef
 
 log = logging.getLogger(__name__)
 
@@ -120,8 +122,7 @@ def force_run(
     every server task, except the `keeper_gated` ones, which run only when named; DBaaS tasks need a database
     and are refused); the vendor is below `maxInFlight` and `maxUsdPerHour`. Without `force` Keeper must also find
     every task eligible (`keeper.block_reasons`; an unknown SKU is blocked, an unreachable Keeper fails closed).
-    With `force` the SKU is not checked here: a SKU SCarpenter cannot offer ends in `-1 SCARPENTER_NO_OFFERING`
-    (Keeper does not know OCI SKUs)."""
+    With `force` the SKU is not checked here: a SKU SCarpenter cannot offer ends in `-1 SCARPENTER_NO_OFFERING`."""
     settings = cfg.settings
     vendor_settings = settings.vendors.get(vendor)
     if vendor_settings is None or not vendor_settings.enabled:
@@ -135,13 +136,27 @@ def force_run(
         _check_keeper(cfg, vendor, sku, names)
     check_vendor_budget(kube, cfg, vendor, crd.list_runs(kube))
 
+    return _create_run(kube, cfg, vendor, sku, names, force=force, capacity=capacity, hold_after=hold_after)
+
+
+def _create_run(
+    kube: Kube,
+    cfg: Config,
+    vendor: str,
+    sku: str,
+    names: list[str],
+    *,
+    force: bool = False,
+    capacity: CapacityMode | None = None,
+    hold_after: timedelta = timedelta(0),
+) -> BenchmarkRun:
     spec = RunSpec(
         vendor=vendor,
         sku=sku,
         run_id=crd.new_run_id(datetime.now(UTC)),
         tasks=names,
         force=force,
-        capacity=capacity or vendor_settings.capacity,
+        capacity=capacity or cfg.settings.vendors[vendor].capacity,
         hold_after=hold_after,
     )
     run = crd.create_run(kube, spec)
@@ -167,21 +182,125 @@ def _check_keeper(cfg: Config, vendor: str, sku: str, names: list[str]) -> None:
         raise ValueError(f"Keeper blocks tasks for {vendor}/{sku} ({details}); use --force to skip the check")
 
 
-def plan_cycle(kube: Kube, cfg: Config, *, dry_run: bool = False) -> list[PlannedRun]:
-    """One autoPlan cycle: for each enabled vendor with autoPlan, respect `max_in_flight`/`max_usd_per_hour`
-    (`check_vendor_budget`), fetch eligibility (`keeper.block_reasons`), read git state of the checkout
-    (due tasks: hash change, `RERUN_`, backoff for -1/-4, `start_retries`, cap 3 -> -5), apply `batching`,
-    create runs unless `dry_run`. STUB in P1 (forced runs only, roadmap): plans nothing; it warns when a
-    vendor asks for autoPlan so the setting is not silently ignored."""
+# `schedule/<task>/meta.json` of every SKU of a vendor: {sku: {task: meta}} (`Publisher.read_schedule_metas`)
+ScheduleReader = Callable[[str], dict[str, dict[str, dict]]]
+
+# Wait after a failure before the task is due again (exit-codes.md "Planner retry"): a `-4` by its `start_retries`
+# (the third `-4` is `-5`, final), a `-1` flat; no capacity or quota at all (`QUOTA_ZERO`, `NO_OFFERING`) only daily.
+RETRY_AFTER_NEVER_FINISHED = (timedelta(hours=2), timedelta(hours=6))
+RETRY_AFTER_NO_NODE = timedelta(hours=2)
+RETRY_AFTER_NO_NODE_DAILY = timedelta(hours=24)
+DAILY_NO_NODE_REASONS = ("SCARPENTER_QUOTA_ZERO", "SCARPENTER_NO_OFFERING")
+
+
+def due_reason(task: TaskDef, meta: dict | None, now: datetime) -> str | None:
+    """Why `task` is due on a SKU whose `schedule/<task>/meta.json` is `meta` (None: never run), else None.
+    Port of sc-inspector `lib.should_start`: a changed (or `RERUN_`-prefixed) hash, no result yet; a finished
+    result with the current hash is final (success, a task's own exit code, `-3`, `-6`, `256`, `-5`) except the
+    retried failures `-1` and `-4`, which wait for their backoff. `now` is naive UTC like the meta times."""
+    if meta is None:
+        return "never run"
+    if meta.get("task_hash") != tasks.task_hash(task):
+        return "task hash changed"
+    code, end = meta.get("exit_code"), meta.get("end")
+    if code is None or end is None:
+        return "no result"
+    code = int(code)
+    if code == ExitCode.NO_NODE:
+        daily = str(meta.get("error_msg") or "").startswith(DAILY_NO_NODE_REASONS)
+        wait = RETRY_AFTER_NO_NODE_DAILY if daily else RETRY_AFTER_NO_NODE
+    elif code == ExitCode.NEVER_FINISHED:
+        retries = min(max(int(meta.get("start_retries") or 1), 1), len(RETRY_AFTER_NEVER_FINISHED))
+        wait = RETRY_AFTER_NEVER_FINISHED[retries - 1]
+    else:
+        return None
+    if now - datetime.fromisoformat(end).replace(tzinfo=None) >= wait:
+        return f"retry after exit code {code}"
+    return None
+
+
+def start_order(vendor: str, sku: str) -> tuple[int, str]:
+    """Legacy `lib.instance_start_order_key`: crc32 of `vendor/sku` mixes the sizes (price order would exhaust the
+    quota of a new vendor on the small SKUs first); the SKU name breaks ties."""
+    return zlib.crc32(f"{vendor}/{sku}".encode()), sku
+
+
+def plan_cycle(kube: Kube, cfg: Config, schedule_reader: ScheduleReader, *, dry_run: bool = False) -> list[PlannedRun]:
+    """One autoPlan cycle. For each enabled vendor with autoPlan whose results are published (`publish`; without it
+    git would never record them and the SKU would be run again and again) and that is below its caps
+    (`check_vendor_budget`): take the vendor's ACTIVE SKUs from Keeper in `start_order`, skip those that already
+    have a BenchmarkRun (the lease), and create a run (not forced) for the first SKU with due tasks (`due_reason`
+    on the git schedule metas) that Keeper does not block, until the caps are reached: usually one run per vendor
+    and cycle. With `dry_run` nothing is created and the first such SKU of each vendor is returned.
+
+    Fails closed: when Keeper or git cannot be read the cycle plans nothing (for git: nothing for that vendor)
+    and logs why."""
     settings = cfg.settings
+    candidates = []
     for vendor, vendor_settings in settings.vendors.items():
         auto = settings.auto_plan if vendor_settings.auto_plan is None else vendor_settings.auto_plan
-        if vendor_settings.enabled and auto:
-            log.warning("autoPlan is not implemented yet, vendor %s is only run on demand", vendor)
-    return []
+        if not (vendor_settings.enabled and auto):
+            continue
+        if not publisher.vendor_allowed(settings, vendor):
+            log.warning("autoPlan of vendor %s needs publish: results would never reach git", vendor)
+            continue
+        try:
+            check_vendor_budget(kube, cfg, vendor, crd.list_runs(kube))
+        except ValueError as e:
+            log.info("autoPlan skips vendor %s: %s", vendor, e)
+            continue
+        candidates.append(vendor)
+    if not candidates:
+        return []
+
+    server_tasks = [task for task in tasks.all_tasks() if not task.dbaas]
+    try:
+        blocked = keeper.active_servers_block_reasons(cfg.env, [task.name for task in server_tasks])
+    except Exception:
+        log.exception("autoPlan skips the cycle: Keeper is not reachable")
+        return []
+
+    now = datetime.now(UTC).replace(tzinfo=None)
+    planned = []
+    for vendor in candidates:
+        try:
+            metas = schedule_reader(vendor)
+        except Exception:
+            log.exception("autoPlan skips vendor %s: cannot read the sc-inspector-data state", vendor)
+            continue
+        runs = crd.list_runs(kube)
+        leased = {run.name for run in runs}
+        skus = sorted(blocked.get(vendor, {}), key=lambda sku: start_order(vendor, sku))
+        for sku in skus:
+            if crd.run_name(vendor, sku) in leased or not publisher.publish_allowed(settings, vendor, sku):
+                continue
+            due = {}
+            for task in server_tasks:
+                if task.name in blocked[vendor][sku]:
+                    continue
+                reason = due_reason(task, metas.get(sku, {}).get(task.name), now)
+                if reason:
+                    due[task.name] = reason
+            if not due:
+                continue
+            if not dry_run:
+                try:
+                    check_vendor_budget(kube, cfg, vendor, runs)
+                except ValueError as e:
+                    log.info("autoPlan stops for vendor %s: %s", vendor, e)
+                    break
+                try:
+                    runs.append(_create_run(kube, cfg, vendor, sku, list(due)))
+                except crd.RunExists:
+                    continue
+            reason = ", ".join(f"{name}: {why}" for name, why in due.items())
+            planned.append(PlannedRun(vendor, sku, tuple(due), reason))
+            if dry_run:
+                break
+    return planned
 
 
-def run_forever(kube: Kube, cfg_provider, stop: threading.Event) -> None:
+def run_forever(kube: Kube, cfg_provider, schedule_reader: ScheduleReader, stop: threading.Event) -> None:
     """Every `planner.interval_minutes`: `plan_cycle`; exceptions are logged, never fatal. `cfg_provider` is a
     zero-argument callable returning the current `Config`."""
     while not stop.is_set():
@@ -189,7 +308,7 @@ def run_forever(kube: Kube, cfg_provider, stop: threading.Event) -> None:
         try:
             cfg = cfg_provider()
             interval_minutes = cfg.settings.planner_interval_minutes
-            for planned in plan_cycle(kube, cfg):
+            for planned in plan_cycle(kube, cfg, schedule_reader):
                 log.info("planned run", extra={"vendor": planned.vendor, "sku": planned.sku, "reason": planned.reason})
         except Exception:
             log.exception("planning cycle failed")

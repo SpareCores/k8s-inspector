@@ -30,22 +30,17 @@ warning and ignored; an invalid value is an error and the controller keeps the l
 benchPool: bench                 # the one NodePool every vendor's bench nodes come from
 planner:
   intervalMinutes: 5
-  autoPlan: false                # true: plan from Keeper and git; false: only forced runs
+  autoPlan: false                # true: the controller picks SKUs itself (below); false: only forced runs
 vendors:
   oci:
     enabled: true
-    autoPlan: false              # per-vendor override
+    autoPlan: false              # per-vendor override; needs publish
     maxInFlight: 2               # 0 pauses the vendor; unset: defaults.maxInFlight
     maxUsdPerHour: 2.0           # checked before a run starts
     capacity: SpotFirst          # SpotFirst (the default) | OnDemand
     publish: false               # true, or a list of SKUs: the publisher pushes these results to sc-inspector-data
 defaults:
   maxInFlight: 2                 # conservative default for every vendor without its own maxInFlight
-batching:                        # hourly-billed vendors: start when expected work fills enough of the billed hour
-  hourlyMinFillRatio: 0.5
-  hourlyMaxWaitDays: 14
-  perSecondMinWorkMinutes: 10
-  perSecondMaxWaitDays: 3
 spot:
   maxSpotAttempts: 2
   maxLostMinutes: 60
@@ -75,6 +70,37 @@ SKUs that are not published are deleted after `keepRunHours`; their outputs stay
 `publish --rescan --sku` can publish them later). A vendor is enabled here when it is
 removed from the legacy pipeline ([roadmap](../roadmap.md)); there is no shared routing file.
 
+## autoPlan
+
+With `autoPlan` on (`planner.autoPlan`, overridable per vendor) for an enabled vendor, every `planner.intervalMinutes`
+the controller starts runs by itself; there is no batching or waiting for a full billed hour, work starts as soon as
+it is due and the vendor has room. Per vendor:
+
+1. The vendor must publish (`publish: true` or a list; only the listed SKUs are planned). Without publishing, git
+   would never learn that a task ran and the SKU would run again and again; the planner logs a warning and skips the
+   vendor.
+2. If one more run would pass `maxInFlight` or `maxUsdPerHour` ([below](#running-instances-per-vendor)) the vendor is
+   skipped before anything else is read. `maxInFlight: 1` means one instance at a time.
+3. The candidate SKUs are the ACTIVE servers of the vendor that Keeper lists
+   (`/inspector/servers/task_block_reason_codes`, the same call that answers eligibility), in the legacy order:
+   crc32 of `<vendor>/<sku>`, which mixes sizes. A SKU that has a `BenchmarkRun` (the lease, also while it is
+   finished and not yet published) is skipped.
+4. A task of a SKU is due when Keeper does not block it (a block reason drops the task; the `keeper_gated` tasks are
+   blocked by Keeper except on its allowlist, so they run only where Keeper allows them) and its
+   `data/<vendor>/<sku>/schedule/<task>/meta.json` in sc-inspector-data `main` says so: no meta yet, or a
+   `task_hash` different from the catalogue's (a changed task, a bumped `revision`, a `RERUN_` prefix), or a failure
+   that is retried and whose wait has passed (`-1`: 2 h, or 24 h for `SCARPENTER_QUOTA_ZERO` and
+   `SCARPENTER_NO_OFFERING`; `-4`: 2 h after the first, 6 h after the second). Anything else with the current hash is
+   final: success, a task's own exit code above 0, `-3`, `-6`, `256` and `-5` ("exceeded retries") stay until the
+   hash changes ([exit codes](exit-codes.md)).
+5. The first SKU in that order with at least one due task gets a run with exactly those tasks (not forced:
+   Keeper's rules were applied). Then the caps are checked again; below them the next SKU follows.
+
+The git state is read from the publisher's checkout (blobless, sparse: only the `schedule/*/meta.json` files of the
+vendor), under the publisher's lock. If Keeper or git cannot be read, the cycle (or that vendor) plans nothing and
+logs why: the planner never creates runs blindly. `k8s-inspector plan [--dry-run]` runs one cycle in its own
+checkout; with `--dry-run` it creates nothing and prints the first SKU that would start for each vendor.
+
 ## CLI
 
 `k8s-inspector serve | plan [--dry-run] | run <vendor> <sku> [--tasks …] [--force] [--on-demand] [--hold 2h] |
@@ -95,7 +121,7 @@ size or total bound. The cap on started and running instances of a vendor is `ve
 acquiring a node (Pending, Provisioning, Running, Releasing, and a Failed or Cancelled run until its anchor Pod is
 deleted) and the live NodeClaims of the vendor in the bench NodePool (NodeClaims carry the vendor in `spec.requirements` from creation and as the label `scarpenter.sparecores.com/vendor` after launch; an instance can outlive its anchor). This is a
 lower bound ("at least" that many instances); leftover NodeClaims without a holding run count as instances but do
-not add to the spend. It applies to forced runs; autoPlan uses the same check.
+not add to the spend. It applies to forced runs; [autoPlan](#autoplan) uses the same check before every run it creates.
 
 `maxUsdPerHour`, when set, is checked before a run starts against the node prices of the holding runs. A run in
 Pending or Provisioning has no node and no price yet, so while one exists a new run is refused ("wait until ... has

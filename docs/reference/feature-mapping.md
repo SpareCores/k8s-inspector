@@ -7,16 +7,16 @@ Legend: **P** planner, **R** run loop, **C** classification, **Pub** publisher, 
 
 | sc-inspector | k8s-inspector |
 |---|---|
-| `start` (GitHub Actions cron every 15 min, vendor matrix, `--limit 8`) | **P** every 5 min in the controller; per-vendor `maxInFlight` and `$/h` caps |
+| `start` (GitHub Actions cron every 15 min, vendor matrix, `--limit 8`) | **P** every 5 min in the controller ([autoPlan](configuration.md#autoplan)); per-vendor `maxInFlight` (default 2; 1 = one instance at a time) and `$/h` caps |
 | `--start-only`, `--force` (`--exclude` unused) | CLI `run <vendor> <sku> [--tasks] [--force]`; creates a `BenchmarkRun` |
 | vendor skiplist in `start.yml` | `vendors.<v>.enabled` / `maxInFlight: 0` |
-| `available_servers` from sc-data, crc32 order | **P** unchanged |
+| `available_servers` from sc-data, crc32 order | **P** ACTIVE servers of the vendor from Keeper's bulk endpoint (no price or region filter: SCarpenter answers `-1 NO_OFFERING`); crc32 order unchanged |
 | Keeper bulk block reasons, fail closed | **P** unchanged; the per-task re-check on the VM is dropped |
 | `always_run` / `start_with_instance` | the probe step is in every attempt; `timing` is publisher output |
 | 2 h `WAIT_SINCE_LAST_START`, boot placeholder commits as a lease | — replaced by the `BenchmarkRun` lease ([state model](../explanation/state.md)) |
 | `FAIL_ON_ERROR` (3 d) raising | — failing tasks via `status --failing` and alerts |
 | `task.rerun`, hash change, `RERUN_` edit | `revision`; hash unchanged; `RERUN_` still works ([tasks](tasks.md)) |
-| `-1` with retryable markers | **C** SCarpenter reasons; **P** backoff |
+| `-1` with retryable markers | **C** SCarpenter reasons; **P** retry after 2 h (24 h for `QUOTA_ZERO`, `NO_OFFERING`) |
 | AWS spot self-heal | [spot strategy](../explanation/spot.md) |
 | stale reconcile, `MAX_START_RETRIES` 3 → `-5` | **P** `start_retries` on `-4`, cap 3 → `-5` |
 | `meta.json` / `schedule/` union, naive UTC | **Pub** same layout and union logic |

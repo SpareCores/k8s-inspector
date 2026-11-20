@@ -1,4 +1,4 @@
-"""Keeper API client: task eligibility for a SKU (autoPlan only; forced runs skip it).
+"""Keeper API client: the ACTIVE servers and task eligibility (autoPlan; forced runs skip it).
 
 Implements decision K25: keep the HTTP call, fail closed (any error means "blocked"). Port of sc-inspector
 `keeper_client.py` (`/inspector/server/<vendor>/<sku>/task_block_reason_codes`), with `urllib.request`.
@@ -68,3 +68,26 @@ def block_reasons(
         else:
             result[sku] = {name: list(reasons) for name, reasons in data.items() if reasons}
     return result
+
+
+def active_servers_block_reasons(
+    env: EnvConfig, task_names: Sequence[str]
+) -> dict[str, dict[str, dict[str, list[str]]]]:
+    """`{vendor: {sku: {task_name: [reason codes]}}}` of every ACTIVE server in one call (legacy
+    `servers_task_block_reasons`); a task absent from a SKU's dict is eligible. The SKU list is the planner's list
+    of candidates. Raises `RuntimeError` when Keeper cannot be reached or answers unexpectedly."""
+    base = (env.keeper_api_base or DEFAULT_API_BASE).rstrip("/")
+    query = urllib.parse.urlencode([("tasks", name) for name in task_names])
+    url = f"{base}/inspector/servers/task_block_reason_codes?{query}"
+    data = _get(url, _read_key(env))
+    if data is None:
+        raise RuntimeError(f"keeper HTTP 404 for {url}")
+    try:
+        return {
+            vendor: {
+                sku: {task: list(reasons) for task, reasons in found.items() if reasons} for sku, found in skus.items()
+            }
+            for vendor, skus in data.items()
+        }
+    except (AttributeError, TypeError) as e:
+        raise RuntimeError(f"keeper returned unexpected JSON for {url}") from e

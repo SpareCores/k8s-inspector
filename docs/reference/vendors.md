@@ -17,12 +17,11 @@ references. Entries marked "verify" disagree between sources or are not document
 
 Consequences:
 
-- **Hourly vendors** (Hetzner, UpCloud, Vultr, possibly OVHcloud US): the planner batches due tasks so a node's work
-  fills at least half of a billed hour, or waits up to 14 days ([configuration](configuration.md)). Stopping a VM does
-  not stop billing there.
-- **Per-second vendors**: start when about 10 minutes of work is due, or after 3 days.
+- **Hourly vendors** (Hetzner, UpCloud, Vultr, possibly OVHcloud US): stopping a VM does not stop billing there, so
+  keep `maxInFlight` and `maxUsdPerHour` low. The planner does not batch work: a SKU with due tasks starts as soon as
+  the vendor has room ([autoPlan](configuration.md#autoplan)).
 - **Spot**: only where the table says yes, per the [spot strategy](../explanation/spot.md).
 - **DBaaS**: run only where the managed database exists; hourly database billing makes a failed attempt cost an hour
   ([DBaaS](../explanation/dbaas.md)).
-- **Keeper**: Keeper's eligibility rules do not allow inspector runs on OCI SKUs (the Keeper API does serve them), so OCI runs are forced runs
-  ([start a forced run](../how-to/run-forced.md)).
+- **Keeper**: Keeper serves the OCI SKUs and applies its normal eligibility rules, so autoPlan picks them like any
+  vendor's. Forced runs are for operators ([start a forced run](../how-to/run-forced.md)).

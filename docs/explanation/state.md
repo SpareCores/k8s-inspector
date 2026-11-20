@@ -60,7 +60,7 @@ publisher, never as a placeholder:
 - new fields ignored by sc-crawler: `run_id`, `image` (digest), `zone`, `capacity_type`, `price`, `node_os`,
   `kubelet`, `runtime`, `nodeclass_hash`, `spot_attempts`.
 
-The planner reads git (what is done and when) and Kubernetes (what is running); together they replace the 2-hour
+The planner reads git (what is done and when: the `schedule/<task>/meta.json` files, [autoPlan](../reference/configuration.md#autoplan)) and Kubernetes (what is running); together they replace the 2-hour
 start window, the boot placeholders and the stale-start reconcile of sc-inspector.
 
 ## Disaster recovery

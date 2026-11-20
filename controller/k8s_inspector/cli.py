@@ -201,7 +201,7 @@ def serve(kube: Kube, provider: ConfigProvider, stop: threading.Event, metrics_p
 
     targets = {
         "runner": lambda: runner.run_forever(stop),
-        "planner": lambda: planner.run_forever(kube, provider, stop),
+        "planner": lambda: planner.run_forever(kube, provider, publisher.read_schedule_metas, stop),
         "publisher": lambda: publisher.run_forever(lambda: provider().settings, stop),
         "metrics": server.serve_forever,
     }
@@ -241,7 +241,10 @@ def cmd_serve(args: argparse.Namespace) -> int:
 
 def cmd_plan(args: argparse.Namespace) -> int:
     kube, provider = _connect()
-    planned = planner.plan_cycle(kube, provider(), dry_run=args.dry_run)
+    cfg = provider()
+    with tempfile.TemporaryDirectory(prefix="k8si-plan-") as workdir:  # its own checkout, like `publish`
+        publisher = Publisher(kube, Storage(cfg.env, cfg.settings.uploads), cfg.env, Path(workdir))
+        planned = planner.plan_cycle(kube, cfg, publisher.read_schedule_metas, dry_run=args.dry_run)
     for run in planned:
         print(f"{run.vendor} {run.sku} {','.join(run.tasks)} ({run.reason})")
     if not planned:

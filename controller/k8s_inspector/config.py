@@ -15,7 +15,6 @@ import yaml
 
 from k8s_inspector.kube import Kube, NotFound
 from k8s_inspector.model import (
-    Batching,
     CapacityMode,
     Config,
     Deadlines,
@@ -98,12 +97,6 @@ def _nonneg_float(value: Any, path: str) -> float:
     return float(value)
 
 
-def _ratio(value: Any, path: str) -> float:
-    if isinstance(value, bool) or not isinstance(value, int | float) or not 0 <= value <= 1:
-        raise _fail(path, "a number between 0 and 1", value)
-    return float(value)
-
-
 def _str(value: Any, path: str) -> str:
     if not isinstance(value, str) or not value:
         raise _fail(path, "a non-empty string", value)
@@ -134,12 +127,6 @@ def _optional(check: Callable[[Any, str], Any]) -> Callable[[Any, str], Any]:
 # camelCase key -> (dataclass field, check). One table per section.
 _PLANNER = {"intervalMinutes": ("planner_interval_minutes", _pos_int), "autoPlan": ("auto_plan", _bool)}
 _DEFAULTS = {"maxInFlight": ("max_in_flight", _nonneg_int)}
-_BATCHING = {
-    "hourlyMinFillRatio": ("hourly_min_fill_ratio", _ratio),
-    "hourlyMaxWaitDays": ("hourly_max_wait_days", _nonneg_int),
-    "perSecondMinWorkMinutes": ("per_second_min_work_minutes", _nonneg_int),
-    "perSecondMaxWaitDays": ("per_second_max_wait_days", _nonneg_int),
-}
 _SPOT = {
     "maxSpotAttempts": ("max_spot_attempts", _pos_int),
     "maxLostMinutes": ("max_lost_minutes", _nonneg_int),
@@ -203,7 +190,7 @@ def parse_settings(data: Mapping) -> Settings:
     sections = dict(_mapping(data, "config"))
     sub = {
         name: _mapping(sections.pop(name, None), name)
-        for name in ("planner", "defaults", "batching", "spot", "deadlines", "publish", "uploads")
+        for name in ("planner", "defaults", "spot", "deadlines", "publish", "uploads")
     }
     vendors = _mapping(sections.pop("vendors", None), "vendors")
     bench_pool = _str(sections.pop("benchPool", "bench"), "benchPool")
@@ -215,7 +202,6 @@ def parse_settings(data: Mapping) -> Settings:
         bench_pool=bench_pool,
         vendors={str(name): _vendor(value, f"vendors.{name}") for name, value in vendors.items()},
         defaults=Defaults(**_read(sub["defaults"], "defaults", _DEFAULTS)),
-        batching=Batching(**_read(sub["batching"], "batching", _BATCHING)),
         spot=SpotSettings(**_read(sub["spot"], "spot", _SPOT)),
         deadlines=Deadlines(**_read(sub["deadlines"], "deadlines", _DEADLINES)),
         publish=PublishSettings(**_read(sub["publish"], "publish", _PUBLISH)),

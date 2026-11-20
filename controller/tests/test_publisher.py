@@ -427,6 +427,33 @@ def test_run_forever_cycles_on_trigger_survives_errors_and_stops(tmp_path, origi
     assert not thread.is_alive() and len(calls) == 2 and calls[0] is settings
 
 
+def test_read_schedule_metas_checks_out_only_the_schedule_metas_and_leaves_the_publisher_working(
+    tmp_path, origin, storage
+):
+    seed = clone(origin, tmp_path, "seed2")
+    for sku, task in (("a", "lscpu"), ("a", "membench"), ("b", "lscpu")):
+        (seed / "data" / "hcloud" / sku / "schedule" / task).mkdir(parents=True)
+        (seed / "data" / "hcloud" / sku / "schedule" / task / "meta.json").write_text(json.dumps({"exit_code": 0}))
+    (seed / "data" / "hcloud" / "a" / "0" / "lscpu").mkdir(parents=True)
+    (seed / "data" / "hcloud" / "a" / "0" / "lscpu" / "stdout").write_text("x")
+    (seed / "data" / "other" / "z" / "schedule" / "lscpu").mkdir(parents=True)
+    (seed / "data" / "other" / "z" / "schedule" / "lscpu" / "meta.json").write_text("{}")
+    git(seed, "add", "-A")
+    git(seed, "commit", "-m", "more")
+    git(seed, "push", "origin", "HEAD:main")
+    env = EnvConfig(bucket="b", bucket_region="r", git_url=origin.as_uri())
+    pub = publisher.Publisher(None, storage, env, tmp_path / "work")
+
+    metas = pub.read_schedule_metas("hcloud")
+
+    assert metas["a"] == {"lscpu": {"exit_code": 0}, "membench": {"exit_code": 0}}
+    assert metas["b"] == {"lscpu": {"exit_code": 0}} and "z" not in metas
+    assert not (tmp_path / "work" / "repo" / "data" / "hcloud" / "a" / "0").exists()
+    assert pub.read_schedule_metas("nothing") == {}
+    pub._sync(["data/hcloud/a"])  # the publisher's cone checkout still works afterwards
+    assert (tmp_path / "work" / "repo" / "data" / "hcloud" / "a" / "0" / "lscpu" / "stdout").exists()
+
+
 def test_deploy_key_is_passed_to_git_through_ssh_command(tmp_path, origin, storage, monkeypatch):
     seen = {}
 
@@ -440,11 +467,28 @@ def test_deploy_key_is_passed_to_git_through_ssh_command(tmp_path, origin, stora
     env = EnvConfig(bucket="b", bucket_region="r", git_url="git@example.test:x/y.git", git_key_file=str(key))
     publisher.Publisher(None, storage, env, tmp_path / "work")._git("status")
     command = seen["env"]["GIT_SSH_COMMAND"]
-    assert f"-i '{key}'" in command and "IdentitiesOnly=yes" in command
+    copy = tmp_path / "work" / "deploy-key"
+    assert f"-i {copy}" in command and "IdentitiesOnly=yes" in command
     assert "StrictHostKeyChecking=yes" in command and str(publisher.KNOWN_HOSTS) in command
     hosts = publisher.KNOWN_HOSTS.read_text().splitlines()
     assert len([line for line in hosts if line.startswith("github.com ")]) == 3
     assert seen["env"]["GIT_TERMINAL_PROMPT"] == "0"
+
+
+def test_deploy_key_is_a_private_copy_refreshed_on_rotation(tmp_path, storage, monkeypatch):
+    monkeypatch.setattr(subprocess, "run", lambda cmd, **kwargs: subprocess.CompletedProcess(cmd, 0, "", ""))
+    key = tmp_path / "secret-key"
+    key.write_text("one")
+    key.chmod(0o440)
+    env = EnvConfig(bucket="b", bucket_region="r", git_url="git@example.test:x/y.git", git_key_file=str(key))
+    pub = publisher.Publisher(None, storage, env, tmp_path / "work")
+    pub._git("status")
+    copy = tmp_path / "work" / "deploy-key"
+    assert copy.read_text() == "one" and copy.stat().st_mode & 0o777 == 0o600
+    key.chmod(0o600)
+    key.write_text("two")
+    pub._git("status")
+    assert copy.read_text() == "two" and copy.stat().st_mode & 0o777 == 0o600
 
 
 def test_absent_deploy_key_is_not_passed_and_ssh_url_fails_clearly(tmp_path, storage, monkeypatch):

@@ -7,9 +7,9 @@
 | `0` | task succeeded | | none |
 | `> 0` | the task's own exit code; `137` with `OOMKilled` when the container's cgroup recorded an OOM kill during the task and the task failed | `OOMKilled` if applicable | none until the task hash or `revision` changes |
 | `256` | harness error: `sc-run` could not start the command, or the controller failed handling the step; also every unfinished task of a run whose reconciles kept failing for 30 minutes | message | none |
-| `-1` | no node: capacity, quota, no offering, boot failure, provisioning budget passed | `SCARPENTER_<ICE\|QUOTA\|QUOTA_ZERO\|NO_OFFERING\|BOOT_FAILURE>: <NodeClaim message>` | backoff 2 h, 6 h, 24 h; `QUOTA_ZERO` and `NO_OFFERING` only daily |
+| `-1` | no node: capacity, quota, no offering, boot failure, provisioning budget passed | `SCARPENTER_<ICE\|QUOTA\|QUOTA_ZERO\|NO_OFFERING\|BOOT_FAILURE>: <NodeClaim message>` | retried after 2 h; `QUOTA_ZERO` and `NO_OFFERING` only after 24 h |
 | `-3` | precheck contradicts the node (for example a GPU task on a node without an NVIDIA GPU) | reason | none |
-| `-4` | the task never finished: node lost, spot interruption, image pull timeout, eviction, step or anchor deadline, run cancelled, outputs lost | `SPOT_INTERRUPTED`, `NODE_LOST`, `IMAGE_PULL_TIMEOUT`, `EVICTED`, `DEADLINE_EXCEEDED`, `CANCELLED`, `OUTPUTS_LOST` | `start_retries += 1`; backoff 2 h, 6 h, 24 h; a spot interruption is handled within the run first ([spot](../explanation/spot.md)) |
+| `-4` | the task never finished: node lost, spot interruption, image pull timeout, eviction, step or anchor deadline, run cancelled, outputs lost | `SPOT_INTERRUPTED`, `NODE_LOST`, `IMAGE_PULL_TIMEOUT`, `EVICTED`, `DEADLINE_EXCEEDED`, `CANCELLED`, `OUTPUTS_LOST` | `start_retries += 1`; retried after 2 h (first), 6 h (second); a spot interruption is handled within the run first ([spot](../explanation/spot.md)) |
 | `-5` | three `-4` in a row | `exceeded 3 start retries` | never again until the hash or `revision` changes |
 | `-6` | the task hit its own timeout; partial stdout/stderr are kept | `Execution timed out after <N>s` | none |
 

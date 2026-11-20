@@ -520,7 +520,7 @@ class Publisher:
         if self._has_deploy_key():
             # GitHub's host keys ship with the package; any other host key is refused
             env["GIT_SSH_COMMAND"] = (
-                f"ssh -i {shlex.quote(str(self._env.git_key_file))} -o IdentitiesOnly=yes "
+                f"ssh -i {shlex.quote(str(self._private_key()))} -o IdentitiesOnly=yes "
                 f"-o StrictHostKeyChecking=yes -o UserKnownHostsFile={shlex.quote(str(KNOWN_HOSTS))}"
             )
         return subprocess.run(
@@ -532,12 +532,27 @@ class Publisher:
             check=check,
         )
 
+    def _private_key(self) -> Path:
+        """Copy of the deploy key in the workdir, mode 0600 and owned by this process: a Secret mount is root-owned
+        with mode 0440 (fsGroup), which ssh may refuse. Copied again when the Secret changes (rotation)."""
+        source = Path(str(self._env.git_key_file))
+        copy = self._repo.parent / "deploy-key"
+        data = source.read_bytes()
+        if not copy.is_file() or copy.read_bytes() != data or copy.stat().st_mode & 0o777 != 0o600:
+            copy.parent.mkdir(parents=True, exist_ok=True)
+            copy.unlink(missing_ok=True)
+            fd = os.open(copy, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(fd, "wb") as f:
+                f.write(data)
+        return copy
+
     def _has_deploy_key(self) -> bool:
         """The deploy key Secret is an optional mount: the file may be absent."""
         return bool(self._env.git_key_file) and Path(str(self._env.git_key_file)).is_file()
 
-    def _sync(self, sparse_dirs: list[str]) -> None:
-        """Fresh checkout of origin/<branch> restricted to `sparse_dirs` (plus the repo root files)."""
+    def _sync(self, sparse: list[str], *, cone: bool = True) -> None:
+        """Fresh checkout of origin/<branch> restricted to `sparse`: directories (plus the repo root files), or with
+        `cone=False` file patterns."""
         url = self._env.git_url
         if (url.startswith("ssh://") or re.match(r"^[\w.-]+@[\w.-]+:", url)) and not self._has_deploy_key():
             raise RuntimeError(
@@ -556,7 +571,19 @@ class Publisher:
         self._git("fetch", "--depth", "1", "origin", branch)
         self._git("reset", "--hard", f"origin/{branch}")
         self._git("clean", "-fd")
-        self._git("sparse-checkout", "set", *sparse_dirs)
+        self._git("sparse-checkout", "set", "--cone" if cone else "--no-cone", *sparse)
+
+    def read_schedule_metas(self, vendor: str) -> dict[str, dict[str, dict]]:
+        """`{sku: {task: meta}}` from the `data/<vendor>/<sku>/schedule/<task>/meta.json` files of origin/<branch>,
+        for the planner. Only those files are checked out (the other outputs are never downloaded), in the
+        publisher's checkout, under its lock."""
+        _safe_part(vendor)
+        with self._lock:
+            self._sync([f"/data/{vendor}/*/schedule/*/meta.json"], cone=False)
+            found: dict[str, dict[str, dict]] = {}
+            for path in (self._repo / "data" / vendor).glob("*/schedule/*/meta.json"):
+                found.setdefault(path.parts[-4], {})[path.parts[-2]] = json.loads(path.read_text())
+            return found
 
     def _git_names(self, path: str) -> list[str]:
         """Entry names under `path` in origin/<branch> (no checkout needed)."""

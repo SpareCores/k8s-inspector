@@ -416,14 +416,6 @@ class Defaults:
 
 
 @dataclass(frozen=True)
-class Batching:
-    hourly_min_fill_ratio: float = 0.5
-    hourly_max_wait_days: int = 14
-    per_second_min_work_minutes: int = 10
-    per_second_max_wait_days: int = 3
-
-
-@dataclass(frozen=True)
 class SpotSettings:
     max_spot_attempts: int = 2
     max_lost_minutes: int = 60
@@ -465,7 +457,6 @@ class Settings:
     bench_pool: str = "bench"  # the one NodePool every vendor shares
     vendors: dict[str, VendorSettings] = field(default_factory=dict)
     defaults: Defaults = field(default_factory=Defaults)
-    batching: Batching = field(default_factory=Batching)
     spot: SpotSettings = field(default_factory=SpotSettings)
     deadlines: Deadlines = field(default_factory=Deadlines)
     publish: PublishSettings = field(default_factory=PublishSettings)

@@ -19,7 +19,12 @@ def server():
         def do_GET(self):
             seen.append((self.path, self.headers.get("Authorization")))
             path = urllib.parse.urlsplit(self.path).path
-            if path.endswith("/broken/task_block_reason_codes"):
+            if path == "/inspector/servers/task_block_reason_codes":
+                self.send_response(200)
+                body = json.dumps(
+                    {"oci": {"s1": {"membench": [], "nvidia_smi": ["No GPUs available."]}, "s2": {}}}
+                ).encode()
+            elif path.endswith("/broken/task_block_reason_codes"):
                 self.send_response(500)
                 body = b"oops"
             elif path.endswith("/gone/task_block_reason_codes"):
@@ -78,3 +83,41 @@ def test_errors_fail_closed(server, sku):
 def test_unreachable_keeper_raises():
     with pytest.raises(RuntimeError):
         keeper.block_reasons(env_for("http://127.0.0.1:1"), "oci", ["x"], ["membench"])
+
+
+def test_active_servers_come_in_one_call_with_only_blocked_tasks(server):
+    base, seen = server
+    result = keeper.active_servers_block_reasons(env_for(base), ["membench", "nvidia_smi"])
+    assert result == {"oci": {"s1": {"nvidia_smi": ["No GPUs available."]}, "s2": {}}}
+    assert [path for path, _ in seen] == ["/inspector/servers/task_block_reason_codes?tasks=membench&tasks=nvidia_smi"]
+
+
+def test_active_servers_fail_closed_when_unreachable():
+    with pytest.raises(RuntimeError):
+        keeper.active_servers_block_reasons(env_for("http://127.0.0.1:1"), ["membench"])
+
+
+REAL_OCI_SHAPE = {  # trimmed from the live bulk response (reasons are free text)
+    "oci": {
+        "BM.DenseIO.A4.Ax.72": {
+            "lscpu": [],
+            "geekbench": ["Benchmark doesn't scale beyond 32 cores."],
+            "stressngfull": [],
+            "llm": [],
+            "stressnglongrun": ["Benchmark limited to a few SKUs."],
+            "nvidia_smi": ["No GPUs available."],
+        },
+        "VM.Optimized3.Flex.1-4": {name: [] for name in ("lscpu", "geekbench", "stressngfull", "llm")}
+        | {"stressnglongrun": ["Benchmark limited to a few SKUs."], "nvidia_smi": ["No GPUs available."]},
+    }
+}
+
+
+def test_real_bulk_response_keeps_oci_skus_with_their_blocked_tasks(monkeypatch):
+    monkeypatch.setattr(keeper, "_get", lambda url, key: REAL_OCI_SHAPE)
+    result = keeper.active_servers_block_reasons(
+        EnvConfig(bucket="b", bucket_region="r"), list(REAL_OCI_SHAPE["oci"]["BM.DenseIO.A4.Ax.72"])
+    )
+    assert set(result["oci"]) == {"BM.DenseIO.A4.Ax.72", "VM.Optimized3.Flex.1-4"}
+    assert set(result["oci"]["VM.Optimized3.Flex.1-4"]) == {"stressnglongrun", "nvidia_smi"}  # lscpu, llm... eligible
+    assert set(result["oci"]["BM.DenseIO.A4.Ax.72"]) == {"geekbench", "stressnglongrun", "nvidia_smi"}

@@ -142,7 +142,6 @@ def test_unknown_keys_warn_but_load(caplog):
         ({"planner": {"autoPlan": "yes"}}, "planner.autoPlan"),
         ({"defaults": {"maxInFlight": -1}}, "defaults.maxInFlight"),
         ({"defaults": {"maxInFlight": True}}, "defaults.maxInFlight"),
-        ({"batching": {"hourlyMinFillRatio": 1.5}}, "batching.hourlyMinFillRatio"),
         ({"uploads": {"partMiB": 0}}, "uploads.partMiB"),
         ({"vendors": {"oci": {"capacity": "Spot"}}}, "vendors.oci.capacity"),
         ({"vendors": {"oci": {"maxUsdPerHour": "2"}}}, "vendors.oci.maxUsdPerHour"),

@@ -2,8 +2,10 @@
 
 *Planned: describes the CLI once it exists.*
 
-A forced run benchmarks one SKU now, skipping Keeper eligibility and the "is it due" check. It is how OCI SKUs are
-benchmarked while Keeper's eligibility rules do not allow inspector runs on OCI SKUs.
+A forced run benchmarks one SKU now, skipping Keeper eligibility and the "is it due" check. It is for operators: to
+rerun a SKU or a task now, or to run a SKU Keeper blocks. The controller picks SKUs itself when `autoPlan` is on for the
+vendor ([autoPlan](../reference/configuration.md#autoplan));
+a forced run of such a SKU takes the SKU's lease like any other run, so autoPlan does not start it twice.
 
 ## Before you start
 

@@ -1,11 +1,12 @@
 import copy
 import threading
-from datetime import timedelta
+import zlib
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
-from k8s_inspector import keeper, planner
-from k8s_inspector.crd import RunExists
+from k8s_inspector import crd, keeper, planner
+from k8s_inspector.crd import RunExists, from_dict
 from k8s_inspector.kube import AlreadyExists, NotFound
 from k8s_inspector.model import (
     CapacityMode,
@@ -13,10 +14,11 @@ from k8s_inspector.model import (
     Defaults,
     EnvConfig,
     RunPhase,
+    RunSpec,
     Settings,
     VendorSettings,
 )
-from k8s_inspector.tasks import all_tasks
+from k8s_inspector.tasks import all_tasks, get_task, task_hash
 
 
 class FakeKube:
@@ -304,14 +306,201 @@ def test_force_skips_keeper(kube, monkeypatch):
     planner.force_run(kube, make_config(), "oci", "sku", force=True)
 
 
-def test_plan_cycle_is_a_stub_that_warns_about_auto_plan(kube, caplog):
-    cfg = Config(
+# --------------------------------------------------------------------------- autoPlan
+
+NOW = datetime.now(UTC).replace(tzinfo=None)  # for `due_reason`; metas are built relative to the real clock
+TASK_NAMES = [t.name for t in all_tasks() if not t.dbaas]
+DEFAULT_TASKS = [t.name for t in all_tasks() if not t.dbaas and not t.keeper_gated]
+
+
+def auto_config(**vendor) -> Config:
+    vendor = {"publish": True, "max_in_flight": 1, **vendor}
+    return Config(
         EnvConfig(bucket="b", bucket_region="r"),
-        Settings(auto_plan=True, vendors={"oci": VendorSettings(enabled=True)}),
+        Settings(auto_plan=True, vendors={"oci": VendorSettings(enabled=True, **vendor)}),
     )
-    assert planner.plan_cycle(kube, cfg) == []
-    assert "autoPlan is not implemented" in caplog.text
-    assert planner.plan_cycle(kube, make_config(), dry_run=True) == []
+
+
+def done_meta(name, *, code=0, ago=timedelta(days=1), **fields):
+    """The schedule meta of a task run `ago` before now with the current hash (`code` is its exit code)."""
+    end = datetime.now(UTC).replace(tzinfo=None) - ago
+    return {
+        "start": (end - timedelta(minutes=1)).isoformat(),
+        "end": end.isoformat(),
+        "exit_code": code,
+        "task_hash": task_hash(get_task(name)),
+        **fields,
+    }
+
+
+def all_done(**overrides) -> dict[str, dict]:
+    """Every default task finished with the current hash; `overrides` replaces single metas (None: never run)."""
+    metas = {name: done_meta(name) for name in DEFAULT_TASKS}
+    for name, meta in overrides.items():
+        if meta is None:
+            del metas[name]
+        else:
+            metas[name] = meta
+    return metas
+
+
+@pytest.fixture
+def keeper_skus(monkeypatch):
+    """`keeper.active_servers_block_reasons` answers with this dict ({vendor: {sku: {task: reasons}}})."""
+    answer = {"oci": {"s1": {}}}
+    monkeypatch.setattr(keeper, "active_servers_block_reasons", lambda env, names: answer)
+    return answer
+
+
+def plan(kube, cfg, metas, **kw):
+    return planner.plan_cycle(kube, cfg, lambda vendor: metas, **kw)
+
+
+def test_plan_cycle_plans_all_tasks_of_a_never_run_sku_without_force(kube, keeper_skus):
+    planned = plan(kube, auto_config(), {})
+    assert [(p.vendor, p.sku, list(p.tasks)) for p in planned] == [("oci", "s1", TASK_NAMES)]
+    (run,) = [from_dict(o) for o in kube.objects.values()]
+    assert run.spec.force is False and run.spec.sku == "s1" and run.spec.tasks == list(planned[0].tasks)
+    assert run.spec.capacity == CapacityMode.SPOT_FIRST
+
+
+def test_current_hash_with_a_final_result_is_not_due(kube, keeper_skus):
+    keeper_skus["oci"]["s1"] = {"stressnglongrun": ["KEEPER_NOT_ALLOWED"]}
+    stored = {"s1": all_done(lscpu=done_meta("lscpu", code=1))}  # a task's own failure is final until the hash changes
+    assert plan(kube, auto_config(), stored) == []
+    assert kube.objects == {}
+
+
+def test_changed_hash_and_rerun_prefix_are_due(kube, keeper_skus):
+    keeper_skus["oci"]["s1"] = {"stressnglongrun": ["x"]}
+    stored = {
+        "s1": all_done(
+            lscpu={**done_meta("lscpu"), "task_hash": "0" * 40},
+            openssl={**done_meta("openssl"), "task_hash": "RERUN_" + task_hash(get_task("openssl"))},
+        )
+    }
+    (planned,) = plan(kube, auto_config(), stored)
+    assert set(planned.tasks) == {"lscpu", "openssl"}
+    assert "task hash changed" in planned.reason
+
+
+def test_exit_code_minus_5_is_final_until_the_hash_changes(kube, keeper_skus):
+    keeper_skus["oci"]["s1"] = {"stressnglongrun": ["x"]}
+    meta = done_meta("lscpu", code=-5, ago=timedelta(days=30), start_retries=3)
+    assert plan(kube, auto_config(), {"s1": all_done(lscpu=meta)}) == []
+    assert plan(kube, auto_config(), {"s1": all_done(lscpu={**meta, "task_hash": "old"})})[0].tasks == ("lscpu",)
+
+
+@pytest.mark.parametrize(
+    ("meta_fields", "ago", "due"),
+    [
+        ({"code": -1, "error_msg": "SCARPENTER_ICE: no capacity"}, timedelta(hours=1), False),
+        ({"code": -1, "error_msg": "SCARPENTER_ICE: no capacity"}, timedelta(hours=3), True),
+        ({"code": -1, "error_msg": "SCARPENTER_NO_OFFERING: none"}, timedelta(hours=3), False),
+        ({"code": -1, "error_msg": "SCARPENTER_QUOTA_ZERO: none"}, timedelta(hours=25), True),
+        ({"code": -4, "error_msg": "NODE_LOST", "start_retries": 1}, timedelta(hours=1), False),
+        ({"code": -4, "error_msg": "NODE_LOST", "start_retries": 1}, timedelta(hours=3), True),
+        ({"code": -4, "error_msg": "NODE_LOST", "start_retries": 2}, timedelta(hours=3), False),
+        ({"code": -4, "error_msg": "NODE_LOST", "start_retries": 2}, timedelta(hours=7), True),
+        ({"code": -3, "error_msg": "no GPU"}, timedelta(days=9), False),
+        ({"code": -6}, timedelta(days=9), False),
+        ({"code": 256}, timedelta(days=9), False),
+    ],
+)
+def test_failed_tasks_wait_for_their_backoff(kube, keeper_skus, meta_fields, ago, due):
+    keeper_skus["oci"]["s1"] = {"stressnglongrun": ["x"]}
+    meta = done_meta("lscpu", ago=ago, **meta_fields)
+    planned = plan(kube, auto_config(), {"s1": all_done(lscpu=meta)})
+    assert bool(planned) is due
+
+
+def test_keeper_block_reasons_drop_tasks_and_skus(kube, keeper_skus):
+    keeper_skus["oci"] = {"s1": {name: ["KEEPER_X"] for name in TASK_NAMES}, "s2": {"membench": ["KEEPER_X"]}}
+    (planned,) = plan(kube, auto_config(), {})
+    assert planned.sku == "s2" and "membench" not in planned.tasks and "lscpu" in planned.tasks
+
+
+def test_keeper_gated_task_runs_only_when_keeper_allows_it(kube, keeper_skus):
+    keeper_skus["oci"]["s1"] = {"stressnglongrun": ["KEEPER_NOT_ALLOWED"]}
+    (planned,) = plan(kube, auto_config(), {}, dry_run=True)
+    assert "stressnglongrun" not in planned.tasks
+    keeper_skus["oci"]["s1"] = {}
+    (planned,) = plan(kube, auto_config(), {}, dry_run=True)
+    assert "stressnglongrun" in planned.tasks
+
+
+def test_sku_with_a_run_is_skipped(kube, keeper_skus):
+    keeper_skus["oci"] = {"s1": {}, "s2": {}}
+    first = order("s1", "s2")[0]
+    kube.create("benchmarkrun", crd.to_manifest(RunSpec("oci", first, "r1", ["lscpu"]), "inspector"))
+    kube.objects[crd.run_name("oci", first)]["status"] = {"phase": "Done"}  # finished, not yet published
+    (planned,) = plan(kube, auto_config(), {})
+    assert planned.sku == order("s1", "s2")[1]
+
+
+def order(*skus):
+    return sorted(skus, key=lambda sku: planner.start_order("oci", sku))
+
+
+def test_order_is_crc32_of_vendor_and_sku_and_one_run_per_cycle(kube, keeper_skus):
+    names = ["s1", "s2", "s3", "s4", "s5"]
+    keeper_skus["oci"] = {name: {} for name in names}
+    assert planner.start_order("oci", "s1")[0] == zlib.crc32(b"oci/s1")
+    (planned,) = plan(kube, auto_config(), {})  # maxInFlight 1: the first run holds the vendor
+    assert planned.sku == order(*names)[0]
+    assert plan(kube, auto_config(), {}) == []  # next cycle: at the limit
+    assert len(kube.objects) == 1
+
+
+def test_max_in_flight_two_starts_two_in_order(kube, keeper_skus):
+    names = ["s1", "s2", "s3"]
+    keeper_skus["oci"] = {name: {} for name in names}
+    planned = plan(kube, auto_config(max_in_flight=2), {})
+    assert [p.sku for p in planned] == order(*names)[:2]
+
+
+def test_dry_run_creates_nothing(kube, keeper_skus):
+    assert len(plan(kube, auto_config(max_in_flight=2), {}, dry_run=True)) == 1
+    assert kube.objects == {}
+
+
+def test_vendor_at_its_cap_or_paused_skips_keeper_and_git(kube, monkeypatch):
+    monkeypatch.setattr(keeper, "active_servers_block_reasons", lambda *a: pytest.fail("keeper called"))
+    assert plan(kube, auto_config(max_in_flight=0), {}) == []
+
+
+def test_keeper_unreachable_skips_the_cycle(kube, monkeypatch, caplog):
+    def down(env, names):
+        raise RuntimeError("keeper HTTP 503")
+
+    monkeypatch.setattr(keeper, "active_servers_block_reasons", down)
+    assert plan(kube, auto_config(), {}) == []
+    assert kube.objects == {} and "Keeper is not reachable" in caplog.text
+
+
+def test_unreadable_git_skips_the_vendor(kube, keeper_skus, caplog):
+    def broken(vendor):
+        raise RuntimeError("git fetch failed")
+
+    assert planner.plan_cycle(kube, auto_config(), broken) == []
+    assert kube.objects == {} and "cannot read" in caplog.text
+
+
+def test_only_published_skus_of_enabled_auto_plan_vendors(kube, keeper_skus):
+    assert plan(kube, auto_config(publish=False), {}) == []  # git would never learn about the results
+    keeper_skus["oci"] = {"s1": {}, "s2": {}}
+    assert [p.sku for p in plan(kube, auto_config(publish=("s2",)), {})] == ["s2"]
+    cfg = Config(
+        EnvConfig(bucket="b", bucket_region="r"), Settings(vendors={"oci": VendorSettings(enabled=True, publish=True)})
+    )
+    assert plan(kube, cfg, {}) == []  # autoPlan off
+
+
+def test_due_reason_without_a_result_or_for_a_current_success():
+    task = get_task("lscpu")
+    assert planner.due_reason(task, None, NOW) == "never run"
+    assert planner.due_reason(task, done_meta("lscpu"), NOW) is None
+    assert planner.due_reason(task, {**done_meta("lscpu"), "end": None}, NOW) == "no result"
 
 
 def test_run_forever_survives_errors_and_stops():
@@ -327,5 +516,5 @@ def test_run_forever_survives_errors_and_stops():
 
     stop_wait = stop.wait
     stop.wait = lambda timeout=None: stop_wait(0)  # no real sleeping
-    planner.run_forever(FakeKube(), provider, stop)
+    planner.run_forever(FakeKube(), provider, lambda vendor: {}, stop)
     assert len(calls) == 2
