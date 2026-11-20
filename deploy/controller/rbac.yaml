@@ -11,6 +11,9 @@ rules:
   resources: [pods/log]
   verbs: [get]
 - apiGroups: [""]
+  resources: [pods/exec]
+  verbs: [create]
+- apiGroups: [""]
   resources: [secrets]
   verbs: [create, get, list, watch, update, patch, delete]
 - apiGroups: [batch]
@@ -18,13 +21,13 @@ rules:
   verbs: [create, get, list, delete]
 - apiGroups: [""]
   resources: [configmaps]
-  verbs: [get, update]
+  verbs: [get, create, update]
 - apiGroups: [inspector.sparecores.com]
   resources: [benchmarkruns, benchmarkruns/status]
   verbs: ["*"]
 - apiGroups: [""]
   resources: [events]
-  verbs: [list]
+  verbs: [list, watch]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding

@@ -162,6 +162,7 @@ _VENDOR = {
     "maxInFlight": ("max_in_flight", _optional(_nonneg_int)),
     "maxUsdPerHour": ("max_usd_per_hour", _optional(_nonneg_float)),
     "capacity": ("capacity", _capacity),
+    "publish": ("publish", _bool),
 }
 
 

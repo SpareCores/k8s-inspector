@@ -24,7 +24,7 @@ and any agent would disturb the measurements.
 
 ## What k8s-inspector exposes
 
-`/metrics` on the controller (Prometheus format):
+`/metrics` on port 9090 of the controller (Prometheus format):
 
 | Metric | Labels |
 |---|---|

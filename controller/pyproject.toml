@@ -8,6 +8,10 @@ dependencies = [
     "lightkube",
     "boto3",
     "pyyaml",
+    "dmiparser",
+    "dateparser",
+    "fastnumbers",
+    "lxml",
 ]
 
 [project.scripts]

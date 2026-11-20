@@ -76,12 +76,12 @@ def _vllm_rungs(task: TaskDef, facts: NodeFacts) -> list[str]:
 def _vllm_step(task: TaskDef, image: str, *, probe: bool, index: int) -> Step:
     use_gpu = "benchmark-vllm-gpu" in image
     key = vllm_probe_key(image) if probe else task.name
-    container_task = replace(task, timeout=VLLM_PROBE_TIMEOUT) if probe else task
     container = StepContainer(
         key=key,
-        task=container_task,
+        task=task,
         image=image_ref(task, image),
         command=VLLM_PROBE_COMMAND if probe else None,
+        timeout=VLLM_PROBE_TIMEOUT if probe else None,
         env=(("BENCHMARK_VLLM_MODE", "gpu" if use_gpu else "cpu"),),
     )
     return Step(index=index, name=f"{index:02d}-{key}", containers=(container,), gpu_runtime=use_gpu)

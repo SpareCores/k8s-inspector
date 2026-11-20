@@ -13,10 +13,15 @@ Values are deployment configuration of the cluster platform, not part of this re
 | `KEEPER_API_BASE`, `KEEPER_API_KEY_FILE` | Keeper API (eligibility) |
 | `SENTRY_DSN` | error reporting |
 | `K8SI_NAMESPACE` | namespace of runs (default `inspector`) |
+| `K8SI_SC_RUN_IMAGE` | the `sc-run` image of anchors and flush steps, digest-pinned (`ghcr.io/sparecores/k8s-inspector-sc-run@sha256:…`); `serve` and `run` refuse to start without it |
+| `K8SI_S3_ENDPOINT_URL` | optional S3-compatible endpoint, for object storage that is not AWS S3 (OCI) |
+
+The controller serves Prometheus metrics on port 9090 (`/metrics`, [monitoring](../explanation/monitoring.md)).
 
 ## ConfigMap `k8s-inspector`
 
-Read on every planning cycle; changes apply without a restart.
+Read on every planning cycle; changes apply without a restart. The YAML is the value of key `config.yaml` of the
+ConfigMap. An unknown key is logged as a warning and ignored; an invalid value is an error.
 
 ```yaml
 planner:
@@ -28,7 +33,8 @@ vendors:
     autoPlan: false              # per-vendor override
     maxInFlight: 2               # 0 pauses the vendor
     maxUsdPerHour: 2.0
-    capacity: SpotFirst          # SpotFirst | OnDemand
+    capacity: SpotFirst          # SpotFirst | OnDemand (the default)
+    publish: false               # true: the publisher pushes this vendor's results to sc-inspector-data
     nodePools: {cpu: bench-oci, lowmem: bench-oci-lowmem, gpu: null}
 defaults:
   maxInFlight: 2
@@ -62,8 +68,9 @@ uploads:
   resignEveryMinutes: 60
 ```
 
-Only vendors listed with `enabled: true` are touched. A vendor is enabled here when it is removed from the legacy
-pipeline ([roadmap](../roadmap.md)); there is no shared routing file.
+Only vendors listed with `enabled: true` are touched, and their results reach sc-inspector-data only with
+`publish: true` (default `false`: runs and outputs happen, git stays untouched). A vendor is enabled here when it is
+removed from the legacy pipeline ([roadmap](../roadmap.md)); there is no shared routing file.
 
 ## CLI
 

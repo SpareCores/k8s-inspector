@@ -55,11 +55,34 @@ writes the keys named in its docstring and in `render.meta_from_status`.
 ## Decisions the docs left open (scaffold choices)
 
 - Catalogue is YAML at `k8s_inspector/catalogue/tasks.yaml` (docs: `catalogue/tasks.yaml`), loaded by `tasks.py`.
-- New env vars: `K8SI_SC_RUN_IMAGE` (the anchor/flush image) and optional `K8SI_S3_ENDPOINT_URL`.
+- New env vars: `K8SI_SC_RUN_IMAGE` (the anchor/flush image; `serve` and `run` must fail fast when it is empty) and
+  optional `K8SI_S3_ENDPOINT_URL`. Both are in configuration.md.
+- Metrics: `serve` must serve `/metrics` on port 9090 (the Deployment's liveness probe and port).
 - `classify` returns a dict per container key (the probe step has several containers).
 - Multipart-capable standard files: `stdout`, `stderr`, `resource_tracker.jsonl` + `TaskDef.large_outputs`.
-- Step deadline slack 5 min (spike) instead of objects.md's 11 min arithmetic.
+- Step deadline = pull + version 1 min + longest container timeout + upload 10 min + slack 5 min (objects.md).
 - Variant number is assigned by the publisher at publish time; `status.variant` is written then.
 - ConfigMap `k8s-inspector` holds the YAML under key `config.yaml`.
 - `revision` joins the hash key set before sorting.
 - `timing` is not a task (publisher output); `gpu_facts` is a normal probe task of the catalogue.
+
+## Contracts the integration pass fixed (runner, planner, cli must follow)
+
+- `TaskDef.image_digests` (vLLM ladder digests), `TaskDef.dbaas` (replaces the `workload_proxy` rule and
+  `tasks.is_dbaas`), `StepContainer.timeout` (use `pods.container_timeout(container)`, never `container.task.timeout`),
+  `TaskOutcome.btime` (kernel boot time; fill `NodeFacts.boot_time` and the `machine_start` timing from it),
+  `VendorSettings.publish` (default false, parsed from `vendors.<v>.publish`).
+- Capacity default is `SpotFirst` everywhere (`VendorSettings`, `RunSpec`, `crd.from_dict`, docs).
+- Secrets: keys of `inspector-secrets` are `sentinel`, `geekbench`, `huggingface` (env `SENTINEL_API_TOKEN`,
+  `BENCHMARK_SECRETS_PASSPHRASE`, `HF_TOKEN`); `pods.SECRET_ENV` is the only mapping.
+- `command` and `version_command` stay legacy values (hashed / documented as arguments of the image). `pods.py`
+  builds the argv (`entrypoint` + `command`) and the `--version-cmd` text (`entrypoint` + `version_command`,
+  shell-quoted for `sh -c`); the runner never builds either.
+- Every catalogue image has a digest (`scripts/refresh_digests.py`, weekly workflow); `tasks.image_ref` no longer raises
+  for catalogue tasks.
+- RBAC (`deploy/controller/rbac.yaml`) covers what the code does: pods/exec create (heartbeat), events list+watch,
+  configmaps get+create+update (`k8s-inspector-spot`). A new API call needs a rule there.
+- The CRD schema is checked against `crd.status_to_dict` and `to_manifest` (`tests/test_deploy.py`): a new status
+  field needs a schema entry.
+- `K8SI_SC_RUN_IMAGE` is set in `deploy/controller/deployment.yaml` (the `main` tag; pin a digest in the platform
+  overlay).

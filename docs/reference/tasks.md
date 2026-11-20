@@ -9,25 +9,29 @@ and `dbaas_tasks.py`; the task list, images, commands, timeouts and priorities a
 |---|---|---|
 | `name` | string | task name, also the directory name in git and in object storage |
 | `image` | string | the legacy image reference with tag (`ghcr.io/sparecores/benchmark:main`); **hashed** |
-| `digest` | `sha256:…` | pinned digest; Pods use `<image>@<digest>`; **not hashed**; bumped by a weekly CI pull request |
+| `digest` | `sha256:…` | pinned multi-arch index digest; Pods use `<image>@<digest>`; **not hashed**; bumped by a weekly CI pull request (`controller/scripts/refresh_digests.py`) |
+| `images`, `digests` | list, map | vLLM only: the image ladder in probe order and one digest per image (`image` is the three joined with `\|`) |
 | `entrypoint` | list | the image's ENTRYPOINT restated (Kubernetes `command` replaces it); a CI test compares it with the pinned image config |
-| `command` | string or null | the legacy command string; **hashed** |
-| `version_command` | string | run before the task, 60 s cap → `meta.version` |
+| `command` | string or null | the legacy command string, arguments of the image as in `docker run <image> <command>`; **hashed** |
+| `version_command` | string | legacy value, same semantics as `command`; run before the task, 60 s cap → `meta.version`. `sc-run` runs it with `sh -c`, so the Pod gets `entrypoint` + `version_command` as one shell-quoted line; the legacy text is not a hash input |
 | `timeout` | duration | task timeout (`sc-run`); the step deadline adds pull 15 m + version 1 m + upload 10 m + slack |
 | `priority`, `parallel` | number, bool | ordering; `parallel: true` tasks form the probe step |
 | `transforms` | list | `raw`, `fetch_geekbench_results`; the legacy source text of each transform is part of the hash |
 | `parse` | string | `dmidecode`, `openssl`, `stressnglongrun`, `lstopo` (run by the publisher) |
 | `privileges` | set | `host_pid` (storage), `db_rlimits` (pgbench) |
 | `memory_cap` | float | fraction of Node allocatable as the memory limit (0.85 for geekbench, vllm) |
-| `shm` | size | `/dev/shm` size (4Gi for vllm) |
-| `gpu` | bool | needs the GPU (no CPU fallback) |
-| `precheck` | string | condition checked against the node (labels, probe output); mismatch → `-3` |
-| `secrets`, `env` | lists | which benchmark secrets and variables the step gets |
+| `shm_gib` | int | `/dev/shm` size in GiB (4 for vllm) |
+| `gpu` | bool | needs the GPU (no CPU fallback); a node without an NVIDIA GPU (accelerator labels) → `-3` |
+| `precheck_command`, `precheck_regex` | strings | the legacy lshw check, kept for the record; the controller does not run it |
+| `secrets` | list | keys of Secret `inspector-secrets` the step gets: `sentinel` → `SENTINEL_API_TOKEN`, `geekbench` → `BENCHMARK_SECRETS_PASSPHRASE`, `huggingface` → `HF_TOKEN` (always for tasks with `models_cache`) |
+| `env` | map | fixed variables of the step |
 | `collect` | list | extra files to upload (`/tmp/pg-server.log:postgres.log`) |
 | `large_outputs` | list | files that get multipart upload slots from the start |
 | `workload_proxy`, `durability` | strings | as in sc-inspector; **hashed** |
+| `dbaas` | bool, default false | DBaaS task: runs only in a DBaaS run (named explicitly), never in the default selection |
 | `revision` | int, default 0 | deliberate rerun; hashed only when > 0, so existing hashes stay equal |
 | `spot` | bool, default true | false forces on-demand for runs containing the task (`stressnglongrun`) |
+| `models_cache` | bool | mount the per-node model cache at `/models` (llm, vllm) |
 
 Eligibility rules (memory, vCPU, GPU, storage, allowlists, credits) are not catalogue fields: they come from Keeper
 (`task_block_reason_codes`), which applies sc-crawler's `inspector_rules`, as today.

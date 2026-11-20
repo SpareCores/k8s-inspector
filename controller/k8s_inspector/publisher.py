@@ -14,8 +14,8 @@ whose tasks are all published gets the condition `Published` and, in phase Publi
 Idempotent: a crash between push and patch re-renders the same content, finds no diff and patches.
 
 Decisions:
-- P1 safety: a vendor is published only when `settings.vendors[<vendor>].enabled` is true (and not explicitly
-  `publish: false` when a settings object carries such a flag). Without settings nothing is published.
+- P1 safety: a vendor is published only when `settings.vendors[<vendor>]` has `enabled` and `publish` true (not
+  `publish: false`, the default). Without settings nothing is published.
 - The hardware variant comes from the run's own `lscpu` task (`tasks/lscpu/{status.json,stdout}`), matched against
   the `variant.json` files in the checkout (`variant.pick_variant`). Without a usable lscpu result a task with a
   negative exit code (no node, never finished) goes to `schedule/<task>/meta.json` only; a task with exit code
@@ -105,7 +105,7 @@ class _Loaded:
 def vendor_allowed(settings: Settings, vendor: str) -> bool:
     """P1 safety: publish a vendor only when it is explicitly enabled in the ConfigMap."""
     vendor_settings = settings.vendors.get(vendor)
-    return bool(vendor_settings and vendor_settings.enabled and getattr(vendor_settings, "publish", True) is not False)
+    return bool(vendor_settings and vendor_settings.enabled and vendor_settings.publish)
 
 
 def _safe_part(value: str) -> str:

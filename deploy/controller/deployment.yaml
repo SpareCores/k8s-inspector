@@ -34,7 +34,7 @@ spec:
         seccompProfile: {type: RuntimeDefault}
       containers:
       - name: controller
-        image: ghcr.io/sparecores/k8s-inspector:latest
+        image: ghcr.io/sparecores/k8s-inspector:main
         command: [k8s-inspector, serve]
         ports:
         - {name: metrics, containerPort: 9090}
@@ -45,6 +45,7 @@ spec:
         - {name: K8SI_ROLE_ARN, valueFrom: {configMapKeyRef: {name: k8s-inspector-platform, key: K8SI_ROLE_ARN}}}
         - {name: K8SI_GIT_URL, valueFrom: {configMapKeyRef: {name: k8s-inspector-platform, key: K8SI_GIT_URL}}}
         - {name: K8SI_GIT_BRANCH, valueFrom: {configMapKeyRef: {name: k8s-inspector-platform, key: K8SI_GIT_BRANCH}}}
+        - {name: K8SI_SC_RUN_IMAGE, value: "ghcr.io/sparecores/k8s-inspector-sc-run:main"}
         - {name: KEEPER_API_BASE, valueFrom: {configMapKeyRef: {name: k8s-inspector-platform, key: KEEPER_API_BASE}}}
         - {name: SENTRY_DSN, valueFrom: {secretKeyRef: {name: k8s-inspector-keeper, key: sentry-dsn, optional: true}}}
         - {name: K8SI_GIT_KEY_FILE, value: /etc/k8s-inspector/git/ssh-privatekey}

@@ -92,6 +92,7 @@ _PLAIN_KEYS = {
     "precheck_command",
     "precheck_regex",
     "workload_proxy",
+    "dbaas",
     "durability",
     "revision",
     "spot",
@@ -99,10 +100,6 @@ _PLAIN_KEYS = {
 }
 _TUPLE_KEYS = {"entrypoint", "transforms", "secrets", "collect", "large_outputs"}
 _OTHER_KEYS = {"name", "command", "image", "images", "digests", "timeout", "env", "privileges"}
-
-# Digests of the vLLM ladder images (image reference -> digest), filled by `load_catalogue`: TaskDef has a single
-# `digest`, a ladder has one per image.
-_LADDER_DIGESTS: dict[str, str] = {}
 
 
 def _parse_duration(text: str) -> timedelta:
@@ -135,7 +132,7 @@ def _task_from_yaml(entry: dict) -> TaskDef:
     if "images" in entry:  # vLLM ladder: the hashed image is the three joined with "|"
         fields["images"] = tuple(entry["images"])
         fields["image"] = "|".join(entry["images"])
-        _LADDER_DIGESTS.update(entry.get("digests", {}))
+        fields["image_digests"] = dict(entry.get("digests", {}))
     elif "image" in entry:
         fields["image"] = entry["image"]
     else:
@@ -178,11 +175,6 @@ def get_task(name: str) -> TaskDef:
     raise KeyError(name)
 
 
-def is_dbaas(task: TaskDef) -> bool:
-    """DBaaS tasks are the ones that declare a `workload_proxy` (legacy `DbaasDbTask`)."""
-    return task.workload_proxy is not None
-
-
 def task_hash(task: TaskDef) -> str:
     """Legacy-compatible hash, see the module docstring."""
     values: dict[str, object] = {
@@ -210,7 +202,7 @@ def image_ref(task: TaskDef, image: str | None = None) -> str:
     if task.images:  # the ladder: a rung must be named, each has its own digest
         if image not in task.images:
             raise ValueError(f"task {task.name}: image must be one of {list(task.images)}, got {image!r}")
-        digest = _LADDER_DIGESTS.get(image)
+        digest = task.image_digests.get(image)
     else:
         if image not in (None, task.image):
             raise ValueError(f"task {task.name}: unknown image {image!r}")
@@ -230,7 +222,7 @@ def select_tasks(names: list[str]) -> list[TaskDef]:
     if unknown:
         raise ValueError(f"unknown tasks: {unknown}")
     if not names:
-        return [task for task in _catalogue() if not is_dbaas(task)]
+        return [task for task in _catalogue() if not task.dbaas]
     return [task for task in _catalogue() if task.name in names]
 
 

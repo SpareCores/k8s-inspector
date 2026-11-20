@@ -105,6 +105,9 @@ class TaskDef:
 
     Hash inputs (see `tasks.task_hash`): `command`, `transforms` (their legacy source text), `image`,
     `workload_proxy`, `durability`, and `revision` when > 0. Nothing else may change a hash.
+
+    `command` and `version_command` are legacy values: arguments appended to `entrypoint` as in
+    `docker run <image> <command>` (`pods.py` builds the argv and the `sh -c` text for sc-run from them).
     """
 
     name: str
@@ -113,6 +116,7 @@ class TaskDef:
     timeout: timedelta
     digest: str | None = None  # "sha256:...", pins the Pod image, NOT hashed
     images: tuple[str, ...] = ()  # vLLM image ladder in order; empty for every other task
+    image_digests: dict[str, str] = field(default_factory=dict)  # ladder: image reference -> digest, NOT hashed
     entrypoint: tuple[str, ...] = ()  # the image's ENTRYPOINT restated (Pod `command` replaces it)
     version_command: str | None = None  # run by sc-run before the task, 60 s cap
     priority: float = float("inf")  # lower runs earlier; inf = last (storage, stressnglongrun)
@@ -130,6 +134,7 @@ class TaskDef:
     collect: tuple[str, ...] = ()  # sc-run --collect specs "src:name"
     large_outputs: tuple[str, ...] = ()  # file names that get multipart slots from the start
     workload_proxy: str | None = None  # HASHED when set
+    dbaas: bool = False  # DBaaS task: runs only in a DBaaS run, never in the default server selection
     durability: str | None = None  # HASHED when set
     revision: int = 0  # deliberate rerun; hashed only when > 0
     spot: bool = True  # False: runs containing this task are on-demand (stressnglongrun)
@@ -144,6 +149,7 @@ class StepContainer:
     task: TaskDef
     image: str  # full Pod image reference including digest
     command: str | None = None  # overrides task.command (vLLM probe, nvbandwidth -b ...)
+    timeout: timedelta | None = None  # overrides task.timeout (vLLM probe: 18 min)
     env: tuple[tuple[str, str], ...] = ()  # extra variables (GPU_VRAM_MIB, ...)
 
 
@@ -297,6 +303,7 @@ class TaskOutcome:
     end: datetime | None = None
     version: str | None = None
     kernel_version: str | None = None
+    btime: datetime | None = None  # kernel boot time (sc-run result.json `btime`)
     timed_out: bool = False
     cancelled: bool = False
     oom_kills: int = 0
@@ -399,7 +406,8 @@ class VendorSettings:
     auto_plan: bool | None = None  # None: inherit planner.autoPlan
     max_in_flight: int | None = None  # None: defaults.maxInFlight; 0 pauses
     max_usd_per_hour: float | None = None
-    capacity: CapacityMode = CapacityMode.ON_DEMAND
+    capacity: CapacityMode = CapacityMode.SPOT_FIRST  # same default as `RunSpec` and `crd.from_dict`
+    publish: bool = False  # the publisher pushes this vendor's results only when true
     node_pools: NodePools | None = None
 
 

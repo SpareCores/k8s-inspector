@@ -30,7 +30,7 @@ GOLDEN = Path(__file__).parent / "fixtures" / "publish" / "hcloud_cax31" / "0"
 DAY = date(2026, 9, 29)
 RUN_ID = "r20260929t1257-abcd"
 KEY = RunKey("hcloud", "cax31", DAY, RUN_ID)
-ENABLED = Settings(vendors={"hcloud": VendorSettings(enabled=True)})
+ENABLED = Settings(vendors={"hcloud": VendorSettings(enabled=True, publish=True)})
 
 TASKS = {
     "lscpu": TaskDef("lscpu", "img", None, timedelta(minutes=5)),
@@ -254,7 +254,8 @@ def test_vendor_must_be_enabled(tmp_path, origin, storage, cluster):
         assert pub.publish_once(settings).tasks_published == 0
     assert not any(t.published for t in run.status.tasks)
     assert git(clone(origin, tmp_path), "log", "--format=%s").splitlines() == ["seed"]
-    assert not publisher.vendor_allowed(Settings(vendors={"oci": VendorSettings(enabled=True)}), "hcloud")
+    assert not publisher.vendor_allowed(Settings(vendors={"oci": VendorSettings(enabled=True, publish=True)}), "hcloud")
+    assert not publisher.vendor_allowed(Settings(vendors={"hcloud": VendorSettings(enabled=True)}), "hcloud")
 
 
 def test_settings_provider_is_the_default_allowlist(tmp_path, origin, storage, cluster):

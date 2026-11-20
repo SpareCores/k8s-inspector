@@ -1,0 +1,24 @@
+name: refresh-digests
+
+on:
+  schedule:
+    - cron: "17 5 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - run: python3 controller/scripts/refresh_digests.py
+      - uses: peter-evans/create-pull-request@3ffccacd46053766916f087ce41d627c0b8cf2d1 # v8.1.3
+        with:
+          branch: refresh-image-digests
+          commit-message: "Refresh catalogue image digests"
+          title: "Refresh catalogue image digests"
+          body: "Weekly run of `controller/scripts/refresh_digests.py`: the catalogue images now resolve to these multi-arch index digests."
+          add-paths: controller/k8s_inspector/catalogue/tasks.yaml

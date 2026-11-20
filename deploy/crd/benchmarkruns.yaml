@@ -88,8 +88,10 @@ spec:
                     start: {type: string, format: date-time, nullable: true}
                     end: {type: string, format: date-time, nullable: true}
                     exitCode: {type: integer, nullable: true}
+                    errorMsg: {type: string}
                     published: {type: boolean}
                     commit: {type: string, nullable: true}
+                    gpuFallback: {type: boolean}
               attempts:
                 type: array
                 items:
@@ -99,6 +101,7 @@ spec:
                     n: {type: integer}
                     capacityType: {type: string}
                     nodeClaim: {type: string}
+                    node: {type: string}
                     start: {type: string, format: date-time, nullable: true}
                     end: {type: string, format: date-time, nullable: true}
                     outcome:

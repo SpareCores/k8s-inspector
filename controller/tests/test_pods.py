@@ -53,7 +53,7 @@ def task(name="membench", **kw) -> TaskDef:
         command="-Hv -t 1800",
         timeout=timedelta(minutes=40),
         entrypoint=("/usr/local/bin/resource-tracker", "--", "/usr/local/bin/membench"),
-        version_command="/usr/local/bin/membench -V",
+        version_command="-V",
     )
     return TaskDef(**(defaults | kw))
 
@@ -145,7 +145,8 @@ def test_step_pod_like_spike(run, cfg):
         "/k8si/bin/sc-run", "exec", "--task", "membench", "--timeout", "40m",
         "--multipart-mib", "32", "--reput", "60s",
         "--spool", "/k8si/runs/r1/membench", "--urls", "/k8si-urls/urls.json",
-        "--heartbeat-dir", "/k8si/runs/r1", "--version-cmd", "/usr/local/bin/membench -V",
+        "--heartbeat-dir", "/k8si/runs/r1",
+        "--version-cmd", "/usr/local/bin/resource-tracker -- /usr/local/bin/membench -V",
         "--", "/usr/local/bin/resource-tracker", "--", "/usr/local/bin/membench", "-Hv", "-t", "1800",
     ]  # fmt: skip
     env = {e["name"]: e["value"] for e in c["env"]}

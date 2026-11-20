@@ -97,9 +97,10 @@ def test_get_task_unknown():
         tasks.get_task("nope")
 
 
-def test_is_dbaas():
-    assert tasks.is_dbaas(tasks.get_task("pgbench_postgres_dbaas_ro_durable"))
-    assert not tasks.is_dbaas(tasks.get_task("pgbench_postgres_ro_durable"))
+def test_dbaas_tasks_are_selected_only_by_name():
+    assert tasks.get_task("pgbench_postgres_dbaas_ro_durable").dbaas
+    assert not tasks.get_task("pgbench_postgres_ro_durable").dbaas
+    assert "pgbench_postgres_dbaas_ro_durable" not in [t.name for t in tasks.select_tasks([])]
 
 
 def test_precheck_gpu_tasks():
@@ -121,11 +122,10 @@ def test_allows_spot():
 
 
 def test_image_ref(tmp_path):
-    with pytest.raises(ValueError, match="no digest"):
-        tasks.image_ref(tasks.get_task("openssl"))
     catalogue = tmp_path / "tasks.yaml"
     catalogue.write_text(
         "tasks:\n"
+        "  - {name: nodigest, image: 'x/n:main', command: run, timeout: 1m}\n"
         "  - {name: a, image: 'x/a:main', digest: 'sha256:aa', command: run, timeout: 1m}\n"
         "  - name: v\n"
         "    images: ['x/g:main', 'x/c:main']\n"
@@ -133,7 +133,9 @@ def test_image_ref(tmp_path):
         "    command: null\n"
         "    timeout: 1h30m\n"
     )
-    a, v = tasks.load_catalogue(catalogue)
+    nodigest, a, v = tasks.load_catalogue(catalogue)
+    with pytest.raises(ValueError, match="no digest"):
+        tasks.image_ref(nodigest)
     assert tasks.image_ref(a) == "x/a:main@sha256:aa"
     assert tasks.image_ref(a, "x/a:main") == "x/a:main@sha256:aa"
     assert v.image == "x/g:main|x/c:main"
@@ -169,3 +171,10 @@ def test_load_catalogue_duplicate(tmp_path):
     catalogue.write_text("tasks:\n" + entry + entry)
     with pytest.raises(ValueError, match="duplicate"):
         tasks.load_catalogue(catalogue)
+
+
+def test_every_catalogue_image_has_a_digest():
+    """`scripts/refresh_digests.py` pins them; a new task needs a run of it."""
+    for task in tasks.all_tasks():
+        for image in task.images or (task.image,):
+            assert tasks.image_ref(task, image if task.images else None).startswith(f"{image}@sha256:")

@@ -46,9 +46,9 @@ status:
   pricePerHour: "0.0337"
   variant: 0
   tasks:
-  - {name: geekbench, state: Running, attempt: 1, start: …, end: null, exitCode: null, published: false, commit: null}
+  - {name: geekbench, state: Running, attempt: 1, start: …, end: null, exitCode: null, published: false, commit: null}   # state: Pending | Running | Done; optional: errorMsg, gpuFallback
   attempts:
-  - {n: 1, capacityType: spot, nodeClaim: …, start: …, end: null, outcome: null}   # Completed | SpotInterrupted | NodeLost | ProvisioningFailed | Cancelled
+  - {n: 1, capacityType: spot, nodeClaim: …, node: …, start: …, end: null, outcome: null}   # Completed | SpotInterrupted | NodeLost | ProvisioningFailed | Cancelled
   conditions: []
 ```
 
@@ -95,7 +95,7 @@ metadata:
 spec:
   nodeName: <anchor's node>
   restartPolicy: Never
-  activeDeadlineSeconds: 5820            # pull 15m + version 1m + timeout 60m + upload 10m + slack
+  activeDeadlineSeconds: 5460            # pull 15m + version 1m + longest timeout 60m + upload 10m + slack 5m
   terminationGracePeriodSeconds: 20      # sc-run's shutdown budget (--grace 15s) plus 5 s margin
   hostNetwork: true
   dnsPolicy: Default
@@ -109,7 +109,8 @@ spec:
     image: ghcr.io/sparecores/benchmark:main@sha256:…
     command: [/k8si/bin/sc-run, exec, --task, geekbench, --timeout, 60m,
               --spool, /k8si/runs/<run_id>/geekbench, --urls, /k8si-urls/urls.json,
-              --version-cmd, "geekbench.sh --version",
+              --multipart-mib, "32", --reput, 60s, --heartbeat-dir, /k8si/runs/<run_id>,
+              --version-cmd, "/usr/local/bin/resource-tracker -- bash -c '…geekbench6 --version | awk …'",
               --, /usr/local/bin/resource-tracker, --, nice, -n, "-20", geekbench.sh]
     env:                                  # plus TRACKER_* (output path in the spool, run id, job name, image digest)
     - {name: SENTINEL_API_TOKEN, valueFrom: {secretKeyRef: {name: inspector-secrets, key: sentinel}}}
@@ -127,6 +128,11 @@ spec:
   # vllm:     emptyDir {medium: Memory, sizeLimit: 4Gi} → /dev/shm
 ```
 
+- Step deadline = image pull (`deadlines.imagePullMinutes`, 15 m) + version 1 m + the longest container timeout +
+  upload 10 m + slack 5 m. The anchor deadline is the sum of the step deadlines plus 1 h.
+- `--version-cmd` is `entrypoint` + the catalogue's `version_command`, shell-quoted: `sc-run` runs it with `sh -c`,
+  while the catalogue value is, as `command`, arguments of the image (`--version`).
+- The vLLM probe containers carry their own 18 min timeout (`--probe-only` waits for the server).
 - The probe step is one Pod with one container per probe task, each wrapped by `sc-run`.
 - The `flush` step uses the `sc-run` image with `args: [flush, --spool, …, --urls, …]` and the same mounts.
 - Secret `<run name>-urls` (owner: the BenchmarkRun): `urls.json`, re-signed hourly ([schema](#url-file)).

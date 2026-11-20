@@ -12,7 +12,7 @@ import json
 import re
 import shlex
 from collections.abc import Sequence
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 
 from k8s_inspector.model import (
     BenchmarkRun,
@@ -24,6 +24,7 @@ from k8s_inspector.model import (
     Reason,
     Step,
     StepContainer,
+    TaskDef,
     TaskOutcome,
 )
 
@@ -49,7 +50,7 @@ DB_RLIMITS = ("nofile=1048576", "memlock=unlimited")  # docker era: nofile 10485
 SECRET_ENV = {
     "sentinel": "SENTINEL_API_TOKEN",
     "geekbench": "BENCHMARK_SECRETS_PASSPHRASE",
-    "hf_token": "HF_TOKEN",
+    "huggingface": "HF_TOKEN",
 }
 START_ERRORS = {"StartError", "CreateContainerError", "RunContainerError", "ContainerCannotRun"}
 PULL_WAITING = {"ErrImagePull", "ImagePullBackOff", "ContainerCreating"}
@@ -220,10 +221,9 @@ def render_anchor(
 
 def step_deadline_seconds(step: Step, cfg: Config) -> int:
     """`activeDeadlineSeconds` of a step: image pull (`deadlines.image_pull_minutes`) + version 1 min + the
-    longest container timeout + upload 10 min + slack 5 min. (spikes/p0/step-membench.yaml: 4260 s for a 40 min
-    task. objects.md's geekbench example says 5820 s = 11 min slack for 60 min; the spike's 5 min is used.)"""
+    longest container timeout + upload 10 min + slack 5 min (a 40 min task: 4260 s with a 15 min pull)."""
     pull = timedelta(minutes=cfg.settings.deadlines.image_pull_minutes)
-    longest = max(c.task.timeout for c in step.containers)
+    longest = max(container_timeout(c) for c in step.containers)
     return int((pull + STEP_VERSION + longest + STEP_UPLOAD + STEP_SLACK).total_seconds())
 
 
@@ -248,10 +248,10 @@ def _env(container: StepContainer, run_id: str, *, gpu_runtime: bool) -> list[di
         add("TRACKER_QUIET", "false")
         add("TRACKER_OUTPUT", f"{HEARTBEAT_ROOT}/{run_id}/{container.key}/resource_tracker.jsonl")
     secrets = list(task.secrets)
-    if task.models_cache and "hf_token" not in secrets:  # llm and vllm download models from the Hub
-        secrets.append("hf_token")
+    if task.models_cache and "huggingface" not in secrets:  # llm and vllm download models from the Hub
+        secrets.append("huggingface")
     for key in secrets:
-        name = SECRET_ENV.get(key, key.upper())
+        name = SECRET_ENV[key]
         env[name] = {"name": name, "valueFrom": {"secretKeyRef": {"name": SECRETS_NAME, "key": key}}}
     if gpu_runtime:
         add("NVIDIA_VISIBLE_DEVICES", "all")
@@ -261,13 +261,29 @@ def _env(container: StepContainer, run_id: str, *, gpu_runtime: bool) -> list[di
     return list(env.values())
 
 
-def _argv(container: StepContainer) -> list[str]:
-    """The image's entrypoint restated plus the command (shell-split like docker does for a string)."""
-    command = container.command if container.command is not None else container.task.command
-    argv = [*container.task.entrypoint, *(shlex.split(command) if command else [])]
+def _docker_argv(task: TaskDef, command: str | None) -> list[str]:
+    """`docker run <image> <command>` semantics: the image's entrypoint restated plus the command
+    (shell-split like docker does for a string)."""
+    argv = [*task.entrypoint, *(shlex.split(command) if command else [])]
     if not argv:
-        raise ValueError(f"task {container.task.name!r} has neither entrypoint nor command")
+        raise ValueError(f"task {task.name!r} has neither entrypoint nor command")
     return argv
+
+
+def _argv(container: StepContainer) -> list[str]:
+    command = container.command if container.command is not None else container.task.command
+    return _docker_argv(container.task, command)
+
+
+def _version_cmd(task: TaskDef) -> str:
+    """`--version-cmd` text. sc-run runs it with `sh -c`, so the legacy value (arguments of the image, like
+    `--version`) becomes a full command line: entrypoint plus version command, shell-quoted."""
+    return shlex.join(_docker_argv(task, task.version_command))
+
+
+def container_timeout(container: StepContainer) -> timedelta:
+    """The container's own timeout, else its task's."""
+    return container.timeout or container.task.timeout
 
 
 def _step_container(
@@ -289,7 +305,7 @@ def _step_container(
         "--task",
         container.key,
         "--timeout",
-        _duration(task.timeout),
+        _duration(container_timeout(container)),
         "--multipart-mib",
         str(uploads.single_put_max_mib),
         "--reput",
@@ -302,7 +318,7 @@ def _step_container(
         f"{HEARTBEAT_ROOT}/{run_id}",
     ]
     if task.version_command:
-        command += ["--version-cmd", task.version_command]
+        command += ["--version-cmd", _version_cmd(task)]
     for spec in task.collect:
         command += ["--collect", spec]
     if "db_rlimits" in task.privileges:
@@ -562,7 +578,7 @@ def _outcome_from_message(key: str, msg: dict, container: StepContainer, pod_rea
     error_msg = msg.get("error_msg") or None
     if msg.get("timed_out"):
         exit_code = ExitCode.TIMEOUT
-        error_msg = error_msg or f"Execution timed out after {int(container.task.timeout.total_seconds())}s"
+        error_msg = error_msg or f"Execution timed out after {int(container_timeout(container).total_seconds())}s"
     elif msg.get("cancelled"):
         # The kubelet's SIGTERM at the Pod deadline or an eviction looks like a cancel to sc-run.
         exit_code = ExitCode.NEVER_FINISHED
@@ -579,6 +595,7 @@ def _outcome_from_message(key: str, msg: dict, container: StepContainer, pod_rea
         end=_parse_time(msg.get("end")),
         version=msg.get("version") or None,
         kernel_version=msg.get("kernel_version") or None,
+        btime=datetime.fromtimestamp(msg["btime"], UTC) if msg.get("btime") else None,
         timed_out=bool(msg.get("timed_out")),
         cancelled=bool(msg.get("cancelled")),
         oom_kills=int(msg.get("oom_kills", 0)),

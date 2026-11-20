@@ -72,13 +72,26 @@ The publisher runs in the controller every 5 minutes and on demand. It never mov
    sc-inspector does: variant dir, `meta.json`, `stdout`/`stderr` (the `raw` transform), geekbench `results.json`,
    the parsers (`dmidecode`, `openssl`, `stressnglongrun` → `parsed.*`, `lstopo` → `lstopo.svg`), timing files, the
    `schedule/` union. A task whose `start` is older than the meta already in git is skipped (stale duplicate).
+   - The **variant** is picked per run from that run's own `lscpu` task output (`tasks/lscpu/stdout`) and the
+     `variant.json` files in the checkout; the publisher assigns a new number when the hardware is new. A task with
+     a negative exit code and no usable `lscpu` result goes to `schedule/<task>/meta.json` only; one with exit code
+     0 or above waits for the next cycle rather than land in the wrong variant.
+   - The **timing** files come from the `timing` map of the run's `run.json` (`api_end`, `machine_start`,
+     `node_registered`, `node_ready`, written by the controller as the run progresses), plus `api_start` (run
+     created) and `inspector_start`/`inspector_end` (first task start, last task end).
+   - **Transforms and parsers run only for tasks with exit code 0**; `stdout` and `stderr` are written for every
+     exit code except the harness error `256`.
+   - **`-5`** is created here, not by the runner: the runner records `-4`, and the publisher, which sees the
+     previous `meta.json` in git, counts consecutive `-4` in `start_retries` and writes the third as `-5`
+     ([exit codes](../reference/exit-codes.md)).
+   - A vendor is published only with `publish: true` ([configuration](../reference/configuration.md)).
 4. One commit per cycle, push. On a non-fast-forward, start again at step 2: rendering is a pure function of object
    storage plus the tree, so there is no rebase or conflict handling.
 5. After the push, set `published: true` (with the commit SHA) on those tasks. A crash between push and patch
    re-renders the same content, finds no diff and patches.
 
 When all tasks of a run are published, the controller deletes the `BenchmarkRun` after 24 h.
-`resource_tracker.jsonl` and `postgres.log` stay in object storage only (git-ignored, as today).
+`resource_tracker.jsonl` and `postgres.log` stay in object storage only (not in git, as today).
 
 ## Why a custom uploader
 

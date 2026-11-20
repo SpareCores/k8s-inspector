@@ -113,7 +113,7 @@ def test_values_override_defaults():
     assert settings.uploads.part_mib == 8 and settings.uploads.max_parts == 64
     aws = settings.vendors["aws"]
     assert aws.max_in_flight == 0 and aws.node_pools == NodePools(cpu="bench-aws")
-    assert aws.capacity == CapacityMode.ON_DEMAND and aws.auto_plan is None
+    assert aws.capacity == CapacityMode.SPOT_FIRST and not aws.publish and aws.auto_plan is None
 
 
 def test_unknown_keys_warn_but_load(caplog):

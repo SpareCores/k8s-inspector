@@ -1,0 +1,2 @@
+# Fixtures are golden files: keep their bytes (some are CRLF) exactly as committed.
+controller/tests/fixtures/** -text

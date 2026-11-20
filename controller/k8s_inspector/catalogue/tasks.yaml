@@ -15,8 +15,9 @@
 # - Ordering: `priority` ascending, then `parallel: true` before serial, then name. No priority = last.
 #   `parallel: true` tasks form the probe step (one Pod, one container per task).
 # - `digest` / `images`: the image digest ("sha256:...") is set by the weekly CI pull request; until then
-#   `tasks.image_ref` raises. The vLLM ladder is `images` (in probe order); its per-image digests are under `digests`
-#   (image reference -> digest) because a ladder has one digest per image.
+#   `tasks.image_ref` raises. `scripts/refresh_digests.py` rewrites them. The vLLM ladder is `images` (in probe
+#   order); its per-image digests are under `digests` (image reference -> digest) because a ladder has one digest
+#   per image.
 # - `secrets` are keys of Secret `inspector-secrets` (sentinel = Sentinel API token, geekbench = licence passphrase,
 #   huggingface = HF_TOKEN). `env` is a map of fixed variables; TRACKER_* and the pgbench SC_DB_* connection
 #   variables are added by the Pod renderer.
@@ -26,14 +27,15 @@
 #   labels (`NodeFacts.has_nvidia_gpu`) instead. Memory, vCPU, storage and allowlist rules are Keeper's, not
 #   the catalogue's (no legacy task sets `minimum_memory` or `maximum_cpus`). vLLM's compute-capability rule and
 #   nvbandwidth's `-b` size are adaptive and live in steps.py.
-# - DBaaS tasks are the ones with `workload_proxy` (legacy DbaasDbTask). They run only in a DBaaS run (explicit task
-#   name, see tasks.is_dbaas); an empty task list means every server task.
+# - DBaaS tasks have `dbaas: true` (the legacy DbaasDbTask, which also sets `workload_proxy`). They run only in a DBaaS
+#   run (explicit task name); an empty task list means every server task.
 # - Not ported: `timing` (publisher output, not a task).
 
 tasks:
   # ------------------------------------------------------------------------- probe step (parallel, priority 0)
   - name: dmidecode
     image: ghcr.io/sparecores/dmidecode:main
+    digest: sha256:2068f32ccf719877f616a598c13fe541148cc56f94a26fad5f97aef9404d95d3
     command: dmidecode
     version_command: dmidecode --version
     timeout: 5m
@@ -43,6 +45,7 @@ tasks:
 
   - name: lshw
     image: ghcr.io/sparecores/hwinfo:main
+    digest: sha256:efb0a027b8972ee134ad24858d8b243c21f3a3cfa234e41e77bbb456f1aa351c
     command: lshw -json
     version_command: lshw -version
     timeout: 5m
@@ -51,6 +54,7 @@ tasks:
 
   - name: lscpu
     image: ghcr.io/sparecores/hwinfo:main
+    digest: sha256:efb0a027b8972ee134ad24858d8b243c21f3a3cfa234e41e77bbb456f1aa351c
     command: bash -c 'lscpu -JB | jq'
     version_command: |-
       bash -c "lscpu --version | awk '{print $4}'"
@@ -60,6 +64,7 @@ tasks:
 
   - name: lstopo
     image: ghcr.io/sparecores/hwinfo:main
+    digest: sha256:efb0a027b8972ee134ad24858d8b243c21f3a3cfa234e41e77bbb456f1aa351c
     command: lstopo --of xml
     version_command: lstopo --version
     timeout: 30s
@@ -69,6 +74,7 @@ tasks:
 
   - name: virtualization
     image: ghcr.io/sparecores/virtualization:main
+    digest: sha256:2b4869534e3340ca3315af351edc2acce4a47c71cdfe1c515c3229b1f03a092e
     command: /usr/local/bin/check_virt.sh
     timeout: 5m
     priority: 0
@@ -77,6 +83,7 @@ tasks:
   # GPU types only. Pinned to the oldest supported CUDA version.
   - name: nvidia_smi
     image: nvidia/cuda:11.4.3-base-ubuntu20.04
+    digest: sha256:cb8622a77602d0d95f3cb7a8b75085cbc996850835a0dc418e85ccde4ba27d12
     command: nvidia-smi -q -x
     version_command: |-
       bash -c "nvidia-smi -h | head -1 | egrep -o 'v[0-9.]+'"
@@ -92,6 +99,7 @@ tasks:
   # Replaces the GPU_VRAM_MIB / GPU_COMPUTE_CAP variables that sc-inspector's user data computed on the host.
   - name: gpu_facts
     image: nvidia/cuda:11.4.3-base-ubuntu20.04
+    digest: sha256:cb8622a77602d0d95f3cb7a8b75085cbc996850835a0dc418e85ccde4ba27d12
     command: nvidia-smi --query-gpu=memory.total,compute_cap --format=csv,noheader,nounits
     timeout: 1m
     priority: 0
@@ -101,6 +109,7 @@ tasks:
   # ------------------------------------------------------------------------- serial hardware listings (priority 0)
   - name: lsblk
     image: ghcr.io/sparecores/hwinfo:main
+    digest: sha256:efb0a027b8972ee134ad24858d8b243c21f3a3cfa234e41e77bbb456f1aa351c
     command: lsblk -O -Jdb
     version_command: lsblk -V
     timeout: 1m
@@ -108,6 +117,7 @@ tasks:
 
   - name: lsblk_discard
     image: ghcr.io/sparecores/hwinfo:main
+    digest: sha256:efb0a027b8972ee134ad24858d8b243c21f3a3cfa234e41e77bbb456f1aa351c
     command: lsblk -DJdb
     version_command: lsblk -V
     timeout: 1m
@@ -115,6 +125,7 @@ tasks:
 
   - name: lsblk_topo
     image: ghcr.io/sparecores/hwinfo:main
+    digest: sha256:efb0a027b8972ee134ad24858d8b243c21f3a3cfa234e41e77bbb456f1aa351c
     command: lsblk -tJdb
     version_command: lsblk -V
     timeout: 1m
@@ -125,6 +136,7 @@ tasks:
   # its own local Postgres server. Eligibility (memory, SKU) is Keeper's. The server log is collected as postgres.log.
   - name: pgbench_postgres_ro_durable
     image: ghcr.io/sparecores/benchmark-pgbench-postgres:main
+    digest: sha256:8be2f14b8b46f2f042366d12cfc68c2e24fd9de5975d95431e65f8334b442310
     entrypoint: [/usr/local/bin/resource-tracker, --, python3, /benchmark/benchmark.py]
     command: null
     timeout: 120m
@@ -140,6 +152,7 @@ tasks:
   # The same benchmark against a vendor-managed database (DBaaS run; SC_DB_* come from the run's Secret).
   - name: pgbench_postgres_dbaas_ro_durable
     image: ghcr.io/sparecores/benchmark-pgbench-postgres:main
+    digest: sha256:8be2f14b8b46f2f042366d12cfc68c2e24fd9de5975d95431e65f8334b442310
     entrypoint: [/usr/local/bin/resource-tracker, --, python3, /benchmark/benchmark.py]
     command: null
     timeout: 120m
@@ -149,12 +162,14 @@ tasks:
       SC_DURABILITY: durable
       SC_CDN_UPLOAD: "0"
     workload_proxy: read_heavy
+    dbaas: true
     durability: durable
 
   # The "SCore" benchmark: all stress-ng `--cpu-method`s were compared on a few instances (x86_64 and ARM, with and
   # without HyperThreading) and `div16` scaled best.
   - name: stressngfull
     image: ghcr.io/sparecores/stress-ng:main
+    digest: sha256:3d112ae6c54cf229fb2545bff13f0be7c631750747d67e061dd6e4d0960c0f85
     entrypoint: [/usr/local/bin/resource-tracker, --, sh]
     command: |-
       -c 'for ncpu in $(awk -f /usr/local/bin/count.awk $(nproc)); do echo -n "$ncpu,"; nice -n -20 stress-ng --metrics --cpu $ncpu --cpu-method div16 -t 10 | egrep "metrc.*cpu" | awk "{print \$9}"; done'
@@ -167,6 +182,7 @@ tasks:
   # Self-contained stress-ng benchmarks (no network, no disk writes), one JSON document.
   - name: stressng_benchmarks
     image: ghcr.io/sparecores/stress-ng:main
+    digest: sha256:3d112ae6c54cf229fb2545bff13f0be7c631750747d67e061dd6e4d0960c0f85
     entrypoint: [/usr/local/bin/resource-tracker, --, sh]
     command: -c 'nice -n -20 python3 /usr/local/bin/run_stressng_benchmarks.py'
     version_command: |-
@@ -177,6 +193,7 @@ tasks:
 
   - name: openssl
     image: ghcr.io/sparecores/benchmark:main
+    digest: sha256:74b8d7ec101277b68a5f2068c2f20e6c3945f861db7beddadd4fb56c92349d57
     entrypoint: [/usr/local/bin/resource-tracker, --]
     command: openssl.sh
     version_command: |-
@@ -188,6 +205,7 @@ tasks:
 
   - name: geekbench
     image: ghcr.io/sparecores/benchmark:main
+    digest: sha256:74b8d7ec101277b68a5f2068c2f20e6c3945f861db7beddadd4fb56c92349d57
     entrypoint: [/usr/local/bin/resource-tracker, --]
     command: nice -n -20 geekbench.sh
     version_command: |-
@@ -200,6 +218,7 @@ tasks:
 
   - name: compression_text
     image: ghcr.io/sparecores/benchmark:main
+    digest: sha256:74b8d7ec101277b68a5f2068c2f20e6c3945f861db7beddadd4fb56c92349d57
     entrypoint: [/usr/local/bin/resource-tracker, --]
     command: nice -n -20 python /usr/local/bin/compress.py
     timeout: 1h
@@ -209,6 +228,7 @@ tasks:
   # Runs for 30 minutes at most (`-t 1800`).
   - name: membench
     image: ghcr.io/sparecores/membench:main
+    digest: sha256:31b431e768cc5829989ee9e6a48e447e29c03767be1a2765319d0d69dc1934c5
     entrypoint: [/usr/local/bin/resource-tracker, --, nice, -n, "-20", /usr/local/bin/membench]
     command: -Hv -t 1800
     version_command: -V
@@ -218,6 +238,7 @@ tasks:
 
   - name: bw_mem
     image: ghcr.io/sparecores/benchmark:main
+    digest: sha256:74b8d7ec101277b68a5f2068c2f20e6c3945f861db7beddadd4fb56c92349d57
     entrypoint: [/usr/local/bin/resource-tracker, --]
     command: bw_mem.sh
     timeout: 1h
@@ -226,6 +247,7 @@ tasks:
 
   - name: static_web
     image: ghcr.io/sparecores/benchmark-web:main
+    digest: sha256:9c1bf2d147b216fc16ee954e74422c989c74fc3a998c9a3d297c9fc6369c97a5
     entrypoint: [/usr/local/bin/resource-tracker, --]
     command: nice -n -20 python /usr/local/bin/benchmark.py
     version_command: |-
@@ -237,6 +259,7 @@ tasks:
   # The legacy version command ran without the image entrypoint; the tracker wrapper does not change its output.
   - name: redis
     image: ghcr.io/sparecores/benchmark-redis:main
+    digest: sha256:a2ab5c0f78b009ff1ab6bbda9415588db74356409ad6c72eb783f9e07f29aa8e
     entrypoint: [/usr/local/bin/resource-tracker, --]
     command: nice -n -20 python /usr/local/bin/benchmark.py
     version_command: redis-server -v
@@ -247,6 +270,7 @@ tasks:
   # GPU only. The `-b <MiB>` buffer size is added from the GPU's VRAM (steps.py).
   - name: nvbandwidth
     image: ghcr.io/sparecores/nvbandwidth:main
+    digest: sha256:a57a4745e780d89ddac02ae99025cd56974cb4243907d42c8c9d3ee7f220044e
     entrypoint: [/usr/local/bin/resource-tracker, --]
     command: nvbandwidth -j
     version_command: |-
@@ -262,6 +286,7 @@ tasks:
   # Might be slow on some machines. The image's default CMD is part of the entrypoint.
   - name: passmark
     image: ghcr.io/sparecores/benchmark-passmark:main
+    digest: sha256:7ca48ad05f40c5b0a43ef115d482d60c9a2ca631b0ac1e4b9894b6b7cd8be3c7
     entrypoint: [/usr/local/bin/resource-tracker, --, /usr/local/bin/passmark.sh]
     command: null
     timeout: 1h
@@ -271,6 +296,7 @@ tasks:
   # Might be slow with large models. GPU first, CPU fallback (no `gpu: true`).
   - name: llm
     image: ghcr.io/sparecores/benchmark-llm:main
+    digest: sha256:786b29bafdbd0d8539bad8a56ecf50f91c8d93634176d1edc99bcd1dc51a36bd
     entrypoint: [/usr/local/bin/resource-tracker, --, /benchmark.py]
     command: null
     version_command: --version
@@ -286,6 +312,10 @@ tasks:
       - ghcr.io/sparecores/benchmark-vllm-gpu:main
       - ghcr.io/sparecores/benchmark-vllm-cpu:main
       - ghcr.io/sparecores/benchmark-vllm-cpu-avx2:main
+    digests:
+      ghcr.io/sparecores/benchmark-vllm-gpu:main: sha256:650ab0dad9264638f9152fe35bf1800eb5ec6e85b8cc7099456a38c926879639
+      ghcr.io/sparecores/benchmark-vllm-cpu:main: sha256:54336500099120f929f1a5cd60d23427cf459ab9132c7e4a0fdddf3e3dcab6b0
+      ghcr.io/sparecores/benchmark-vllm-cpu-avx2:main: sha256:5aef8eee792cc24815481a4854c8a2fa8dbf953240f2fea8b528baee24d87e70
     entrypoint: [/usr/local/bin/resource-tracker, --, python3, /benchmark.py]
     command: null
     version_command: --version
@@ -298,6 +328,7 @@ tasks:
 
   - name: ffmpeg
     image: ghcr.io/sparecores/benchmark-ffmpeg:main
+    digest: sha256:fcc38e2c7e4f9d00d5a726cd84ce961115b45a1ef62bb8d3ce14c599f0305d9d
     entrypoint: [/usr/local/bin/resource-tracker, --, python3, /benchmark.py]
     command: null
     version_command: --version
@@ -311,6 +342,7 @@ tasks:
   # Does not work on Flatcar as-is: the protected mounts differ (see docs/explanation/node-profile.md).
   - name: storage
     image: ghcr.io/sparecores/benchmark-storage:main
+    digest: sha256:41df3f3bce889c88e6547ae117d85fbdcd6c1ad6745cfd676a520ee10878b80a
     entrypoint: [/usr/local/bin/resource-tracker, --, python3, /usr/local/bin/benchmark.py]
     command: null
     version_command: --version
@@ -322,6 +354,7 @@ tasks:
   # 11th hour), then sleeping to the start of the next minute, 1440 times: a full day. SKU allowlist is Keeper's.
   - name: stressnglongrun
     image: ghcr.io/sparecores/stress-ng-longrun:main
+    digest: sha256:6193ef5e3fa5b409a1a93b7418c4d65cc30ec44dede424177637e7c2719180fe
     entrypoint: [/usr/local/bin/resource-tracker, --, sh]
     command: |-
       -c "nice -n -20 sh -c 'for i in $(seq 1 1440); do SPM=$(($(($i / 60 + 1)) * 5)); SPM=$(( $SPM > 55 ? 55 : $SPM )); stress-ng --metrics --cpu $(nproc) --cpu-method div16 -t $SPM -Y /dev/stderr; sleep $((60 - $(date +%-S) )); done'"

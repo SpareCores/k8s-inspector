@@ -20,7 +20,7 @@ logs/inspect/<vendor>/<sku>/<Y>/<m>/<d>/<run_id>/tasks/<task>/stdout
 | Item | Rule |
 |---|---|
 | `<Y>/<m>/<d>` | the run's creation date (UTC), fixed for all attempts of the run |
-| `run_id` | `r<UTC yyyymmddThhmm>-<4 hex>`; also the `timing/<run_id>/` directory in git and `TRACKER_EXTERNAL_RUN_ID` |
+| `run_id` | `r<UTC yyyymmdd>t<hhmm>-<4 hex>`, lowercase `t`, for example `r20261120t0930-3f9c`; also the `timing/<run_id>/` directory in git and `TRACKER_EXTERNAL_RUN_ID` |
 | `<task>` | task name; vLLM probes as `vllm-probe-<image>`; a task repeated in a later attempt overwrites its keys |
 | `run.json` | controller: vendor, SKU, plan, attempts (capacity type, node, NodeClaim, region, zone, price, node timings, outcome), variant |
 | `status.json` | controller, after uploads are verified: the final `meta.json` content plus Kubernetes facts (Pod, reason, image digest, node) |
@@ -46,9 +46,9 @@ the contract to keep.
 | `data/<vendor>/<sku>/<N>/timing/<run_id>/{api_start,api_end,machine_start,…}` | one ISO UTC line each | `api_start`, `machine_start` |
 | `data/<vendor>/<sku>/schedule/<task>/meta.json` | union view across variants (ported `select_schedule_meta`) | no (planner) |
 | `dbaas/<vendor>/<id>/postgres/<ver>/standalone/<task>/{meta.json,stdout}` | DBaaS results | yes |
-| git-ignored | `resource_tracker.jsonl`, `postgres.log` | — |
+| not carried over to git | `resource_tracker.jsonl`, `postgres.log`, `result.json`, `manifest.json`, `status.json`, `version`: object storage only | — |
 
-Timing files: `api_start` = run created, `api_end` = NodeClaim launched, `machine_start` = kernel boot time from
+Timing files (from `run.json` `timing`): `api_start` = run created, `api_end` = NodeClaim launched, `machine_start` = kernel boot time from
 `sc-run`, plus `node_registered`, `node_ready`, `inspector_start`/`inspector_end` (first and last step).
 
 Variant dirs `<N>` are integers; a run picks its variant after the probe step with the ported `variant_id.py`
@@ -63,7 +63,7 @@ match the legacy layout; P0 spikes never publish. OCI SKU directories use Keeper
 
 Unchanged fields and semantics, naive UTC timestamps, no trailing newline:
 `start, end, exit_code, error_msg, task_hash, version, kernel_version, stdout_bytes, stderr_bytes, outputs,
-start_retries, spot, region`.
+start_retries, spot, region`. `spot` and `region` are always written (`null` when unknown).
 
 Added fields (sc-crawler reads `meta.json` as a dict and ignores unknown keys):
 `run_id, image, zone, capacity_type, price, spot_attempts, node_os, kubelet, runtime, nodeclass_hash`.

@@ -92,7 +92,7 @@ def test_vllm_ladder_on_gpu_node():
         "--probe-only",
         True,
     )
-    assert c.task.timeout == timedelta(minutes=18)
+    assert c.timeout == timedelta(minutes=18)
     assert c.image == f"{GPU}@sha256:d"
     assert dict(c.env) == {"BENCHMARK_VLLM_MODE": "gpu"}
 
@@ -105,7 +105,7 @@ def test_vllm_ladder_on_gpu_node():
     s = steps.next_step([VLLM], finished, f, index=5)
     c = s.containers[0]
     assert (s.name, c.key, c.command, c.image) == ("05-vllm", "vllm", None, f"{CPU}@sha256:d")
-    assert c.task is VLLM and c.task.timeout == VLLM.timeout
+    assert c.task is VLLM and c.timeout is None
 
 
 def test_vllm_gpu_rung_success_runs_gpu_benchmark():
