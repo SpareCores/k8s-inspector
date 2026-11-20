@@ -95,7 +95,7 @@ def rewrite(text: str, digests: dict[str, str]) -> str:
                 refs.append(item[1])
                 i += 1
             out.append("    digests:")
-            out += [f"      {ref}: {digests[ref]}" for ref in refs]
+            out += [f"      {ref}: {digests[ref]}" for ref in dict.fromkeys(refs)]  # one key per image
             if i < len(lines) and lines[i] == "    digests:":
                 i += 1
                 while i < len(lines) and lines[i].startswith("      "):

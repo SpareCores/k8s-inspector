@@ -4,6 +4,7 @@ import json
 import shutil
 import subprocess
 import threading
+from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
@@ -343,7 +344,7 @@ def test_delete_expired_runs(tmp_path, origin, storage, cluster):
     old.status.conditions = stamp(now - timedelta(hours=25))
     open_run.status.conditions = stamp(now - timedelta(hours=99))
     open_run.status.tasks[0].published = False
-    assert pub.delete_expired_runs(Settings(publish=PublishSettings(keep_run_hours=24))) == 1
+    assert pub.delete_expired_runs(replace(ENABLED, publish=PublishSettings(keep_run_hours=24))) == 1
     assert sorted(cluster.runs) == ["hcloud-cax31", "hcloud-open"]
 
 
@@ -409,4 +410,157 @@ def test_deploy_key_is_passed_to_git_through_ssh_command(tmp_path, origin, stora
     publisher.Publisher(None, storage, env, tmp_path / "work")._git("status")
     command = seen["env"]["GIT_SSH_COMMAND"]
     assert "-i '/keys/deploy key'" in command and "IdentitiesOnly=yes" in command
+    assert "StrictHostKeyChecking=yes" in command and str(publisher.KNOWN_HOSTS) in command
+    hosts = publisher.KNOWN_HOSTS.read_text().splitlines()
+    assert len([line for line in hosts if line.startswith("github.com ")]) == 3
     assert seen["env"]["GIT_TERMINAL_PROMPT"] == "0"
+
+
+# --------------------------------------------------------------------------- review fixes
+
+
+def test_publish_allowlist_per_sku():
+    only = Settings(vendors={"hcloud": VendorSettings(enabled=True, publish=("cax31",))})
+    assert publisher.publish_allowed(only, "hcloud", "cax31") and not publisher.publish_allowed(only, "hcloud", "cx22")
+    assert publisher.publish_allowed(ENABLED, "hcloud", "anything")
+    assert not publisher.publish_allowed(
+        Settings(vendors={"hcloud": VendorSettings(enabled=False, publish=True)}), "hcloud", "cax31"
+    )
+
+
+def test_listed_sku_publishes_and_others_wait(tmp_path, origin, storage, cluster):
+    only = Settings(vendors={"hcloud": VendorSettings(enabled=True, publish=("cax31",))})
+    run = cluster.add_run(NAMES)
+    other = cluster.add_run(NAMES, sku="cx22")
+    assert make_publisher(tmp_path, origin, storage).publish_once(only).tasks_published == 4
+    assert all(t.published for t in run.status.tasks) and not any(t.published for t in other.status.tasks)
+
+
+def test_finished_runs_that_will_never_be_published_are_deleted_to_free_the_lease(tmp_path, origin, storage, cluster):
+    pub = make_publisher(tmp_path, origin, storage)
+    only = replace(ENABLED, vendors={"hcloud": VendorSettings(enabled=True, publish=("cax31",))})
+    never = cluster.add_run(NAMES, sku="cx22")
+    keep = cluster.add_run(NAMES)  # publishable, not published yet
+    running = cluster.add_run(NAMES, sku="cx32", phase=RunPhase.RUNNING)
+    assert pub.delete_expired_runs(only) == 1
+    assert never.name not in cluster.runs and keep.name in cluster.runs and running.name in cluster.runs
+
+
+def test_mark_ignores_a_task_recorded_again_after_it_was_read(tmp_path, origin, storage, cluster):
+    run = cluster.add_run(NAMES)
+    pub = make_publisher(tmp_path, origin, storage)
+    original = pub._publish
+
+    def racing(items):
+        task = run.status.tasks[1]  # the runner records geekbench again while the publisher renders
+        task.end, task.attempt = task.end + timedelta(minutes=5), 2
+        return original(items)
+
+    pub._publish = racing
+    pub.publish_once(ENABLED)
+    assert {t.name: t.published for t in run.status.tasks}["geekbench"] is False
+    assert run.status.tasks[0].published
+
+
+def _two_attempt_run_json(lscpu_a: str, lscpu_b: str) -> bytes:
+    return json.dumps(
+        {
+            "timing": {"api_start": "2026-09-29T13:30:00Z"},
+            "attempts": [
+                {"attempt": 1, "api_start": "2026-09-29T12:50:00Z", "machine_start": "2026-09-29T12:58:07Z",
+                 "lscpu_stdout": lscpu_a},
+                {"attempt": 2, "api_start": "2026-09-29T13:30:00Z", "machine_start": "2026-09-29T13:31:00Z",
+                 "lscpu_stdout": lscpu_b},
+            ],
+        }
+    ).encode()  # fmt: skip
+
+
+def test_variant_comes_from_the_attempt_that_ran_the_task_and_timing_from_the_latest(
+    tmp_path, origin, storage, cluster
+):
+    first = (GOLDEN / "lscpu/stdout").read_text()
+    other = json.loads(first)
+    for row in other["lscpu"]:
+        if row["field"] == "Model name:":
+            row["data"] = "Neoverse-N2"
+    storage.objects[okey(KEY, "run.json")] = _two_attempt_run_json(first, json.dumps(other))
+    storage.objects[okey(KEY, "tasks/lscpu/stdout")] = json.dumps(other).encode()  # overwritten by attempt 2
+    for name, attempt in (("lscpu", 2), ("openssl", 1)):
+        status = json.loads(storage.objects[okey(KEY, f"tasks/{name}/status.json")]) | {"attempt": attempt}
+        storage.objects[okey(KEY, f"tasks/{name}/status.json")] = json.dumps(status).encode()
+    cluster.add_run(["lscpu", "openssl"])
+    for t in cluster.runs["hcloud-cax31"].status.tasks:
+        t.attempt = 2 if t.name == "lscpu" else 1
+    make_publisher(tmp_path, origin, storage).publish_once(ENABLED)
+    inst = clone(origin, tmp_path) / "data/hcloud/cax31"
+    assert (inst / "0/lscpu").is_dir() and (inst / "1/openssl").is_dir()  # openssl ran on attempt 1 hardware
+    timing = inst / "0/timing" / RUN_ID  # the latest attempt's hardware
+    assert (timing / "machine_start").read_text() == "2026-09-29T13:31:00Z\n"
+    assert (timing / "api_start").read_text() == "2026-09-29T13:30:00Z\n"
+
+
+def test_multi_attempt_run_without_per_attempt_lscpu_does_not_guess_a_variant(tmp_path, origin, storage, cluster):
+    storage.objects[okey(KEY, "run.json")] = json.dumps({"attempts": [{"attempt": 1}, {"attempt": 2}]}).encode()
+    run = cluster.add_run(["openssl"])
+    assert make_publisher(tmp_path, origin, storage).publish_once(ENABLED).tasks_published == 0
+    assert not run.status.tasks[0].published
+
+
+def test_failing_task_is_published_without_parser_output_after_repeated_failures(
+    tmp_path, origin, storage, cluster, monkeypatch
+):
+    monkeypatch.setattr(publisher, "MAX_RENDER_FAILURES", 2)
+    storage.objects[okey(KEY, "tasks/openssl/stdout")] = b"\xff\xfe not utf-8"
+    run = cluster.add_run(NAMES)
+    pub = make_publisher(tmp_path, origin, storage)
+    for _ in range(2):
+        pub.publish_once(ENABLED)
+        assert not {t.name: t.published for t in run.status.tasks}["openssl"]
+    pub.publish_once(ENABLED)
+    assert all(t.published for t in run.status.tasks)
+    inst = clone(origin, tmp_path) / "data/hcloud/cax31/0/openssl"
+    assert (inst / "meta.json").exists() and not (inst / "parsed.json").exists()
+
+
+def test_variant_json_is_not_left_behind_by_a_task_that_fails_to_render(tmp_path, origin, storage, cluster):
+    storage.objects[okey(KEY, "tasks/openssl/stdout")] = b"\xff\xfe not utf-8"
+    cluster.add_run(["openssl"])
+    storage.objects[okey(KEY, "tasks/lscpu/status.json")] = storage.objects[okey(KEY, "tasks/lscpu/status.json")]
+    pub = make_publisher(tmp_path, origin, storage)
+    pub.publish_once(ENABLED)
+    assert git(clone(origin, tmp_path), "log", "--format=%s").splitlines() == ["seed"]
+
+
+def test_forced_run_of_an_unknown_sku_without_a_node_publishes_nothing(tmp_path, origin, cluster):
+    storage = FakeStorage()
+    run_key = RunKey("hcloud", "typo", DAY, RUN_ID)
+    status = {"start": "2026-10-01T10:00:00", "end": "2026-10-01T10:01:00", "exit_code": -1, "task_hash": "h",
+              "run_id": RUN_ID}  # fmt: skip
+    storage.put_task("geekbench", status, run=run_key)
+    run = cluster.add_run(["geekbench"], sku="typo")
+    run.spec.force = True
+    result = make_publisher(tmp_path, origin, storage).publish_once(ENABLED)
+    assert result.tasks_published == 0 and run.status.tasks[0].published and run.status.tasks[0].commit is None
+    assert not (clone(origin, tmp_path) / "data").exists()
+
+
+def test_rescan_routes_dbaas_runs_by_run_json(tmp_path, origin, cluster):
+    storage = FakeStorage()
+    seed = clone(origin, tmp_path, "seed3")
+    (seed / "data/hcloud/cax31").mkdir(parents=True)
+    (seed / "data/hcloud/cax31/.keep").write_text("")
+    git(seed, "add", "-A")
+    git(seed, "commit", "-m", "sku exists")
+    git(seed, "push", "origin", "HEAD:main")
+    today = datetime.now(UTC).date()
+    run = RunKey("hcloud", "cax31", today, "r-db")
+    database = {"vendor": "hcloud", "id": "db1", "engineVersion": 16}
+    storage.put_task("pgbench", {"start": "2026-10-01T10:00:00", "end": "2026-10-01T10:05:00", "exit_code": 0,
+                                 "task_hash": "h", "run_id": "r-db"}, b"tps", run=run)  # fmt: skip
+    storage.objects[okey(run, "run.json")] = json.dumps({"database": database}).encode()
+    tasks = {**TASKS, "pgbench": TaskDef("pgbench", "img", None, timedelta(minutes=5))}
+    env = EnvConfig(bucket="b", bucket_region="r", git_url=origin.as_uri())
+    pub = publisher.Publisher(None, storage, env, tmp_path / "work", get_task=tasks.__getitem__)
+    assert pub.rescan(1, settings=ENABLED).tasks_published == 1
+    assert (clone(origin, tmp_path) / "dbaas/hcloud/db1/postgres/16/standalone/pgbench/meta.json").exists()

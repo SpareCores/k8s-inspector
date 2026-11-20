@@ -45,6 +45,14 @@ def test_every_status_key_the_controller_writes_is_in_the_crd_schema():
     status = RunStatus(
         phase=RunPhase.RUNNING,
         current_step="01-probes",
+        step={
+            "index": 1,
+            "name": "01-probes",
+            "gpuRuntime": True,
+            "containers": [
+                {"key": "k", "image": "i", "command": "c", "timeoutSeconds": 5, "env": {"A": "b"}},
+            ],
+        },
         attempt=1,
         capacity_type=CapacityType.SPOT,
         node="n",
@@ -89,3 +97,21 @@ def test_every_spec_key_the_controller_writes_is_in_the_crd_schema():
     spec = RunSpec(vendor="v", sku="s", run_id="r", database={"vendor": "v", "id": "i", "engineVersion": "1"})
     manifest = crd.to_manifest(spec, "inspector")
     assert unknown_keys(manifest["spec"], schema()["spec"], "spec") == []
+
+
+def test_rbac_is_least_privilege_for_what_the_controller_calls():
+    docs = yaml.safe_load_all((CRD_PATH.parents[1] / "controller" / "rbac.yaml").read_text())
+    granted = {
+        (rule["apiGroups"][0], resource): set(rule["verbs"])
+        for doc in docs
+        if doc["kind"] in ("Role", "ClusterRole")
+        for rule in doc["rules"]
+        for resource in rule["resources"]
+    }
+    assert granted[("", "pods/exec")] == {"get", "create"}
+    assert granted[("", "configmaps")] == {"get", "create", "patch"}  # spot.py merge-patches the history
+    assert granted[("", "secrets")] == {"create", "get", "update", "delete"}  # no list/watch of other Secrets
+    assert granted[("", "pods")] == {"create", "list", "watch", "delete"}
+    assert granted[("inspector.sparecores.com", "benchmarkruns/status")] == {"patch"}
+    assert granted[("", "nodes")] == {"get"}
+    assert ("", "events") not in granted and ("batch", "jobs") not in granted

@@ -13,6 +13,8 @@ RUN uv sync --locked --no-dev --no-editable
 
 FROM python:3.15-slim@sha256:65a65fc7b30b06cb6df4930fd4650697cb23f4c2698ab81fc87e4b031bc36928
 # git and ssh push the results to sc-inspector-data; lstopo renders the lstopo.svg of the website.
+# hwloc-nox is pinned to the Debian trixie build of hwloc 2.12.0: a different lstopo changes the rendered SVGs.
+# When the base image moves to a release without this version, the build fails: bump the pin deliberately.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends git openssh-client hwloc-nox=2.12.0-4 \
     && rm -rf /var/lib/apt/lists/*

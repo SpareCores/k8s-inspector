@@ -22,7 +22,7 @@ func ParseRlimit(spec string) (Rlimit, error) {
 		return Rlimit{}, fmt.Errorf("rlimit %q: want NAME=SOFT[:HARD]", spec)
 	}
 	if _, known := rlimitResource(name); !known {
-		return Rlimit{}, fmt.Errorf("rlimit %q: unknown name %q (nofile, memlock, nproc, stack, core, as, fsize, data, cpu)", spec, name)
+		return Rlimit{}, fmt.Errorf("rlimit %q: unknown name %q (nofile, memlock)", spec, name)
 	}
 	softS, hardS, hasHard := strings.Cut(val, ":")
 	if !hasHard {

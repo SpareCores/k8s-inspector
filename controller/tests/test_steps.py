@@ -76,7 +76,7 @@ def test_gpu_node_runs_every_step_with_runtime():
     assert s.gpu_runtime
 
 
-@pytest.mark.parametrize(("vram", "buffer"), [(None, 512), (80000, 512), (2048, 256), (1024, 256), (2049, 512)])
+@pytest.mark.parametrize(("vram", "buffer"), [(None, 256), (80000, 512), (2048, 256), (1024, 256), (2049, 512)])
 def test_nvbandwidth_buffer(vram, buffer):
     s = steps.next_step([task("nvbandwidth", gpu=True)], {}, facts(has_nvidia_gpu=True, gpu_vram_mib=vram), index=2)
     assert s.containers[0].command == f"nvbandwidth -j -b {buffer}"
@@ -157,3 +157,34 @@ def test_retry_without_gpu():
     assert steps.retry_without_gpu(retry, {"llm": outcome("llm", 256, container_start_error=True)}) is None
     g = steps.next_step([gpu_only], {}, facts(has_nvidia_gpu=True), index=2)
     assert steps.retry_without_gpu(g, {"nvbandwidth": outcome("nvbandwidth", 256, container_start_error=True)}) is None
+
+
+def test_retry_without_gpu_on_any_start_failure():
+    s = steps.next_step([task("llm")], {}, facts(has_nvidia_gpu=True), index=2)
+    for failure in (outcome("llm", 256), outcome("llm", -4, error_msg="IMAGE_PULL_TIMEOUT")):
+        assert steps.retry_without_gpu(s, {"llm": failure}) is not None
+    assert steps.retry_without_gpu(s, {"llm": outcome("llm", -6)}) is None
+
+
+def test_vllm_gpu_image_is_not_retried_without_the_runtime():
+    f = facts(has_nvidia_gpu=True, gpu_compute_cap=(8, 0))
+    probe = steps.next_step([VLLM], {}, f, index=3)
+    assert probe.gpu_runtime
+    key = probe.containers[0].key
+    assert steps.retry_without_gpu(probe, {key: outcome(key, 256, container_start_error=True)}) is None
+
+
+def test_vllm_label_ignores_tag_and_digest():
+    assert steps.vllm_label("ghcr.io/sparecores/benchmark-vllm-gpu@sha256:abc") == "benchmark-vllm-gpu"
+    assert steps.vllm_label(GPU) == "benchmark-vllm-gpu"
+
+
+def test_step_survives_the_status_round_trip(monkeypatch):
+    monkeypatch.setattr(steps, "all_tasks", lambda: [VLLM])
+    f = facts(has_nvidia_gpu=True, gpu_compute_cap=(8, 0))
+    original = steps.next_step([VLLM], {}, f, index=3)
+    restored = steps.from_status(steps.to_status(original))
+    assert restored is not None and restored.name == original.name and restored.gpu_runtime
+    c, o = restored.containers[0], original.containers[0]
+    assert (c.key, c.image, c.command, c.timeout, c.env) == (o.key, o.image, o.command, o.timeout, o.env)
+    assert steps.from_status(None) is None and steps.from_status({"containers": [{"key": "nope"}]}) is None

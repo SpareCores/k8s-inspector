@@ -305,6 +305,18 @@ def test_start_retries_count_minus_four_and_become_minus_five(tmp_path):
     assert json.loads((tmp_path / "data/hcloud/cax31/schedule/lscpu/meta.json").read_text())["start_retries"] == 0
 
 
+def test_start_retries_reset_on_a_changed_hash_and_on_other_failures(tmp_path):
+    def attempt(n: int, exit_code: int = -4, task_hash: str = "h"):
+        inp = plain_input(exit_code=exit_code, start=f"2026-10-0{n}T10:00:00", run_id=f"r{n}", task_hash=task_hash)
+        render.render_task(tmp_path, "hcloud", "cax31", None, inp)
+        return json.loads((tmp_path / "data/hcloud/cax31/schedule/lscpu/meta.json").read_text())["start_retries"]
+
+    assert attempt(1) == 1 and attempt(2) == 2
+    assert attempt(3, task_hash="new") == 1  # the task changed: a fresh count
+    assert attempt(4, exit_code=1, task_hash="new") == 0  # a task failure is not a start failure
+    assert attempt(5, task_hash="new") == 1  # not carried over the failure
+
+
 def test_failing_parser_leaves_the_tree_untouched(tmp_path):
     inp = plain_input("stressnglongrun", stdout=b"x", stderr=b"not yaml")
     inp.stderr = b"not yaml"

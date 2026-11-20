@@ -134,11 +134,16 @@ def test_backlog_lag_spend_and_node_age(runs, metrics):
     assert 'k8s_inspector_node_age_seconds{run="oci-a",sku="a",vendor="oci"} 2700' in text
 
 
-def test_last_publish_timestamp_only_after_a_publish(runs, metrics):
-    assert "last_publish_timestamp_seconds" not in metrics.render()
+def test_last_publish_timestamp_starts_at_process_start(runs, metrics):
+    def stamp():
+        line = next(x for x in metrics.render().splitlines() if x.startswith("k8s_inspector_last_publish"))
+        return float(line.split()[1])
+
+    started = stamp()
+    assert started > 1e9
+    metrics._last_publish = 0.0
     metrics.record_publish()
-    line = next(x for x in metrics.render().splitlines() if x.startswith("k8s_inspector_last_publish"))
-    assert float(line.split()[1]) > 1e9
+    assert stamp() >= started
 
 
 def test_refresh_failure_serves_previous_snapshot(runs, metrics, monkeypatch):

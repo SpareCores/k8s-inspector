@@ -57,3 +57,9 @@ def test_rewrite_sets_digests_keeps_the_rest_and_is_idempotent():
     assert "    image: nvidia/cuda:11.4\n    digest: sha256:n\n" in out
     assert "sha256:old" not in out
     assert refresh.rewrite(out, DIGESTS) == out
+
+
+def test_rewrite_writes_one_digest_key_for_a_repeated_ladder_image():
+    text = CATALOGUE.replace("      - ghcr.io/x/c:main\n", "      - ghcr.io/x/c:main\n      - ghcr.io/x/g:main\n")
+    out = refresh.rewrite(text, DIGESTS)
+    assert out.count("      ghcr.io/x/g:main: sha256:g\n") == 1

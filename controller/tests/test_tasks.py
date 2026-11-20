@@ -178,3 +178,12 @@ def test_every_catalogue_image_has_a_digest():
     for task in tasks.all_tasks():
         for image in task.images or (task.image,):
             assert tasks.image_ref(task, image if task.images else None).startswith(f"{image}@sha256:")
+
+
+def test_load_catalogue_rejects_duplicate_yaml_keys(tmp_path):
+    catalogue = tmp_path / "tasks.yaml"
+    catalogue.write_text(
+        "tasks:\n  - name: v\n    images: [a, b]\n    digests:\n      a: sha256:1\n      a: sha256:2\n    timeout: 1m\n"
+    )
+    with pytest.raises(ValueError, match=r"duplicate YAML keys \['a'\]"):
+        tasks.load_catalogue(catalogue)

@@ -171,7 +171,7 @@ class FakeStorage(Storage):
             self.planned.append(c.key)
             for name in STANDARD_FILES:
                 plan = UploadPlan(urls_key=f"{c.key}/{name}", object_key=object_key(run, c.key, name))
-                if name in LARGE_STANDARD_FILES:
+                if name in LARGE_STANDARD_FILES and not c.task.parallel:
                     plan = replace(plan, upload_id=f"up-{c.key}-{name}-{len(self.planned)}", part_size=16, n_parts=2)
                 plans.append(plan)
         return plans
@@ -336,22 +336,19 @@ class Cluster:
 
     def finish(self, pod: dict) -> bool:
         """Script the end of one step or flush Pod. False when it stays Pending (`pull_stuck`)."""
-        statuses = []
+        statuses, stuck = [], False
         for name, key in self.container_keys(pod):
             queue = self.behaviour.get(key, [])
             spec = queue.pop(0) if queue else {}
             if spec.get("pull_stuck"):
-                self.kube.set_status(
-                    "pod",
-                    pod["metadata"]["name"],
-                    {
-                        "phase": "Pending",
-                        "startTime": iso(self.clock.now),
-                        "containerStatuses": [{"name": name, "state": {"waiting": {"reason": "ErrImagePull"}}}],
-                    },
-                )
-                return False
-            statuses.append({"name": name, **self._terminated(key, spec)})
+                stuck = True
+                statuses.append({"name": name, "state": {"waiting": {"reason": "ErrImagePull"}}})
+            else:
+                statuses.append({"name": name, **self._terminated(key, spec)})
+        if stuck:
+            status = {"phase": "Pending", "startTime": iso(self.clock.now), "containerStatuses": statuses}
+            self.kube.set_status("pod", pod["metadata"]["name"], status)
+            return False
         self.kube.set_status("pod", pod["metadata"]["name"], {"phase": "Succeeded", "containerStatuses": statuses})
         return True
 

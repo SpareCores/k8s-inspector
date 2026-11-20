@@ -69,6 +69,27 @@ spec:
                 enum: [Pending, Provisioning, Running, Releasing, Publishing, Done, Failed, Cancelled]
               progress: {type: string}
               currentStep: {type: string}
+              step:
+                description: The step Pod in flight (a restarted controller continues from it, it never re-plans).
+                type: object
+                nullable: true
+                properties:
+                  index: {type: integer}
+                  name: {type: string}
+                  gpuRuntime: {type: boolean}
+                  containers:
+                    type: array
+                    items:
+                      type: object
+                      required: [key, image]
+                      properties:
+                        key: {type: string}
+                        image: {type: string}
+                        command: {type: string}
+                        timeoutSeconds: {type: integer}
+                        env:
+                          type: object
+                          additionalProperties: {type: string}
               attempt: {type: integer}
               capacityType: {type: string}
               node: {type: string}

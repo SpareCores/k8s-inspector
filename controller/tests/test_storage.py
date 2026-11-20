@@ -2,7 +2,7 @@
 
 import json
 import re
-from datetime import date, timedelta
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -95,6 +95,43 @@ def test_plan_uploads_slots(store):
     assert (p.part_size, p.n_parts) == (5 * MIB, 3)
     assert p.object_key == storage.object_key(RUN, "membench", "big.bin")
     assert not p.put_url and not p.part_urls
+
+
+def test_parallel_probe_gets_no_multipart_slots_and_logs_get_fewer_parts(store):
+    probe = container("lscpu", parallel=True, large_outputs=("big.bin",))
+    plans = {p.urls_key: p for p in store.plan_uploads(RUN, [probe])}
+    assert {k for k, p in plans.items() if p.upload_id} == {"lscpu/big.bin"}
+    wide = Storage(EnvConfig(bucket=BUCKET, bucket_region="eu-west-1"), UploadSettings(max_parts=64))
+    serial = {p.urls_key: p for p in wide.plan_uploads(RUN, [container()])}
+    assert serial["membench/stdout"].n_parts == storage.LOG_MAX_PARTS
+    assert serial["membench/resource_tracker.jsonl"].n_parts == 64
+
+
+def test_urls_json_above_the_limit_is_refused_with_a_clear_error():
+    big = storage.UploadPlan("t/x", "k", put_url="u" * (storage.MAX_URLS_BYTES + 1))
+    with pytest.raises(storage.UrlsTooLarge, match="KiB"):
+        storage.render_urls_json([big])
+    assert storage.secret_size("x" * 300) == 400
+
+
+def test_credentials_refresh_before_the_next_resign_is_due():
+    uploads = UploadSettings(resign_every_minutes=60)
+    calls = []
+
+    def fetch(remaining_minutes):
+        def refresh():
+            calls.append(remaining_minutes)
+            expiry = datetime.now(UTC) + timedelta(minutes=remaining_minutes)
+            return {"access_key": "a", "secret_key": "s", "token": "t", "expiry_time": expiry.isoformat()}
+
+        return refresh
+
+    for minutes, refreshed in ((70, True), (200, False)):
+        calls.clear()
+        credentials = storage.refreshable_credentials(fetch(minutes), uploads)
+        credentials.get_frozen_credentials()  # the first fetch
+        credentials.get_frozen_credentials()
+        assert (len(calls) > 1) == refreshed
 
 
 def test_presigned_put_works(store):

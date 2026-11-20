@@ -40,12 +40,21 @@ from k8s_inspector.model import (
 MIB = 1024 * 1024
 DEFAULT_TOKEN_FILE = "/var/run/secrets/kubernetes.io/serviceaccount/token"
 SESSION_SECONDS = 12 * 3600
+REFRESH_MARGIN_SECONDS = 15 * 60
 
 # Files every task container produces (sc-run exec); each gets a presigned PUT.
 STANDARD_FILES = ("stdout", "stderr", "version", "result.json", "resource_tracker.jsonl", "manifest.json")
-# Standard files that also get multipart slots from the start (they can outgrow 32 MiB); a task adds its own
-# via `TaskDef.large_outputs`. Not settled by the docs: see INTERFACES.md "Decisions".
+# Standard files of serial tasks that also get multipart slots from the start (they can outgrow 32 MiB); a task
+# adds its own via `TaskDef.large_outputs`. Not settled by the docs: see INTERFACES.md "Decisions".
+# Parallel (probe) tasks get none of them: they run without resource-tracker and their logs are small, and
+# the urls Secret must stay far below the 1 MiB object limit.
 LARGE_STANDARD_FILES = ("stdout", "stderr", "resource_tracker.jsonl")
+LOG_MAX_PARTS = 16  # stdout/stderr never need `uploads.max_parts` parts (16 x 16 MiB = 256 MiB)
+MAX_URLS_BYTES = 700 * 1024  # urls.json size above which the Secret (base64: x 4/3) gets near 1 MiB
+
+
+class UrlsTooLarge(ValueError):
+    """The rendered urls Secret would approach the Kubernetes 1 MiB object limit."""
 
 
 # --------------------------------------------------------------------------- key layout (pure)
@@ -80,7 +89,18 @@ def _is_missing(e: ClientError) -> bool:
     return e.response["Error"]["Code"] in ("NoSuchKey", "404", "NotFound")
 
 
-def _s3_client(env: EnvConfig):
+def refreshable_credentials(refresh_using, uploads: UploadSettings) -> DeferredRefreshableCredentials:
+    """Credentials that refresh early: presigned URLs die with the credentials that signed them and are
+    re-signed every `resign_every_minutes`, so credentials with less than that plus a margin left are replaced
+    (botocore's default is 15 minutes, too late for 12 h URLs)."""
+    credentials = DeferredRefreshableCredentials(method="assume-role-with-web-identity", refresh_using=refresh_using)
+    resign = uploads.resign_every_minutes * 60
+    credentials._advisory_refresh_timeout = resign + REFRESH_MARGIN_SECONDS
+    credentials._mandatory_refresh_timeout = resign
+    return credentials
+
+
+def _s3_client(env: EnvConfig, uploads: UploadSettings):
     # "when_required": newer boto3 otherwise signs a checksum of an empty body into presigned PUT URLs.
     # Path-style addressing for S3-compatible endpoints (for example OCI).
     config = Config(
@@ -104,9 +124,7 @@ def _s3_client(env: EnvConfig):
             role_arn=env.role_arn,
             extra_args={"RoleSessionName": "k8s-inspector", "DurationSeconds": SESSION_SECONDS},
         )
-        botocore_session._credentials = DeferredRefreshableCredentials(
-            method="assume-role-with-web-identity", refresh_using=fetcher.fetch_credentials
-        )
+        botocore_session._credentials = refreshable_credentials(fetcher.fetch_credentials, uploads)
         session = boto3.Session(botocore_session=botocore_session, region_name=env.bucket_region)
     return session.client("s3", config=config, endpoint_url=env.s3_endpoint_url)
 
@@ -120,7 +138,7 @@ class Storage:
         token). No network call here."""
         self.bucket = env.bucket
         self.uploads = uploads
-        self.s3 = _s3_client(env)
+        self.s3 = _s3_client(env, uploads)
 
     # ---- planning and signing
 
@@ -128,7 +146,9 @@ class Storage:
         """For each container: a slot per `STANDARD_FILES` entry plus `task.large_outputs`, and the names
         of `task.collect` specs (the part after `:`). Large-capable files (`LARGE_STANDARD_FILES` plus
         `large_outputs`) get `CreateMultipartUpload`, `part_size` = `uploads.part_mib` MiB and `n_parts` =
-        `uploads.max_parts`. Returned plans have no URLs yet. Whether a file goes by single PUT or by parts
+        `uploads.max_parts` (`LOG_MAX_PARTS` at most for stdout/stderr). Only serial tasks get the standard
+        ones (parallel probes run without resource-tracker and write small logs); `large_outputs` always do.
+        Returned plans have no URLs yet. Whether a file goes by single PUT or by parts
         is sc-run's decision (`singlePutMaxMiB` is passed to it); the PUT URL is always present. Idempotent
         per attempt is NOT needed: a repeated task in a later attempt creates new uploads and overwrites
         its keys."""
@@ -136,7 +156,7 @@ class Storage:
         for c in containers:
             collected = [spec.partition(":")[2] for spec in c.task.collect]
             names = dict.fromkeys([*STANDARD_FILES, *c.task.large_outputs, *collected])
-            large = {*LARGE_STANDARD_FILES, *c.task.large_outputs}
+            large = {*(() if c.task.parallel else LARGE_STANDARD_FILES), *c.task.large_outputs}
             for name in names:
                 okey = object_key(run, c.key, name)
                 plan = UploadPlan(urls_key=f"{c.key}/{name}", object_key=okey)
@@ -146,7 +166,9 @@ class Storage:
                         plan,
                         upload_id=upload_id,
                         part_size=self.uploads.part_mib * MIB,
-                        n_parts=self.uploads.max_parts,
+                        n_parts=min(self.uploads.max_parts, LOG_MAX_PARTS)
+                        if name in ("stdout", "stderr")
+                        else self.uploads.max_parts,
                     )
                 plans.append(plan)
         return plans
@@ -361,11 +383,29 @@ class Storage:
 def render_urls_json(plans: Sequence[UploadPlan]) -> str:
     """The Secret's `urls.json`: `{"version": 1, "objects": {urls_key: entry}}` with `put` always,
     and `upload_id`, `part_size`, `parts` for multipart-capable plans (schema above). Deterministic key
-    order, compact JSON."""
+    order, compact JSON. Raises `UrlsTooLarge` above `MAX_URLS_BYTES`."""
     objects = {}
     for p in sorted(plans, key=lambda p: p.urls_key):
         entry: dict = {"put": p.put_url}
         if p.upload_id:
             entry |= {"upload_id": p.upload_id, "part_size": p.part_size, "parts": list(p.part_urls)}
         objects[p.urls_key] = entry
-    return json.dumps({"version": 1, "objects": objects}, separators=(",", ":"))
+    text = json.dumps({"version": 1, "objects": objects}, separators=(",", ":"))
+    check_urls_size(text)
+    return text
+
+
+def secret_size(urls_json: str) -> int:
+    """Bytes the urls.json takes in the Secret object (base64 of the JSON)."""
+    return len(urls_json.encode()) * 4 // 3
+
+
+def check_urls_size(urls_json: str) -> None:
+    """Raise `UrlsTooLarge` when `urls_json` exceeds `MAX_URLS_BYTES` (Kubernetes rejects Secrets over 1 MiB)."""
+    size = len(urls_json.encode())
+    if size > MAX_URLS_BYTES:
+        raise UrlsTooLarge(
+            f"urls.json is {size // 1024} KiB (Secret about {secret_size(urls_json) // 1024} KiB), above the "
+            f"{MAX_URLS_BYTES // 1024} KiB limit: too many multipart slots in one step "
+            "(lower uploads.maxParts or split the step)"
+        )

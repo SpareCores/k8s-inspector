@@ -24,5 +24,5 @@ would pay a full hour each time; the long-running Deployment avoids that churn. 
 repository: SCarpenter's UpCloud worker support is being finished and has not yet run against the real cloud, and the vendor list of the `apps` pool is
 cluster platform configuration. Until both are done, the controller runs on the current `apps` vendor.
 
-Resources: requests `cpu: 100m`, `memory: 512Mi`, limit `memory: 1Gi`, an emptyDir of 4 GiB for the git checkout and
-the sc-data SQLite file.
+Resources: requests `cpu: 100m`, `memory: 512Mi`, limit `memory: 1Gi`, an emptyDir of 4 GiB for the git checkout of
+sc-inspector-data.

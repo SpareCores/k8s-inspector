@@ -62,7 +62,7 @@ Legend: **P** planner, **R** run loop, **C** classification, **Pub** publisher, 
 | offline `parse` workflow with `git restore-mtime` | **Pub** parses at publish time |
 | timing files | **Pub** from run status and `sc-run` |
 | region/zone/spot from the start job | **R** from Node labels and NodeClaim |
-| Sentry | controller Sentry + [monitoring](../explanation/monitoring.md) |
+| Sentry | controller logs (JSON lines) + [monitoring](../explanation/monitoring.md) |
 
 ## DBaaS
 

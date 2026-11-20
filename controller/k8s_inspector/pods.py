@@ -27,6 +27,7 @@ from k8s_inspector.model import (
     TaskDef,
     TaskOutcome,
 )
+from k8s_inspector.steps import VLLM_PROBE_TIMEOUT
 
 NODE_DIR = "/var/lib/k8s-inspector"  # hostPath on the node; mounted at /k8si in every Pod
 MOUNT_DIR = "/k8si"
@@ -41,6 +42,7 @@ HEARTBEAT_ROOT = f"{MOUNT_DIR}/runs"
 MODELS_DIR = f"{NODE_DIR}/models"
 SECRETS_NAME = "inspector-secrets"
 FLUSH_DEADLINE_SECONDS = 900  # upload budget 10 min plus 5 min
+FLUSH_STEPS = 2  # flush Pods per step before its outputs are given up
 STEP_SLACK = timedelta(minutes=5)
 STEP_VERSION = timedelta(minutes=1)
 STEP_UPLOAD = timedelta(minutes=10)
@@ -219,17 +221,29 @@ def render_anchor(
     }
 
 
-def step_deadline_seconds(step: Step, cfg: Config) -> int:
-    """`activeDeadlineSeconds` of a step: image pull (`deadlines.image_pull_minutes`) + version 1 min + the
-    longest container timeout + upload 10 min + slack 5 min (a 40 min task: 4260 s with a 15 min pull)."""
+def _step_budget(longest: timedelta, cfg: Config) -> timedelta:
+    """Image pull (`deadlines.image_pull_minutes`) + version 1 min + the longest container timeout + upload
+    10 min + slack 5 min."""
     pull = timedelta(minutes=cfg.settings.deadlines.image_pull_minutes)
+    return pull + STEP_VERSION + longest + STEP_UPLOAD + STEP_SLACK
+
+
+def step_deadline_seconds(step: Step, cfg: Config) -> int:
+    """`activeDeadlineSeconds` of a step (a 40 min task: 4260 s with a 15 min pull)."""
     longest = max(container_timeout(c) for c in step.containers)
-    return int((pull + STEP_VERSION + longest + STEP_UPLOAD + STEP_SLACK).total_seconds())
+    return int(_step_budget(longest, cfg).total_seconds())
 
 
-def anchor_deadline_seconds(steps: Sequence[Step], cfg: Config) -> int:
-    """Sum of step deadlines plus 1 h (objects.md)."""
-    return sum(step_deadline_seconds(s, cfg) for s in steps) + int(ANCHOR_EXTRA.total_seconds())
+def anchor_deadline_seconds(selected: Sequence[TaskDef], cfg: Config, hold_after: timedelta = timedelta(0)) -> int:
+    """The anchor's `activeDeadlineSeconds`: the budgets of the probe step and of every serial task (one probe
+    step per vLLM image besides), two flush Pods for each of them, `hold_after` and 1 h (objects.md)."""
+    longest = [max((t.timeout for t in selected if t.parallel), default=STEP_SLACK)]
+    for task in selected:
+        if not task.parallel:
+            longest += [task.timeout, *[VLLM_PROBE_TIMEOUT for _ in task.images]]
+    flushes = timedelta(seconds=FLUSH_DEADLINE_SECONDS * FLUSH_STEPS)
+    total = sum((_step_budget(t, cfg) + flushes for t in longest), hold_after + ANCHOR_EXTRA)
+    return int(total.total_seconds())
 
 
 def _env(container: StepContainer, run_id: str, *, gpu_runtime: bool) -> list[dict]:
@@ -544,16 +558,24 @@ def _parse_time(value: str | None) -> datetime | None:
     return datetime.fromisoformat(value) if value else None
 
 
-def pull_stuck(pod: dict, now: datetime, limit_minutes: int) -> bool:
-    """True when a container waits in `ErrImagePull`/`ImagePullBackOff`/`ContainerCreating` for longer than
-    `limit_minutes` since the Pod started -> the runner deletes the Pod and records `-4 IMAGE_PULL_TIMEOUT`."""
+def stuck_containers(pod: dict, now: datetime, limit_minutes: int) -> set[str]:
+    """Names of the containers that wait in `ErrImagePull`/`ImagePullBackOff`/`ContainerCreating` for longer
+    than `limit_minutes` since the Pod started (all of them while the kubelet has not created the sandbox).
+    The runner ends their tasks with `-4 IMAGE_PULL_TIMEOUT`; containers that started are left alone."""
     started = _parse_time(pod.get("status", {}).get("startTime"))
     if started is None or now - started <= timedelta(minutes=limit_minutes):
-        return False
+        return set()
     statuses = _container_statuses(pod)
     if not statuses:  # admitted by the kubelet, sandbox still being created
-        return _phase(pod) == "Pending"
-    return any(s.get("state", {}).get("waiting", {}).get("reason") in PULL_WAITING for s in statuses)
+        if _phase(pod) != "Pending":
+            return set()
+        return {c["name"] for c in pod.get("spec", {}).get("containers", [])}
+    return {s["name"] for s in statuses if s.get("state", {}).get("waiting", {}).get("reason") in PULL_WAITING}
+
+
+def unfinished_containers(pod: dict) -> set[str]:
+    """Names of the containers that have not terminated."""
+    return {s["name"] for s in _container_statuses(pod) if "terminated" not in s.get("state", {})}
 
 
 def is_finished(pod: dict) -> bool:

@@ -9,9 +9,9 @@ and `dbaas_tasks.py`; the task list, images, commands, timeouts and priorities a
 |---|---|---|
 | `name` | string | task name, also the directory name in git and in object storage |
 | `image` | string | the legacy image reference with tag (`ghcr.io/sparecores/benchmark:main`); **hashed** |
-| `digest` | `sha256:…` | pinned multi-arch index digest; Pods use `<image>@<digest>`; **not hashed**; bumped by a weekly CI pull request (`controller/scripts/refresh_digests.py`) |
+| `digest` | `sha256:…` | pinned multi-arch index digest; Pods use `<image>@<digest>`; **not hashed**; bumped by a weekly pull request (`controller/scripts/refresh_digests.py`; the refresh workflow dispatches CI on it) |
 | `images`, `digests` | list, map | vLLM only: the image ladder in probe order and one digest per image (`image` is the three joined with `\|`) |
-| `entrypoint` | list | the image's ENTRYPOINT restated (Kubernetes `command` replaces it); a CI test compares it with the pinned image config |
+| `entrypoint` | list | the image's ENTRYPOINT restated (Kubernetes `command` replaces it) |
 | `command` | string or null | the legacy command string, arguments of the image as in `docker run <image> <command>`; **hashed** |
 | `version_command` | string | legacy value, same semantics as `command`; run before the task, 60 s cap → `meta.version`. `sc-run` runs it with `sh -c`, so the Pod gets `entrypoint` + `version_command` as one shell-quoted line; the legacy text is not a hash input |
 | `timeout` | duration | task timeout (`sc-run`); the step deadline adds pull 15 m + version 1 m + upload 10 m + slack |

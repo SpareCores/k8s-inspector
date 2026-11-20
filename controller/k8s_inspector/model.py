@@ -234,7 +234,8 @@ class AttemptStatus:
 class RunStatus:
     phase: RunPhase = RunPhase.PENDING
     progress: str = "0/0"
-    current_step: str | None = None
+    current_step: str | None = None  # name of the step Pod created last; the next step's number is its plus one
+    step: dict | None = None  # the step in flight as `steps.to_status` wrote it; None between steps
     attempt: int = 0
     capacity_type: CapacityType | None = None
     node: str | None = None
@@ -387,7 +388,6 @@ class EnvConfig:
     git_key_file: str | None = None
     keeper_api_base: str | None = None
     keeper_api_key_file: str | None = None
-    sentry_dsn: str | None = None
     namespace: str = "inspector"
     sc_run_image: str = ""  # K8SI_SC_RUN_IMAGE: "ghcr.io/sparecores/sc-run@sha256:..." (not in configuration.md)
     s3_endpoint_url: str | None = None  # K8SI_S3_ENDPOINT_URL: S3-compatible endpoint (OCI), optional
@@ -407,7 +407,7 @@ class VendorSettings:
     max_in_flight: int | None = None  # None: defaults.maxInFlight; 0 pauses
     max_usd_per_hour: float | None = None
     capacity: CapacityMode = CapacityMode.SPOT_FIRST  # same default as `RunSpec` and `crd.from_dict`
-    publish: bool = False  # the publisher pushes this vendor's results only when true
+    publish: bool | tuple[str, ...] = False  # True: every SKU; a tuple: only these SKUs; False: none
     node_pools: NodePools | None = None
 
 

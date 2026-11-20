@@ -13,8 +13,8 @@ from collections.abc import Mapping, Sequence
 from dataclasses import replace
 from datetime import timedelta
 
-from k8s_inspector.model import NodeFacts, Step, StepContainer, TaskDef, TaskOutcome
-from k8s_inspector.tasks import image_ref
+from k8s_inspector.model import ExitCode, NodeFacts, Reason, Step, StepContainer, TaskDef, TaskOutcome
+from k8s_inspector.tasks import all_tasks, image_ref
 
 PROBE_STEP_NAME = "01-probes"
 VLLM_PROBE_COMMAND = "--probe-only"
@@ -22,7 +22,7 @@ VLLM_PROBE_TIMEOUT = timedelta(minutes=18)  # must exceed the harness /health wa
 VLLM_MIN_GPU_COMPUTE_CAP = (8, 0)  # the GPU image ships Ampere+ kernels only
 NVBANDWIDTH_BUFFER_MIB = 512
 NVBANDWIDTH_BUFFER_MIB_LOW_VRAM = 256
-NVBANDWIDTH_LOW_VRAM_MIB = 2048  # bidirectional copy needs 3x the buffer on the GPU
+NVBANDWIDTH_LOW_VRAM_MIB = 2048  # bidirectional copy needs 3x the buffer on the GPU; unknown VRAM counts as low
 
 
 def _container(task: TaskDef) -> StepContainer:
@@ -50,8 +50,8 @@ def probe_step(tasks: Sequence[TaskDef], *, index: int = 1) -> Step | None:
 
 
 def vllm_label(image: str) -> str:
-    """Image name without registry and tag: `benchmark-vllm-gpu`."""
-    return image.rsplit("/", 1)[-1].split(":", 1)[0]
+    """Image name without registry, tag and digest: `benchmark-vllm-gpu`."""
+    return image.rsplit("/", 1)[-1].split("@", 1)[0].split(":", 1)[0]
 
 
 def vllm_probe_key(image: str) -> str:
@@ -114,7 +114,7 @@ def vllm_ladder_failure(task: TaskDef, finished: Mapping[str, TaskOutcome], fact
 
 
 def nvbandwidth_command(vram_mib: int | None) -> str:
-    low = vram_mib is not None and vram_mib <= NVBANDWIDTH_LOW_VRAM_MIB
+    low = vram_mib is None or vram_mib <= NVBANDWIDTH_LOW_VRAM_MIB
     return f"nvbandwidth -j -b {NVBANDWIDTH_BUFFER_MIB_LOW_VRAM if low else NVBANDWIDTH_BUFFER_MIB}"
 
 
@@ -155,13 +155,65 @@ def next_step(
     return None
 
 
+def _start_failed(outcome: TaskOutcome) -> bool:
+    """The container never ran the task: the runtime refused it, sc-run failed itself or the Pod hung before
+    starting (legacy: any exception while starting the GPU container)."""
+    return (
+        outcome.container_start_error
+        or outcome.exit_code == ExitCode.HARNESS_ERROR
+        or outcome.error_msg == Reason.IMAGE_PULL_TIMEOUT
+    )
+
+
 def retry_without_gpu(step: Step, outcomes: Mapping[str, TaskOutcome]) -> Step | None:
-    """GPU-first-then-CPU: when a container of a `gpu_runtime` step has `container_start_error`, the same
-    step without the runtime class (same containers; the runner creates it once). None when no container
-    failed to start or a failed container's task has `gpu=True` (no CPU fallback)."""
+    """GPU-first-then-CPU: when a container of a `gpu_runtime` step did not start, the same step without the
+    runtime class (same containers; the runner creates it once). None when no container failed to start, a
+    failed container's task has `gpu=True` (no CPU fallback) or it is the vLLM GPU image (a CPU run of it is
+    pointless: the ladder moves on to the CPU images)."""
     if not step.gpu_runtime:
         return None
-    failed = [c for c in step.containers if c.key in outcomes and outcomes[c.key].container_start_error]
-    if not failed or any(c.task.gpu for c in failed):
+    failed = [c for c in step.containers if c.key in outcomes and _start_failed(outcomes[c.key])]
+    if not failed or any(c.task.gpu or ("BENCHMARK_VLLM_MODE", "gpu") in c.env for c in failed):
         return None
     return replace(step, gpu_runtime=False)
+
+
+# --------------------------------------------------------------------------- the step in `status.step`
+
+
+def task_of(key: str) -> TaskDef | None:
+    """The catalogue task of a container key (vLLM probe keys belong to the vllm task), None when unknown."""
+    for task in all_tasks():
+        if task.name == key or key in {vllm_probe_key(image) for image in task.images}:
+            return task
+    return None
+
+
+def to_status(step: Step) -> dict:
+    """The step as stored in `status.step` (camelCase), enough to render and judge its Pod again."""
+    containers = []
+    for c in step.containers:
+        item: dict = {"key": c.key, "image": c.image, "env": dict(c.env)}
+        if c.command is not None:
+            item["command"] = c.command
+        if c.timeout is not None:
+            item["timeoutSeconds"] = int(c.timeout.total_seconds())
+        containers.append(item)
+    return {"index": step.index, "name": step.name, "gpuRuntime": step.gpu_runtime, "containers": containers}
+
+
+def from_status(data: dict | None) -> Step | None:
+    """Inverse of `to_status`; None when there is nothing stored or it no longer matches the catalogue."""
+    try:
+        containers = []
+        for c in (data or {})["containers"]:
+            task = task_of(c["key"])
+            if task is None:
+                return None
+            timeout = timedelta(seconds=c["timeoutSeconds"]) if "timeoutSeconds" in c else None
+            containers.append(
+                StepContainer(c["key"], task, c["image"], c.get("command"), timeout, tuple(c["env"].items()))
+            )
+        return Step(data["index"], data["name"], tuple(containers), data["gpuRuntime"])
+    except KeyError, TypeError, AttributeError:
+        return None

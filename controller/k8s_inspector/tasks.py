@@ -144,10 +144,22 @@ def _task_from_yaml(entry: dict) -> TaskDef:
     return TaskDef(**fields)
 
 
+class _UniqueKeyLoader(yaml.SafeLoader):
+    """YAML loader that rejects a mapping key given twice (PyYAML keeps the last one silently)."""
+
+    def construct_mapping(self, node, deep=False):
+        keys = [self.construct_object(key_node, deep=True) for key_node, _ in node.value]
+        duplicates = sorted({str(key) for key in keys if keys.count(key) > 1})
+        if duplicates:
+            raise ValueError(f"duplicate YAML keys {duplicates} (line {node.start_mark.line + 1})")
+        return super().construct_mapping(node, deep)
+
+
 def load_catalogue(path: Path = CATALOGUE_PATH) -> list[TaskDef]:
     """Parse the YAML into TaskDefs (durations like `40m`/`26h`, `digest` optional), validating names
-    (lowercase `[a-z0-9_]`) and that every transform name is in `TRANSFORM_SOURCES`."""
-    entries = yaml.safe_load(path.read_text())["tasks"]
+    (lowercase `[a-z0-9_]`), that every transform name is in `TRANSFORM_SOURCES` and that no YAML key is
+    duplicated."""
+    entries = yaml.load(path.read_text(), Loader=_UniqueKeyLoader)["tasks"]  # noqa: S506 (SafeLoader subclass)
     tasks = [_task_from_yaml(entry) for entry in entries]
     names = [task.name for task in tasks]
     duplicates = sorted({name for name in names if names.count(name) > 1})

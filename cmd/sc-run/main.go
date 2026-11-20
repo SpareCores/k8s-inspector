@@ -75,7 +75,7 @@ func runExec(args []string) int {
 	fs.DurationVar(&cfg.Timeout, "timeout", 30*time.Minute, "task timeout")
 	fs.StringVar(&cfg.VersionCmd, "version-cmd", "", "shell command whose output is the tool version (60 s cap)")
 	fs.Var(&collect, "collect", "extra file to upload, src:name (repeatable)")
-	fs.Var(&rlimits, "rlimit", "resource limit of the task, NAME=SOFT[:HARD] (repeatable; nofile, memlock, nproc, stack, core, as, fsize, data, cpu; integer or unlimited)")
+	fs.Var(&rlimits, "rlimit", "resource limit of the task, NAME=SOFT[:HARD] (repeatable; nofile or memlock; integer or unlimited)")
 	fs.DurationVar(&cfg.Reput, "reput", 60*time.Second, "interval of re-uploading growing files")
 	fs.DurationVar(&cfg.UploadBudget, "upload-budget", 10*time.Minute, "final upload budget")
 	fs.DurationVar(&cfg.KillAfter, "kill-after", 5*time.Second, "SIGTERM to SIGKILL for the task")

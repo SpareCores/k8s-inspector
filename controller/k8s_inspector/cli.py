@@ -226,7 +226,6 @@ def serve(kube: Kube, provider: ConfigProvider, stop: threading.Event, metrics_p
 
 
 def cmd_serve(args: argparse.Namespace) -> int:
-    setup_logging()
     kube, provider = _connect(need_run_image=True)
     stop = threading.Event()
     previous = {sig: signal.signal(sig, lambda *_: stop.set()) for sig in (signal.SIGTERM, signal.SIGINT)}
@@ -329,16 +328,17 @@ def cmd_status(args: argparse.Namespace) -> int:
 
 
 def cmd_cancel(args: argparse.Namespace) -> int:
-    """Delete the BenchmarkRun; the serving controller records `-4 CANCELLED` and releases the node."""
-    kube, _ = _connect()
+    """`Runner.cancel`: unfinished tasks end `-4 CANCELLED`, Pods are deleted, the BenchmarkRun is kept."""
+    kube, provider = _connect()
     try:
         run = crd.get_run(kube, args.run)
     except NotFound:
         raise CliError(f"no such run: {args.run}") from None
-    if run.status.phase in (RunPhase.DONE, RunPhase.FAILED, RunPhase.CANCELLED) or run.deleting:
-        print(f"{run.name} is already {'being cancelled' if run.deleting else run.status.phase.value}; nothing to do")
+    if run.status.phase in (RunPhase.DONE, RunPhase.FAILED, RunPhase.CANCELLED):
+        print(f"{run.name} is already {run.status.phase.value}; nothing to do")
         return 0
-    crd.delete_run(kube, run.name)
+    cfg = provider()
+    Runner(kube, Storage(cfg.env, cfg.settings.uploads), provider, cfg.env.namespace).cancel(run.name)
     print(f"cancelled {run.name}")
     return 0
 
@@ -372,6 +372,7 @@ COMMANDS = {
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    setup_logging()
     try:
         return COMMANDS[args.command](args)
     except CliError as e:

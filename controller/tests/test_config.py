@@ -51,14 +51,13 @@ def test_env_all_variables():
             "K8SI_GIT_KEY_FILE": "/keys/git",
             "KEEPER_API_BASE": "https://keeper.test",
             "KEEPER_API_KEY_FILE": "/keys/keeper",
-            "SENTRY_DSN": "https://dsn.test/1",
             "K8SI_NAMESPACE": "other",
             "K8SI_SC_RUN_IMAGE": "ghcr.io/sparecores/sc-run@sha256:abc",
             "K8SI_S3_ENDPOINT_URL": "https://s3.test",
         }
     )
     assert env.git_branch == "dev" and env.namespace == "other"
-    assert env.keeper_api_key_file == "/keys/keeper" and env.sentry_dsn == "https://dsn.test/1"
+    assert env.keeper_api_key_file == "/keys/keeper"
     assert env.sc_run_image.endswith("@sha256:abc") and env.s3_endpoint_url == "https://s3.test"
 
 
@@ -170,3 +169,10 @@ def test_load_settings_invalid_yaml_is_a_clear_error():
 def test_load_config_combines_env_and_settings():
     config = load_config(MINIMAL_ENV | {"K8SI_NAMESPACE": "ns"}, FakeKube(None))
     assert config.env.namespace == "ns" and config.settings == Settings()
+
+
+def test_vendor_publish_is_a_bool_or_a_list_of_skus():
+    parse = lambda value: parse_settings({"vendors": {"aws": {"publish": value}}}).vendors["aws"].publish  # noqa: E731
+    assert parse(True) is True and parse(["a", "b"]) == ("a", "b")
+    with pytest.raises(ValueError, match="vendors.aws.publish"):
+        parse("yes")

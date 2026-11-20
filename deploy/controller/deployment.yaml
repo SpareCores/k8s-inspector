@@ -2,7 +2,7 @@
 #   ConfigMap k8s-inspector-platform: K8SI_BUCKET, K8SI_BUCKET_REGION, K8SI_ROLE_ARN, K8SI_GIT_URL, K8SI_GIT_BRANCH,
 #                                     KEEPER_API_BASE
 #   Secret    k8s-inspector-git-key:  ssh-privatekey (sc-inspector-data deploy key)
-#   Secret    k8s-inspector-keeper:   api-key, and sentry-dsn
+#   Secret    k8s-inspector-keeper:   api-key
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -34,7 +34,7 @@ spec:
         seccompProfile: {type: RuntimeDefault}
       containers:
       - name: controller
-        image: ghcr.io/sparecores/k8s-inspector:main
+        image: ghcr.io/sparecores/k8s-inspector@sha256:0000000000000000000000000000000000000000000000000000000000000000   # placeholder: pin your digest in an overlay (deploy/README.md)
         command: [k8s-inspector, serve]
         ports:
         - {name: metrics, containerPort: 9090}
@@ -45,19 +45,16 @@ spec:
         - {name: K8SI_ROLE_ARN, valueFrom: {configMapKeyRef: {name: k8s-inspector-platform, key: K8SI_ROLE_ARN}}}
         - {name: K8SI_GIT_URL, valueFrom: {configMapKeyRef: {name: k8s-inspector-platform, key: K8SI_GIT_URL}}}
         - {name: K8SI_GIT_BRANCH, valueFrom: {configMapKeyRef: {name: k8s-inspector-platform, key: K8SI_GIT_BRANCH}}}
-        - {name: K8SI_SC_RUN_IMAGE, value: "ghcr.io/sparecores/k8s-inspector-sc-run:main"}
+        - {name: K8SI_SC_RUN_IMAGE, value: "ghcr.io/sparecores/k8s-inspector-sc-run@sha256:0000000000000000000000000000000000000000000000000000000000000000"}  # placeholder, as above
         - {name: KEEPER_API_BASE, valueFrom: {configMapKeyRef: {name: k8s-inspector-platform, key: KEEPER_API_BASE}}}
-        - {name: SENTRY_DSN, valueFrom: {secretKeyRef: {name: k8s-inspector-keeper, key: sentry-dsn, optional: true}}}
         - {name: K8SI_GIT_KEY_FILE, value: /etc/k8s-inspector/git/ssh-privatekey}
         - {name: KEEPER_API_KEY_FILE, value: /etc/k8s-inspector/keeper/api-key}
-        # AWS web identity: the SDK exchanges the projected token for a role session.
+        # AWS web identity: the controller exchanges the projected token for a role session (K8SI_ROLE_ARN).
         - {name: AWS_WEB_IDENTITY_TOKEN_FILE, value: /var/run/secrets/aws/token}
-        - {name: AWS_ROLE_ARN, valueFrom: {configMapKeyRef: {name: k8s-inspector-platform, key: K8SI_ROLE_ARN}}}
-        - {name: AWS_ROLE_SESSION_NAME, value: k8s-inspector}
         - {name: HOME, value: /work}
         - {name: TMPDIR, value: /tmp}
         livenessProbe:
-          httpGet: {path: /metrics, port: metrics}
+          httpGet: {path: /healthz, port: metrics}
           initialDelaySeconds: 20
           periodSeconds: 30
           timeoutSeconds: 5
@@ -76,7 +73,7 @@ spec:
         - {name: git-key, mountPath: /etc/k8s-inspector/git, readOnly: true}
         - {name: keeper-key, mountPath: /etc/k8s-inspector/keeper, readOnly: true}
       volumes:
-      - name: work                # git checkout and the sc-data SQLite file
+      - name: work                # git checkout of sc-inspector-data
         emptyDir: {sizeLimit: 4Gi}
       - name: tmp
         emptyDir: {sizeLimit: 256Mi}

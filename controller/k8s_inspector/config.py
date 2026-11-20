@@ -38,7 +38,7 @@ SETTINGS_KEY = "config.yaml"  # key inside the ConfigMap's data
 
 
 def load_env(environ: Mapping[str, str]) -> EnvConfig:
-    """Read the `K8SI_*`, `KEEPER_*`, `SENTRY_DSN` variables. Raise `ValueError` naming the missing
+    """Read the `K8SI_*`, `KEEPER_*` variables. Raise `ValueError` naming the missing
     required variable (K8SI_BUCKET, K8SI_BUCKET_REGION). Never log values."""
 
     def optional(name: str) -> str | None:
@@ -59,7 +59,6 @@ def load_env(environ: Mapping[str, str]) -> EnvConfig:
         git_key_file=optional("K8SI_GIT_KEY_FILE"),
         keeper_api_base=optional("KEEPER_API_BASE"),
         keeper_api_key_file=optional("KEEPER_API_KEY_FILE"),
-        sentry_dsn=optional("SENTRY_DSN"),
         namespace=optional("K8SI_NAMESPACE") or "inspector",
         sc_run_image=optional("K8SI_SC_RUN_IMAGE") or "",
         s3_endpoint_url=optional("K8SI_S3_ENDPOINT_URL"),
@@ -117,6 +116,13 @@ def _capacity(value: Any, path: str) -> CapacityMode:
         raise _fail(path, " or ".join(m.value for m in CapacityMode), value) from None
 
 
+def _publish(value: Any, path: str) -> bool | tuple[str, ...]:
+    """`true`, `false` or a list of SKUs."""
+    if isinstance(value, list):
+        return tuple(_str(sku, f"{path}[]") for sku in value)
+    return _bool(value, path)
+
+
 def _optional(check: Callable[[Any, str], Any]) -> Callable[[Any, str], Any]:
     """The same check, but `null` is allowed."""
     return lambda value, path: None if value is None else check(value, path)
@@ -162,7 +168,7 @@ _VENDOR = {
     "maxInFlight": ("max_in_flight", _optional(_nonneg_int)),
     "maxUsdPerHour": ("max_usd_per_hour", _optional(_nonneg_float)),
     "capacity": ("capacity", _capacity),
-    "publish": ("publish", _bool),
+    "publish": ("publish", _publish),
 }
 
 

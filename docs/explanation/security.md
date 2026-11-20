@@ -47,11 +47,12 @@ are switched over ([roadmap](../roadmap.md)).
 - A `ValidatingAdmissionPolicy` (cluster platform) denies the bench taint toleration, `privileged`, `hostPID` and
   hostPath outside the `inspector` and `kube-system` namespaces, and inside `inspector` allows Pod creation only by the
   controller's ServiceAccount.
-- The controller's RBAC, in `inspector`: Pods (create, get, list, watch, delete, patch), `pods/log` (get),
-  `pods/exec` (create; the heartbeat `exec` between steps), Secrets (CRUD), Jobs (create, get, list, delete),
-  ConfigMaps (get, create, update; `k8s-inspector-spot` is created on first use), `benchmarkruns` and
-  `benchmarkruns/status` (all), Events (list, watch). Cluster-wide: get/list/watch Nodes, NodeClaims, NodePools, SCNodeClasses; delete NodeClaims (orphan
-  cleanup). Nothing else.
+- The controller's RBAC is exactly what the code calls (`deploy/controller/rbac.yaml`; a test pins the sensitive
+  rules). In `inspector`: Pods (create, list, watch, delete), `pods/exec` (get, create; the heartbeat `exec` between
+  steps is a websocket upgrade), Secrets (create, get, update, delete; no list or watch, so it cannot enumerate
+  `inspector-secrets` or the platform Secrets), ConfigMaps (get, create, patch; `k8s-inspector-spot` is created on first
+  use), `benchmarkruns` (create, get, list, watch, patch, delete) and `benchmarkruns/status` (patch). Cluster-wide:
+  get Nodes; get, list and delete NodeClaims (orphan cleanup). Nothing else.
 
 ## Public repository
 

@@ -7,8 +7,9 @@ Prometheus handles as a counter reset (kept runs are counted once more).
 
 Exposed: `k8s_inspector_runs`, `_tasks_total`, `_run_attempts_total`, `_node_age_seconds`, `_publish_backlog`,
 `_publish_lag_seconds` (age of the oldest done, unpublished task), `_last_publish_timestamp_seconds`
-(last publish cycle that did not fail, set by `record_publish`), `_spend_usd_per_hour`, `_task_duration_seconds`
-(summary sum/count). Not yet: `_dbaas_instances` (P4). `/healthz` answers 200 as long as the process serves.
+(last publish cycle that did not fail, set by `record_publish`; process start before the first one),
+`_spend_usd_per_hour`, `_task_duration_seconds` (summary sum/count). Not yet: `_dbaas_instances` (P4).
+`/healthz` answers 200 as long as the process serves.
 """
 
 import logging
@@ -79,7 +80,7 @@ class Metrics:
         self._counters: dict[str, dict[Labels, float]] = defaultdict(lambda: defaultdict(float))
         self._seen: set[tuple] = set()
         self._gauges: list[str] = []  # last good snapshot, served when the API server is unreachable
-        self._last_publish: float | None = None
+        self._last_publish = time.time()  # process start until the first cycle: a stuck publisher still ages
 
     def record_publish(self) -> None:
         """A publish cycle finished without error."""
@@ -98,9 +99,8 @@ class Metrics:
             for name, series in sorted(self._counters.items()):
                 lines.append(f"# TYPE {PREFIX}{name} counter")
                 lines.extend(_line(name, labels, value) for labels, value in sorted(series.items()))
-            if self._last_publish is not None:
-                lines += [f"# TYPE {PREFIX}last_publish_timestamp_seconds gauge"]
-                lines.append(_line("last_publish_timestamp_seconds", (), self._last_publish))
+            lines.append(f"# TYPE {PREFIX}last_publish_timestamp_seconds gauge")
+            lines.append(_line("last_publish_timestamp_seconds", (), self._last_publish))
             return "\n".join(lines) + "\n"
 
     def _refresh(self) -> None:

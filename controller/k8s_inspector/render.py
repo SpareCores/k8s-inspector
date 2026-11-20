@@ -678,16 +678,22 @@ def refresh_schedule_meta(instance_root: Path, task: str, current_hash: str) -> 
 
 
 def _apply_start_retries(meta: dict, prior: dict | None) -> None:
-    """`start_retries` counts consecutive `-4`: +1 on `-4`, reset on success, else carried; the third `-4`
+    """`start_retries` counts consecutive `-4` of the same task hash: +1 on `-4` after a `-4` of that hash,
+    otherwise 1 on `-4` and 0 on any other code (success, a changed task hash, another failure; `-5` counts as
+    a `-4` here); the third `-4`
     in a row becomes `-5`. The same run and start seen again (re-render after a crash) keeps its count."""
     if prior and prior.get("run_id") == meta["run_id"] and prior.get("start") == meta["start"]:
         retries = prior.get("start_retries", 0)
+    elif meta["exit_code"] != ExitCode.NEVER_FINISHED:
+        retries = 0
+    elif (
+        prior
+        and prior.get("exit_code") in (ExitCode.NEVER_FINISHED, ExitCode.RETRIES_EXHAUSTED)
+        and prior.get("task_hash") == meta["task_hash"]
+    ):
+        retries = prior.get("start_retries", 0) + 1
     else:
-        retries = prior.get("start_retries", 0) if prior else 0
-        if meta["exit_code"] == ExitCode.NEVER_FINISHED:
-            retries += 1
-        elif meta["exit_code"] == ExitCode.OK:
-            retries = 0
+        retries = 1
     meta["start_retries"] = retries
     if meta["exit_code"] == ExitCode.NEVER_FINISHED and retries >= MAX_START_RETRIES:
         meta["exit_code"] = int(ExitCode.RETRIES_EXHAUSTED)

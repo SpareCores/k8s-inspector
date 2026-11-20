@@ -7,16 +7,15 @@ Values are deployment configuration of the cluster platform, not part of this re
 | Variable | Meaning |
 |---|---|
 | `K8SI_BUCKET`, `K8SI_BUCKET_REGION` | object storage bucket for outputs |
-| `K8SI_ROLE_ARN` | IAM role assumed with the ServiceAccount token (web identity) |
+| `K8SI_ROLE_ARN` | IAM role assumed with the ServiceAccount token (web identity); its `MaxSessionDuration` must be at least 12 h (the controller asks for 12 h sessions) |
 | `K8SI_GIT_URL`, `K8SI_GIT_BRANCH` | sc-inspector-data remote and branch (`main`) |
 | `K8SI_GIT_KEY_FILE` | mounted deploy key |
 | `KEEPER_API_BASE`, `KEEPER_API_KEY_FILE` | Keeper API (eligibility) |
-| `SENTRY_DSN` | error reporting |
 | `K8SI_NAMESPACE` | namespace of runs (default `inspector`) |
 | `K8SI_SC_RUN_IMAGE` | the `sc-run` image of anchors and flush steps, digest-pinned (`ghcr.io/sparecores/k8s-inspector-sc-run@sha256:…`); `serve` and `run` refuse to start without it |
 | `K8SI_S3_ENDPOINT_URL` | optional S3-compatible endpoint, for object storage that is not AWS S3 (OCI) |
 
-The controller serves Prometheus metrics on port 9090 (`/metrics`, [monitoring](../explanation/monitoring.md)).
+The controller serves Prometheus metrics on port 9090 (`/metrics`, [monitoring](../explanation/monitoring.md)) and `/healthz`, which is the liveness probe.
 
 ## ConfigMap `k8s-inspector`
 
@@ -33,7 +32,7 @@ vendors:
     autoPlan: false              # per-vendor override
     maxInFlight: 2               # 0 pauses the vendor
     maxUsdPerHour: 2.0
-    capacity: SpotFirst          # SpotFirst | OnDemand (the default)
+    capacity: SpotFirst          # SpotFirst (the default) | OnDemand
     publish: false               # true: the publisher pushes this vendor's results to sc-inspector-data
     nodePools: {cpu: bench-oci, lowmem: bench-oci-lowmem, gpu: null}
 defaults:
@@ -75,5 +74,10 @@ removed from the legacy pipeline ([roadmap](../roadmap.md)); there is no shared 
 ## CLI
 
 `k8s-inspector serve | plan [--dry-run] | run <vendor> <sku> [--tasks …] [--force] [--on-demand] [--hold 2h] |
-status [--failing] | cancel <run> | publish [--rescan --since 7d]`. Inside the cluster:
+status [--failing] | cancel <run> | publish [--rescan --since 7d [--sku <sku>]…]`. Inside the cluster:
 `kubectl -n inspector exec deploy/k8s-inspector -- k8s-inspector …`.
+
+`cancel` ends the run in place (unfinished tasks `-4 CANCELLED`, Pods deleted, phase `Cancelled`) and keeps the
+`BenchmarkRun` until the publisher purges it. Deleting the `BenchmarkRun` with `kubectl` also stops the run, but drops
+the record. `--sku` (repeatable, with `--rescan`) names a SKU that was never published, so its outputs are recovered too.
+Every command logs JSON lines on stderr.

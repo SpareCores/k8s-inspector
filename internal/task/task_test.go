@@ -357,8 +357,7 @@ func TestParseRlimit(t *testing.T) {
 		"nofile=4096":         {"nofile", 4096, 4096},
 		"nofile=1024:1048576": {"nofile", 1024, 1048576},
 		"memlock=unlimited":   {"memlock", inf, inf},
-		"core=0:unlimited":    {"core", 0, inf},
-		"cpu=10":              {"cpu", 10, 10},
+		"memlock=0:unlimited": {"memlock", 0, inf},
 	}
 	for spec, want := range good {
 		got, err := ParseRlimit(spec)
@@ -366,7 +365,7 @@ func TestParseRlimit(t *testing.T) {
 			t.Errorf("%s: got %+v, %v; want %+v", spec, got, err, want)
 		}
 	}
-	for _, spec := range []string{"", "nofile", "bogus=1", "nofile=-1", "nofile=x", "nofile=", "nofile=1:", "nofile=10:5", "nofile=1:2:3"} {
+	for _, spec := range []string{"", "nofile", "bogus=1", "core=0", "nproc=10", "cpu=10", "nofile=-1", "nofile=x", "nofile=", "nofile=1:", "nofile=10:5", "nofile=1:2:3"} {
 		if _, err := ParseRlimit(spec); err == nil {
 			t.Errorf("%q: want error", spec)
 		}

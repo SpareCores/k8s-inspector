@@ -14,7 +14,7 @@ data:
         autoPlan: false              # per-vendor override
         maxInFlight: 2               # 0 pauses the vendor
         maxUsdPerHour: 2.0
-        capacity: SpotFirst          # SpotFirst | OnDemand (the default)
+        capacity: SpotFirst          # SpotFirst (the default) | OnDemand
         publish: false               # true: the publisher pushes this vendor's results to sc-inspector-data
         nodePools: {cpu: bench-oci, lowmem: bench-oci-lowmem, gpu: null}
     defaults:

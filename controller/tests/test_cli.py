@@ -188,6 +188,15 @@ def env(monkeypatch):
     monkeypatch.delenv("K8SI_NAMESPACE", raising=False)
     monkeypatch.setattr(cli, "Kube", lambda namespace: FakeKube())
     monkeypatch.setattr(cli.config_loader, "load_settings", lambda kube, ns: SETTINGS)
+    monkeypatch.setattr(cli, "setup_logging", lambda: None)
+
+
+def test_main_sets_up_logging_for_every_command(env, monkeypatch):
+    calls = []
+    monkeypatch.setattr(cli, "setup_logging", lambda: calls.append(1))
+    monkeypatch.setattr(crd, "list_runs", lambda kube: [])
+    assert cli.main(["status"]) == 0
+    assert calls == [1]
 
 
 def test_run_prints_run_name(env, monkeypatch, capsys):
@@ -286,20 +295,29 @@ def test_plan_command(env, monkeypatch, capsys):
 
 def test_cancel(env, monkeypatch, capsys):
     runs = {"oci-a": make_run("a", RunPhase.RUNNING), "oci-d": make_run("d", RunPhase.DONE)}
-    deleted = []
+    cancelled = []
 
     def get_run(kube, name):
         if name not in runs:
             raise NotFound(name)
         return runs[name]
 
+    class FakeRunner:
+        def __init__(self, kube, storage, provider, namespace):
+            pass
+
+        def cancel(self, name):
+            cancelled.append(name)
+
     monkeypatch.setattr(crd, "get_run", get_run)
-    monkeypatch.setattr(crd, "delete_run", lambda kube, name: deleted.append(name))
+    monkeypatch.setattr(crd, "delete_run", lambda *a: pytest.fail("cancel must keep the BenchmarkRun"))
+    monkeypatch.setattr(cli, "Runner", FakeRunner)
+    monkeypatch.setattr(cli, "Storage", lambda env, uploads: object())
 
     assert cli.main(["cancel", "oci-a"]) == 0
-    assert deleted == ["oci-a"]
+    assert cancelled == ["oci-a"]
     assert cli.main(["cancel", "oci-d"]) == 0  # finished: nothing to cancel
-    assert deleted == ["oci-a"]
+    assert cancelled == ["oci-a"]
     assert cli.main(["cancel", "nope"]) == 1
     assert "no such run" in capsys.readouterr().err
 

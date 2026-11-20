@@ -8,32 +8,16 @@ import (
 	"syscall"
 )
 
-// Linux asm-generic resource numbers that package syscall does not export.
-const (
-	rlimitNproc   = 6
-	rlimitMemlock = 8
-)
+// Linux asm-generic resource number that package syscall does not export.
+const rlimitMemlock = 8
 
+// rlimitResource maps the two names --rlimit accepts (the DB tasks need exactly these).
 func rlimitResource(name string) (int, bool) {
 	switch name {
 	case "nofile":
 		return syscall.RLIMIT_NOFILE, true
 	case "memlock":
 		return rlimitMemlock, true
-	case "nproc":
-		return rlimitNproc, true
-	case "stack":
-		return syscall.RLIMIT_STACK, true
-	case "core":
-		return syscall.RLIMIT_CORE, true
-	case "as":
-		return syscall.RLIMIT_AS, true
-	case "fsize":
-		return syscall.RLIMIT_FSIZE, true
-	case "data":
-		return syscall.RLIMIT_DATA, true
-	case "cpu":
-		return syscall.RLIMIT_CPU, true
 	}
 	return 0, false
 }

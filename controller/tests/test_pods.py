@@ -123,7 +123,10 @@ def test_deadlines(cfg):
         container(task("a", timeout=timedelta(minutes=5))), container(task("b", timeout=timedelta(seconds=30)))
     )
     assert pods.step_deadline_seconds(probes, cfg) == 2160
-    assert pods.anchor_deadline_seconds([s, probes], cfg) == 4260 + 2160 + 3600
+    # probe step (5 min task) and a 40 min task, two 15 min flush Pods each, a 1 h hold, 1 h extra
+    selected = [task("a", timeout=timedelta(minutes=5), parallel=True), task()]
+    flushes = 2 * 2 * 900
+    assert pods.anchor_deadline_seconds(selected, cfg, timedelta(hours=1)) == 4260 + 2160 + 3600 * 2 + flushes
     cfg2 = Config(cfg.env, Settings(deadlines=Deadlines(image_pull_minutes=1)))
     assert pods.step_deadline_seconds(s, cfg2) == (1 + 1 + 40 + 10 + 5) * 60
 
@@ -258,19 +261,23 @@ def test_pod_readers():
     assert not pods.is_ready({"status": {}})
 
 
-def test_pull_stuck():
-    def pod(reason, start="2026-11-20T09:30:00Z", phase="Pending"):
+def test_stuck_containers():
+    def pod(*reasons, start="2026-11-20T09:30:00Z", phase="Pending", names=("a", "b")):
         status = {"phase": phase, "startTime": start}
-        if reason:
-            status["containerStatuses"] = [{"state": {"waiting": {"reason": reason}}}]
-        return {"status": status}
+        if reasons:
+            status["containerStatuses"] = [
+                {"name": n, "state": {"waiting": {"reason": r}} if r else {"terminated": {"exitCode": 0}}}
+                for n, r in zip(names, reasons, strict=True)
+            ]
+        return {"spec": {"containers": [{"name": n} for n in names]}, "status": status}
 
-    assert pods.pull_stuck(pod("ImagePullBackOff"), NOW, 15)
-    assert pods.pull_stuck(pod("ContainerCreating"), NOW, 15)
-    assert not pods.pull_stuck(pod("ImagePullBackOff", "2026-11-20T09:50:00Z"), NOW, 15)
-    assert not pods.pull_stuck(pod("CrashLoopBackOff"), NOW, 15)
-    assert not pods.pull_stuck({"status": {"phase": "Pending"}}, NOW, 15)  # not started by a kubelet
-    assert pods.pull_stuck(pod(None), NOW, 15)
+    assert pods.stuck_containers(pod("ImagePullBackOff", "ErrImagePull"), NOW, 15) == {"a", "b"}
+    assert pods.stuck_containers(pod("ContainerCreating", None), NOW, 15) == {"a"}  # b ran: not stuck
+    assert pods.stuck_containers(pod("ImagePullBackOff", None, start="2026-11-20T09:50:00Z"), NOW, 15) == set()
+    assert pods.stuck_containers(pod("CrashLoopBackOff", "CrashLoopBackOff"), NOW, 15) == set()
+    assert pods.stuck_containers({"status": {"phase": "Pending"}}, NOW, 15) == set()  # not started by a kubelet
+    assert pods.stuck_containers(pod(), NOW, 15) == {"a", "b"}  # no sandbox yet: every container waits
+    assert pods.unfinished_containers(pod("ContainerCreating", None)) == {"a"}
 
 
 def finished_pod(*statuses, phase="Failed", reason=None):
