@@ -1,0 +1,181 @@
+import urllib.error
+import urllib.request
+from datetime import UTC, datetime, timedelta
+
+import pytest
+
+from k8s_inspector import crd
+from k8s_inspector.metrics import Metrics, make_server, task_result
+from k8s_inspector.model import (
+    AttemptOutcome,
+    AttemptStatus,
+    BenchmarkRun,
+    CapacityType,
+    RunPhase,
+    RunSpec,
+    RunStatus,
+    Settings,
+    TaskState,
+    TaskStatus,
+    VendorSettings,
+)
+
+NOW = datetime(2026, 11, 20, 12, 0, tzinfo=UTC)
+SETTINGS = Settings(vendors={"oci": VendorSettings(enabled=True, publish=True), "aws": VendorSettings(enabled=True)})
+
+
+def done(name, exit_code, minutes_ago=30, published=False):
+    return TaskStatus(
+        name,
+        TaskState.DONE,
+        1,
+        NOW - timedelta(minutes=minutes_ago + 5),
+        NOW - timedelta(minutes=minutes_ago),
+        exit_code,
+        published=published,
+    )
+
+
+def make_run(sku, phase, tasks=(), vendor="oci", **status):
+    return BenchmarkRun(
+        f"{vendor}-{sku}",
+        "inspector",
+        f"uid-{sku}",
+        "1",
+        NOW - timedelta(hours=1),
+        RunSpec(vendor, sku, "r1"),
+        RunStatus(phase=phase, tasks=list(tasks), **status),
+    )
+
+
+@pytest.fixture
+def runs(monkeypatch):
+    store: list[BenchmarkRun] = []
+    monkeypatch.setattr(crd, "list_runs", lambda kube: list(store))
+    return store
+
+
+@pytest.fixture
+def metrics(runs):
+    return Metrics(None, lambda: SETTINGS, clock=lambda: NOW)
+
+
+def test_task_result_mapping():
+    assert [task_result(c) for c in (0, 1, 137, 256, -1, -3, -4, -5, -6)] == [
+        "ok",
+        "failed",
+        "failed",
+        "failed",
+        "lost",
+        "failed",
+        "lost",
+        "lost",
+        "timeout",
+    ]
+
+
+def test_run_phases_listed_for_every_configured_vendor(runs, metrics):
+    runs.append(make_run("a", RunPhase.RUNNING))
+    runs.append(make_run("b", RunPhase.RUNNING))
+    text = metrics.render()
+
+    assert 'k8s_inspector_runs{phase="Running",vendor="oci"} 2' in text
+    assert 'k8s_inspector_runs{phase="Pending",vendor="oci"} 0' in text
+    assert 'k8s_inspector_runs{phase="Running",vendor="aws"} 0' in text
+    assert "# TYPE k8s_inspector_runs gauge" in text
+
+
+def test_task_counters_count_each_task_once(runs, metrics):
+    runs.append(make_run("a", RunPhase.PUBLISHING, [done("lscpu", 0), done("geekbench", -6), done("stress", 1)]))
+    metrics.render()
+    text = metrics.render()  # a second scrape must not count again
+
+    assert 'k8s_inspector_tasks_total{result="ok",task="lscpu",vendor="oci"} 1' in text
+    assert 'k8s_inspector_tasks_total{result="timeout",task="geekbench",vendor="oci"} 1' in text
+    assert 'k8s_inspector_tasks_total{result="failed",task="stress",vendor="oci"} 1' in text
+    assert 'k8s_inspector_task_duration_seconds_sum{task="lscpu",vendor="oci"} 300' in text
+    assert 'k8s_inspector_task_duration_seconds_count{task="lscpu",vendor="oci"} 1' in text
+
+    runs[0].status.tasks.append(done("openssl", 0))
+    assert 'k8s_inspector_tasks_total{result="ok",task="openssl",vendor="oci"} 1' in metrics.render()
+
+
+def test_attempt_counters(runs, metrics):
+    attempts = [
+        AttemptStatus(1, CapacityType.SPOT, outcome=AttemptOutcome.SPOT_INTERRUPTED),
+        AttemptStatus(2, CapacityType.ON_DEMAND, outcome=AttemptOutcome.COMPLETED),
+        AttemptStatus(3, CapacityType.ON_DEMAND),  # open: not counted
+    ]
+    runs.append(make_run("a", RunPhase.RUNNING, attempts=attempts))
+    text = metrics.render()
+
+    assert 'k8s_inspector_run_attempts_total{capacity_type="spot",outcome="interrupted",vendor="oci"} 1' in text
+    assert 'k8s_inspector_run_attempts_total{capacity_type="on-demand",outcome="completed",vendor="oci"} 1' in text
+    assert text.count("run_attempts_total{") == 2
+
+
+def test_backlog_lag_spend_and_node_age(runs, metrics):
+    running = make_run(
+        "a",
+        RunPhase.RUNNING,
+        [done("lscpu", 0, minutes_ago=90), done("geekbench", 0, minutes_ago=10, published=True)],
+        node="node-1",
+        price_per_hour="0.25",
+        attempts=[AttemptStatus(1, CapacityType.SPOT, start=NOW - timedelta(minutes=45))],
+    )
+    runs.append(running)
+    runs.append(make_run("b", RunPhase.PUBLISHING, [done("lscpu", 0)], vendor="aws"))  # aws does not publish
+    text = metrics.render()
+
+    assert "k8s_inspector_publish_backlog 1\n" in text
+    assert "k8s_inspector_publish_lag_seconds 5400\n" in text
+    assert 'k8s_inspector_spend_usd_per_hour{vendor="oci"} 0.25' in text
+    assert 'k8s_inspector_spend_usd_per_hour{vendor="aws"} 0' in text
+    assert 'k8s_inspector_node_age_seconds{run="oci-a",sku="a",vendor="oci"} 2700' in text
+
+
+def test_last_publish_timestamp_only_after_a_publish(runs, metrics):
+    assert "last_publish_timestamp_seconds" not in metrics.render()
+    metrics.record_publish()
+    line = next(x for x in metrics.render().splitlines() if x.startswith("k8s_inspector_last_publish"))
+    assert float(line.split()[1]) > 1e9
+
+
+def test_refresh_failure_serves_previous_snapshot(runs, metrics, monkeypatch):
+    runs.append(make_run("a", RunPhase.RUNNING))
+    metrics.render()
+
+    def boom(kube):
+        raise RuntimeError("api down")
+
+    monkeypatch.setattr(crd, "list_runs", boom)
+    assert 'k8s_inspector_runs{phase="Running",vendor="oci"} 1' in metrics.render()
+
+
+def test_label_values_are_escaped(runs, metrics):
+    runs.append(make_run("a", RunPhase.RUNNING, [done('we"ird\\', 0)]))
+    assert 'task="we\\"ird\\\\"' in metrics.render()
+
+
+def test_http_endpoints(runs, metrics):
+    import threading
+
+    runs.append(make_run("a", RunPhase.RUNNING))
+    server = make_server(metrics, 0)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base = f"http://127.0.0.1:{server.server_address[1]}"
+    try:
+        with urllib.request.urlopen(f"{base}/metrics", timeout=5) as r:
+            assert r.status == 200
+            assert r.headers["Content-Type"].startswith("text/plain")
+            assert b"k8s_inspector_runs" in r.read()
+        with urllib.request.urlopen(f"{base}/healthz", timeout=5) as r:
+            assert r.read() == b"ok\n"
+        with pytest.raises(urllib.error.HTTPError) as e:
+            urllib.request.urlopen(f"{base}/nope", timeout=5)
+        assert e.value.code == 404
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(5)
