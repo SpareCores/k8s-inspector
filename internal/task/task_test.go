@@ -424,3 +424,55 @@ func TestRlimitAppliesToChildOnly(t *testing.T) {
 		t.Fatalf("soft nofile of the test process changed: %d -> %d", before.Cur, after.Cur)
 	}
 }
+
+func TestNiceAppliesToChildOnly(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("linux only")
+	}
+	runtime.LockOSThread() // nice is per thread: compare the same thread before and after
+	defer runtime.UnlockOSThread()
+	before, err := syscall.Getpriority(syscall.PRIO_PROCESS, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Probe the permission.
+	probe := syscall.Setpriority(syscall.PRIO_PROCESS, 0, -20)
+	_ = syscall.Setpriority(syscall.PRIO_PROCESS, 0, 20-before)
+	if probe != nil {
+		t.Skipf("cannot lower nice (%v); run as root or with CAP_SYS_NICE", probe)
+	}
+	cfg, _ := setup(t, "sh", "-c", `cut -d" " -f19 /proc/self/stat`)
+	cfg.Nice = -20
+	run(cfg, make(chan os.Signal))
+	out, err := os.ReadFile(filepath.Join(cfg.Spool, "stdout"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.TrimSpace(string(out)); got != "-20" {
+		t.Fatalf("child nice: %q", got)
+	}
+	after, err := syscall.Getpriority(syscall.PRIO_PROCESS, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after != before {
+		t.Fatalf("nice of the test thread changed: %d -> %d (raw)", before, after)
+	}
+}
+
+func TestNiceZeroLeavesChildAlone(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("linux only")
+	}
+	cfg, _ := setup(t, "sh", "-c", `cut -d" " -f19 /proc/self/stat`)
+	cfg.Nice = 0
+	run(cfg, make(chan os.Signal))
+	out, err := os.ReadFile(filepath.Join(cfg.Spool, "stdout"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := strconv.Itoa(20 - func() int { p, _ := syscall.Getpriority(syscall.PRIO_PROCESS, 0); return p }())
+	if got := strings.TrimSpace(string(out)); got != want {
+		t.Fatalf("child nice: %q, want %q", got, want)
+	}
+}

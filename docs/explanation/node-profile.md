@@ -82,7 +82,7 @@ Measured on the `Lean` E5.Flex.2-8 node.
 | no CPU limits | no CPU limits (no CFS quota, so `nproc` and cgroup-aware tools see the whole node) |
 | memory cap 0.85 × available for geekbench and vLLM | `limits.memory` = 0.85 × Node allocatable for those two (decision K9); everything else under the `kubepods.slice` limit |
 | `shm_size=4g` for vLLM | emptyDir `medium: Memory`, `sizeLimit: 4Gi` at `/dev/shm`, vLLM only |
-| `nice -n -20` in commands and images | unchanged |
+| `nice -n -20` in commands and images | unchanged, and every task also runs at nice -20 via `sc-run exec --nice -20` (generic rule: benchmarks get as much CPU as possible; the legacy per-command `nice` stays, as nice clamps at -20) |
 
 `storage` runs last on a node, because it may unmount and overwrite free disks. The spool is on the boot disk, which
 the storage benchmark treats as protected (it holds `/`). Until the Flatcar-specific protected mounts land in the

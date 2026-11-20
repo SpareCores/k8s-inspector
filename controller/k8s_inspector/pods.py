@@ -55,6 +55,7 @@ STEP_VERSION = timedelta(minutes=1)
 STEP_UPLOAD = timedelta(minutes=10)
 ANCHOR_EXTRA = timedelta(hours=1)
 DB_RLIMITS = ("nofile=1048576", "memlock=unlimited")  # docker era: nofile 1048576, memlock -1
+TASK_NICE = -20  # generic rule: every benchmark gets as much CPU as possible (sc-run exec --nice)
 # `inspector-secrets` key -> environment variable of the container.
 SECRET_ENV = {
     "sentinel": "SENTINEL_API_TOKEN",
@@ -335,6 +336,7 @@ def _step_container(
         "--heartbeat-dir",
         f"{HEARTBEAT_ROOT}/{run_id}",
     ]
+    command += ["--nice", str(TASK_NICE)]
     if task.version_command:
         command += ["--version-cmd", _version_cmd(task)]
     for spec in task.collect:

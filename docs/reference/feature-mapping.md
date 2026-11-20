@@ -38,6 +38,7 @@ Legend: **P** planner, **R** run loop, **C** classification, **Pub** publisher, 
 | `version_command` in a separate container | **W** `--version-cmd` before the task |
 | `DOCKER_OPTS` privileged + host network | **S** `privileged`, `hostNetwork` |
 | `DB_DOCKER_OPTS` seccomp, `nofile`, `memlock` | **S** `Unconfined`; **W** `--rlimit` |
+| `nice -n -20` per command | unchanged in commands; additionally **W** `--nice -20` for every task (generic rule) |
 | `pid_mode=host` (storage) | **S** `hostPID` on that step |
 | 0.85 × available memory cap, `shm_size` 4 GiB | **S** memory limit from Node allocatable; memory-backed `/dev/shm` |
 | per-task timeout, output discarded on timeout | **W** timeout with partial output kept, `-6` |

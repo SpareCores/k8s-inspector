@@ -139,7 +139,7 @@ def test_step_pod_like_spike(run, cfg):
         "/k8si/bin/sc-run", "exec", "--task", "membench", "--timeout", "40m",
         "--multipart-mib", "32", "--reput", "60s",
         "--spool", "/k8si/runs/r1/membench", "--urls", "/k8si-urls/urls.json",
-        "--heartbeat-dir", "/k8si/runs/r1",
+        "--heartbeat-dir", "/k8si/runs/r1", "--nice", "-20",
         "--version-cmd", "/usr/local/bin/resource-tracker -- /usr/local/bin/membench -V",
         "--", "/usr/local/bin/resource-tracker", "--", "/usr/local/bin/membench", "-Hv", "-t", "1800",
     ]  # fmt: skip
@@ -179,6 +179,8 @@ def test_memory_cap_models_shm_secrets_rlimits_hostpid(run, cfg):
     assert c["resources"]["limits"] == {"memory": "850"}
     cmd = c["command"]
     assert cmd[cmd.index("--collect") + 1] == "/x:y"
+    assert cmd[cmd.index("--nice") + 1] == "-20"
+    assert cmd.index("--nice") < cmd.index("--")
     assert [cmd[i + 1] for i, a in enumerate(cmd) if a == "--rlimit"] == ["nofile=1048576", "memlock=unlimited"]
     env = {e["name"]: e for e in c["env"]}
     assert env["A"]["value"] == "2"  # container env overrides task env

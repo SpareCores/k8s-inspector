@@ -67,6 +67,7 @@ type Config struct {
 	TermLog      string // termination message path
 	Cmd          []string
 	Rlimits      []string // "NAME=SOFT[:HARD]" limits for the task process only; see ParseRlimit
+	Nice         int      // nice value of the task process (see withNice); 0 leaves it unchanged
 }
 
 // Result is result.json and, with Upload, the termination message.
@@ -242,7 +243,8 @@ func execute(stopCtx context.Context, cfg Config) (res Result) {
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 
 	oomBefore := oomKills()
-	if err := withRlimits(limits, cmd.Start); err != nil {
+	startNiced := func() error { return withNice(cfg.Nice, cmd.Start) }
+	if err := withRlimits(limits, startNiced); err != nil {
 		res.ExitCode, res.ErrorMsg = CodeHarnessError, "cannot start command: "+err.Error()
 		return res
 	}
