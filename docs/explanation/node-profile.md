@@ -1,8 +1,11 @@
 # Node profile and comparability
 
-## Bench NodeClasses and NodePools
+## Bench NodeClass and NodePool
 
-Defined by the cluster platform, one set per vendor. k8s-inspector only selects them by name.
+Defined by the cluster platform: one `bench` SCNodeClass with a block per vendor and one `bench` NodePool for all vendors
+(the ConfigMap key `benchPool`). Adding a vendor adds its block to the SCNodeClass. There are no `-lowmem` or `-gpu`
+pools: SCarpenter chooses GPU drivers per NodeClaim, and whether GPU types need their own pool for the 256 GiB root
+disk is decided in P6. k8s-inspector only selects the pool by name.
 
 | Setting | Value | Why |
 |---|---|---|
@@ -10,12 +13,12 @@ Defined by the cluster platform, one set per vendor. k8s-inspector only selects 
 | `kubelet.maxPods` | 10 (the `Lean` default) | anchor, step, flannel, kube-proxy and the probe Pod fit |
 | `kubelet.evictionHard` | `memory.available: 50Mi`, `nodefs.available: 1%`, `imagefs.available: 1%` | a task that exhausts memory gets the kernel OOM killer, not eviction ([memory and disk behaviour](#memory-and-disk-behaviour)); llm downloads models bounded by RAM and stays far above 1 % free |
 | Image garbage collection | kubelet defaults | replaces Docker's prune between task groups |
-| Root disk | 128 GiB (256 GiB for GPU) (decision K21) | images, the llm model, the spool |
+| Root disk | 128 GiB (256 GiB for GPU, see above) (decision K21) | images, the llm model, the spool |
 | Local instance storage | `ignore` (left raw) | the storage benchmark measures raw disks |
 | Instance metadata | `Open` ([security](security.md#instance-metadata-imds)) | resource tracker cloud detection |
 | Butane | mask `docker.socket`, `systemd-sysupdate*`, `systemd-oomd`, the SSH key fetch units; stop vendor agents after Ready | less background noise |
 | Billing retention | off | a node is never reused |
-| NodePools `bench-<vendor>` (`-lowmem` for ≤ 2 GiB, `-gpu`) | taint `frankenscube/bench=true:NoSchedule`, label `frankenscube/pool=bench`, `WhenEmpty`, `consolidateAfter: 0s`, `expireAfter: 48h`, `terminationGracePeriod: 1h`, no `limits` (every instance type of the vendor must be benchmarkable; the controller bounds running instances with `maxInFlight`), node repair off | dedicated, short-lived |
+| NodePool `bench` | taint `frankenscube/bench=true:NoSchedule`, label `frankenscube/pool=bench`, `WhenEmpty`, `consolidateAfter: 0s`, `expireAfter: 48h`, `terminationGracePeriod: 1h`, no `limits` (every instance type of every vendor must be benchmarkable; the controller bounds running instances with `maxInFlight`), node repair off | dedicated, short-lived |
 
 Without `Lean`, the default kube-reserved is min(255 MiB + 11 MiB × maxPods, 25 % of memory), at least 320 MiB.
 `Lean` is a flat reservation: 192 MiB kube-reserved + 128 MiB system-reserved + 50 MiB eviction threshold = 370 MiB.

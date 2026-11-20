@@ -5,8 +5,8 @@
 You will benchmark one small OCI instance type end to end and find its results in sc-inspector-data.
 
 1. **Look around.** `kubectl -n inspector get deploy,cm`: the platform-managed ConfigMap `k8s-inspector` (key
-   `config.yaml`) must enable `oci`; changes to it apply within ~30 s, no restart. `kubectl get nodepools bench-oci`
-   shows the bench NodePool.
+   `config.yaml`) must enable `oci`; changes to it apply within ~30 s, no restart. `kubectl get nodepools bench`
+   shows the bench NodePool (shared by all vendors).
 2. **Pick a SKU.** A cheap flexible shape size, for example `VM.Standard.E5.Flex.1-8`.
 3. **Start a forced run** with two quick tasks, on demand (`--tasks lscpu,stressngfull`):
 

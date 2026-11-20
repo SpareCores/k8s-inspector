@@ -21,7 +21,6 @@ from k8s_inspector.model import (
     Deadlines,
     Defaults,
     EnvConfig,
-    NodePools,
     PublishSettings,
     Settings,
     SpotSettings,
@@ -194,24 +193,8 @@ def _read(section: Mapping, path: str, table: dict) -> dict[str, Any]:
     return kwargs
 
 
-def _node_pools(value: Any, path: str) -> NodePools | None:
-    if value is None:
-        return None
-    section = _mapping(value, path)
-    kwargs = _read(
-        section,
-        path,
-        {"cpu": ("cpu", _str), "lowmem": ("lowmem", _optional(_str)), "gpu": ("gpu", _optional(_str))},
-    )
-    if "cpu" not in kwargs:
-        raise ValueError(f"missing config value {path}.cpu")
-    return NodePools(**kwargs)
-
-
 def _vendor(value: Any, path: str) -> VendorSettings:
-    section = dict(_mapping(value, path))
-    pools = _node_pools(section.pop("nodePools", None), f"{path}.nodePools")
-    return VendorSettings(node_pools=pools, **_read(section, path, _VENDOR))
+    return VendorSettings(**_read(_mapping(value, path), path, _VENDOR))
 
 
 def parse_settings(data: Mapping) -> Settings:
@@ -223,11 +206,13 @@ def parse_settings(data: Mapping) -> Settings:
         for name in ("planner", "defaults", "batching", "spot", "deadlines", "publish", "uploads")
     }
     vendors = _mapping(sections.pop("vendors", None), "vendors")
+    bench_pool = _str(sections.pop("benchPool", "bench"), "benchPool")
     for key in sections:
         log.warning("unknown config key %s (ignored)", key)
 
     return Settings(
         **_read(sub["planner"], "planner", _PLANNER),
+        bench_pool=bench_pool,
         vendors={str(name): _vendor(value, f"vendors.{name}") for name, value in vendors.items()},
         defaults=Defaults(**_read(sub["defaults"], "defaults", _DEFAULTS)),
         batching=Batching(**_read(sub["batching"], "batching", _BATCHING)),

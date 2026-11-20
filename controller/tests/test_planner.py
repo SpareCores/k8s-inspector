@@ -12,7 +12,6 @@ from k8s_inspector.model import (
     Config,
     Defaults,
     EnvConfig,
-    NodePools,
     RunPhase,
     Settings,
     VendorSettings,
@@ -206,9 +205,12 @@ def test_max_usd_per_hour_refuses_a_running_run_without_price(kube, caplog):
 
 
 def test_max_in_flight_counts_live_nodeclaims_beyond_runs(kube):
-    cfg = make_config(max_in_flight=2, node_pools=NodePools(cpu="bench-oci", lowmem="bench-oci-lowmem"))
-    claim = lambda pool: {"metadata": {"labels": {"karpenter.sh/nodepool": pool}}}  # noqa: E731
-    kube.nodeclaims = [claim("bench-oci"), claim("bench-oci-lowmem"), claim("other-pool")]
+    cfg = make_config(max_in_flight=2)
+    claim = lambda pool, vendor: {  # noqa: E731
+        "metadata": {"labels": {"karpenter.sh/nodepool": pool, "scarpenter.sparecores.com/vendor": vendor}}
+    }
+    # Two OCI claims in the shared bench pool count; another vendor's claim and another pool's claim do not.
+    kube.nodeclaims = [claim("bench", "oci"), claim("bench", "oci"), claim("bench", "aws"), claim("other-pool", "oci")]
     with pytest.raises(ValueError, match="2 of 2"):  # no run holds an anchor, two instances are still up
         planner.force_run(kube, cfg, "oci", "a")
 

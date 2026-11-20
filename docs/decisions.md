@@ -20,8 +20,8 @@ Status: **accepted** (decided by the maintainers), **open** (recommendation in b
 | K14 | Anchor implementation | accepted | `sc-run hold`, 45 min idle timeout, installs `sc-run` for the steps |
 | K15 | Unsupported GPU classes (GRID/fractional, AMD, pre-Pascal) | accepted | not benchmarked on k8s; legacy until it retires, then dropped |
 | K16 | Host-network-only bench nodes (no flannel/kube-proxy) | accepted | not adopted: keep flannel and kube-proxy. They use ~97-98 MB RSS and ~40-55 MiB cgroup working set; `Lean` leaves 1606 MiB allocatable on the real 2 GB OCI node and no 1 GiB type exists ([node profile](explanation/node-profile.md)). Re-open only if a vendor offers real 1 GiB types |
-| K17 | Instance metadata on bench nodes | accepted | `Open` on bench NodeClasses; later pass cloud facts as env and return to the default |
-| K18 | Node footprint on bench pools | accepted | `Lean` on every bench NodePool: a flat 370 MiB reservation, 153-1145 MiB more allocatable than `Standard` on 2-8 GB nodes ([node profile](explanation/node-profile.md)) |
+| K17 | Instance metadata on bench nodes | accepted | `Open` on the bench NodeClass; later pass cloud facts as env and return to the default |
+| K18 | Node footprint on the bench pool | accepted | `Lean` on the bench NodePool: a flat 370 MiB reservation, 153-1145 MiB more allocatable than `Standard` on 2-8 GB nodes ([node profile](explanation/node-profile.md)) |
 | K19 | Caps and batching | accepted | 2 in flight per vendor (GPU 1), `$/h` per vendor; hourly vendors fill ≥ 0.5 h or wait ≤ 14 d; per-second vendors ~10 min of work or ≤ 3 d |
 | K20 | Spot | accepted | spot-first with per-run and per-SKU budgets and on-demand fallback ([spot](explanation/spot.md)); SpotFirst for OCI, AWS, GCP; OnDemand elsewhere; defaults 2 attempts / 60 min lost / quarantine after 2 in 14 d |
 | K21 | Root disk | accepted | 128 GiB, 256 GiB for GPU |

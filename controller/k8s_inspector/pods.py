@@ -129,33 +129,19 @@ def _duration(value: timedelta) -> str:
 # --------------------------------------------------------------------------- rendering
 
 
-def node_pool(run: BenchmarkRun, cfg: Config, *, gpu: bool, lowmem: bool) -> str:
-    """NodePool name from `cfg.settings.vendors[vendor].node_pools` (cpu | lowmem | gpu). `ValueError` when
-    the vendor lacks the pool."""
-    vendor = run.spec.vendor
-    settings = cfg.settings.vendors.get(vendor)
-    if settings is None or settings.node_pools is None:
-        raise ValueError(f"vendor {vendor!r} has no node pools configured")
-    pools = settings.node_pools
-    kind, name = ("gpu", pools.gpu) if gpu else ("lowmem", pools.lowmem) if lowmem else ("cpu", pools.cpu)
-    if not name:
-        raise ValueError(f"vendor {vendor!r} has no {kind} node pool")
-    return name
-
-
 def render_anchor(
     run: BenchmarkRun,
     attempt: int,
     cfg: Config,
     *,
-    nodepool: str,
     capacity: Sequence[CapacityType],
     deadline_seconds: int,
     owner: OwnerRef,
 ) -> dict:
-    """The anchor Pod (objects.md "Anchor Pod"): nodeSelector (`karpenter.sh/nodepool`,
-    `node.kubernetes.io/instance-type: <vendor>.<sku>`), capacity-type node affinity from `capacity`
-    (`[spot, on-demand]` or `[on-demand]`), `do-not-disrupt`, toleration `frankenscube/bench`, container
+    """The anchor Pod (objects.md "Anchor Pod"): nodeSelector (`karpenter.sh/nodepool: <benchPool>`,
+    `node.kubernetes.io/instance-type: <vendor>.<sku>`, `scarpenter.sparecores.com/vendor: <vendor>`),
+    capacity-type node affinity from `capacity` (`[spot, on-demand]` or `[on-demand]`),
+    `do-not-disrupt`, toleration `frankenscube/bench`, container
     `hold` with `cfg.env.sc_run_image` and args `hold --install /k8si/bin --heartbeat-dir
     /k8si/runs/<run_id> --idle-timeout <deadlines.hold_idle_minutes>m`, readiness probe `/sc-run ready
     /k8si/bin`, hostPath volume, owner reference = the BenchmarkRun. `deadline_seconds` is the anchor's
@@ -181,8 +167,9 @@ def render_anchor(
             "hostNetwork": True,
             "dnsPolicy": "Default",
             "nodeSelector": {
-                "karpenter.sh/nodepool": nodepool,
+                "karpenter.sh/nodepool": cfg.settings.bench_pool,
                 "node.kubernetes.io/instance-type": f"{spec.vendor}.{spec.sku}",
+                "scarpenter.sparecores.com/vendor": spec.vendor,
             },
             "affinity": {
                 "nodeAffinity": {

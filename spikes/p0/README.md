@@ -1,7 +1,7 @@
 # P0 spike kit (OCI)
 
 Hand-written manifests, a first `sc-run` and a presign helper, to observe the mechanics listed in the
-[roadmap](../../docs/roadmap.md) P0 row on a real `bench-oci` node. Everything writes to object storage only. Nothing
+[roadmap](../../docs/roadmap.md) P0 row on a real `bench` node. Everything writes to object storage only. Nothing
 here publishes to sc-inspector-data.
 
 | File | Purpose |
@@ -175,7 +175,7 @@ For a quick check, set `--idle-timeout` to `3m` in `anchor.yaml`. To keep the no
 ```sh
 date -u +%T; kubectl -n inspector delete pod p0-anchor            # T0
 while kubectl get node $NODE >/dev/null 2>&1; do sleep 5; done; date -u +%T          # Node removed
-CLAIM=$(kubectl get nodeclaim -l karpenter.sh/nodepool=bench-oci -o name | head -1)    # taken before T0
+CLAIM=$(kubectl get nodeclaim -l karpenter.sh/nodepool=bench -o name | head -1)    # taken before T0
 while kubectl get $CLAIM >/dev/null 2>&1; do sleep 5; done; date -u +%T              # NodeClaim gone
 ```
 

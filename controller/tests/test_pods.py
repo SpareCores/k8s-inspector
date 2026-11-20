@@ -10,7 +10,6 @@ from k8s_inspector.model import (
     Config,
     Deadlines,
     EnvConfig,
-    NodePools,
     OwnerRef,
     PodRole,
     RunSpec,
@@ -27,9 +26,7 @@ OWNER = OwnerRef("v1", "Pod", "run-a1", "uid-1")
 
 @pytest.fixture
 def cfg() -> Config:
-    settings = Settings(
-        vendors={"oci": VendorSettings(enabled=True, node_pools=NodePools(cpu="bench-oci", gpu="bench-oci-gpu"))}
-    )
+    settings = Settings(vendors={"oci": VendorSettings(enabled=True)})
     env = EnvConfig(bucket="b", bucket_region="r", sc_run_image="ghcr.io/sparecores/sc-run@sha256:abc")
     return Config(env=env, settings=settings)
 
@@ -81,20 +78,12 @@ def test_names_and_labels(run):
     }
 
 
-def test_node_pool(run, cfg):
-    assert pods.node_pool(run, cfg, gpu=False, lowmem=False) == "bench-oci"
-    assert pods.node_pool(run, cfg, gpu=True, lowmem=False) == "bench-oci-gpu"
-    with pytest.raises(ValueError):
-        pods.node_pool(run, cfg, gpu=False, lowmem=True)
-
-
 def test_anchor(run, cfg):
     owner = OwnerRef("inspector.sparecores.com/v1alpha1", "BenchmarkRun", run.name, "u")
     pod = pods.render_anchor(
         run,
         1,
         cfg,
-        nodepool="bench-oci",
         capacity=[CapacityType.SPOT, CapacityType.ON_DEMAND],
         deadline_seconds=100,
         owner=owner,
@@ -103,8 +92,9 @@ def test_anchor(run, cfg):
     assert pod["metadata"]["annotations"] == {"karpenter.sh/do-not-disrupt": "true"}
     assert "blockOwnerDeletion" not in pod["metadata"]["ownerReferences"][0]
     assert spec["nodeSelector"] == {
-        "karpenter.sh/nodepool": "bench-oci",
+        "karpenter.sh/nodepool": "bench",
         "node.kubernetes.io/instance-type": "oci.VM.Standard.E5.Flex.2-16",
+        "scarpenter.sparecores.com/vendor": "oci",
     }
     expr = spec["affinity"]["nodeAffinity"]["requiredDuringSchedulingIgnoredDuringExecution"]["nodeSelectorTerms"][0]
     assert expr["matchExpressions"][0]["values"] == ["spot", "on-demand"]

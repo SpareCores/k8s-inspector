@@ -21,7 +21,6 @@ from k8s_inspector.model import (
     EnvConfig,
     ExitCode,
     NodeFacts,
-    NodePools,
     RunPhase,
     RunSpec,
     Settings,
@@ -39,7 +38,7 @@ LSCPU = json.dumps(
 
 
 def make_config(**settings) -> Config:
-    vendors = {"oci": VendorSettings(enabled=True, node_pools=NodePools(cpu="bench-oci", gpu="bench-oci-gpu"))}
+    vendors = {"oci": VendorSettings(enabled=True)}
     env = EnvConfig(bucket="b", bucket_region="r", sc_run_image="ghcr.io/sparecores/sc-run@sha256:abc")
     return Config(env=env, settings=Settings(vendors=vendors, **settings))
 
@@ -772,15 +771,6 @@ def test_pending_run_that_cannot_start_gets_its_tasks_so_the_lease_can_expire(h)
     assert [(t.name, t.state, t.exit_code, t.published) for t in run.status.tasks] == [
         ("no_such_task", TaskState.DONE, 256, True)
     ]
-
-
-def test_unplaceable_run_fills_status_tasks_before_it_fails(h):
-    h.cfg = Config(h.cfg.env, Settings(vendors={"oci": VendorSettings(enabled=True)}))
-    h.start(["membench"])
-    h.runner.reconcile(h.name)
-    run = h.run
-    assert run.status.phase == RunPhase.FAILED
-    assert h.codes()["membench"][0] == 256 and "membench" in h.storage.status
 
 
 def test_urls_too_large_for_a_secret_end_the_step_with_a_harness_error(h, monkeypatch):

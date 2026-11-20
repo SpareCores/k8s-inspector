@@ -6,7 +6,7 @@ import yaml
 
 from k8s_inspector.config import SETTINGS_KEY, load_config, load_env, load_settings, parse_settings
 from k8s_inspector.kube import NotFound
-from k8s_inspector.model import CapacityMode, NodePools, Settings, VendorSettings
+from k8s_inspector.model import CapacityMode, Settings, VendorSettings
 
 DOCS_CONFIGURATION = Path(__file__).parents[2] / "docs" / "reference" / "configuration.md"
 
@@ -94,7 +94,6 @@ def test_defaults_equal_documented_example():
             max_in_flight=2,
             max_usd_per_hour=2.0,
             capacity=CapacityMode.SPOT_FIRST,
-            node_pools=NodePools(cpu="bench-oci", lowmem="bench-oci-lowmem", gpu=None),
         )
     }
     # Everything except the example vendor equals the dataclass defaults.
@@ -107,15 +106,23 @@ def test_values_override_defaults():
             "planner": {"intervalMinutes": 10, "autoPlan": True},
             "defaults": {"maxInFlight": 3},
             "uploads": {"partMiB": 8},
-            "vendors": {"aws": {"enabled": True, "maxInFlight": 0, "nodePools": {"cpu": "bench-aws"}}},
+            "vendors": {"aws": {"enabled": True, "maxInFlight": 0}},
         }
     )
     assert settings.planner_interval_minutes == 10 and settings.auto_plan is True
     assert settings.defaults.max_in_flight == 3
     assert settings.uploads.part_mib == 8 and settings.uploads.max_parts == 64
     aws = settings.vendors["aws"]
-    assert aws.max_in_flight == 0 and aws.node_pools == NodePools(cpu="bench-aws")
+    assert aws.max_in_flight == 0
     assert aws.capacity == CapacityMode.SPOT_FIRST and not aws.publish and aws.auto_plan is None
+
+
+def test_bench_pool_defaults_and_overrides(caplog):
+    assert parse_settings({}).bench_pool == "bench"
+    assert parse_settings({"benchPool": "other"}).bench_pool == "other"
+    with caplog.at_level(logging.WARNING):
+        parse_settings({"vendors": {"oci": {"nodePools": {"cpu": "bench-oci"}}}})
+    assert "vendors.oci.nodePools" in caplog.text
 
 
 def test_unknown_keys_warn_but_load(caplog):
@@ -139,8 +146,7 @@ def test_unknown_keys_warn_but_load(caplog):
         ({"uploads": {"partMiB": 0}}, "uploads.partMiB"),
         ({"vendors": {"oci": {"capacity": "Spot"}}}, "vendors.oci.capacity"),
         ({"vendors": {"oci": {"maxUsdPerHour": "2"}}}, "vendors.oci.maxUsdPerHour"),
-        ({"vendors": {"oci": {"nodePools": {"lowmem": "x"}}}}, "vendors.oci.nodePools.cpu"),
-        ({"vendors": {"oci": {"nodePools": {"cpu": 3}}}}, "vendors.oci.nodePools.cpu"),
+        ({"benchPool": 3}, "benchPool"),
         ({"vendors": {"oci": "enabled"}}, "vendors.oci"),
         ({"spot": ["maxSpotAttempts"]}, "spot"),
     ],

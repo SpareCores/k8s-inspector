@@ -400,13 +400,6 @@ class EnvConfig:
 
 
 @dataclass(frozen=True)
-class NodePools:
-    cpu: str
-    lowmem: str | None = None
-    gpu: str | None = None
-
-
-@dataclass(frozen=True)
 class VendorSettings:
     enabled: bool = False
     auto_plan: bool | None = None  # None: inherit planner.autoPlan
@@ -414,7 +407,6 @@ class VendorSettings:
     max_usd_per_hour: float | None = None
     capacity: CapacityMode = CapacityMode.SPOT_FIRST  # same default as `RunSpec` and `crd.from_dict`
     publish: bool | tuple[str, ...] = False  # True: every SKU; a tuple: only these SKUs; False: none
-    node_pools: NodePools | None = None
 
 
 @dataclass(frozen=True)
@@ -469,6 +461,7 @@ class Settings:
 
     planner_interval_minutes: int = 5
     auto_plan: bool = False
+    bench_pool: str = "bench"  # the one NodePool every vendor shares
     vendors: dict[str, VendorSettings] = field(default_factory=dict)
     defaults: Defaults = field(default_factory=Defaults)
     batching: Batching = field(default_factory=Batching)

@@ -77,7 +77,7 @@ spec:
   enableServiceLinks: false
   hostNetwork: true
   dnsPolicy: Default
-  nodeSelector: {karpenter.sh/nodepool: bench-oci, node.kubernetes.io/instance-type: oci.VM.Standard.E5.Flex.2-16}
+  nodeSelector: {karpenter.sh/nodepool: bench, node.kubernetes.io/instance-type: oci.VM.Standard.E5.Flex.2-16, scarpenter.sparecores.com/vendor: oci}
   affinity: {nodeAffinity: {requiredDuringSchedulingIgnoredDuringExecution: {nodeSelectorTerms: [{matchExpressions:
     [{key: karpenter.sh/capacity-type, operator: In, values: [spot, on-demand]}]}]}}}
   tolerations: [{key: frankenscube/bench, operator: Exists}]

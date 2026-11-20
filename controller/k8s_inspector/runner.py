@@ -277,18 +277,18 @@ class Runner:
         namespace: str,
         *,
         clock: Callable[[], datetime] | None = None,
-        sku_shape: Callable[[str, str], tuple[bool, bool]] | None = None,
+        is_gpu: Callable[[str, str], bool] | None = None,
     ) -> None:
         """`cfg_provider`: zero-argument callable returning the current `Config` (settings are re-read from the
         ConfigMap every cycle, so a callable is passed instead of a snapshot). `clock` (tests) returns the
-        current UTC time. `sku_shape(vendor, sku) -> (gpu, lowmem)` picks the NodePool; the default is the plain
-        `cpu` pool (the planner knows the SKU, the runner does not)."""
+        current UTC time. `is_gpu(vendor, sku)` picks the GPU provisioning deadline; the default is the CPU
+        deadline (the planner knows the SKU, the runner does not)."""
         self.kube = kube
         self.storage = storage
         self.namespace = namespace
         self._cfg = cfg_provider
         self._clock = clock or (lambda: datetime.now(UTC))
-        self._sku_shape = sku_shape or (lambda vendor, sku: (False, False))
+        self._is_gpu = is_gpu or (lambda vendor, sku: False)
         self._queue: queue.Queue[str] = queue.Queue()
         self._lock = threading.Lock()
         self._queued: set[str] = set()
@@ -711,17 +711,10 @@ class Runner:
         now = self._now()
         quarantined = spot.is_quarantined(self.kube, run.spec.vendor, run.spec.sku, settings, now)
         capacity = spot.capacity_for_next_attempt(run, selected, settings, quarantined)
-        gpu, lowmem = self._sku_shape(run.spec.vendor, run.spec.sku)
-        try:
-            pool = pods.node_pool(run, cfg, gpu=gpu, lowmem=lowmem)
-        except ValueError as e:
-            self._end_run(run, ExitCode.HARNESS_ERROR, f"cannot place the run: {e}", AttemptOutcome.PROVISIONING_FAILED)
-            return
         anchor = pods.render_anchor(
             run,
             attempt,
             cfg,
-            nodepool=pool,
             capacity=capacity,
             deadline_seconds=pods.anchor_deadline_seconds(selected, cfg, run.spec.hold_after),
             owner=self._run_owner(run),
@@ -758,10 +751,9 @@ class Runner:
         claims = self._pending_claims(anchor)
         error = _claim_error(claims)
         started = self._attempt(run).start or _time(_meta(anchor).get("creationTimestamp"))
-        gpu, _ = self._sku_shape(run.spec.vendor, run.spec.sku)
         budget = (
             timedelta(hours=cfg.settings.deadlines.provision_gpu_hours)
-            if gpu
+            if self._is_gpu(run.spec.vendor, run.spec.sku)
             else timedelta(minutes=cfg.settings.deadlines.provision_cpu_minutes)
         )
         if error is None and self._now() - started > budget:

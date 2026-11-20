@@ -27,6 +27,7 @@ missing ConfigMap or an empty `config.yaml` gives the defaults, with no vendor e
 warning and ignored; an invalid value is an error and the controller keeps the last good settings.
 
 ```yaml
+benchPool: bench                 # the one NodePool every vendor's bench nodes come from
 planner:
   intervalMinutes: 5
   autoPlan: false                # true: plan from Keeper and git; false: only forced runs
@@ -38,7 +39,6 @@ vendors:
     maxUsdPerHour: 2.0           # checked before a run starts
     capacity: SpotFirst          # SpotFirst (the default) | OnDemand
     publish: false               # true, or a list of SKUs: the publisher pushes these results to sc-inspector-data
-    nodePools: {cpu: bench-oci, lowmem: bench-oci-lowmem, gpu: null}
 defaults:
   maxInFlight: 2                 # conservative default for every vendor without its own maxInFlight
 batching:                        # hourly-billed vendors: start when expected work fills enough of the billed hour
@@ -89,11 +89,11 @@ Every command logs JSON lines on stderr.
 
 ## Running instances per vendor
 
-Bench NodePools have no `limits`: the goal is to benchmark every instance type of a vendor, so there is no pool-level
+The bench NodePool has no `limits`: the goal is to benchmark every instance type of every vendor, so there is no pool-level
 size or total bound. The cap on started and running instances of a vendor is `vendors.<v>.maxInFlight`
 (default `defaults.maxInFlight`, 2; 0 pauses the vendor). The count is the larger of the runs that hold or are
 acquiring a node (Pending, Provisioning, Running, Releasing, and a Failed or Cancelled run until its anchor Pod is
-deleted) and the live NodeClaims of the vendor's bench NodePools (an instance can outlive its anchor). This is a
+deleted) and the live NodeClaims of the vendor in the bench NodePool (NodeClaims carry the label `scarpenter.sparecores.com/vendor`; an instance can outlive its anchor). This is a
 lower bound ("at least" that many instances); leftover NodeClaims without a holding run count as instances but do
 not add to the spend. It applies to forced runs; autoPlan uses the same check.
 

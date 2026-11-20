@@ -5,15 +5,16 @@
 ## Why a node per run
 
 A benchmark needs the whole machine and a clean state, so a node is never shared between runs or reused after one.
-Bench NodePools have billing retention off, and the controller checks that the anchor's node was created after the
+The bench NodePool has billing retention off, and the controller checks that the anchor's node was created after the
 anchor (otherwise it deletes the anchor and that NodeClaim and tries again; the third failed attempt ends the run).
 
 ## Anchor
 
 The anchor is the only Pod the scheduler and SCarpenter ever see for a run.
 
-- `nodeSelector`: `karpenter.sh/nodepool: bench-<vendor>[-lowmem|-gpu]` and
-  `node.kubernetes.io/instance-type: <vendor>.<sku>`, plus a `karpenter.sh/capacity-type` requirement set by the
+- `nodeSelector`: `karpenter.sh/nodepool: <benchPool>` (`bench`),
+  `node.kubernetes.io/instance-type: <vendor>.<sku>` and `scarpenter.sparecores.com/vendor: <vendor>` (so a SKU name
+  shared by two vendors cannot land on the wrong one), plus a `karpenter.sh/capacity-type` requirement set by the
   [spot strategy](spot.md).
 - It holds the node: a Running Pod keeps the node non-empty, and `karpenter.sh/do-not-disrupt: "true"` blocks
   consolidation and drift. It does **not** block spot reclaim, `expireAfter` or a manual delete.

@@ -7,8 +7,8 @@ benchmarked while Keeper's eligibility rules do not allow inspector runs on OCI 
 
 ## Before you start
 
-- The vendor is enabled in the ConfigMap `k8s-inspector` (managed by the platform) and has a bench NodePool.
-- The SKU is an instance type SCarpenter offers: `kubectl get nodepools bench-oci -o yaml` shows the pool;
+- The vendor is enabled in the ConfigMap `k8s-inspector` (managed by the platform) and has a block in the `bench` SCNodeClass.
+- The SKU is an instance type SCarpenter offers: `kubectl get nodepools bench -o yaml` shows the pool;
   the type name is the vendor's `api_reference` (for OCI flexible shapes `<shape>.<ocpus>-<gb>`).
 
 ## Steps

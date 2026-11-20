@@ -33,7 +33,7 @@ The vendors' metadata services serve each node's user-data, which holds the node
 SCarpenter lets only an allowlist of its own host units reach the metadata service; other host processes, Pods and
 hostNetwork Pods get nothing. `spec.instanceMetadata.access: Open` on an SCNodeClass lifts the restriction.
 
-On bench NodeClasses the setting is `Open` (decision K17): the resource tracker inside every benchmark image detects
+On the bench NodeClass the setting is `Open` (decision K17): the resource tracker inside every benchmark image detects
 the cloud through the metadata service, and a privileged container could read the node's disk anyway, so a restriction
 would protect nothing there. All other NodeClasses keep the default. Later the controller can pass the cloud facts to
 the tracker as environment variables, and bench nodes can return to the default.
