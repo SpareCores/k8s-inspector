@@ -70,8 +70,8 @@ uploads:
 `deadlines.provisionCpuMinutes` / `provisionGpuHours` bound the wait for a node. A SKU SCarpenter cannot offer would
 hold the vendor's slot for that whole time, so the controller ends it early: when the anchor Pod is still Pending
 with `PodScheduled` False and a message, and no NodeClaim for its vendor and SKU exists `noOfferingMinutes` after the
-attempt started (Karpenter creates one within seconds for any SKU it can launch), the remaining tasks end
-`-1 SCARPENTER_NO_OFFERING: <PodScheduled message>`. When the most recent Karpenter `FailedScheduling` Event of the anchor already has
+attempt started (Karpenter creates one within seconds for any SKU it can launch), the run ends as a temporary
+`SCARPENTER_NO_OFFERING: <PodScheduled message>` ([launch retries](../explanation/launch-retries.md); a forced run records it as `-1`). When the most recent Karpenter `FailedScheduling` Event of the anchor already has
 a `no instance type met all requirements` clause for `karpenter.sh/nodepool In [<benchPool>]` (and the attempt has no launch failure), the run ends the same way (`no instance type met all requirements for <SKU> in nodepool <benchPool>`)
 after `noOfferingFastMinutes`; this needs `list` on `events`.
 
@@ -114,9 +114,9 @@ it is due and the vendor has room. Per vendor:
    blocked by Keeper except on its allowlist, so they run only where Keeper allows them) and its
    `data/<vendor>/<sku>/schedule/<task>/meta.json` in sc-inspector-data `main` says so: no meta yet, or a
    `task_hash` different from the catalogue's (a changed task, a bumped `revision`, a `RERUN_` prefix), or a failure
-   that is retried and whose wait has passed (`-1`: 2 h, 24 h for `SCARPENTER_NO_OFFERING`, 30 days
-   for `SCARPENTER_LAUNCH_REJECTED` and `SCARPENTER_BOOT_FAILURE`, and no wait for the older metas of temporary
-   reasons; `-4`: 2 h after the first, 6 h after the second). Anything else with the current hash is
+   that is retried and whose wait has passed (`-1`: 2 h, 30 days
+   for `SCARPENTER_LAUNCH_REJECTED` and `SCARPENTER_BOOT_FAILURE`, and no wait for the metas of temporary
+   reasons, which are paced by the launch ConfigMap; `-4`: 2 h after the first, 6 h after the second). Anything else with the current hash is
    final: success, a task's own exit code above 0, `-3`, `-6`, `256` and `-5` ("exceeded retries") stay until the
    hash changes ([exit codes](exit-codes.md)). GPU tasks are dropped for a SKU whose `nvidia_smi` Keeper blocks (no
    GPU), and a SKU whose due tasks are only GPU tasks is not planned.

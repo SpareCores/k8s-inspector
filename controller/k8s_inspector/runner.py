@@ -71,7 +71,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 
-from k8s_inspector import crd, launch, pods, render, spot, steps, tasks, variant
+from k8s_inspector import crd, launch, planner, pods, render, spot, steps, tasks, variant
 from k8s_inspector.kube import AlreadyExists, Forbidden, Kube, NotFound, backoff_delay, retry_until_ok
 from k8s_inspector.model import (
     AttemptOutcome,
@@ -250,6 +250,16 @@ def _claim_error(claims: list[dict]) -> str | None:
             default = "BOOT_FAILURE" if condition["type"] == "Registered" else "ICE"
             return launch.error_message(launch.reason_of_class(message, default), message)
     return None
+
+
+def _launched_unregistered(claims: list[dict]) -> bool:
+    """A NodeClaim reached `Launched` but never `Registered`: the node was created and did not join. (A claim
+    that never launched is capacity or quota: Karpenter keeps creating new ones.)"""
+    for claim in claims:
+        conditions = {c.get("type"): c.get("status") for c in claim.get("status", {}).get("conditions") or []}
+        if conditions.get("Launched") == "True" and conditions.get("Registered") != "True":
+            return True
+    return False
 
 
 def _launch_failed_message(claim: dict) -> str | None:
@@ -742,9 +752,13 @@ class Runner:
         vendor, sku = run.spec.vendor, run.spec.sku
         if self._on_launch_failure:
             self._on_launch_failure(vendor, reason)
-        if reason not in launch.REASONS:
+        if reason in launch.PERMANENT and reason != "BOOT_FAILURE":
+            launch.clear(self.kube, vendor, [sku])
             return False
-        count = launch.record_failure(self.kube, vendor, sku, reason, self._now())
+        if reason not in launch.REASONS or run.spec.force:  # a forced run is the operator's: it records its result
+            return False
+        until = planner.offered_until(self.kube, self._cfg(), vendor, sku) if reason == "DAILY_LIMIT" else None
+        count = launch.record_failure(self.kube, vendor, sku, reason, self._now(), until)
         if reason == "BOOT_FAILURE" and count >= launch.BOOT_FAILURE_LIMIT:
             launch.clear(self.kube, vendor, [sku])
             return False
@@ -891,7 +905,7 @@ class Runner:
                 error = self._launch_error(failures[-1].message)
             else:
                 message = f"no node after {int(budget.total_seconds() // 60)} minutes"
-                error = launch.error_message("BOOT_FAILURE" if claims else "ICE", message)
+                error = launch.error_message("BOOT_FAILURE" if _launched_unregistered(claims) else "ICE", message)
         if error is None:
             return
         if on_demand_retry and pods.allows_spot(anchor):

@@ -31,9 +31,11 @@ CLASS_REASONS = {
     "InvalidOffering": "LAUNCH_REJECTED",
     "Fatal": "LAUNCH_REJECTED",
 }
-TEMPORARY = ("ICE", "QUOTA", "DAILY_LIMIT", "VENDOR")
+# NO_OFFERING (no instance type for the SKU, or an anchor nobody schedules) is usually a short SCarpenter mark.
+TEMPORARY = ("ICE", "QUOTA", "DAILY_LIMIT", "VENDOR", "NO_OFFERING")
 # Reasons of `-1` schedule metas written before the classes existed; they were temporary too.
 LEGACY_TEMPORARY = ("QUOTA_ZERO", "LAUNCH_FAILED")
+NO_NODE_MESSAGE = ": no node after "  # the old BOOT_FAILURE of a run that merely waited out its budget
 PERMANENT = ("LAUNCH_REJECTED", "BOOT_FAILURE")
 BOOT_FAILURE_LIMIT = 3  # runs that ended BOOT_FAILURE before it is final
 REASONS = (*TEMPORARY, "BOOT_FAILURE")  # the reasons an entry of the ConfigMap can have
@@ -42,20 +44,22 @@ MAX_WAIT = {
     "ICE": timedelta(hours=24),
     "QUOTA": timedelta(hours=6),
     "VENDOR": timedelta(hours=6),
+    "NO_OFFERING": timedelta(hours=6),
     "BOOT_FAILURE": timedelta(hours=6),
-    "DAILY_LIMIT": timedelta(hours=1),  # SCarpenter's offered-types mark (`until`) holds the SKU back meanwhile
+    "DAILY_LIMIT": timedelta(hours=6),  # without SCarpenter's `until`
 }
 RETRY_AFTER_PERMANENT = timedelta(days=30)
 PATCH_RETRIES = 3
 
-_CLASSIFIED = re.compile(r"^(\w+) \(([^)]*)\): ")
+# The class may be wrapped (`launching X: Retryable (RequestLimitExceeded): ...`): search for the token.
+_CLASSIFIED = re.compile(rf"\b({'|'.join(CLASS_REASONS)}) \([^)]*\): ")
 _ERROR = re.compile(r"^SCARPENTER_([A-Z_]+):")
 
 
 def reason_of_class(message: str, default: str) -> str:
-    """The reason of a NodeClaim message `<Class> (<Code>): <text>`; `default` when it has no known class
+    """The reason of a NodeClaim message containing `<Class> (<Code>): <text>`; `default` when it has no known class
     (an older SCarpenter, or a failure that is not a launch call)."""
-    found = _CLASSIFIED.match(message)
+    found = _CLASSIFIED.search(message)
     return CLASS_REASONS.get(found.group(1), default) if found else default
 
 
@@ -71,7 +75,8 @@ def reason_of_error(error_msg: str | None) -> str | None:
 
 
 def is_temporary(error_msg: str | None) -> bool:
-    return reason_of_error(error_msg) in (*TEMPORARY, *LEGACY_TEMPORARY)
+    reason = reason_of_error(error_msg)
+    return reason in (*TEMPORARY, *LEGACY_TEMPORARY) or (reason == "BOOT_FAILURE" and NO_NODE_MESSAGE in error_msg)
 
 
 def wait_after(reason: str, count: int) -> timedelta:
@@ -136,20 +141,24 @@ def _change(kube: Kube, vendor: str, mutate) -> None:
         log.warning("%s not updated", name, exc_info=True)
 
 
-def record_failure(kube: Kube, vendor: str, sku: str, reason: str, now: datetime) -> int:
-    """Count a failed launch of the SKU and set when it may be tried again. Returns the count (1 when the
-    ConfigMap could not be read: the retry is then only earlier)."""
+def record_failure(kube: Kube, vendor: str, sku: str, reason: str, now: datetime, until: datetime | None = None) -> int:
+    """Count a failed launch of the SKU (failures in a row of the same reason) and set when it may be tried again:
+    after the backoff, or at `until` (when SCarpenter says when a daily limit resets). Returns the count (1 when
+    the ConfigMap could not be read: the retry is then only earlier)."""
     count = 1
 
     def mutate(entries: dict[str, dict]) -> None:
         nonlocal count
         old = entries.get(sku) or {}
+        if old.get("reason") != reason:
+            old = {}  # a different failure starts counting again
         count = int(old.get("count", 0)) + 1
+        wait = until if until and until > now else now + wait_after(reason, count)
         entries[sku] = {
             "reason": reason,
             "since": old.get("since") or now.isoformat(),
             "count": count,
-            "next": (now + wait_after(reason, count)).isoformat(),
+            "next": wait.isoformat(),
         }
 
     _change(kube, vendor, mutate)

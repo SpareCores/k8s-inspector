@@ -218,12 +218,11 @@ class KeeperCache:
 ScheduleReader = Callable[[str], dict[str, dict[str, dict | None]]]
 
 # Wait after a failure before the task is due again (exit-codes.md "Planner retry"): a `-4` by its `start_retries`
-# (the third `-4` is `-5`, final), a `-1` flat; `NO_OFFERING` only daily, a permanent launch failure
+# (the third `-4` is `-5`, final), a `-1` flat, a permanent launch failure
 # (`launch.PERMANENT`) after 30 days. A `-1` of a temporary reason (`launch.is_temporary`; no longer written, but
 # older metas have them) is ignored: the launch ConfigMap and SCarpenter's offered-types marks pace the retries.
 RETRY_AFTER_NEVER_FINISHED = (timedelta(hours=2), timedelta(hours=6))
 RETRY_AFTER_NO_NODE = timedelta(hours=2)
-RETRY_AFTER_NO_NODE_DAILY = timedelta(hours=24)
 GPU_PROBE_TASK = "nvidia_smi"  # Keeper blocks it for a SKU without an NVIDIA GPU
 
 
@@ -245,10 +244,7 @@ def due_reason(task: TaskDef, meta: dict | None, now: datetime) -> str | None:
         if launch.is_temporary(error_msg):
             return "temporary launch failure"
         reason = launch.reason_of_error(error_msg)
-        if reason in launch.PERMANENT:
-            wait = launch.RETRY_AFTER_PERMANENT
-        else:
-            wait = RETRY_AFTER_NO_NODE_DAILY if reason == "NO_OFFERING" else RETRY_AFTER_NO_NODE
+        wait = launch.RETRY_AFTER_PERMANENT if reason in launch.PERMANENT else RETRY_AFTER_NO_NODE
     elif code == ExitCode.NEVER_FINISHED:
         retries = min(max(int(meta.get("start_retries") or 1), 1), len(RETRY_AFTER_NEVER_FINISHED))
         wait = RETRY_AFTER_NEVER_FINISHED[retries - 1]
@@ -270,6 +266,22 @@ def _mark_expired(until: str | None, now: datetime) -> bool:
         return datetime.fromisoformat(until or "") <= now
     except ValueError, TypeError:
         return False
+
+
+def offered_until(kube: Kube, cfg: Config, vendor: str, sku: str) -> datetime | None:
+    """The `until` SCarpenter's offered-types ConfigMap puts on the SKU's marked offering, else None (also when
+    the ConfigMap is absent or unreadable)."""
+    name = f"scarpenter-offered-{cfg.settings.bench_class}-{vendor}"
+    try:
+        data = json.loads(kube.get_configmap_in(SCARPENTER_NAMESPACE, name)["data"]["types.json"])
+        untils = [
+            datetime.fromisoformat(entry["until"])
+            for entry in data["types"].values()
+            if entry.get("apiReference") == sku and entry.get("until")
+        ]
+        return max((u for u in untils if u.tzinfo), default=None)
+    except Exception:
+        return None
 
 
 def not_offered(kube: Kube, cfg: Config, vendor: str, skus: list[str]) -> dict[str, str]:

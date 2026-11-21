@@ -24,7 +24,8 @@ NOW = datetime(2026, 11, 20, 10, 0, tzinfo=UTC)
         ("no node after 60 minutes", "BOOT_FAILURE", "BOOT_FAILURE"),
         ("SomethingNew (X): y", "ICE", "ICE"),
         ("Fatal (): y", "ICE", "LAUNCH_REJECTED"),
-        ("launch said Fatal (X): y", "ICE", "ICE"),
+        ("launching X: Retryable (RequestLimitExceeded): slow", "ICE", "VENDOR"),  # wrapped
+        ("QuotaExceededX (X): y", "ICE", "ICE"),
         ("", "ICE", "ICE"),
     ],
 )
@@ -39,12 +40,13 @@ def test_error_message_round_trip_and_temporary_reasons():
     assert launch.reason_of_error(None) is None
     temporary = [
         r
-        for r in ("ICE", "QUOTA", "DAILY_LIMIT", "VENDOR", "QUOTA_ZERO", "LAUNCH_FAILED")
+        for r in ("ICE", "QUOTA", "DAILY_LIMIT", "VENDOR", "NO_OFFERING", "QUOTA_ZERO", "LAUNCH_FAILED")
         if launch.is_temporary(f"SCARPENTER_{r}: x")
     ]
-    assert len(temporary) == 6
-    for reason in ("LAUNCH_REJECTED", "BOOT_FAILURE", "NO_OFFERING"):
+    assert len(temporary) == 7
+    for reason in ("LAUNCH_REJECTED", "BOOT_FAILURE"):
         assert not launch.is_temporary(f"SCARPENTER_{reason}: x")
+    assert launch.is_temporary("SCARPENTER_BOOT_FAILURE: no node after 60 minutes")  # older runs that only waited
     assert not launch.is_temporary(None)
 
 
@@ -54,7 +56,8 @@ def test_error_message_round_trip_and_temporary_reasons():
         ("ICE", [1, 2, 4, 8, 16, 24, 24, 24]),  # never gives up
         ("QUOTA", [1, 2, 4, 6, 6]),
         ("VENDOR", [1, 2, 4, 6]),
-        ("DAILY_LIMIT", [1, 1, 1]),
+        ("NO_OFFERING", [1, 2, 4, 6]),
+        ("DAILY_LIMIT", [1, 2, 4, 6, 6]),
     ],
 )
 def test_backoff_doubles_to_the_cap_of_the_reason(reason, waits):
@@ -106,3 +109,15 @@ def test_a_damaged_configmap_means_no_entries_and_is_repaired():
     assert launch.read(kube, "oci") == {}
     assert launch.deferred(kube, "oci", ["a"], NOW) == set()
     assert launch.record_failure(kube, "oci", "a", "ICE", NOW) == 1
+
+
+def test_a_different_reason_restarts_the_count_and_until_sets_next():
+    kube = FakeKube(Clock(NOW))
+    assert launch.record_failure(kube, "oci", "a", "ICE", NOW) == 1
+    assert launch.record_failure(kube, "oci", "a", "ICE", NOW) == 2
+    assert launch.record_failure(kube, "oci", "a", "BOOT_FAILURE", NOW) == 1
+    until = NOW + timedelta(hours=9)
+    launch.record_failure(kube, "oci", "b", "DAILY_LIMIT", NOW, until)
+    assert launch.read(kube, "oci")["b"]["next"] == until.isoformat()
+    launch.record_failure(kube, "oci", "b", "DAILY_LIMIT", NOW, NOW - timedelta(hours=1))  # a past `until` is ignored
+    assert launch.read(kube, "oci")["b"]["next"] == (NOW + timedelta(hours=2)).isoformat()

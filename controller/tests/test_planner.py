@@ -413,10 +413,9 @@ def test_exit_code_minus_5_is_final_until_the_hash_changes(kube, keeper_skus):
         # a temporary reason is ignored: the launch ConfigMap paces the retries
         *[
             ({"code": -1, "error_msg": f"SCARPENTER_{reason}: x"}, timedelta(minutes=1), True)
-            for reason in ("ICE", "QUOTA", "DAILY_LIMIT", "VENDOR", "QUOTA_ZERO", "LAUNCH_FAILED")
+            for reason in ("ICE", "QUOTA", "DAILY_LIMIT", "VENDOR", "NO_OFFERING", "QUOTA_ZERO", "LAUNCH_FAILED")
         ],
-        ({"code": -1, "error_msg": "SCARPENTER_NO_OFFERING: none"}, timedelta(hours=3), False),
-        ({"code": -1, "error_msg": "SCARPENTER_NO_OFFERING: none"}, timedelta(hours=25), True),
+        ({"code": -1, "error_msg": "SCARPENTER_BOOT_FAILURE: no node after 60 minutes"}, timedelta(minutes=1), True),
         # permanent: final for 30 days
         ({"code": -1, "error_msg": "SCARPENTER_LAUNCH_REJECTED: Fatal (X): y"}, timedelta(days=29), False),
         ({"code": -1, "error_msg": "SCARPENTER_LAUNCH_REJECTED: Fatal (X): y"}, timedelta(days=31), True),
