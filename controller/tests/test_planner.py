@@ -673,8 +673,9 @@ def test_offered_types_on_demand_mode_needs_an_on_demand_offering(kube, keeper_s
         {"data": {"types.json": json.dumps({"generatedAt": "now", "truncated": False, "types": {}})}},
         offered_configmap({"s1": QUOTA}, naive_time=True),
         offered_configmap({"s1": {"available": True, "capacityTypes": None}}),
+        offered_configmap({"s1": {"available": True, "capacityTypes": ["spot"], "offerings": None}}),
     ],
-    ids=["absent", "stale", "bad-json", "no-key", "bad-time", "naive-time", "null-capacity-types"],
+    ids=["absent", "stale", "bad-json", "no-key", "bad-time", "naive-time", "null-capacity-types", "null-offerings"],
 )
 def test_offered_types_unusable_configmap_filters_nothing(kube, keeper_skus, caplog, configmap):
     if configmap:
@@ -752,13 +753,6 @@ def test_a_sku_waiting_for_its_launch_retry_is_skipped_until_next(kube, keeper_s
     assert planned_skus(kube) == ["s1"]
 
 
-def test_entries_of_skus_keeper_no_longer_lists_are_pruned(kube, keeper_skus):
-    launch.record_failure(kube, "oci", "gone", "ICE", NOW)
-    launch.record_failure(kube, "oci", "s1", "ICE", NOW)
-    planned_skus(kube)
-    assert set(launch.read(kube, "oci")) == {"s1"}
-
-
 def test_a_stale_temporary_meta_does_not_block_and_a_current_permanent_one_does(kube, keeper_skus):
     keeper_skus["oci"]["s1"] = {"stressnglongrun": ["x"]}
     old = done_meta("lscpu", ago=timedelta(minutes=5), code=-1, error_msg="SCARPENTER_ICE: x")
@@ -767,26 +761,86 @@ def test_a_stale_temporary_meta_does_not_block_and_a_current_permanent_one_does(
     assert plan(kube, auto_config(), {"s1": all_done(lscpu=rejected)}) == []
 
 
-def test_a_marked_offering_is_skipped_until_its_until(kube, keeper_skus):
-    marked = {**QUOTA, "reason": "DailyLimit", "until": (NOW + timedelta(hours=3)).isoformat()}
-    publish_offered(kube, offered_configmap({"s1": {**marked, "capacityTypes": ["on-demand"]}}))
-    assert planned_skus(kube) == []
-    expired = {**marked, "until": (NOW - timedelta(minutes=1)).isoformat(), "capacityTypes": ["on-demand"]}
-    publish_offered(kube, offered_configmap({"s1": expired}))
-    assert planned_skus(kube) == ["s1"]
-    broken = {**marked, "until": "tomorrow", "capacityTypes": ["on-demand"]}  # tolerated: stays marked
-    publish_offered(kube, offered_configmap({"s1": broken}))
-    assert planned_skus(kube) == []
+# An unavailable type as SCarpenter writes it when launch errors marked its offerings (scarpenter
+# pkg/controllers/offered/listing_test.go): `until` is per offering, the entry itself has none.
+MARKED = {
+    "available": False,
+    "capacityTypes": [],
+    "reason": "UnavailableCache",
+    "detail": "QuotaExceeded until 2026-11-21T10:05:00Z",
+    "offerings": [
+        {"capacityType": "on-demand", "zones": ["z5"], "available": True},
+        {"capacityType": "on-demand", "zones": ["z3"], "available": False, "reason": "DailyLimit",
+         "until": "2026-11-22T00:00:00Z"},
+        {"capacityType": "on-demand", "zones": ["z1", "z2"], "available": False, "reason": "QuotaExceeded",
+         "until": "2026-11-21T10:05:00Z"},
+    ],
+}  # fmt: skip
 
 
-@pytest.mark.parametrize("reason", ["InsufficientCapacity", "QuotaExceeded", "DailyLimit", "UnavailableCache"])
-def test_marked_offerings_of_every_class_are_skipped_until_their_until(kube, keeper_skus, reason):
-    """SCarpenter marks a group with `reason` = the class (`UnavailableCache` in older versions) and `until`."""
-    entry = {"available": False, "reason": reason, "until": (NOW + timedelta(minutes=5)).strftime("%Y-%m-%dT%H:%M:%SZ")}
-    publish_offered(kube, offered_configmap({"s1": {**entry, "capacityTypes": ["on-demand"]}}))
-    assert planned_skus(kube) == []
-    past = (NOW - timedelta(minutes=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
-    publish_offered(kube, offered_configmap({"s1": {**entry, "until": past, "capacityTypes": ["on-demand"]}}))
+def test_a_marked_sku_is_skipped_whatever_its_until(kube, keeper_skus, caplog):
+    for until in ("2099-01-01T00:00:00Z", "2000-01-01T00:00:00Z", "tomorrow"):  # SCarpenter drops an expired mark
+        offerings = [{**o, "until": until} if "until" in o else o for o in MARKED["offerings"]]
+        publish_offered(kube, offered_configmap({"s1": {**MARKED, "offerings": offerings}}))
+        with caplog.at_level("INFO"):
+            assert planned_skus(kube) == []
+        assert "e.g. s1 (UnavailableCache)" in caplog.text
+
+
+def test_offered_until_is_the_latest_until_of_the_unavailable_offerings(kube):
+    cfg = make_config()
+    publish_offered(kube, offered_configmap({"s1": MARKED}))
+    assert planner.offered_until(kube, cfg, "oci", "s1") == datetime(2026, 11, 22, tzinfo=UTC)
+    assert planner.offered_until(kube, cfg, "oci", "other") is None
+    publish_offered(kube, offered_configmap({"s1": OFFERED}))
+    assert planner.offered_until(kube, cfg, "oci", "s1") is None  # nothing marked
+    # an until of an available offering, a damaged one and one without timezone are ignored
+    offerings = [
+        {"capacityType": "spot", "zones": ["z"], "available": True, "until": "2099-01-01T00:00:00Z"},
+        {"capacityType": "spot", "zones": ["z"], "available": False, "until": "tomorrow"},
+        {"capacityType": "spot", "zones": ["z"], "available": False, "until": "2099-01-01T00:00:00"},
+        {"capacityType": "spot", "zones": ["z"], "available": False, "until": None},
+        {"capacityType": "spot", "zones": ["z"], "available": False, "until": "2026-11-21T10:05:00+01:00"},
+    ]
+    publish_offered(kube, offered_configmap({"s1": {**QUOTA, "offerings": offerings}}))
+    assert planner.offered_until(kube, cfg, "oci", "s1") == datetime(2026, 11, 21, 9, 5, tzinfo=UTC)
+
+
+def test_offered_until_has_the_checks_of_not_offered(kube):
+    cfg = make_config()
+    for configmap in (
+        None,
+        offered_configmap({"s1": MARKED}, age=timedelta(minutes=31)),  # stale
+        offered_configmap({"s1": MARKED}, naive_time=True),
+        {"data": {"types.json": "{not json"}},
+        offered_configmap({"s1": {**MARKED, "capacityTypes": None}}),
+    ):
+        if configmap:
+            publish_offered(kube, configmap)
+        assert planner.offered_until(kube, cfg, "oci", "s1") is None
+
+
+@pytest.mark.parametrize("reason", ["InsufficientCapacity", "QuotaExceeded", "DailyLimit", "ZoneUnusable"])
+def test_marked_offerings_of_every_class_are_skipped(kube, keeper_skus, reason):
+    """SCarpenter marks an offering with `reason` = the launch-error class and `until`: the SKU is unavailable."""
+    mark = {"capacityType": "on-demand", "zones": ["z1"], "available": False, "reason": reason}
+    for offering in (mark, {**mark, "until": "2026-11-22T00:00:00Z"}):  # an older SCarpenter writes no `until`
+        publish_offered(kube, offered_configmap({"s1": {**QUOTA, "offerings": [offering]}}))
+        assert planned_skus(kube) == []
+
+
+def test_a_damaged_launch_configmap_stops_no_vendor_and_a_dry_run_prunes_nothing(kube, keeper_skus):
+    launch.record_failure(kube, "oci", "gone", "ICE", NOW)
     assert planned_skus(kube) == ["s1"]
-    publish_offered(kube, offered_configmap({"s1": {k: v for k, v in entry.items() if k != "until"}}))
-    assert planned_skus(kube) == []  # an old SCarpenter writes no `until`: the mark holds
+    assert set(launch.read(kube, "oci")) == {"gone"}  # a dry run leaves the entry of a SKU Keeper does not list
+    for skus in (["s1"], {"s1": {"next": 5}, "x": None}):
+        kube.configmaps["k8s-inspector-launch-oci"]["data"]["skus"] = json.dumps(skus)
+        assert planned_skus(kube) == ["s1"]
+    assert [p.sku for p in plan(kube, auto_config(), {})] == ["s1"]
+
+
+def test_a_live_cycle_prunes_the_skus_keeper_no_longer_lists(kube, keeper_skus):
+    launch.record_failure(kube, "oci", "gone", "ICE", NOW)
+    launch.record_failure(kube, "oci", "s1", "ICE", NOW)
+    plan(kube, auto_config(), {})
+    assert set(launch.read(kube, "oci")) == {"s1"}

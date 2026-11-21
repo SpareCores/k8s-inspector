@@ -120,8 +120,8 @@ it is due and the vendor has room. Per vendor:
    final: success, a task's own exit code above 0, `-3`, `-6`, `256` and `-5` ("exceeded retries") stay until the
    hash changes ([exit codes](exit-codes.md)). GPU tasks are dropped for a SKU whose `nvidia_smi` Keeper blocks (no
    GPU), and a SKU whose due tasks are only GPU tasks is not planned.
-   A SKU waiting in the launch ConfigMap (`next` ahead) or marked unavailable in SCarpenter's offered-types
-   ConfigMap (`until` ahead) is skipped ([launch retries](../explanation/launch-retries.md)).
+   A SKU waiting in the launch ConfigMap (`next` ahead) or unavailable in SCarpenter's offered-types ConfigMap is
+   skipped ([launch retries](../explanation/launch-retries.md), [Offered types](#offered-types)).
 5. The first SKU in that order with at least one due task gets a run with exactly those tasks (not forced:
    Keeper's rules were applied). Then the caps are checked again; below them the next SKU follows.
 
@@ -138,13 +138,19 @@ cycle autoPlan reads it (the controller may `get` only the ConfigMaps named in `
 SKU, matched by the entry's `apiReference` (entries without one are ignored; of two with the same one the available
 wins), when:
 
-- its entry is missing or `available` is false (e.g. a tenancy quota), or
+- its entry is missing or `available` is false (e.g. a tenancy quota, or an offering SCarpenter marked after a launch
+  error), or
 - the entry has `available: true` but no `capacityTypes`, or
 - the vendor's `capacity` is `OnDemand` and `on-demand` is not in the entry's `capacityTypes` (`SpotFirst` takes
   either type).
 
 One info line per vendor and cycle gives the count and a few examples with SCarpenter's `reason`. Such SKUs would
-only end in `-1 SCARPENTER_NO_OFFERING` after the fail-fast wait.
+only end in a `NO_OFFERING` launch failure after the fail-fast wait.
+
+Every `available: false` entry is skipped; SCarpenter rewrites the entry when a mark expires. The `reason` and
+`offerings[].until` (RFC3339) of an offering that a launch error marked (for example `DailyLimit`, until the next
+00:00 UTC) do not change that: the `until` of a SKU, the latest among its unavailable offerings, only sets how long
+the [launch backoff](../explanation/launch-retries.md#temporary-failure) of a `DAILY_LIMIT` failure waits.
 
 The filter fails open: a ConfigMap that is absent (the vendor is not opted in), unreadable, malformed or stale
 (`generatedAt` older than 30 minutes) filters nothing, and the cycle logs why. In a ConfigMap with `truncated: true`

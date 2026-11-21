@@ -1,3 +1,4 @@
+import json
 import urllib.error
 import urllib.request
 from datetime import UTC, datetime, timedelta
@@ -224,3 +225,19 @@ def test_launch_gauges_and_failure_counter():
     assert 'k8s_inspector_launch_blocked{reason="DAILY_LIMIT",vendor="aws"} 0' in text
     assert 'k8s_inspector_launch_failures_total{reason="ICE",vendor="oci"} 2' in text
     assert 'k8s_inspector_launch_failures_total{reason="OTHER",vendor="aws"} 1' in text
+
+
+def test_launch_gauges_survive_a_damaged_launch_configmap():
+    from fakes import Clock, FakeKube
+
+    from k8s_inspector import launch
+
+    kube = FakeKube(Clock(NOW))
+    launch.record_failure(kube, "oci", "a", "ICE", NOW)
+    for skus in (
+        '["a"]',
+        json.dumps({"a": {"reason": ["ICE"], "next": 5}, "b": "x", "c": {"reason": "ICE", "next": None}}),
+    ):
+        kube.merge_patch("configmap", "k8s-inspector-launch-oci", {"data": {"skus": skus}})
+        text = Metrics(kube, lambda: SETTINGS, clock=lambda: NOW).render()
+        assert 'k8s_inspector_launch_blocked{reason="ICE",vendor="oci"} 0' in text

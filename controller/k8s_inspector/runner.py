@@ -108,7 +108,6 @@ EXTRA_ATTEMPTS = 2  # attempts beyond `max_spot_attempts` (the on-demand one plu
 MAX_LAUNCH_FAILURES = 2  # distinct NodeClaims that failed to launch in one attempt before the run gives up
 SPOT_FALLBACK_ERRORS = (
     "SCARPENTER_LAUNCH_REJECTED",
-    "SCARPENTER_LAUNCH_FAILED",
     "SCARPENTER_BOOT_FAILURE",
 )  # a spot attempt ending so goes on-demand (not a capacity error: those wait, or end as ICE or quota)
 MAX_LAUNCH_FAILURES_KEPT = 5  # entries of `status.launchFailures`
