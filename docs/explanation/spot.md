@@ -39,8 +39,9 @@ classification exact and the flush complete.
 1. **Per-task results are durable.** Each task's outputs and `status.json` are confirmed in object storage before the
    next task starts ([output pipeline](outputs.md)).
 2. **Resume, do not restart.** After an interruption the same `BenchmarkRun` starts a new attempt (new anchor, new
-   node) with only the remaining tasks. The probe step runs again on every attempt (it is short); if the new node is a
-   different hardware variant, the due tasks are re-evaluated against that variant, as sc-inspector does.
+   node) with only the remaining tasks. The probe step runs again on every attempt (it is short). A done task stays done,
+   even when the new node is a different hardware variant: the tasks left run on the new node, and each result is
+   filed under the variant of the `lscpu` output of the attempt that ran it ([publishing](outputs.md#publishing-to-git)).
 3. **Per-run spot budget.** A run allows spot for at most `maxSpotAttempts` (default 2) interrupted attempts and
    `maxLostMinutes` (default 60) of lost task time. When either is exceeded, the next attempt requires `on-demand`.
 4. **Per-SKU memory.** The controller keeps per-SKU interruption counts in the ConfigMap `k8s-inspector-spot`. A SKU
