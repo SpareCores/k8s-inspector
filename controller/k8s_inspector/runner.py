@@ -756,7 +756,9 @@ class Runner:
             return False
         if reason not in launch.REASONS or run.spec.force:  # a forced run is the operator's: it records its result
             return False
-        until = planner.offered_until(self.kube, self._cfg(), vendor, sku) if reason == "DAILY_LIMIT" else None
+        until = (
+            planner.offered_until(self.kube, self._cfg(), vendor, sku, self._now()) if reason == "DAILY_LIMIT" else None
+        )
         count = launch.record_failure(self.kube, vendor, sku, reason, self._now(), until)
         if reason == "BOOT_FAILURE" and count >= launch.BOOT_FAILURE_LIMIT:
             launch.clear(self.kube, vendor, [sku])

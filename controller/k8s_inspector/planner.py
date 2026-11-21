@@ -273,11 +273,14 @@ def _until(offerings: list) -> datetime | None:
     return max(untils, default=None)
 
 
-def read_offered(kube: Kube, cfg: Config, vendor: str) -> tuple[dict[str, dict], bool] | None:
+def read_offered(
+    kube: Kube, cfg: Config, vendor: str, now: datetime | None = None
+) -> tuple[dict[str, dict], bool] | None:
     """The usable content of SCarpenter's offered-types ConfigMap `scarpenter-offered-<benchClass>-<vendor>` in
     `SCARPENTER_NAMESPACE`: `({apiReference: entry}, truncated)`, where an entry is `{available, capacityTypes, reason,
     until}` and `until` is the latest of its unavailable offerings (`offerings[].until`, else None). Entries without
-    an `apiReference` are ignored; of two with the same one the available wins.
+    an `apiReference` are ignored; of two with the same one the available wins and `until` is the latest of both.
+    `now` (default the current time) judges staleness.
 
     None (fail open, the reason is logged) when the ConfigMap is absent, unreadable, malformed or stale
     (`generatedAt` missing, without timezone or older than `OFFERED_MAX_AGE`), or has a malformed entry."""
@@ -293,31 +296,39 @@ def read_offered(kube: Kube, cfg: Config, vendor: str) -> tuple[dict[str, dict],
             api_reference = entry.get("apiReference")
             if not api_reference:
                 continue
-            available, capacity_types, offerings = entry["available"], entry["capacityTypes"], entry["offerings"]
+            available, capacity_types, offerings = (
+                entry["available"],
+                entry["capacityTypes"],
+                entry.get("offerings", []),
+            )
             if not (isinstance(available, bool) and isinstance(capacity_types, list) and isinstance(offerings, list)):
                 raise ValueError(f"malformed entry for {api_reference!r}")
-            if api_reference not in entries or (available and not entries[api_reference]["available"]):
-                entries[api_reference] = {
+            old = entries.get(api_reference)
+            untils = [u for u in (old and old["until"], _until(offerings)) if u]
+            if old is None or (available and not old["available"]):
+                entries[api_reference] = old = {
                     "available": available,
                     "capacityTypes": capacity_types,
                     "reason": entry.get("reason", "unavailable"),
-                    "until": _until(offerings),
                 }
+            old["until"] = max(untils, default=None)
     except NotFound:
-        log.debug("autoPlan does not filter vendor %s: ConfigMap %s not found", vendor, name)
+        log.debug("offered types of vendor %s unusable: ConfigMap %s not found", vendor, name)
         return None
     except Exception as e:  # unreadable, bad JSON or a missing key: one reason, fail open
-        log.warning("autoPlan does not filter vendor %s: cannot use ConfigMap %s: %r", vendor, name, e)
+        log.warning("offered types of vendor %s unusable: cannot use ConfigMap %s: %r", vendor, name, e)
         return None
-    if datetime.now(UTC) - generated > OFFERED_MAX_AGE:
-        log.warning("autoPlan does not filter vendor %s: ConfigMap %s is stale (generated %s)", vendor, name, generated)
+    if (now or datetime.now(UTC)) - generated > OFFERED_MAX_AGE:
+        log.warning(
+            "offered types of vendor %s unusable: ConfigMap %s is stale (generated %s)", vendor, name, generated
+        )
         return None
     return entries, truncated
 
 
-def offered_until(kube: Kube, cfg: Config, vendor: str, sku: str) -> datetime | None:
+def offered_until(kube: Kube, cfg: Config, vendor: str, sku: str, now: datetime | None = None) -> datetime | None:
     """When SCarpenter's marks on the SKU's unavailable offerings expire (`read_offered`), else None."""
-    offered = read_offered(kube, cfg, vendor)
+    offered = read_offered(kube, cfg, vendor, now)
     return offered[0].get(sku, {}).get("until") if offered else None
 
 
@@ -450,9 +461,16 @@ def plan_cycle(
             for task in server_tasks:
                 if task.name in blocked[vendor][sku] or (task.gpu and no_gpu):
                     continue
-                reason = due_reason(task, metas.get(sku, {}).get(task.name), now)
+                try:
+                    reason = due_reason(task, metas.get(sku, {}).get(task.name), now)
+                except AttributeError, TypeError, ValueError:  # a damaged meta.json field: unreadable, skip the SKU
+                    log.warning("autoPlan skips %s/%s: damaged schedule/%s/meta.json", vendor, sku, task.name)
+                    due = None
+                    break
                 if reason:
                     due[task.name] = reason
+            if due is None:
+                continue
             if all(tasks.get_task(name).gpu for name in due):  # nothing due, or only GPU tasks
                 continue
             if not dry_run:

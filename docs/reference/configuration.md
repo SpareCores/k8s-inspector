@@ -138,8 +138,8 @@ cycle autoPlan reads it (the controller may `get` only the ConfigMaps named in `
 SKU, matched by the entry's `apiReference` (entries without one are ignored; of two with the same one the available
 wins), when:
 
-- its entry is missing or `available` is false (e.g. a tenancy quota, or an offering SCarpenter marked after a launch
-  error), or
+- its entry is missing or `available` is false (e.g. a tenancy quota; a type is unavailable only when SCarpenter has
+  marked or left out all of its offerings), or
 - the entry has `available: true` but no `capacityTypes`, or
 - the vendor's `capacity` is `OnDemand` and `on-demand` is not in the entry's `capacityTypes` (`SpotFirst` takes
   either type).

@@ -72,6 +72,11 @@ def test_backoff_doubles_to_the_cap_of_the_reason(reason, waits):
     assert [launch.wait_after(reason, n) for n in range(1, len(waits) + 1)] == [timedelta(hours=h) for h in waits]
 
 
+def test_backoff_does_not_overflow_for_a_huge_count():
+    assert launch.wait_after("ICE", 100) == timedelta(hours=24)
+    assert launch.wait_after("QUOTA", 10**6) == timedelta(hours=6)
+
+
 def test_failures_are_counted_per_sku_and_set_next():
     kube = FakeKube(Clock(NOW))
     assert launch.read(kube, "oci") == {}

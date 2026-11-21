@@ -1862,9 +1862,9 @@ def test_a_forced_run_records_its_temporary_failure(h):
 
 
 def test_a_daily_limit_waits_until_the_offered_until(h):
-    until = datetime.now(UTC) + timedelta(hours=9)  # the parser judges staleness by the real clock
+    until = h.clock.now + timedelta(hours=9)
     document = {
-        "generatedAt": datetime.now(UTC).isoformat(),
+        "generatedAt": h.clock.now.isoformat(),
         "truncated": False,
         "types": {
             "oci.x": {

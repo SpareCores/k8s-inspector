@@ -85,7 +85,7 @@ def wait_after(reason: str, count: int) -> timedelta:
     """Wait before the SKU is launched again after its `count`-th failure in a row."""
     if reason == "NO_OFFERING":
         return NO_OFFERING_WAIT
-    return min(timedelta(hours=2 ** (count - 1)), MAX_WAIT[reason])
+    return min(timedelta(hours=2 ** min(count - 1, 10)), MAX_WAIT[reason])
 
 
 # ----------------------------------------------------------------------------- the ConfigMap
