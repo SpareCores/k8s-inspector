@@ -36,15 +36,18 @@ until `next`. The count is of failures in a row with the same reason (another re
 | Reason | Cap |
 |---|---|
 | `ICE` | 24 h, never gives up |
-| `QUOTA`, `VENDOR`, `NO_OFFERING`, `BOOT_FAILURE` | 6 h |
-| `DAILY_LIMIT` | `next` is the `until` of SCarpenter's offered-types entry when it has one (the vendor's reset), else 6 h |
+| `QUOTA`, `VENDOR`, `BOOT_FAILURE` | 6 h |
+| `NO_OFFERING` | 24 h at once (no doubling): where the offered-types filter fails open nothing else stops the retries |
+| `DAILY_LIMIT` | `next` is the SKU's `until` in SCarpenter's offered-types ConfigMap when it has one (the vendor's reset), else 6 h |
 
 SCarpenter's own short marks handle the fast path; this wait only bounds how often a failing SKU is tried. An entry
 is removed when a node of the SKU is ready, or when the SKU is no longer in Keeper's ACTIVE list (the planner
 prunes). Losing the ConfigMap only means an earlier retry.
 
-The planner also skips a SKU whose offered-types entry is unavailable with an `until` still ahead; an `until` that
-has passed is ignored, a missing or unreadable one changes nothing.
+The planner also skips a SKU that SCarpenter's offered-types ConfigMap lists as unavailable; the rules, and where
+`until` comes from, are in [Offered types](../reference/configuration.md#offered-types). A damaged launch ConfigMap
+(not a JSON object, entries that are not objects, a `next` that is not a timezone-aware time) is treated as having no
+such entries. `k8s-inspector plan --dry-run` reads it but never prunes it.
 
 ## Permanent failure
 

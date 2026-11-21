@@ -1866,7 +1866,30 @@ def test_a_daily_limit_waits_until_the_offered_until(h):
     document = {
         "generatedAt": h.clock.now.isoformat(),
         "truncated": False,
-        "types": {"oci.x": {"apiReference": "VM.Standard.E5.Flex.2-16", "until": until.isoformat()}},
+        "types": {
+            "oci.x": {
+                "apiReference": "VM.Standard.E5.Flex.2-16",
+                "available": False,
+                "capacityTypes": [],
+                "reason": "UnavailableCache",
+                "offerings": [
+                    {
+                        "capacityType": "on-demand",
+                        "zones": ["z1"],
+                        "available": False,
+                        "reason": "QuotaExceeded",
+                        "until": (until - timedelta(hours=8)).isoformat(),
+                    },
+                    {
+                        "capacityType": "on-demand",
+                        "zones": ["z2"],
+                        "available": False,
+                        "reason": "DailyLimit",
+                        "until": until.isoformat(),
+                    },
+                ],
+            }
+        },
     }
     h.kube.objects["configmap/scarpenter-system"] = {
         "scarpenter-offered-bench-oci": {

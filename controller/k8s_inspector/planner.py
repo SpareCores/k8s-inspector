@@ -259,89 +259,109 @@ SCARPENTER_NAMESPACE = "scarpenter-system"  # keep in sync with deploy/controlle
 OFFERED_MAX_AGE = timedelta(minutes=30)  # an older offered-types ConfigMap is stale: SCarpenter stopped writing it
 
 
-def _mark_expired(until: str | None, now: datetime) -> bool:
-    """The `until` (RFC3339) of a marked offering has passed. Absent, damaged or without timezone: not expired
-    (an older SCarpenter writes none)."""
-    try:
-        return datetime.fromisoformat(until or "") <= now
-    except ValueError, TypeError:
-        return False
+def _until(offerings: list) -> datetime | None:
+    """The latest `until` (RFC3339, with timezone) among the unavailable offerings. An absent, damaged or
+    timezone-less one is ignored (an older SCarpenter writes none)."""
+    untils = []
+    for offering in offerings:
+        try:
+            until = datetime.fromisoformat(offering["until"])
+        except KeyError, TypeError, ValueError:
+            continue
+        if until.tzinfo and not offering.get("available"):
+            untils.append(until)
+    return max(untils, default=None)
 
 
-def offered_until(kube: Kube, cfg: Config, vendor: str, sku: str) -> datetime | None:
-    """The `until` SCarpenter's offered-types ConfigMap puts on the SKU's marked offering, else None (also when
-    the ConfigMap is absent or unreadable)."""
+def read_offered(
+    kube: Kube, cfg: Config, vendor: str, now: datetime | None = None
+) -> tuple[dict[str, dict], bool] | None:
+    """The usable content of SCarpenter's offered-types ConfigMap `scarpenter-offered-<benchClass>-<vendor>` in
+    `SCARPENTER_NAMESPACE`: `({apiReference: entry}, truncated)`, where an entry is `{available, capacityTypes, reason,
+    until}` and `until` is the latest of its unavailable offerings (`offerings[].until`, else None). Entries without
+    an `apiReference` are ignored; of two with the same one the available wins and `until` is the latest of both.
+    `now` (default the current time) judges staleness.
+
+    None (fail open, the reason is logged) when the ConfigMap is absent, unreadable, malformed or stale
+    (`generatedAt` missing, without timezone or older than `OFFERED_MAX_AGE`), or has a malformed entry."""
     name = f"scarpenter-offered-{cfg.settings.bench_class}-{vendor}"
-    try:
-        data = json.loads(kube.get_configmap_in(SCARPENTER_NAMESPACE, name)["data"]["types.json"])
-        untils = [
-            datetime.fromisoformat(entry["until"])
-            for entry in data["types"].values()
-            if entry.get("apiReference") == sku and entry.get("until")
-        ]
-        return max((u for u in untils if u.tzinfo), default=None)
-    except Exception:
-        return None
-
-
-def not_offered(kube: Kube, cfg: Config, vendor: str, skus: list[str]) -> dict[str, str]:
-    """The SKUs (of `skus`) that SCarpenter's offered-types ConfigMap `scarpenter-offered-<benchClass>-<vendor>`
-    in `SCARPENTER_NAMESPACE` does not offer for the vendor's capacity mode, with the reason. A SKU is matched by
-    the entry's `apiReference` (entries without one are ignored; of two with the same one the available wins); it
-    is not offered when its entry is missing, `available` is false (and its `until`, when it has one, has not
-    passed: SCarpenter marks an offering with `reason` and `until`) or has no capacity type, or when the mode is
-    OnDemand and `on-demand` is not in its `capacityTypes` (SpotFirst takes either type).
-
-    Fails open: a ConfigMap that is absent (vendor not opted in), unreadable, malformed or stale filters
-    nothing, and the reason is logged. In a truncated list a missing entry proves nothing, so only entries
-    with `available` false count."""
-    settings = cfg.settings
-    name = f"scarpenter-offered-{settings.bench_class}-{vendor}"
     try:
         data = json.loads(kube.get_configmap_in(SCARPENTER_NAMESPACE, name)["data"]["types.json"])
         generated = datetime.fromisoformat(data["generatedAt"])
         if generated.tzinfo is None:
             raise ValueError(f"generatedAt {data['generatedAt']!r} has no timezone")
         truncated = data["truncated"] is True
-        now = datetime.now(UTC)
-        entries = {}  # apiReference -> (available, capacityTypes, reason); a malformed entry fails the whole read
+        entries = {}  # a malformed entry fails the whole read
         for entry in data["types"].values():
             api_reference = entry.get("apiReference")
             if not api_reference:
                 continue
-            available, capacity_types = entry["available"], entry["capacityTypes"]
-            if not isinstance(available, bool) or not isinstance(capacity_types, list):
+            available, capacity_types, offerings = (
+                entry["available"],
+                entry["capacityTypes"],
+                entry.get("offerings", []),
+            )
+            if not (isinstance(available, bool) and isinstance(capacity_types, list) and isinstance(offerings, list)):
                 raise ValueError(f"malformed entry for {api_reference!r}")
-            if not available and _mark_expired(entry.get("until"), now):
-                available = True  # a mark SCarpenter has not yet cleaned up
-            if api_reference not in entries or (available and not entries[api_reference][0]):
-                entries[api_reference] = (available, capacity_types, entry.get("reason", "unavailable"))
-        stale = now - generated > OFFERED_MAX_AGE
+            old = entries.get(api_reference)
+            untils = [u for u in (old and old["until"], _until(offerings)) if u]
+            if old is None or (available and not old["available"]):
+                entries[api_reference] = old = {
+                    "available": available,
+                    "capacityTypes": capacity_types,
+                    "reason": entry.get("reason", "unavailable"),
+                }
+            old["until"] = max(untils, default=None)
     except NotFound:
-        log.debug("autoPlan does not filter vendor %s: ConfigMap %s not found", vendor, name)
-        return {}
+        log.debug("offered types of vendor %s unusable: ConfigMap %s not found", vendor, name)
+        return None
     except Exception as e:  # unreadable, bad JSON or a missing key: one reason, fail open
-        log.warning("autoPlan does not filter vendor %s: cannot use ConfigMap %s: %r", vendor, name, e)
-        return {}
-    if stale:
-        log.warning("autoPlan does not filter vendor %s: ConfigMap %s is stale (generated %s)", vendor, name, generated)
-        return {}
-    if truncated:
-        log.warning("ConfigMap %s is truncated: autoPlan skips only SKUs it lists as unavailable", name)
+        log.warning("offered types of vendor %s unusable: cannot use ConfigMap %s: %r", vendor, name, e)
+        return None
+    if (now or datetime.now(UTC)) - generated > OFFERED_MAX_AGE:
+        log.warning(
+            "offered types of vendor %s unusable: ConfigMap %s is stale (generated %s)", vendor, name, generated
+        )
+        return None
+    return entries, truncated
 
-    on_demand_only = settings.vendors[vendor].capacity == CapacityMode.ON_DEMAND
+
+def offered_until(kube: Kube, cfg: Config, vendor: str, sku: str, now: datetime | None = None) -> datetime | None:
+    """When SCarpenter's marks on the SKU's unavailable offerings expire (`read_offered`), else None."""
+    offered = read_offered(kube, cfg, vendor, now)
+    return offered[0].get(sku, {}).get("until") if offered else None
+
+
+def not_offered(kube: Kube, cfg: Config, vendor: str, skus: list[str]) -> dict[str, str]:
+    """The SKUs (of `skus`) that SCarpenter's offered-types ConfigMap (`read_offered`) does not offer for the
+    vendor's capacity mode, with the reason. A SKU is not offered when its entry is missing, `available` is false
+    (whatever its offerings' `until`: SCarpenter rewrites the listing when a mark expires) or it has no capacity
+    type, or when the mode is OnDemand and `on-demand` is not in its `capacityTypes` (SpotFirst takes either
+    type).
+
+    Fails open: when `read_offered` returns nothing, nothing is filtered. In a truncated list a missing entry
+    proves nothing, so only entries with `available` false count."""
+    offered = read_offered(kube, cfg, vendor)
+    if offered is None:
+        return {}
+    entries, truncated = offered
+    if truncated:
+        log.warning(
+            "offered types of vendor %s are truncated: autoPlan skips only SKUs it lists as unavailable", vendor
+        )
+    on_demand_only = cfg.settings.vendors[vendor].capacity == CapacityMode.ON_DEMAND
     skipped = {}
     for sku in skus:
         if sku not in entries:
             if not truncated:
                 skipped[sku] = "not listed"
             continue
-        available, capacity_types, reason = entries[sku]
-        if not available:
-            skipped[sku] = reason
-        elif not capacity_types:
+        entry = entries[sku]
+        if not entry["available"]:
+            skipped[sku] = entry["reason"]
+        elif not entry["capacityTypes"]:
             skipped[sku] = "no capacity types"
-        elif on_demand_only and CapacityType.ON_DEMAND not in capacity_types:
+        elif on_demand_only and CapacityType.ON_DEMAND not in entry["capacityTypes"]:
             skipped[sku] = f"no {CapacityType.ON_DEMAND} capacity"
     return skipped
 
@@ -369,7 +389,7 @@ def plan_cycle(
     for a SKU whose `nvidia_smi` Keeper blocks (no GPU); a SKU with only GPU tasks due is not planned. A vendor
     whose publishing is stalled (`publisher.publishing_stalled`) is skipped: new runs would only pile up
     unpublished. SKUs SCarpenter does not offer (`not_offered`) and SKUs waiting for a launch retry
-    (`launch.deferred`) are skipped.
+    (`launch.deferred`, which also drops the entries of SKUs Keeper no longer lists, except in a dry run) are skipped.
     With `dry_run` nothing is created and the first such SKU of each vendor is returned.
 
     Fails closed: when Keeper or git cannot be read the cycle plans nothing (for git: nothing for that vendor)
@@ -417,7 +437,7 @@ def plan_cycle(
         if not skus:
             log.info("autoPlan: Keeper lists no ACTIVE servers for vendor %s", vendor)
         skipped = not_offered(kube, cfg, vendor, skus) if skus else {}
-        waiting = launch.deferred(kube, vendor, skus, datetime.now(UTC))  # also drops SKUs Keeper no longer lists
+        waiting = launch.deferred(kube, vendor, skus, datetime.now(UTC), prune=not dry_run)
         if skipped:
             examples = ", ".join(f"{sku} ({why})" for sku, why in list(skipped.items())[:3])
             log.info(
@@ -441,9 +461,16 @@ def plan_cycle(
             for task in server_tasks:
                 if task.name in blocked[vendor][sku] or (task.gpu and no_gpu):
                     continue
-                reason = due_reason(task, metas.get(sku, {}).get(task.name), now)
+                try:
+                    reason = due_reason(task, metas.get(sku, {}).get(task.name), now)
+                except AttributeError, TypeError, ValueError:  # a damaged meta.json field: unreadable, skip the SKU
+                    log.warning("autoPlan skips %s/%s: damaged schedule/%s/meta.json", vendor, sku, task.name)
+                    due = None
+                    break
                 if reason:
                     due[task.name] = reason
+            if due is None:
+                continue
             if all(tasks.get_task(name).gpu for name in due):  # nothing due, or only GPU tasks
                 continue
             if not dry_run:

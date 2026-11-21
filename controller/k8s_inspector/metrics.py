@@ -181,7 +181,7 @@ class Metrics:
         blocked = dict(deferred)
         for vendor in settings.vendors:
             for entry in launch.read(self._kube, vendor).values():
-                key = (vendor, entry.get("reason"))
+                key = (vendor, str(entry.get("reason")))
                 if key in deferred:
                     deferred[key] += 1
                     blocked[key] += launch.is_waiting(entry, now)

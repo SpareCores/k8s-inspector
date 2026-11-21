@@ -1,3 +1,4 @@
+import json
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -53,6 +54,8 @@ def test_error_message_round_trip_and_temporary_reasons():
         assert not launch.is_temporary(f"SCARPENTER_{reason}: x")
     assert launch.is_temporary("SCARPENTER_BOOT_FAILURE: no node after 60 minutes")  # older runs that only waited
     assert not launch.is_temporary(None)
+    for odd in (7, ["SCARPENTER_ICE: x"], {"a": 1}):  # a damaged meta.json: not an error message, never raises
+        assert launch.reason_of_error(odd) is None and not launch.is_temporary(odd)
 
 
 @pytest.mark.parametrize(
@@ -61,12 +64,17 @@ def test_error_message_round_trip_and_temporary_reasons():
         ("ICE", [1, 2, 4, 8, 16, 24, 24, 24]),  # never gives up
         ("QUOTA", [1, 2, 4, 6, 6]),
         ("VENDOR", [1, 2, 4, 6]),
-        ("NO_OFFERING", [1, 2, 4, 6]),
+        ("NO_OFFERING", [24, 24, 24]),  # flat: the offered filter may fail open
         ("DAILY_LIMIT", [1, 2, 4, 6, 6]),
     ],
 )
 def test_backoff_doubles_to_the_cap_of_the_reason(reason, waits):
     assert [launch.wait_after(reason, n) for n in range(1, len(waits) + 1)] == [timedelta(hours=h) for h in waits]
+
+
+def test_backoff_does_not_overflow_for_a_huge_count():
+    assert launch.wait_after("ICE", 100) == timedelta(hours=24)
+    assert launch.wait_after("QUOTA", 10**6) == timedelta(hours=6)
 
 
 def test_failures_are_counted_per_sku_and_set_next():
@@ -126,3 +134,49 @@ def test_a_different_reason_restarts_the_count_and_until_sets_next():
     assert launch.read(kube, "oci")["b"]["next"] == until.isoformat()
     launch.record_failure(kube, "oci", "b", "DAILY_LIMIT", NOW, NOW - timedelta(hours=1))  # a past `until` is ignored
     assert launch.read(kube, "oci")["b"]["next"] == (NOW + timedelta(hours=2)).isoformat()
+
+
+def test_deferred_in_a_dry_run_prunes_nothing():
+    kube = FakeKube(Clock(NOW))
+    for sku in ("a", "gone"):
+        launch.record_failure(kube, "oci", sku, "ICE", NOW)
+    assert launch.deferred(kube, "oci", ["a"], NOW, prune=False) == {"a", "gone"}
+    assert set(launch.read(kube, "oci")) == {"a", "gone"}
+
+
+@pytest.mark.parametrize(
+    "skus",
+    [
+        '["a", "b"]',  # not an object
+        '"text"',
+        "null",
+        '{"a": "ICE", "b": 3, "c": null, "d": ["ICE"]}',  # no entry is an object
+    ],
+)
+def test_a_launch_configmap_of_the_wrong_shape_has_no_entries_and_is_repaired(skus):
+    kube = FakeKube(Clock(NOW))
+    launch.record_failure(kube, "oci", "x", "ICE", NOW)
+    kube.merge_patch("configmap", "k8s-inspector-launch-oci", {"data": {"skus": skus}})
+    assert launch.read(kube, "oci") == {}
+    assert launch.deferred(kube, "oci", ["a"], NOW) == set()
+    assert launch.record_failure(kube, "oci", "a", "ICE", NOW) == 1
+    assert set(launch.read(kube, "oci")) == {"a"}
+
+
+def test_damaged_entries_are_dropped_and_damaged_times_block_nothing():
+    kube = FakeKube(Clock(NOW))
+    good = {"reason": "ICE", "since": NOW.isoformat(), "count": 1, "next": (NOW + timedelta(hours=1)).isoformat()}
+    skus = {
+        "good": good,
+        "list": ["ICE"],
+        "naive": {**good, "next": (NOW + timedelta(hours=1)).replace(tzinfo=None).isoformat()},
+        "number": {**good, "next": 5},
+        "null": {**good, "next": None},
+        "text": {**good, "next": "soon"},
+        "missing": {"reason": "ICE"},
+        "count": {**good, "count": "many"},
+    }
+    kube.create("configmap", {"metadata": {"name": "k8s-inspector-launch-oci"}, "data": {"skus": json.dumps(skus)}})
+    assert set(launch.read(kube, "oci")) == set(skus) - {"list"}
+    assert launch.deferred(kube, "oci", list(skus), NOW) == {"good", "count"}
+    assert launch.record_failure(kube, "oci", "count", "ICE", NOW) == 1  # an unusable count starts again
