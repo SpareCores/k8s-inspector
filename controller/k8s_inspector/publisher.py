@@ -33,6 +33,13 @@ Decisions:
   guessed variant. The SKU then waits for the launch backoff (`NO_LSCPU`). A forced
   run of a SKU that git does not know, without lscpu (a typo), publishes nothing and is marked published
   without a commit.
+- A `-4 CANCELLED` task of a run an operator cancelled (phase `Cancelled`) is discarded at once, whatever the lscpu
+  result (marked published without a commit, not counted as unpublishable): nothing is written, so the SKU's
+  previous `schedule/<task>/meta.json` stays authoritative and the cancel is no start retry. Such a run never
+  defers its SKU (`NO_LSCPU`). A task of such a run that finished (exit code 0 or above) without an lscpu result of
+  its attempt is discarded the same way: no lscpu will come, so it is neither filed under a guessed variant nor
+  waited for. Other `-4` reasons, and a `CANCELLED` of a SIGTERM in a run that was not cancelled,
+  are published as usual.
 - A task whose rendering keeps failing is published without parser output after `MAX_RENDER_FAILURES` cycles.
 - vLLM probe keys (`vllm-probe-<image>`) are not tasks of the data tree: they are marked published unrendered.
 - Timing files come from `run.json`: the latest attempt that has an lscpu result (`attempts[]`: `api_start`,
@@ -65,6 +72,7 @@ from k8s_inspector.model import (
     BenchmarkRun,
     EnvConfig,
     ExitCode,
+    Reason,
     RunKey,
     RunPhase,
     RunStatus,
@@ -117,6 +125,7 @@ class _Item:
     run_times: tuple[tuple[datetime | None, datetime | None], ...] = ()  # start/end of every task of the run
     status: dict | None = None  # status.json when already read (rescan)
     no_lscpu_coming: bool = False  # the run's lscpu task failed and every task is done: no lscpu result will come
+    cancelled: bool = False  # the run was cancelled by an operator (phase Cancelled)
 
 
 @dataclass
@@ -364,6 +373,7 @@ class Publisher:
                 t.attempt,
                 times,
                 no_lscpu_coming=no_lscpu_coming,
+                cancelled=run.status.phase == RunPhase.CANCELLED,
             )
             for t in pending
         ]
@@ -482,6 +492,12 @@ class Publisher:
             if one.inp is None:
                 rendered.append((one, None))
                 continue
+            if item.cancelled and _is_cancelled(one.inp.status):
+                log.info(
+                    "%s/%s: cancelled by an operator before it finished, nothing to publish", item.run.run_id, item.key
+                )
+                discarded.append(one)  # the SKU's previous result stays authoritative
+                continue
             failed = (item.run, item.key)
             try:
                 variant = self._render_one(one, degraded=self._render_failures.get(failed, 0) >= MAX_RENDER_FAILURES)
@@ -494,7 +510,14 @@ class Publisher:
                 discarded.append(one)
             elif variant is _SKIPPED:
                 end = _parse_status_time(one.inp.status.get("end"))
-                if item.no_lscpu_coming:
+                if item.cancelled:
+                    log.info(
+                        "%s/%s: finished in a cancelled run without an lscpu result, nothing to publish",
+                        item.run.run_id,
+                        item.key,
+                    )
+                    discarded.append(one)  # no lscpu will come: not worth blocking the vendor for keep_run_hours
+                elif item.no_lscpu_coming:
                     log.error("%s/%s: succeeded without an lscpu result, not publishable", item.run.run_id, item.key)
                     unpublishable.append(one)
                 elif end and datetime.now(UTC) - end >= keep:
@@ -761,13 +784,21 @@ def _lscpu_of(status: dict, run_json: dict | None, legacy_status: dict | None):
 
 
 def _no_lscpu_coming(run: BenchmarkRun) -> bool:
-    """The run's lscpu task failed (or was rejected) and every task is done, so no lscpu result will come."""
+    """The run's lscpu task failed (or was rejected) and every task is done, so no lscpu result will come. Not for
+    a run an operator cancelled: its unfinished lscpu says nothing about the SKU."""
     lscpu = next((t for t in run.status.tasks if t.name == "lscpu"), None)
     return (
-        lscpu is not None
+        run.status.phase != RunPhase.CANCELLED
+        and lscpu is not None
         and lscpu.exit_code != ExitCode.OK
         and all(t.state == TaskState.DONE for t in run.status.tasks)
     )
+
+
+def _is_cancelled(status: dict) -> bool:
+    """`-4 CANCELLED`. Only in a run of phase Cancelled is it an operator's cancel: a SIGTERM of a step Pod (node
+    shutdown, external delete) is also `CANCELLED` (`pods.outcome_from_message`) and is published as a `-4`."""
+    return status.get("exit_code") == ExitCode.NEVER_FINISHED and status.get("error_msg") == Reason.CANCELLED
 
 
 def _waits_for_lscpu(one: _Loaded) -> bool:

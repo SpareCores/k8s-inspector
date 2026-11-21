@@ -109,6 +109,11 @@ The publisher runs in the controller every 5 minutes and on demand. It never mov
      it again. A task that is given up is marked published without a commit, logged as an error and counted in
      `k8s_inspector_unpublishable_tasks_total`, so the run no longer holds the SKU lease. The run is deleted `keepRunHours` after that, so such a run holds
 the lease about twice `keepRunHours` after its end.
+     A `-4 CANCELLED` task of a run an operator cancelled is discarded at once, with or without an `lscpu` result,
+     and not counted as unpublishable: nothing is written, so the SKU's previous `schedule/<task>/meta.json` stays
+     authoritative, the cancel is no start retry and the SKU is not deferred. A task of a cancelled run that finished
+     without an `lscpu` result of its attempt is discarded the same way at once (no `lscpu` will come). Other `-4` reasons are published as
+     usual. Finished tasks of a cancelled run are published normally.
    - The **timing** files come from the attempt of the task: the latest `run.json` `attempts[]` entry with an lscpu
      result (else its `timing` map) gives `api_start` (the attempt's anchor created), `api_end`, `machine_start`,
      `node_registered` and `node_ready`; the publisher adds `inspector_start`/`inspector_end` (first task start, last
