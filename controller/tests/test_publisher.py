@@ -1044,3 +1044,17 @@ def test_run_cancelled_before_lscpu_finished_does_not_defer_the_sku(tmp_path, or
     assert result.tasks_published == 0 and result.unpublishable == 0 and all(t.published for t in run.status.tasks)
     assert cluster.deferred == []
     assert not (clone(origin, tmp_path) / "data").exists()
+
+
+def test_success_without_lscpu_in_a_cancelled_run_is_discarded_at_once(tmp_path, origin, cluster):
+    storage = FakeStorage()
+    storage.put_task("lscpu", golden_status("lscpu") | {"exit_code": -4, "error_msg": "CANCELLED"})
+    now = datetime.now(UTC).replace(tzinfo=None).isoformat()
+    storage.put_task("openssl", golden_status("openssl") | {"end": now}, (GOLDEN / "openssl/stdout").read_bytes())
+    run = cluster.add_run(["lscpu", "openssl"], phase=RunPhase.CANCELLED)
+    run.status.tasks[0].exit_code, run.status.tasks[0].error_msg = -4, "CANCELLED"
+    result = make_publisher(tmp_path, origin, storage).publish_once(ENABLED)
+    assert result.tasks_published == 0 and result.unpublishable == 0
+    assert all(t.published for t in run.status.tasks)
+    assert not publisher.publishing_stalled(ENABLED, "hcloud", list(cluster.runs.values()))
+    assert cluster.deferred == [] and not (clone(origin, tmp_path) / "data").exists()

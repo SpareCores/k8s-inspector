@@ -36,7 +36,9 @@ Decisions:
 - A `-4 CANCELLED` task of a run an operator cancelled (phase `Cancelled`) is discarded at once, whatever the lscpu
   result (marked published without a commit, not counted as unpublishable): nothing is written, so the SKU's
   previous `schedule/<task>/meta.json` stays authoritative and the cancel is no start retry. Such a run never
-  defers its SKU (`NO_LSCPU`). Other `-4` reasons, and a `CANCELLED` of a SIGTERM in a run that was not cancelled,
+  defers its SKU (`NO_LSCPU`). A task of such a run that finished (exit code 0 or above) without an lscpu result of
+  its attempt is discarded the same way: no lscpu will come, so it is neither filed under a guessed variant nor
+  waited for. Other `-4` reasons, and a `CANCELLED` of a SIGTERM in a run that was not cancelled,
   are published as usual.
 - A task whose rendering keeps failing is published without parser output after `MAX_RENDER_FAILURES` cycles.
 - vLLM probe keys (`vllm-probe-<image>`) are not tasks of the data tree: they are marked published unrendered.
@@ -508,7 +510,14 @@ class Publisher:
                 discarded.append(one)
             elif variant is _SKIPPED:
                 end = _parse_status_time(one.inp.status.get("end"))
-                if item.no_lscpu_coming:
+                if item.cancelled:
+                    log.info(
+                        "%s/%s: finished in a cancelled run without an lscpu result, nothing to publish",
+                        item.run.run_id,
+                        item.key,
+                    )
+                    discarded.append(one)  # no lscpu will come: not worth blocking the vendor for keep_run_hours
+                elif item.no_lscpu_coming:
                     log.error("%s/%s: succeeded without an lscpu result, not publishable", item.run.run_id, item.key)
                     unpublishable.append(one)
                 elif end and datetime.now(UTC) - end >= keep:
