@@ -99,7 +99,7 @@ def ondemand_usd_per_hour(env: EnvConfig, vendor: str, sku: str) -> float | None
     price (or does not know the SKU). Raises `RuntimeError` when Keeper cannot be reached or answers unexpectedly."""
     base = (env.keeper_api_base or DEFAULT_API_BASE).rstrip("/")
     path = f"/server/{urllib.parse.quote(vendor, safe='')}/{urllib.parse.quote(sku, safe='')}/prices"
-    url = f"{base}{path}?currency=USD"
+    url = f"{base}{path}?currency=USD&only_active=true"
     try:
         prices = _get(url, _read_key(env), kind=list) or []
         return min((p["price"] for p in prices if p["allocation"] == "ondemand"), default=None)

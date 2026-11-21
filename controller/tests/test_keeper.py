@@ -144,7 +144,7 @@ def test_real_bulk_response_keeps_oci_skus_with_their_blocked_tasks(monkeypatch)
 def test_ondemand_price_is_the_cheapest_ondemand_one_in_usd(server):
     base, seen = server
     assert keeper.ondemand_usd_per_hour(env_for(base), "oci", "priced") == 2.5
-    assert seen[0][0] == "/server/oci/priced/prices?currency=USD"
+    assert seen[0][0] == "/server/oci/priced/prices?currency=USD&only_active=true"
 
 
 @pytest.mark.parametrize("sku", ["spot-only", "gone"])

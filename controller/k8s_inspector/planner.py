@@ -325,22 +325,13 @@ def not_offered(kube: Kube, cfg: Config, vendor: str, skus: list[str]) -> dict[s
     return skipped
 
 
-def within_sku_price_cap(
-    keeper_cache: KeeperCache, env, vendor: str, sku: str, cap: float, skipped: dict[str, str]
-) -> bool:
-    """Whether the SKU's cheapest on-demand price (Keeper) is at most `cap` USD/hour; otherwise the reason goes
-    into `skipped`. A SKU without a price, or when Keeper cannot tell, is skipped: the cap cannot be checked."""
-    try:
-        price = keeper_cache.usd_per_hour(env, vendor, sku)
-    except RuntimeError as e:
-        skipped[sku] = "price unavailable"
-        log.warning("autoPlan cannot check the price of %s/%s: %s", vendor, sku, e)
-        return False
+def sku_price_skip(keeper_cache: KeeperCache, env, vendor: str, sku: str, cap: float) -> str | None:
+    """Why the SKU is over `cap` USD/hour (its cheapest on-demand price at Keeper), else None. A SKU without a
+    price is skipped: the cap cannot be checked. Raises `RuntimeError` when Keeper cannot tell."""
+    price = keeper_cache.usd_per_hour(env, vendor, sku)
     if price is None:
-        skipped[sku] = "no on-demand price"
-    elif price > cap:
-        skipped[sku] = f"{price:g} USD/h"
-    return sku not in skipped
+        return "no on-demand price"
+    return f"{price:g} USD/h" if price > cap else None
 
 
 def start_order(vendor: str, sku: str) -> tuple[int, str]:
@@ -444,8 +435,15 @@ def plan_cycle(
             if all(tasks.get_task(name).gpu for name in due):  # nothing due, or only GPU tasks
                 continue
             cap = settings.vendors[vendor].max_sku_usd_per_hour
-            if cap is not None and not within_sku_price_cap(keeper_cache, cfg.env, vendor, sku, cap, too_expensive):
-                continue
+            if cap is not None:
+                try:
+                    why = sku_price_skip(keeper_cache, cfg.env, vendor, sku, cap)
+                except RuntimeError as e:  # fail closed, and ask no more this cycle: every lookup would fail or hang
+                    log.warning("autoPlan skips the rest of vendor %s: cannot check prices: %s", vendor, e)
+                    break
+                if why:
+                    too_expensive[sku] = why
+                    continue
             if not dry_run:
                 try:
                     check_vendor_budget(kube, cfg, vendor, runs)

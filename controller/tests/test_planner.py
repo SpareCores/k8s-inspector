@@ -742,14 +742,40 @@ def test_sku_price_cap_skips_expensive_skus(kube, keeper_skus, sku_prices, caplo
     assert "autoPlan skips 1 SKUs of vendor oci over maxSkuUsdPerHour, e.g. big (45 USD/h)" in caplog.text
 
 
-def test_sku_price_cap_skips_skus_without_a_price_or_when_keeper_fails(kube, keeper_skus, sku_prices, caplog):
-    keeper_skus["oci"] = {"unpriced": {}, "failing": {}, "cheap": {}}
-    sku_prices.update({"failing": RuntimeError("keeper HTTP 503"), "cheap": 0.2})
+def test_sku_price_cap_skips_skus_without_a_price(kube, keeper_skus, sku_prices, caplog):
+    keeper_skus["oci"] = {"unpriced": {}, "cheap": {}}
+    sku_prices["cheap"] = 0.2
     cfg = auto_config(max_sku_usd_per_hour=1.0, max_in_flight=5)
     with caplog.at_level("INFO"):
         assert [p.sku for p in plan(kube, cfg, {})] == ["cheap"]
-    assert "cannot check the price of oci/failing" in caplog.text
     assert "unpriced (no on-demand price)" in caplog.text
+
+
+def test_keeper_price_outage_stops_pricing_the_vendor_for_the_cycle(kube, keeper_skus, sku_prices, caplog):
+    keeper_skus["oci"] = {f"s{i}": {} for i in range(20)}
+    for sku in keeper_skus["oci"]:
+        sku_prices[sku] = RuntimeError("keeper HTTP 503")
+    cfg = auto_config(max_sku_usd_per_hour=1.0, max_in_flight=5)
+    with caplog.at_level("WARNING"):
+        assert plan(kube, cfg, {}) == []
+    assert len(sku_prices["asked"]) == 1
+    assert caplog.text.count("cannot check prices") == 1
+
+
+def test_price_error_is_not_cached(monkeypatch):
+    cache = planner.KeeperCache()
+    failing = [True]
+
+    def ondemand_usd_per_hour(env, vendor, sku):
+        if failing[0]:
+            raise RuntimeError("keeper HTTP 503")
+        return 2.0
+
+    monkeypatch.setattr(keeper, "ondemand_usd_per_hour", ondemand_usd_per_hour)
+    with pytest.raises(RuntimeError):
+        cache.usd_per_hour(None, "oci", "s1")
+    failing[0] = False
+    assert cache.usd_per_hour(None, "oci", "s1") == 2.0
 
 
 def test_without_a_sku_price_cap_prices_are_not_asked(kube, keeper_skus, sku_prices):

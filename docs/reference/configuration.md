@@ -148,11 +148,12 @@ only entries with `available: false` are skipped; a missing entry proves nothing
 ### Price cap per SKU
 
 `vendors.<v>.maxSkuUsdPerHour`, when set, makes autoPlan skip every SKU whose node costs more per hour. Without it a
-vendor's most expensive SKUs are planned like any other (AWS lists SKUs of tens of USD per hour). The price is the cheapest on-demand
-price in USD per hour that Keeper lists for the SKU in any region (`/server/<vendor>/<sku>/prices`), which is what
-SCarpenter pays for the cheapest offering; a spot run is checked against it too, since it may fall back to on-demand.
-It is asked only for a SKU that has due tasks and is cached for 24 hours. A SKU without an on-demand price, or whose
-price Keeper cannot give, is skipped (the cap cannot be checked; a warning per failed lookup). One info line per
+vendor's most expensive SKUs are planned like any other (AWS lists SKUs of tens of USD per hour). The price is the cheapest active on-demand price in USD per hour that Keeper lists for the SKU
+(`/server/<vendor>/<sku>/prices?currency=USD&only_active=true`) over all regions it knows, including regions the
+bench class does not use, so it can be lower than the price of the node SCarpenter launches; a spot run is checked
+against it too, since it may fall back to on-demand.
+It is asked only for a SKU that has due tasks and is cached for 24 hours. A SKU without an on-demand price is skipped (the cap cannot be checked). When Keeper fails to answer, autoPlan
+skips the rest of that vendor for the cycle (one warning) instead of asking for every SKU. One info line per
 vendor and cycle gives the count and a few examples. Forced runs ignore the cap. It limits the price of one run;
 `maxUsdPerHour` bounds the sum over the runs that hold nodes.
 
