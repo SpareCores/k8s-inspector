@@ -268,6 +268,59 @@ def test_stale_duplicate_is_skipped_and_same_start_rewrites(tmp_path):
     assert render.render_task(tmp_path, "hcloud", "cax31", 0, plain_input(start="2026-10-02T10:00:00"))
 
 
+@pytest.mark.parametrize("exit_code", [1, -4, 137])
+def test_failure_does_not_replace_a_good_result(tmp_path, exit_code):
+    render.render_task(tmp_path, "hcloud", "cax31", 0, plain_input(start="2026-10-01T10:00:00", stdout=b"good"))
+    failed = plain_input(start="2026-10-02T10:00:00", run_id="r2", exit_code=exit_code, stdout=b"partial")
+    assert render.render_task(tmp_path, "hcloud", "cax31", 0, failed) == []
+    assert tree_file(tmp_path, "lscpu", "stdout").read_bytes() == b"good"
+    assert read_meta(tmp_path, "lscpu")["run_id"] == "r1"
+    assert read_meta(tmp_path, "lscpu", "schedule")["run_id"] == "r1"
+
+
+def test_failure_of_a_changed_task_goes_to_the_schedule_only(tmp_path):
+    render.render_task(tmp_path, "hcloud", "cax31", 0, plain_input(start="2026-10-01T10:00:00", stdout=b"good"))
+    failed = plain_input(start="2026-10-02T10:00:00", run_id="r2", exit_code=137, stdout=b"partial")
+    failed.status["task_hash"] = "h2"
+    sched = tmp_path / "data/hcloud/cax31/schedule/lscpu/meta.json"
+    assert render.render_task(tmp_path, "hcloud", "cax31", 0, failed) == [sched]
+    assert (
+        tree_file(tmp_path, "lscpu", "stdout").read_bytes() == b"good"
+        and read_meta(tmp_path, "lscpu")["run_id"] == "r1"
+    )
+    assert read_meta(tmp_path, "lscpu", "schedule")["run_id"] == "r2"
+    assert read_meta(tmp_path, "lscpu", "schedule")["exit_code"] == 137
+
+
+def test_failure_of_a_changed_task_does_not_hide_a_current_hash_success_of_another_variant(tmp_path):
+    ok = plain_input(start="2026-10-01T10:00:00", stdout=b"good")
+    ok.status["task_hash"] = "h2"
+    render.render_task(tmp_path, "hcloud", "cax31", 1, ok)  # variant 1 is done with the current hash
+    render.render_task(tmp_path, "hcloud", "cax31", 0, plain_input(start="2026-10-01T10:00:00"))  # variant 0: old hash
+    failed = plain_input(start="2026-10-02T10:00:00", run_id="r2", exit_code=137)
+    failed.status["task_hash"] = "h2"
+    render.render_task(tmp_path, "hcloud", "cax31", 0, failed)
+    assert read_meta(tmp_path, "lscpu", "schedule")["exit_code"] == 0
+    assert read_meta(tmp_path, "lscpu", "schedule")["task_hash"] == "h2"
+
+
+def test_failure_kept_out_of_a_variant_is_logged(tmp_path, caplog):
+    render.render_task(tmp_path, "hcloud", "cax31", 0, plain_input(start="2026-10-01T10:00:00"))
+    with caplog.at_level("INFO"):
+        render.render_task(tmp_path, "hcloud", "cax31", 0, plain_input(start="2026-10-02T10:00:00", exit_code=137))
+    assert "exit code 137 kept out of variant 0" in caplog.text
+
+
+def test_failure_replaces_a_failure_and_success_replaces_a_failure(tmp_path):
+    render.render_task(tmp_path, "hcloud", "cax31", 0, plain_input(start="2026-10-01T10:00:00", exit_code=1))
+    render.render_task(
+        tmp_path, "hcloud", "cax31", 0, plain_input(start="2026-10-02T10:00:00", exit_code=2, run_id="r2")
+    )
+    assert read_meta(tmp_path, "lscpu")["exit_code"] == 2
+    render.render_task(tmp_path, "hcloud", "cax31", 0, plain_input(start="2026-10-03T10:00:00", run_id="r3"))
+    assert read_meta(tmp_path, "lscpu")["exit_code"] == 0
+
+
 def test_schedule_is_the_union_across_variants(tmp_path):
     render.render_task(tmp_path, "hcloud", "cax31", 0, plain_input(start="2026-10-01T10:00:00", run_id="r1"))
     failed = plain_input(start="2026-10-05T10:00:00", run_id="r2", exit_code=1)
