@@ -80,7 +80,7 @@ Measured on the `Lean` E5.Flex.2-8 node.
 | `seccomp=unconfined`, `nofile=1048576`, `memlock=-1` for DB tasks | `seccompProfile: Unconfined` for all; rlimits set by `sc-run` |
 | `--pid=host` for storage | `hostPID: true` on the storage step only |
 | no CPU limits | no CPU limits (no CFS quota, so `nproc` and cgroup-aware tools see the whole node); the step Pod's CPU **request** is what the other Pods leave ([CPU weight](#cpu-weight)) |
-| memory cap 0.85 × available for geekbench and vLLM | `limits.memory` = 0.85 × Node allocatable for those two (decision K9); everything else under the `kubepods.slice` limit |
+| memory cap 0.85 × available for geekbench and vLLM | `limits.memory` = 0.85 × Node memory capacity for those two (decision K9); everything else under the `kubepods.slice` limit |
 | `shm_size=4g` for vLLM | emptyDir `medium: Memory`, `sizeLimit: 4Gi` at `/dev/shm`, vLLM only |
 | `nice -n -20` in commands and images | unchanged, and every task also runs at nice -20 via `sc-run exec --nice -20` (generic rule: benchmarks get as much CPU as possible; the legacy per-command `nice` stays, as nice clamps at -20) |
 
@@ -125,21 +125,16 @@ the recreated Pod, and every relaunch (also after a DiskPressure rejection) carr
 
 ### Memory request
 
-A step container requests 64Mi of memory, unless the node cannot take that much: the controller sizes the Pod's
-request from the same list of Pods,
-
-```
-room = node allocatable memory − memory requests of the other Pods on the node − 4Mi
-request per container = min(64Mi, room / number of containers)
-```
-
-A 512 MB node has about 77 MiB allocatable, and its anchor and DaemonSets already request most of it; a fixed 64Mi
-request would be rejected at kubelet admission ("Node didn't have enough resource: memory"), and every task of the
-run would fail without running. With `room` at or below zero the memory request is omitted. A task's memory limit
-(`memory_cap` times the node's allocatable memory) is kept, may exceed the allocatable memory (the kubelet admits on
-requests only), and is never below the request; a real out-of-memory kill is recorded as an ordinary failed task. A
-limit with no request would make the request equal to the limit, so a node without room gets an explicit request of
-0 for a task with a limit. When the Pods of the node cannot be listed, the request stays at 64Mi.
+Step Pods request no memory: every step container has an explicit `requests.memory: "0"` (explicit, so a
+LimitRange default request cannot add one). A 512 MB node has about 77 MiB allocatable, and its anchor and DaemonSets
+already request most of it; any fixed request would be rejected at kubelet admission ("Node didn't have enough
+resource: memory") and every task of the run would fail without running. Step Pods are bound to the node with
+`nodeName`, so the scheduler does not place them, and the CPU request keeps them Burstable. Without a memory request
+they are OOM-killed or evicted before the anchor and the DaemonSets. The memory limit of the two capped tasks
+(`memory_cap`, geekbench and vLLM) is `memory_cap` × the node's `status.capacity.memory`: allocatable would leave about
+65 MiB of a 512 MB node, where about 470 MiB are physically there. A limit above allocatable is fine, the kubelet
+admits on requests only. A task killed by the OOM killer ends with exit code 137 and `OOMKilled`; under node memory
+pressure the kubelet can instead evict the Pod, which is recorded as `-4` with `EVICTED`.
 
 ## Comparability with the VM era
 

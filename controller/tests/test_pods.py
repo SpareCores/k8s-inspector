@@ -123,9 +123,7 @@ def test_deadlines(cfg):
 
 
 def test_step_pod_like_spike(run, cfg):
-    pod = pods.render_step(
-        run, 1, step(container(task())), cfg, node_name="n1", node_allocatable_memory_bytes=1000, owner=OWNER
-    )
+    pod = pods.render_step(run, 1, step(container(task())), cfg, node_name="n1", node_memory_bytes=1000, owner=OWNER)
     spec = pod["spec"]
     assert spec["nodeName"] == "n1"
     assert spec["activeDeadlineSeconds"] == 4260
@@ -147,7 +145,7 @@ def test_step_pod_like_spike(run, cfg):
     assert env["TRACKER_OUTPUT"] == "/k8si/runs/r1/membench/resource_tracker.jsonl"
     assert env["TRACKER_EXTERNAL_RUN_ID"] == "r1"
     assert c["securityContext"] == {"privileged": True, "seccompProfile": {"type": "Unconfined"}}
-    assert c["resources"] == {"requests": {"cpu": "10m", "memory": "67108864"}}
+    assert c["resources"] == {"requests": {"cpu": "10m", "memory": "0"}}
     assert c["terminationMessagePolicy"] == "File"
     assert [v["name"] for v in spec["volumes"]] == ["k8si", "urls"]
     assert spec["volumes"][1]["secret"]["secretName"] == f"{run.name}-urls"
@@ -226,9 +224,9 @@ def test_step_cpu_never_drops_below_the_floor():
 
 
 def test_step_pod_requests_the_given_cpu_split_over_containers_without_limit(run, cfg):
-    kw = {"node_name": "n", "node_allocatable_memory_bytes": 1, "owner": OWNER}
+    kw = {"node_name": "n", "node_memory_bytes": 1, "owner": OWNER}
     pod = pods.render_step(run, 1, step(container(task())), cfg, cpu_millicores=3900, **kw)
-    assert pod["spec"]["containers"][0]["resources"] == {"requests": {"cpu": "3900m", "memory": "67108864"}}
+    assert pod["spec"]["containers"][0]["resources"] == {"requests": {"cpu": "3900m", "memory": "0"}}
     a, b = task("lscpu", parallel=True), task("lstopo", parallel=True)
     pod = pods.render_step(run, 1, step(container(a), container(b)), cfg, cpu_millicores=3900, **kw)
     assert [c["resources"]["requests"]["cpu"] for c in pod["spec"]["containers"]] == ["1950m", "1950m"]
@@ -269,13 +267,13 @@ def test_memory_cap_models_shm_secrets_rlimits_hostpid(run, cfg):
         step(container(t, env=(("A", "2"),))),
         cfg,
         node_name="n",
-        node_allocatable_memory_bytes=10**9,
+        node_memory_bytes=1000,
         owner=OWNER,
     )
     spec = pod["spec"]
     c = spec["containers"][0]
     assert spec["hostPID"] is True
-    assert c["resources"]["limits"] == {"memory": "850000000"}
+    assert c["resources"]["limits"] == {"memory": "850"}
     cmd = c["command"]
     assert cmd[cmd.index("--collect") + 1] == "/x:y"
     assert cmd[cmd.index("--nice") + 1] == "-20"
@@ -297,7 +295,7 @@ def test_memory_cap_models_shm_secrets_rlimits_hostpid(run, cfg):
 def test_probe_pod_has_no_tracker(run, cfg):
     a, b = task("lscpu", parallel=True), task("lstopo", parallel=True)
     pod = pods.render_step(
-        run, 1, step(container(a), container(b)), cfg, node_name="n", node_allocatable_memory_bytes=1, owner=OWNER
+        run, 1, step(container(a), container(b)), cfg, node_name="n", node_memory_bytes=1, owner=OWNER
     )
     assert pod["metadata"]["labels"]["inspector.sparecores.com/task"] == "probe"
     assert [c["name"] for c in pod["spec"]["containers"]] == ["lscpu", "lstopo"]
@@ -306,7 +304,7 @@ def test_probe_pod_has_no_tracker(run, cfg):
 
 def test_gpu_step(run, cfg):
     s = step(container(task("nvbandwidth", gpu=True)), gpu_runtime=True)
-    pod = pods.render_step(run, 1, s, cfg, node_name="n", node_allocatable_memory_bytes=1, owner=OWNER, gpu_count=4)
+    pod = pods.render_step(run, 1, s, cfg, node_name="n", node_memory_bytes=1, owner=OWNER, gpu_count=4)
     assert pod["spec"]["runtimeClassName"] == "nvidia"
     c = pod["spec"]["containers"][0]
     assert c["resources"]["limits"] == {"nvidia.com/gpu": "4"}
@@ -316,7 +314,7 @@ def test_gpu_step(run, cfg):
 def test_vllm_probe_key_container_name(run, cfg):
     t = task("vllm")
     s = step(container(t, key="vllm-probe-benchmark-vllm-gpu", command="--probe-only"))
-    pod = pods.render_step(run, 1, s, cfg, node_name="n", node_allocatable_memory_bytes=1, owner=OWNER)
+    pod = pods.render_step(run, 1, s, cfg, node_name="n", node_memory_bytes=1, owner=OWNER)
     c = pod["spec"]["containers"][0]
     assert c["name"] == "vllm-probe-benchmark-vllm-gpu"
     assert c["command"][-1] == "--probe-only"
@@ -521,52 +519,3 @@ def test_rejected_pod_is_recognised_and_classified_with_its_message():
 )
 def test_is_label_value(value, ok):
     assert pods.is_label_value(value) is ok
-
-
-def memory_pod(request=None, limit=None, phase="Running"):
-    resources = {k: {"memory": v} for k, v in (("requests", request), ("limits", limit)) if v}
-    return {"spec": {"containers": [{"resources": resources}]}, "status": {"phase": phase}}
-
-
-def test_step_memory_room_is_what_the_other_pods_leave():
-    node_pods = [memory_pod("16Mi"), memory_pod("32Mi"), memory_pod("1Gi", phase="Succeeded"), memory_pod(None)]
-    mib = 1024 * 1024
-    assert pods.step_memory_room(1000 * mib, node_pods) == (1000 - 48) * mib - pods.MEMORY_MARGIN
-    assert pods.step_memory_room(1000 * mib, [memory_pod(limit="100Mi")]) == 900 * mib - pods.MEMORY_MARGIN
-    assert pods.step_memory_room(40 * mib, node_pods) < 0  # no room
-
-
-def render_with_room(run, cfg, room, *containers):
-    return pods.render_step(
-        run, 1, step(*containers), cfg, node_name="n", node_allocatable_memory_bytes=10**9, owner=OWNER,
-        memory_room=room,
-    )["spec"]["containers"]  # fmt: skip
-
-
-def test_step_memory_request_fits_the_node(run, cfg):
-    full = pods.STEP_MEMORY_REQUEST
-    assert render_with_room(run, cfg, 10 * full, container(task()))[0]["resources"]["requests"]["memory"] == str(full)
-    assert render_with_room(run, cfg, None, container(task()))[0]["resources"]["requests"]["memory"] == str(full)
-    capped = render_with_room(run, cfg, 1000, container(task()))[0]["resources"]
-    assert capped["requests"]["memory"] == "1000" and "limits" not in capped
-    a, b = task("a"), task("b")  # the room is shared by the containers
-    two = render_with_room(run, cfg, 1000, container(a), container(b))
-    assert [c["resources"]["requests"]["memory"] for c in two] == ["500", "500"]
-
-
-def test_step_memory_request_is_dropped_without_room(run, cfg):
-    for room in (0, -5):
-        assert "memory" not in render_with_room(run, cfg, room, container(task()))[0]["resources"]["requests"]
-
-
-def test_step_memory_limit_never_below_the_request_and_may_exceed_the_node(run, cfg):
-    capped = task("vllm", memory_cap=0.85)
-    big = render_with_room(run, cfg, 1000, container(capped))[0]["resources"]
-    assert big["limits"] == {"memory": "850000000"} and big["requests"]["memory"] == "1000"  # above the room: fine
-    # a limit alone would become the request, so a node without room spells out a zero request
-    none = render_with_room(run, cfg, 0, container(capped))[0]["resources"]
-    assert none["requests"]["memory"] == "0" and none["limits"] == {"memory": "850000000"}
-    tiny = pods.render_step(
-        run, 1, step(container(capped)), cfg, node_name="n", node_allocatable_memory_bytes=1000, owner=OWNER
-    )["spec"]["containers"][0]["resources"]
-    assert tiny["limits"]["memory"] == tiny["requests"]["memory"] == str(pods.STEP_MEMORY_REQUEST)

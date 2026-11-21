@@ -1905,22 +1905,10 @@ def test_a_daily_limit_waits_until_the_offered_until(h):
     assert datetime.fromisoformat(h.entry()["next"]) == until
 
 
-def test_step_pod_memory_request_fits_a_small_node(h):
-    h.cluster.node_allocatable = {"memory": "77Mi", "cpu": "1"}
-    h.start(["geekbench"])
-    daemonset = node_pod("flannel", f"node-{h.name}-a1", "10m")
-    daemonset["spec"]["containers"][0]["resources"]["requests"]["memory"] = "50Mi"
-    h.kube.foreign_pods.append(daemonset)
-    h.drive(stop=lambda run: any(n.endswith("geekbench") for n in h.pod_names("step")))
-    resources = h.kube.get("pod", geekbench_pod(h))["spec"]["containers"][0]["resources"]
-    # 77Mi minus flannel's 50Mi, the anchor's 16Mi and the 4Mi margin; geekbench's limit (85% of 77Mi) stays
-    assert resources["requests"]["memory"] == str(7 * 1024 * 1024)
-    assert int(resources["limits"]["memory"]) >= int(resources["requests"]["memory"])
-
-
-def test_step_pod_memory_request_is_left_alone_when_the_node_pods_cannot_be_listed(h):
-    h.kube.node_pods_forbidden = True
+def test_step_pod_requests_no_memory_and_limits_from_the_node_capacity(h):
+    h.cluster.node_allocatable = {"memory": "77Mi", "cpu": "1"}  # capacity of the fake node is 16Gi
     h.start(["geekbench"])
     h.drive(stop=lambda run: any(n.endswith("geekbench") for n in h.pod_names("step")))
     resources = h.kube.get("pod", geekbench_pod(h))["spec"]["containers"][0]["resources"]
-    assert resources["requests"]["memory"] == str(pods.STEP_MEMORY_REQUEST)
+    assert resources["requests"]["memory"] == "0"
+    assert resources["limits"]["memory"] == str(int(0.85 * 16 * 1024**3))

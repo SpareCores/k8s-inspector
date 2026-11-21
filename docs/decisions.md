@@ -12,7 +12,7 @@ Status: **accepted** (decided by the maintainers), **open** (recommendation in b
 | K6 | Rerun the fleet on the new platform | open | **decide after the first vendor's A/B**; if yes, cheapest SKUs first via `revision` |
 | K7 | Exit codes | accepted | keep -1/-3/-4/-5/256/>0, add -6 for timeouts, drop -2; -4 retried 3× then -5, DBaaS included |
 | K8 | GPU fallback, vLLM ladder, nvbandwidth size | accepted | adaptive in the controller (ported) |
-| K9 | Memory limits | accepted | 0.85 × Node allocatable for geekbench and vLLM only; no CPU limits |
+| K9 | Memory limits | accepted | 0.85 × Node memory capacity for geekbench and vLLM only; no CPU limits; step Pods request no memory |
 | K10 | Publish granularity | accepted | per task, every 5 minutes |
 | K11 | DBaaS provisioning | accepted | Job running Pulumi (DB only, networks pre-created), client node first, DB removed first ([DBaaS](explanation/dbaas.md)) |
 | K12 | Multi-instance runs | accepted | deferred; nothing in the single-node design blocks two anchors per run |

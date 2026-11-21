@@ -807,35 +807,55 @@ def _published_metas(origin, tmp_path) -> dict[str, int]:
     }
 
 
-def test_run_whose_lscpu_failed_publishes_under_variant_0_when_the_sku_has_none(tmp_path, origin, cluster, caplog):
+def test_run_whose_lscpu_failed_files_its_failures_in_the_schedule_and_finishes(tmp_path, origin, cluster, caplog):
     storage = FakeStorage()
     run = _rejected_run(cluster, storage)
-    run.status.phase = RunPhase.PUBLISHING
     result = make_publisher(tmp_path, origin, storage).publish_once(ENABLED)
     assert result.tasks_published == 3 and all(t.published for t in run.status.tasks)
     assert run.status.phase == RunPhase.DONE and run.status.variant is None
-    metas = _published_metas(origin, tmp_path)
-    assert {"0/lscpu/meta.json": 256, "0/geekbench/meta.json": 256, "0/openssl/meta.json": 256}.items() <= metas.items()
-    assert metas["schedule/openssl/meta.json"] == 256  # what autoPlan's due/backoff logic reads
     inst = clone(origin, tmp_path) / "data/hcloud/cax31"
-    assert not (inst / "0/variant.json").exists() and not (inst / "0/timing").exists()
-    assert json.loads((inst / "0/openssl/meta.json").read_text())["error_msg"].startswith("Pod was rejected")
-    assert [r.levelname for r in caplog.records if "current variant" in r.message] == ["WARNING"]  # once per run
+    assert [p.name for p in inst.iterdir()] == ["schedule"]  # no variant directory
+    metas = {
+        t: json.loads((inst / "schedule" / t / "meta.json").read_text()) for t in ("lscpu", "geekbench", "openssl")
+    }
+    assert {m["exit_code"] for m in metas.values()} == {256}
+    assert metas["openssl"]["error_msg"].startswith("Pod was rejected")  # what autoPlan's due/backoff logic reads
+    assert [r.levelname for r in caplog.records if "no lscpu result will come" in r.message] == ["WARNING"]
 
 
-def test_run_whose_lscpu_failed_publishes_under_the_highest_existing_variant(tmp_path, origin, cluster):
+def test_success_of_a_run_whose_lscpu_failed_is_not_filed_under_a_guessed_variant(tmp_path, origin, cluster):
     seed = clone(origin, tmp_path, "seed2")
-    (seed / "data/hcloud/cax31/2/lscpu").mkdir(parents=True)
-    (seed / "data/hcloud/cax31/2/lscpu/meta.json").write_text("{}")
-    (seed / "data/hcloud/cax31/10").mkdir()
-    (seed / "data/hcloud/cax31/10/x").write_text("")
+    (seed / "data/hcloud/cax31/2/openssl").mkdir(parents=True)
+    (seed / "data/hcloud/cax31/2/openssl/meta.json").write_text('{"exit_code": 0}')
     git(seed, "add", "-A")
-    git(seed, "commit", "-m", "variants")
+    git(seed, "commit", "-m", "variant 2")
     git(seed, "push", "origin", "HEAD:main")
     storage = FakeStorage()
-    _rejected_run(cluster, storage)
+    run = _rejected_run(cluster, storage)
+    storage.put_task("openssl", golden_status("openssl") | {"end": datetime.now(UTC).replace(tzinfo=None).isoformat()},
+                     (GOLDEN / "openssl/stdout").read_bytes())  # fmt: skip
+    run.status.tasks[2].exit_code = 0
+    result = make_publisher(tmp_path, origin, storage).publish_once(ENABLED)
+    assert result.unpublishable == 1 and result.tasks_published == 2
+    assert all(t.published for t in run.status.tasks) and run.status.phase == RunPhase.DONE
+    inst = clone(origin, tmp_path) / "data/hcloud/cax31"
+    assert json.loads((inst / "2/openssl/meta.json").read_text()) == {"exit_code": 0}  # untouched
+    assert sorted(p.name for p in inst.iterdir()) == ["2", "schedule"]
+    assert not (inst / "schedule/openssl").exists()
+
+
+def test_lscpu_that_succeeded_on_attempt_2_does_not_fall_back(tmp_path, origin, storage, cluster):
+    lscpu_out = (GOLDEN / "lscpu/stdout").read_text()
+    attempts = [{"attempt": 1, "node": "n1"}, {"attempt": 2, "node": "n2", "lscpu_stdout": lscpu_out}]
+    storage.objects[okey(KEY, "run.json")] = json.dumps({"attempts": attempts}).encode()
+    for name in ("lscpu", "openssl"):
+        storage.put_task(name, golden_status(name) | {"attempt": 2})
+    run = cluster.add_run(["lscpu", "openssl"])
+    for task in run.status.tasks:
+        task.attempt = 2  # attempt 1 had failed its tasks; lscpu of attempt 2 is the result
+    assert not publisher._no_lscpu_coming(run)
     make_publisher(tmp_path, origin, storage).publish_once(ENABLED)
-    assert "10/openssl/meta.json" in _published_metas(origin, tmp_path)
+    assert (clone(origin, tmp_path) / "data/hcloud/cax31/0/openssl/meta.json").exists()
 
 
 def test_run_waits_while_lscpu_or_another_task_is_still_to_end(tmp_path, origin, cluster):
