@@ -21,6 +21,7 @@ import copy
 import csv
 import io
 import json
+import logging
 import re
 import subprocess
 import tempfile
@@ -87,6 +88,9 @@ class RenderInput:
     stdout: bytes = b""
     stderr: bytes = b""
     files: dict[str, bytes] = field(default_factory=dict)  # other objects of the task prefix by name
+
+
+log = logging.getLogger(__name__)
 
 
 # --------------------------------------------------------------------------- status.json <-> meta.json
@@ -646,11 +650,12 @@ def _meta_sort_key(meta: dict) -> tuple:
     return (_parse_dt(meta.get("end")) or datetime.min, _parse_dt(meta.get("start")) or datetime.min)
 
 
-def select_schedule_meta(instance_root: Path, task: str, current_hash: str) -> dict | None:
+def select_schedule_meta(instance_root: Path, task: str, current_hash: str, extra: dict | None = None) -> dict | None:
     """Materialized-union pick across variant metas for one task (legacy `select_schedule_meta`): unfinished
     metas are leftovers of dead runs and are ignored; otherwise current-hash success, else newest terminal
-    current-hash, else newest available."""
-    candidates = []
+    current-hash, else newest available. `extra` is one more candidate that is not in a variant dir (a failure
+    kept out of it)."""
+    candidates = [extra] if extra else []
     for root in _variant_roots(instance_root):
         meta = _read_meta(root / task / "meta.json")
         if meta is None:
@@ -669,9 +674,9 @@ def select_schedule_meta(instance_root: Path, task: str, current_hash: str) -> d
     return max(candidates, key=_meta_sort_key)
 
 
-def refresh_schedule_meta(instance_root: Path, task: str, current_hash: str) -> Path | None:
-    """Recompute `schedule/<task>/meta.json` from all variant metas; untouched when none is usable."""
-    selected = select_schedule_meta(instance_root, task, current_hash)
+def refresh_schedule_meta(instance_root: Path, task: str, current_hash: str, extra: dict | None = None) -> Path | None:
+    """Recompute `schedule/<task>/meta.json` from all variant metas (and `extra`); untouched when none is usable."""
+    selected = select_schedule_meta(instance_root, task, current_hash, extra)
     if selected is None:
         return None
     path = instance_root / "schedule" / task / "meta.json"
@@ -733,12 +738,20 @@ def render_task(tree: Path, vendor: str, sku: str, variant: int | None, inp: Ren
         and previous.get("end")
     ):
         # A failure (a cancelled task's partial output included) never replaces a good result of the task in this
-        # variant. A changed task hash still needs the failure in the schedule, or the planner would start the
-        # task again at every cycle.
+        # variant. A changed task hash still needs the failure in the schedule (picked among the variants like any
+        # other meta), or the planner would start the task again at every cycle.
         if previous.get("task_hash") == meta["task_hash"]:
+            log.info(
+                "%s/%s/%s: exit code %s kept out of variant %s, which has a good result",
+                vendor,
+                sku,
+                task,
+                meta["exit_code"],
+                variant,
+            )
             return []
-        _write(schedule_path, dump_meta(meta))
-        return [schedule_path]
+        schedule = refresh_schedule_meta(instance, task, meta["task_hash"], extra=meta)
+        return [schedule] if schedule else []
     files: dict[str, bytes] = {}
     outputs: list[str] = []
     if "raw" in inp.task.transforms and meta["exit_code"] != ExitCode.HARNESS_ERROR:

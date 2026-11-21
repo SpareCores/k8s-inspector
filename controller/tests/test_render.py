@@ -292,6 +292,25 @@ def test_failure_of_a_changed_task_goes_to_the_schedule_only(tmp_path):
     assert read_meta(tmp_path, "lscpu", "schedule")["exit_code"] == 137
 
 
+def test_failure_of_a_changed_task_does_not_hide_a_current_hash_success_of_another_variant(tmp_path):
+    ok = plain_input(start="2026-10-01T10:00:00", stdout=b"good")
+    ok.status["task_hash"] = "h2"
+    render.render_task(tmp_path, "hcloud", "cax31", 1, ok)  # variant 1 is done with the current hash
+    render.render_task(tmp_path, "hcloud", "cax31", 0, plain_input(start="2026-10-01T10:00:00"))  # variant 0: old hash
+    failed = plain_input(start="2026-10-02T10:00:00", run_id="r2", exit_code=137)
+    failed.status["task_hash"] = "h2"
+    render.render_task(tmp_path, "hcloud", "cax31", 0, failed)
+    assert read_meta(tmp_path, "lscpu", "schedule")["exit_code"] == 0
+    assert read_meta(tmp_path, "lscpu", "schedule")["task_hash"] == "h2"
+
+
+def test_failure_kept_out_of_a_variant_is_logged(tmp_path, caplog):
+    render.render_task(tmp_path, "hcloud", "cax31", 0, plain_input(start="2026-10-01T10:00:00"))
+    with caplog.at_level("INFO"):
+        render.render_task(tmp_path, "hcloud", "cax31", 0, plain_input(start="2026-10-02T10:00:00", exit_code=137))
+    assert "exit code 137 kept out of variant 0" in caplog.text
+
+
 def test_failure_replaces_a_failure_and_success_replaces_a_failure(tmp_path):
     render.render_task(tmp_path, "hcloud", "cax31", 0, plain_input(start="2026-10-01T10:00:00", exit_code=1))
     render.render_task(
