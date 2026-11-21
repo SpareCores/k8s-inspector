@@ -987,7 +987,7 @@ def _cancelled_run(cluster, storage, reason="CANCELLED"):
 def test_cancelled_task_writes_nothing_and_the_run_finishes(tmp_path, origin, storage, cluster):
     run = _cancelled_run(cluster, storage)
     result = make_publisher(tmp_path, origin, storage).publish_once(ENABLED)
-    assert result.unpublishable == 1 and result.tasks_published == 2
+    assert result.unpublishable == 0 and result.tasks_published == 2
     assert all(t.published for t in run.status.tasks) and run.status.phase == RunPhase.CANCELLED
     assert not (clone(origin, tmp_path) / "data/hcloud/cax31/schedule/geekbench").exists()
     assert not publisher.publishing_stalled(ENABLED, "hcloud", list(cluster.runs.values()))
@@ -1021,3 +1021,26 @@ def test_other_never_finished_reasons_still_publish(tmp_path, origin, storage, c
     result = make_publisher(tmp_path, origin, storage).publish_once(ENABLED)
     assert result.unpublishable == 0 and all(t.published for t in run.status.tasks)
     assert _published_metas(origin, tmp_path)["schedule/geekbench/meta.json"] == -4
+
+
+def test_cancelled_task_of_a_run_that_was_not_cancelled_still_publishes(tmp_path, origin, storage, cluster):
+    """A SIGTERM of a step Pod is also `-4 CANCELLED` (pods.py): it counts as a start retry."""
+    run = _cancelled_run(cluster, storage)
+    run.status.phase = RunPhase.PUBLISHING
+    result = make_publisher(tmp_path, origin, storage).publish_once(ENABLED)
+    assert result.unpublishable == 0 and all(t.published for t in run.status.tasks)
+    meta = json.loads((clone(origin, tmp_path) / "data/hcloud/cax31/schedule/geekbench/meta.json").read_text())
+    assert (meta["exit_code"], meta["error_msg"], meta["start_retries"]) == (-4, "CANCELLED", 1)
+
+
+def test_run_cancelled_before_lscpu_finished_does_not_defer_the_sku(tmp_path, origin, cluster):
+    storage = FakeStorage()
+    for name in ("lscpu", "geekbench", "openssl"):
+        storage.put_task(name, golden_status(name) | {"exit_code": -4, "error_msg": "CANCELLED"})
+    run = cluster.add_run(["lscpu", "geekbench", "openssl"], phase=RunPhase.CANCELLED)
+    for task in run.status.tasks:
+        task.exit_code, task.error_msg = -4, "CANCELLED"
+    result = make_publisher(tmp_path, origin, storage).publish_once(ENABLED)
+    assert result.tasks_published == 0 and result.unpublishable == 0 and all(t.published for t in run.status.tasks)
+    assert cluster.deferred == []
+    assert not (clone(origin, tmp_path) / "data").exists()

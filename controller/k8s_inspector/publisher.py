@@ -33,10 +33,11 @@ Decisions:
   guessed variant. The SKU then waits for the launch backoff (`NO_LSCPU`). A forced
   run of a SKU that git does not know, without lscpu (a typo), publishes nothing and is marked published
   without a commit.
-- A task of a cancelled run that never finished (`-4 CANCELLED`) is given up at once, whatever the lscpu result
-  (marked published without a commit, counted as unpublishable): nothing is written, so the SKU's previous
-  `schedule/<task>/meta.json` stays authoritative and the cancel does not count as a start retry. Other `-4`
-  reasons (eviction, rejected pod, image pull timeout, ...) are published as usual.
+- A `-4 CANCELLED` task of a run an operator cancelled (phase `Cancelled`) is discarded at once, whatever the lscpu
+  result (marked published without a commit, not counted as unpublishable): nothing is written, so the SKU's
+  previous `schedule/<task>/meta.json` stays authoritative and the cancel is no start retry. Such a run never
+  defers its SKU (`NO_LSCPU`). Other `-4` reasons, and a `CANCELLED` of a SIGTERM in a run that was not cancelled,
+  are published as usual.
 - A task whose rendering keeps failing is published without parser output after `MAX_RENDER_FAILURES` cycles.
 - vLLM probe keys (`vllm-probe-<image>`) are not tasks of the data tree: they are marked published unrendered.
 - Timing files come from `run.json`: the latest attempt that has an lscpu result (`attempts[]`: `api_start`,
@@ -122,6 +123,7 @@ class _Item:
     run_times: tuple[tuple[datetime | None, datetime | None], ...] = ()  # start/end of every task of the run
     status: dict | None = None  # status.json when already read (rescan)
     no_lscpu_coming: bool = False  # the run's lscpu task failed and every task is done: no lscpu result will come
+    cancelled: bool = False  # the run was cancelled by an operator (phase Cancelled)
 
 
 @dataclass
@@ -369,6 +371,7 @@ class Publisher:
                 t.attempt,
                 times,
                 no_lscpu_coming=no_lscpu_coming,
+                cancelled=run.status.phase == RunPhase.CANCELLED,
             )
             for t in pending
         ]
@@ -487,9 +490,11 @@ class Publisher:
             if one.inp is None:
                 rendered.append((one, None))
                 continue
-            if _is_cancelled(one.inp.status):
-                log.warning("%s/%s: cancelled before it finished, not publishable", item.run.run_id, item.key)
-                unpublishable.append(one)  # the SKU's previous result stays authoritative
+            if item.cancelled and _is_cancelled(one.inp.status):
+                log.info(
+                    "%s/%s: cancelled by an operator before it finished, nothing to publish", item.run.run_id, item.key
+                )
+                discarded.append(one)  # the SKU's previous result stays authoritative
                 continue
             failed = (item.run, item.key)
             try:
@@ -770,17 +775,20 @@ def _lscpu_of(status: dict, run_json: dict | None, legacy_status: dict | None):
 
 
 def _no_lscpu_coming(run: BenchmarkRun) -> bool:
-    """The run's lscpu task failed (or was rejected) and every task is done, so no lscpu result will come."""
+    """The run's lscpu task failed (or was rejected) and every task is done, so no lscpu result will come. Not for
+    a run an operator cancelled: its unfinished lscpu says nothing about the SKU."""
     lscpu = next((t for t in run.status.tasks if t.name == "lscpu"), None)
     return (
-        lscpu is not None
+        run.status.phase != RunPhase.CANCELLED
+        and lscpu is not None
         and lscpu.exit_code != ExitCode.OK
         and all(t.state == TaskState.DONE for t in run.status.tasks)
     )
 
 
 def _is_cancelled(status: dict) -> bool:
-    """`-4 CANCELLED`: an operator cancelled the run before the task finished. It says nothing about the SKU."""
+    """`-4 CANCELLED`. Only in a run of phase Cancelled is it an operator's cancel: a SIGTERM of a step Pod (node
+    shutdown, external delete) is also `CANCELLED` (`pods.outcome_from_message`) and is published as a `-4`."""
     return status.get("exit_code") == ExitCode.NEVER_FINISHED and status.get("error_msg") == Reason.CANCELLED
 
 
