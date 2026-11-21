@@ -37,7 +37,7 @@ until `next`. The count is of failures in a row with the same reason (another re
 |---|---|
 | `ICE` | 24 h, never gives up |
 | `QUOTA`, `VENDOR`, `BOOT_FAILURE` | 6 h |
-| `NO_LSCPU` | 6 h; recorded by the publisher, not by a launch: a run ended without an `lscpu` result and its successful tasks were given up ([outputs](outputs.md#publishing-to-git)) |
+| `NO_LSCPU` | 24 h at once (no doubling: a node clears the count every run, and a big SKU relaunched hourly costs money); recorded by the publisher, not by a launch: a run ended without an `lscpu` result and its successful tasks were given up ([outputs](outputs.md#publishing-to-git)) |
 | `NO_OFFERING` | 24 h at once (no doubling): where the offered-types filter fails open nothing else stops the retries |
 | `DAILY_LIMIT` | `next` is the SKU's `until` in SCarpenter's offered-types ConfigMap when it has one (the vendor's reset), else 6 h |
 

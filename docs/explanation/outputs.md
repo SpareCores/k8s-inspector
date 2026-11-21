@@ -105,7 +105,7 @@ The publisher runs in the controller every 5 minutes and on demand. It never mov
      planner then plans by its exit code: `-4` is retried after its wait, `256` is final), and a successful one,
      whose hardware is unknown, is given up at once instead of being filed under a guessed variant. Tasks of an earlier
      attempt that did have an `lscpu` result still go to their variant. A warning is logged for the run, and its SKU
-     waits for the launch backoff (reason `NO_LSCPU`, [launch retries](launch-retries.md)) before the planner starts
+     waits for the launch backoff (reason `NO_LSCPU`, 24 h, [launch retries](launch-retries.md)) before the planner starts
      it again. A task that is given up is marked published without a commit, logged as an error and counted in
      `k8s_inspector_unpublishable_tasks_total`, so the run no longer holds the SKU lease. The run is deleted `keepRunHours` after that, so such a run holds
 the lease about twice `keepRunHours` after its end.
