@@ -777,3 +777,16 @@ def test_a_marked_offering_is_skipped_until_its_until(kube, keeper_skus):
     broken = {**marked, "until": "tomorrow", "capacityTypes": ["on-demand"]}  # tolerated: stays marked
     publish_offered(kube, offered_configmap({"s1": broken}))
     assert planned_skus(kube) == []
+
+
+@pytest.mark.parametrize("reason", ["InsufficientCapacity", "QuotaExceeded", "DailyLimit", "UnavailableCache"])
+def test_marked_offerings_of_every_class_are_skipped_until_their_until(kube, keeper_skus, reason):
+    """SCarpenter marks a group with `reason` = the class (`UnavailableCache` in older versions) and `until`."""
+    entry = {"available": False, "reason": reason, "until": (NOW + timedelta(minutes=5)).strftime("%Y-%m-%dT%H:%M:%SZ")}
+    publish_offered(kube, offered_configmap({"s1": {**entry, "capacityTypes": ["on-demand"]}}))
+    assert planned_skus(kube) == []
+    past = (NOW - timedelta(minutes=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    publish_offered(kube, offered_configmap({"s1": {**entry, "until": past, "capacityTypes": ["on-demand"]}}))
+    assert planned_skus(kube) == ["s1"]
+    publish_offered(kube, offered_configmap({"s1": {k: v for k, v in entry.items() if k != "until"}}))
+    assert planned_skus(kube) == []  # an old SCarpenter writes no `until`: the mark holds

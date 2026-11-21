@@ -26,6 +26,11 @@ NOW = datetime(2026, 11, 20, 10, 0, tzinfo=UTC)
         ("Fatal (): y", "ICE", "LAUNCH_REJECTED"),
         ("launching X: Retryable (RequestLimitExceeded): slow", "ICE", "VENDOR"),  # wrapped
         ("QuotaExceededX (X): y", "ICE", "ICE"),
+        # SCarpenter's contract: the code is "Unknown" when the vendor gave none; core wraps the message in an event
+        ("InsufficientCapacity (Unknown): no capacity", "BOOT_FAILURE", "ICE"),
+        ("NodeClaim bench-x event: insufficient capacity, QuotaExceeded (Unknown): vCPU", "ICE", "QUOTA"),
+        ("NodeClaim bench-x event: insufficient capacity, DailyLimit (LimitExceeded): daily", "ICE", "DAILY_LIMIT"),
+        ("NodeClaim bench-x event: insufficient capacity, ZoneUnusable (Unknown): z", "BOOT_FAILURE", "ICE"),
         ("", "ICE", "ICE"),
     ],
 )
