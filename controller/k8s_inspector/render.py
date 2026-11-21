@@ -725,6 +725,20 @@ def render_task(tree: Path, vendor: str, sku: str, variant: int | None, inp: Ren
         return [schedule_path]
 
     task_dir = instance / str(variant) / task
+    previous = _read_meta(task_dir / "meta.json")
+    if (
+        meta["exit_code"] != ExitCode.OK
+        and previous
+        and previous.get("exit_code") == ExitCode.OK
+        and previous.get("end")
+    ):
+        # A failure (a cancelled task's partial output included) never replaces a good result of the task in this
+        # variant. A changed task hash still needs the failure in the schedule, or the planner would start the
+        # task again at every cycle.
+        if previous.get("task_hash") == meta["task_hash"]:
+            return []
+        _write(schedule_path, dump_meta(meta))
+        return [schedule_path]
     files: dict[str, bytes] = {}
     outputs: list[str] = []
     if "raw" in inp.task.transforms and meta["exit_code"] != ExitCode.HARNESS_ERROR:

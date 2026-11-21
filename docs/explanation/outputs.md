@@ -107,6 +107,12 @@ the lease about twice `keepRunHours` after its end.
      result (else its `timing` map) gives `api_start` (the attempt's anchor created), `api_end`, `machine_start`,
      `node_registered` and `node_ready`; the publisher adds `inspector_start`/`inspector_end` (first task start, last
      task end). They go to the variant of that attempt.
+   - **A failed task never replaces a good result.** When the tree already holds an exit code 0 result of the
+     task in the variant, a result with another exit code (a failure, a cancelled task's partial output, an
+     out-of-memory kill) is not rendered: its files, `meta.json` and parsed output stay as they were, and the failure
+     stays in the run status. If the task hash changed since the good result, the failure goes to
+     `schedule/<task>/meta.json` so the planner waits before it retries. A failure still replaces an earlier failure,
+     and a success replaces anything.
    - **Transforms and parsers run only for tasks with exit code 0**; `stdout` and `stderr` are written for every
      exit code except the harness error `256`.
    - **`-5`** is created here, not by the runner: the runner records `-4`, and the publisher, which sees the
