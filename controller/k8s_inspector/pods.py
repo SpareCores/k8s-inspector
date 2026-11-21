@@ -64,6 +64,8 @@ CPU_FLOOR_M = (
 CONTAINER_FLOOR_M = 1  # smallest CPU request of one container of a multi-container step Pod
 CPU_MARGIN_MIN_M = 100  # smallest CPU left unrequested on the node (see `cpu_margin_millicores`)
 CPU_MARGIN_FRACTION = 20  # ... or 1/20 (5%) of the node's allocatable CPU
+STEP_MEMORY_REQUEST = 64 * 1024 * 1024  # a step container's memory request when the node has room for it
+MEMORY_MARGIN = 4 * 1024 * 1024  # memory left unrequested on the node (see `step_memory_room`)
 TASK_NICE = -20  # generic rule: every benchmark gets as much CPU as possible (sc-run exec --nice)
 # `inspector-secrets` key -> environment variable of the container.
 SECRET_ENV = {
@@ -335,6 +337,7 @@ def _step_container(
     single: bool,
     allocatable: int,
     cpu_millicores: int,
+    memory_request: int,
 ) -> dict:
     task = container.task
     spool = f"{HEARTBEAT_ROOT}/{run_id}/{container.key}"
@@ -375,9 +378,13 @@ def _step_container(
         mounts.append({"name": "models", "mountPath": "/models"})
     if task.shm_gib:
         mounts.append({"name": "dshm", "mountPath": "/dev/shm"})
-    resources: dict = {"requests": {"cpu": f"{cpu_millicores}m", "memory": "64Mi"}}
+    resources: dict = {"requests": {"cpu": f"{cpu_millicores}m"}}
     if task.memory_cap is not None:
-        resources["limits"] = {"memory": str(int(task.memory_cap * allocatable))}
+        # A limit may exceed the node's allocatable memory (kubelet admits on requests only), but never the
+        # request. A limit without a request makes the request equal the limit, so a zero one is spelled out.
+        resources["limits"] = {"memory": str(max(int(task.memory_cap * allocatable), memory_request))}
+    if memory_request or task.memory_cap is not None:
+        resources["requests"]["memory"] = str(memory_request)
     if gpu_runtime and gpu_count and single:
         # Extended resources are exclusive: only a single-container step can claim every GPU.
         resources.setdefault("limits", {})["nvidia.com/gpu"] = str(gpu_count)
@@ -418,6 +425,7 @@ def render_step(
     owner: OwnerRef,
     gpu_count: int = 0,
     cpu_millicores: int = CPU_FLOOR_M,
+    memory_room: int | None = None,
 ) -> dict:
     """A step Pod (objects.md "Step Pod"): `nodeName`, bare Pod, `hostNetwork`, `dnsPolicy: Default`,
     `hostPID` iff any task has `host_pid`, `runtimeClassName: nvidia` iff `step.gpu_runtime`, tolerations
@@ -426,7 +434,8 @@ def render_step(
     image `container.image`, `command: [/k8si/bin/sc-run, exec, --task <key>, --timeout <t>, --spool
     /k8si/runs/<run_id>/<key>, --urls /k8si-urls/urls.json, --version-cmd ..., --collect ..., --, <entrypoint
     + resource-tracker/nice wrapper + command>]`, `privileged` + `seccompProfile: Unconfined`, requests
-    `cpu <cpu_millicores split evenly over the containers>, memory 64Mi`, memory limit =
+    `cpu <cpu_millicores split evenly over the containers>, memory 64Mi (less when the node has no room)`,
+    memory limit =
     `task.memory_cap * node_allocatable_memory_bytes` when set (no CPU limits ever), `terminationMessagePolicy:
     File`, env: `TRACKER_*` (project, job name, external run id
     = `run_id`, output path in the spool) + `HF_TOKEN` for llm/vllm only + secrets from `inspector-secrets`
@@ -438,7 +447,11 @@ def render_step(
     requests all `nvidia.com/gpu`. Every GPU step exposes the GPUs through `NVIDIA_VISIBLE_DEVICES=all`.
 
     `cpu_millicores` (extra keyword, default the 10m floor): the whole Pod's CPU request (at least 10m for the
-    whole Pod, split over the containers with at least 1m each), see `step_cpu_millicores`. Never a CPU limit."""
+    whole Pod, split over the containers with at least 1m each), see `step_cpu_millicores`. Never a CPU limit.
+
+    `memory_room` (extra keyword, default None: unknown): the memory the node has left for requests, see
+    `step_memory_room`. Each container requests 64Mi, or its share of the room when that is less; with no room the
+    memory request is omitted. The memory limit (`task.memory_cap`) is never below the request."""
     run_id = run.spec.run_id
     single = len(step.containers) == 1
     return {
@@ -472,6 +485,9 @@ def render_step(
                     single=single,
                     allocatable=node_allocatable_memory_bytes,
                     cpu_millicores=max(CONTAINER_FLOOR_M, max(CPU_FLOOR_M, cpu_millicores) // len(step.containers)),
+                    memory_request=STEP_MEMORY_REQUEST
+                    if memory_room is None
+                    else min(STEP_MEMORY_REQUEST, max(0, memory_room) // len(step.containers)),
                 )
                 for c in step.containers
             ],
@@ -653,18 +669,20 @@ def cpu_millicores(quantity, *, round_up: bool = True) -> int:
     return int(millicores.to_integral_value(ROUND_CEILING if round_up else ROUND_FLOOR))
 
 
-def pod_cpu_request_millicores(pod: dict) -> int:
-    """What the scheduler counts for the Pod: the Pod-level `spec.resources.requests.cpu` when set, else the
-    larger of the steady sum (containers plus native sidecars: init containers with `restartPolicy: Always`) and
-    the peak while the init containers run (each plus the sidecars started before it); plus `spec.overhead.cpu`."""
+def _pod_request(pod: dict, resource: str, parse) -> int:
+    """What the scheduler counts for the Pod of `resource` (`parse`: quantity -> int): the Pod-level
+    `spec.resources.requests` when set, else the larger of the steady sum (containers plus native sidecars: init
+    containers with `restartPolicy: Always`) and the peak while the init containers run (each plus the sidecars
+    started before it); plus `spec.overhead`. A container with a limit and no request requests its limit."""
     spec = pod.get("spec", {})
 
     def request(container: dict) -> int:
-        return cpu_millicores(container.get("resources", {}).get("requests", {}).get("cpu", 0))
+        res = container.get("resources", {})
+        return parse(res.get("requests", {}).get(resource, res.get("limits", {}).get(resource, 0)))
 
-    pod_level = (spec.get("resources") or {}).get("requests", {}).get("cpu")
+    pod_level = (spec.get("resources") or {}).get("requests", {}).get(resource)
     if pod_level is not None:
-        total = cpu_millicores(pod_level)
+        total = parse(pod_level)
     else:
         sidecars = 0
         init_peak = 0
@@ -674,7 +692,22 @@ def pod_cpu_request_millicores(pod: dict) -> int:
             else:
                 init_peak = max(init_peak, sidecars + request(c))
         total = max(sum(request(c) for c in spec.get("containers") or []) + sidecars, init_peak)
-    return total + cpu_millicores((spec.get("overhead") or {}).get("cpu", 0))
+    return total + parse((spec.get("overhead") or {}).get(resource, 0))
+
+
+def pod_cpu_request_millicores(pod: dict) -> int:
+    """What the scheduler counts for the Pod of CPU, in millicores (see `_pod_request`)."""
+    return _pod_request(pod, "cpu", cpu_millicores)
+
+
+def memory_bytes(quantity) -> int:
+    """A Kubernetes memory quantity ("128Mi", "1G", "1500", "0") in bytes, rounded up."""
+    return int(parse_quantity(str(quantity)).to_integral_value(ROUND_CEILING))
+
+
+def pod_memory_request_bytes(pod: dict) -> int:
+    """What the scheduler counts for the Pod of memory, in bytes (see `_pod_request`)."""
+    return _pod_request(pod, "memory", memory_bytes)
 
 
 def _active(pods: Sequence[dict]) -> list[dict]:
@@ -697,6 +730,14 @@ def step_cpu_millicores(allocatable_millicores: int, node_pods: Sequence[dict]) 
     others = sum(pod_cpu_request_millicores(p) for p in _active(node_pods))
     margin = cpu_margin_millicores(allocatable_millicores, node_pods)
     return max(CPU_FLOOR_M, allocatable_millicores - others - margin)
+
+
+def step_memory_room(allocatable_bytes: int, node_pods: Sequence[dict]) -> int:
+    """Memory the node has left for the step Pod's request: the allocatable memory minus the requests of the Pods
+    already on it (finished ones do not count) minus `MEMORY_MARGIN`. At or below 0 on a node too small for
+    the request (a 512 MB node leaves about 77 MiB), where kubelet admission would reject the Pod."""
+    others = sum(pod_memory_request_bytes(p) for p in _active(node_pods))
+    return allocatable_bytes - others - MEMORY_MARGIN
 
 
 def is_out_of_cpu(pod: dict) -> bool:

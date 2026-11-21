@@ -1264,6 +1264,7 @@ class Runner:
         for c in step.containers:  # only this attempt's manifest may count at the end
             self.storage.clear_task(crd.run_key(run), c.key)
         self._heartbeat(run)
+        cpu_millicores, memory_room = self._step_requests(nd, floor=_cpu_refusals(annotations) >= CPU_REFUSALS_FLOOR)
         pod = pods.render_step(
             run,
             run.status.attempt,
@@ -1273,27 +1274,34 @@ class Runner:
             node_allocatable_memory_bytes=nd.facts.allocatable_memory_bytes,
             owner=self._anchor_owner(run, live),
             gpu_count=nd.gpu_count,
-            cpu_millicores=self._step_cpu_millicores(nd, floor=_cpu_refusals(annotations) >= CPU_REFUSALS_FLOOR),
+            cpu_millicores=cpu_millicores,
+            memory_room=memory_room,
         )
         if annotations:
             _meta(pod).setdefault("annotations", {}).update(annotations)
         self._create("pod", pod)
 
-    def _step_cpu_millicores(self, nd: _Node, *, floor: bool) -> int:
-        """The step Pod's CPU request: the node's allocatable CPU minus what the Pods on it request, so the
-        benchmark gets nearly all of the CPU weight kubelet derives from requests (see `pods.step_cpu_millicores`).
-        `floor`: the floor, after the kubelet refused the computed request twice; also when the node's Pods
-        cannot be listed (RBAC): the launch is never blocked."""
-        if floor or not nd.facts.allocatable_cpu_millicores:
-            return pods.CPU_FLOOR_M
+    def _step_requests(self, nd: _Node, *, floor: bool) -> tuple[int, int | None]:
+        """The step Pod's CPU request in millicores and the memory room for its memory request (None: unknown).
+        CPU: the node's allocatable CPU minus what the Pods on it request, so the benchmark gets nearly all of the
+        CPU weight kubelet derives from requests (see `pods.step_cpu_millicores`); `floor`: the floor, after the
+        kubelet refused the computed request twice. Memory: the allocatable memory minus the Pods' requests, so the
+        request fits a small node (see `pods.step_memory_room`). When the node's Pods cannot be listed (RBAC): the
+        CPU floor and no memory room: the launch is never blocked."""
         try:
             node_pods = self.kube.list_node_pods(nd.facts.node_name)
         except Forbidden:
             log.warning(
                 "node %s: the Pods on it cannot be listed (forbidden), step Pod requests the floor", nd.facts.node_name
             )
-            return pods.CPU_FLOOR_M
-        return pods.step_cpu_millicores(nd.facts.allocatable_cpu_millicores, node_pods)
+            return pods.CPU_FLOOR_M, None
+        cpu = pods.CPU_FLOOR_M
+        if not floor and nd.facts.allocatable_cpu_millicores:
+            cpu = pods.step_cpu_millicores(nd.facts.allocatable_cpu_millicores, node_pods)
+        room = None
+        if nd.facts.allocatable_memory_bytes:
+            room = pods.step_memory_room(nd.facts.allocatable_memory_bytes, node_pods)
+        return cpu, room
 
     def _relaunch_refused(
         self, run: BenchmarkRun, cfg: Config, live: dict[str, dict], nd: _Node, step: Step, pod: dict

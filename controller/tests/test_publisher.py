@@ -779,3 +779,80 @@ def test_old_failed_runs_of_temporary_launch_reasons_are_deleted_unpublished(tmp
     failed("other", "NODE_LOST", code=-4)
     make_publisher(tmp_path, origin, storage).publish_once(ENABLED)
     assert sorted(cluster.runs) == ["hcloud-other", "hcloud-rejected"]
+
+
+def _rejected_run(cluster, storage, *, lscpu_state=TaskState.DONE):
+    """The live run vultr-vc2-1c-0.5gb: every step Pod rejected by kubelet admission (lscpu included, exit code 256
+    with an error message) on a node the run did get."""
+    message = "Pod was rejected: Node didn't have enough resource: memory, requested: 335544320"
+    now = datetime.now(UTC).replace(tzinfo=None, microsecond=0)  # recent: the keepRunHours give-up does not apply
+    start = (now - timedelta(minutes=1)).isoformat()
+    status = {"start": start, "end": now.isoformat(), "exit_code": 256, "error_msg": message, "task_hash": "h",
+              "run_id": RUN_ID, "attempt": 1}  # fmt: skip
+    names = ["lscpu", "geekbench", "openssl"]
+    for name in names:
+        storage.put_task(name, status)
+    storage.objects[okey(KEY, "run.json")] = json.dumps({"attempts": [{"attempt": 1, "node": "bench-nh4mb"}]}).encode()
+    run = cluster.add_run(names)
+    for task in run.status.tasks:
+        task.exit_code, task.error_msg = 256, message
+    run.status.tasks[0].state = lscpu_state
+    return run
+
+
+def _published_metas(origin, tmp_path) -> dict[str, int]:
+    inst = clone(origin, tmp_path) / "data/hcloud/cax31"
+    return {
+        str(p.relative_to(inst)): json.loads(p.read_text()).get("exit_code") for p in sorted(inst.glob("*/*/meta.json"))
+    }
+
+
+def test_run_whose_lscpu_failed_publishes_under_variant_0_when_the_sku_has_none(tmp_path, origin, cluster, caplog):
+    storage = FakeStorage()
+    run = _rejected_run(cluster, storage)
+    run.status.phase = RunPhase.PUBLISHING
+    result = make_publisher(tmp_path, origin, storage).publish_once(ENABLED)
+    assert result.tasks_published == 3 and all(t.published for t in run.status.tasks)
+    assert run.status.phase == RunPhase.DONE and run.status.variant is None
+    metas = _published_metas(origin, tmp_path)
+    assert {"0/lscpu/meta.json": 256, "0/geekbench/meta.json": 256, "0/openssl/meta.json": 256}.items() <= metas.items()
+    assert metas["schedule/openssl/meta.json"] == 256  # what autoPlan's due/backoff logic reads
+    inst = clone(origin, tmp_path) / "data/hcloud/cax31"
+    assert not (inst / "0/variant.json").exists() and not (inst / "0/timing").exists()
+    assert json.loads((inst / "0/openssl/meta.json").read_text())["error_msg"].startswith("Pod was rejected")
+    assert [r.levelname for r in caplog.records if "current variant" in r.message] == ["WARNING"]  # once per run
+
+
+def test_run_whose_lscpu_failed_publishes_under_the_highest_existing_variant(tmp_path, origin, cluster):
+    seed = clone(origin, tmp_path, "seed2")
+    (seed / "data/hcloud/cax31/2/lscpu").mkdir(parents=True)
+    (seed / "data/hcloud/cax31/2/lscpu/meta.json").write_text("{}")
+    (seed / "data/hcloud/cax31/10").mkdir()
+    (seed / "data/hcloud/cax31/10/x").write_text("")
+    git(seed, "add", "-A")
+    git(seed, "commit", "-m", "variants")
+    git(seed, "push", "origin", "HEAD:main")
+    storage = FakeStorage()
+    _rejected_run(cluster, storage)
+    make_publisher(tmp_path, origin, storage).publish_once(ENABLED)
+    assert "10/openssl/meta.json" in _published_metas(origin, tmp_path)
+
+
+def test_run_waits_while_lscpu_or_another_task_is_still_to_end(tmp_path, origin, cluster):
+    storage = FakeStorage()
+    run = _rejected_run(cluster, storage, lscpu_state=TaskState.RUNNING)  # lscpu may still produce a result
+    assert make_publisher(tmp_path, origin, storage).publish_once(ENABLED).tasks_published == 0
+    run.status.tasks[0].state = TaskState.DONE
+    run.status.tasks[2].state = TaskState.RUNNING  # lscpu ended, the run is not done
+    assert make_publisher(tmp_path, origin, storage).publish_once(ENABLED).tasks_published == 0
+    assert not any(t.published for t in run.status.tasks)
+
+
+def test_run_whose_lscpu_succeeded_never_falls_back(tmp_path, origin, storage, cluster):
+    # lscpu succeeded but the task's attempt has no lscpu output in run.json: the hardware is unknown, wait
+    storage.objects[okey(KEY, "run.json")] = json.dumps({"attempts": [{"attempt": 1, "node": "n"}]}).encode()
+    for name in ("lscpu", "openssl"):
+        storage.put_task(name, golden_status(name) | {"end": datetime.now(UTC).replace(tzinfo=None).isoformat()})
+    run = cluster.add_run(["lscpu", "openssl"])
+    assert make_publisher(tmp_path, origin, storage).publish_once(ENABLED).tasks_published == 0
+    assert not any(t.published for t in run.status.tasks)

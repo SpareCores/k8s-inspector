@@ -121,8 +121,25 @@ the recomputed request; a second refusal gives the 10m floor request; a third is
 (`-4` with the message). The number of refusals is kept in the annotation `inspector.sparecores.com/cpu-refusals` of
 the recreated Pod, and every relaunch (also after a DiskPressure rejection) carries over the Pod's
 `inspector.sparecores.com/*` annotations, so the relaunches are bounded. When the Pods of the node cannot be listed
-(RBAC: Forbidden), the controller logs a warning and requests the floor; the launch is never blocked. Memory requests
-stay at 64Mi.
+(RBAC: Forbidden), the controller logs a warning and requests the floor; the launch is never blocked.
+
+### Memory request
+
+A step container requests 64Mi of memory, unless the node cannot take that much: the controller sizes the Pod's
+request from the same list of Pods,
+
+```
+room = node allocatable memory − memory requests of the other Pods on the node − 4Mi
+request per container = min(64Mi, room / number of containers)
+```
+
+A 512 MB node has about 77 MiB allocatable, and its anchor and DaemonSets already request most of it; a fixed 64Mi
+request would be rejected at kubelet admission ("Node didn't have enough resource: memory"), and every task of the
+run would fail without running. With `room` at or below zero the memory request is omitted. A task's memory limit
+(`memory_cap` times the node's allocatable memory) is kept, may exceed the allocatable memory (the kubelet admits on
+requests only), and is never below the request; a real out-of-memory kill is recorded as an ordinary failed task. A
+limit with no request would make the request equal to the limit, so a node without room gets an explicit request of
+0 for a task with a limit. When the Pods of the node cannot be listed, the request stays at 64Mi.
 
 ## Comparability with the VM era
 

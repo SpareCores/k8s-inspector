@@ -25,7 +25,11 @@ Decisions:
   the planner does not plan it again); a task with exit code >= 0 stays unpublished
   (and is retried every cycle) rather than being filed under the wrong variant, until `publish.keep_run_hours`
   after its end: then it is marked published without a commit, logged as an error and counted in
-  `PublishResult.unpublishable` (`k8s_inspector_unpublishable_tasks_total`), so the run frees its lease. A forced
+  `PublishResult.unpublishable` (`k8s_inspector_unpublishable_tasks_total`), so the run frees its lease. When the
+  run's `lscpu` task failed and every task is done, no lscpu result will come: its tasks are filed under the SKU's
+  current variant (the highest variant directory in the checkout, 0 when there is none), logged once per run, so
+  the failures reach git. `variant.json` and timing files are not written and `status.variant` stays unset; a task
+  with a negative exit code, or any task of a run that never had a node, still goes to `schedule/` only. A forced
   run of a SKU that git does not know, without lscpu (a typo), publishes nothing and is marked published
   without a commit.
 - A task whose rendering keeps failing is published without parser output after `MAX_RENDER_FAILURES` cycles.
@@ -111,6 +115,7 @@ class _Item:
     attempt: int | None = None
     run_times: tuple[tuple[datetime | None, datetime | None], ...] = ()  # start/end of every task of the run
     status: dict | None = None  # status.json when already read (rescan)
+    no_lscpu_coming: bool = False  # the run's lscpu task failed and every task is done: no lscpu result will come
 
 
 @dataclass
@@ -208,6 +213,7 @@ class Publisher:
         self._env = env
         self._repo = Path(workdir) / "repo"
         self._render_failures: dict[tuple[RunKey, str], int] = {}
+        self._fallback_logged: set[RunKey] = set()  # runs published under the current variant (logged once)
         self._settings_provider = settings_provider
         self._get_task = get_task
         self._lock = threading.Lock()  # one cycle at a time (run_forever, CLI, trigger)
@@ -333,8 +339,12 @@ class Publisher:
             return []
         key = crd.run_key(run)
         times = tuple((t.start, t.end) for t in run.status.tasks)
+        no_lscpu_coming = _no_lscpu_coming(run)
         return [
-            _Item(key, t.name, run.name, run.spec.database, run.spec.force, t.end, t.attempt, times) for t in pending
+            _Item(
+                key, t.name, run.name, run.spec.database, run.spec.force, t.end, t.attempt, times, None, no_lscpu_coming
+            )
+            for t in pending
         ]
 
     def _items_in_bucket(self, settings: Settings, vendor: str, sku: str, day: date) -> list[_Item]:
@@ -456,8 +466,9 @@ class Publisher:
                     unpublishable.append(one)
             else:
                 one.variant = variant
-                rendered.append((one, variant))
-                if variant is not None:
+                has_lscpu = one.lscpu is not None  # a fallback variant is not the run's hardware
+                rendered.append((one, variant if has_lscpu else None))
+                if variant is not None and has_lscpu:
                     first_with_variant.setdefault(item.run, one)
         for one in first_with_variant.values():
             self._render_timing(one)
@@ -478,13 +489,18 @@ class Publisher:
             fields = variants.parse_lscpu_stdout(one.lscpu)
             variant = variants.pick_variant(self._existing_variants(run.vendor, run.sku), fields)
         elif inp.status.get("exit_code", 0) >= 0 and not _harness_error_without_node(inp.status, one.run_json):
-            log.warning("%s/%s: no lscpu result for the run, cannot pick a variant yet", run.run_id, item.key)
-            return _SKIPPED
+            if not item.no_lscpu_coming:
+                log.warning("%s/%s: no lscpu result for the run, cannot pick a variant yet", run.run_id, item.key)
+                return _SKIPPED
+            variant = self._current_variant(run.vendor, run.sku)
+            if run not in self._fallback_logged:
+                self._fallback_logged.add(run)
+                log.warning("%s: no lscpu result, publishing under the current variant %d", run.run_id, variant)
         elif item.forced and not (self._repo / "data" / run.vendor / run.sku).exists():
             log.warning("%s/%s: forced run of a SKU git does not know, not publishing", run.run_id, item.key)
             return _DISCARDED
         render.render_task(self._repo, run.vendor, run.sku, variant, inp)
-        if variant is not None:  # after the task: a task that fails to render leaves no variant behind
+        if fields is not None:  # after the task: a task that fails to render leaves no variant behind
             status = one.lscpu_status or {}
             render.render_variant(
                 self._repo, run.vendor, run.sku, variant, one.lscpu,
@@ -503,6 +519,11 @@ class Publisher:
             if not (self._repo / "data" / run.vendor / run.sku / str(variant) / "variant.json").exists():
                 return
         render.render_timing(self._repo, run.vendor, run.sku, variant, run, self._timings(item, one.run_json))
+
+    def _current_variant(self, vendor: str, sku: str) -> int:
+        """The highest variant directory of the SKU in the checkout, 0 when it has none."""
+        dirs = (self._repo / "data" / vendor / sku).glob("[0-9]*")
+        return max((int(d.name) for d in dirs if d.name.isdigit() and d.is_dir()), default=0)
 
     def _existing_variants(self, vendor: str, sku: str) -> dict[int, dict]:
         found = {}
@@ -706,6 +727,16 @@ def _lscpu_of(status: dict, run_json: dict | None, legacy_status: dict | None):
         same = legacy_status and legacy_status.get("attempt") == n
         return entry["lscpu_stdout"].encode(), legacy_status if same else None
     return None, None
+
+
+def _no_lscpu_coming(run: BenchmarkRun) -> bool:
+    """The run's lscpu task failed (or was rejected) and every task is done, so no lscpu result will come."""
+    lscpu = next((t for t in run.status.tasks if t.name == "lscpu"), None)
+    return (
+        lscpu is not None
+        and lscpu.exit_code != ExitCode.OK
+        and all(t.state == TaskState.DONE for t in run.status.tasks)
+    )
 
 
 def _harness_error_without_node(status: dict, run_json: dict | None) -> bool:

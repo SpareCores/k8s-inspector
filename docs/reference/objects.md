@@ -122,7 +122,7 @@ spec:
     - {name: SENTINEL_API_TOKEN, valueFrom: {secretKeyRef: {name: inspector-secrets, key: sentinel}}}
     - {name: BENCHMARK_SECRETS_PASSPHRASE, valueFrom: {secretKeyRef: {name: inspector-secrets, key: geekbench}}}
     securityContext: {privileged: true, seccompProfile: {type: Unconfined}}
-    resources: {requests: {cpu: <allocatable − other Pods' requests − 10m, min 10m>, memory: 64Mi}, limits: {memory: <0.85 × Node allocatable>}}  # never a CPU limit
+    resources: {requests: {cpu: <allocatable − other Pods' requests − 10m, min 10m>, memory: <64Mi, less when the node has no room for it>}, limits: {memory: <0.85 × Node allocatable, at least the request>}}  # never a CPU limit
     terminationMessagePolicy: File
     volumeMounts:
     - {name: k8si, mountPath: /k8si}
