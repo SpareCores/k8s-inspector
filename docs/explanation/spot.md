@@ -46,12 +46,15 @@ classification exact and the flush complete.
 4. **Per-SKU memory.** The controller keeps per-SKU interruption counts in the ConfigMap `k8s-inspector-spot`. A SKU
    with `interruptionsToQuarantine` (default 2) interruptions within `quarantineDays` (default 14) starts on-demand
    for that period. Losing this ConfigMap is harmless: spot is tried again.
-5. **Provisioning budget.** An anchor allows `spot, on-demand`, so a spot shortage falls back by itself. If the anchor
+5. **A failed launch falls back to on-demand.** When a NodeClaim of a spot-allowed attempt fails to launch (two
+   distinct `LaunchFailed` claims) or to register, the attempt ends `ProvisioningFailed`, and every later attempt of
+   the run allows `on-demand` only. The same failure of an on-demand attempt ends the run (`-1`, below).
+6. **Provisioning budget.** An anchor allows `spot, on-demand`, so a spot shortage falls back by itself. If the anchor
    is still pending after the normal provisioning budget, the attempt ends as `-1` like any capacity failure (backoff
    2 h, 6 h, 24 h).
-6. **Long tasks run on-demand.** Tasks whose timeout exceeds `spotMaxTaskMinutes` (default 240, so `stressnglongrun`
+7. **Long tasks run on-demand.** Tasks whose timeout exceeds `spotMaxTaskMinutes` (default 240, so `stressnglongrun`
    with 26 h) are never planned on spot; a run that contains one is on-demand.
-7. **Statistics are recorded.** `status.attempts` lists each attempt's capacity type, node, duration and outcome.
+8. **Statistics are recorded.** `status.attempts` lists each attempt's capacity type, node, duration and outcome.
    `meta.json` gets `capacity_type` and `spot_attempts`; the controller exports interruption counts per vendor and SKU
    as metrics ([monitoring](monitoring.md)).
 

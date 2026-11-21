@@ -543,7 +543,7 @@ def _launch_failed(h, name, message="Fatal (InvalidParameter): 400"):
 
 def test_two_distinct_launch_failures_end_the_run_even_when_claims_are_replaced(h):
     h.cluster.provision_enabled = False
-    h.start(["geekbench"])
+    h.start(["geekbench"], capacity=CapacityMode.ON_DEMAND)
     h.runner.reconcile(h.name)
     _launch_failed(h, "bench-aaaaa", "first")
     h.runner.reconcile(h.name)
@@ -561,6 +561,35 @@ def test_two_distinct_launch_failures_end_the_run_even_when_claims_are_replaced(
         code == -1
         and message == "SCARPENTER_LAUNCH_FAILED: Fatal (InvalidParameter): Error returned by Compute Service. 400"
     )
+
+
+def test_launch_failures_of_a_spot_attempt_fall_back_to_an_on_demand_attempt(h):
+    h.cluster.provision_enabled = False
+    h.start(["geekbench"])
+    h.runner.reconcile(h.name)
+    assert pods.allows_spot(h.kube.get("pod", f"{h.name}-a1"))
+    _launch_failed(h, "bench-aaaaa", "first")
+    _launch_failed(h, "bench-bbbbb", "second")
+    h.runner.reconcile(h.name)
+    assert h.run.status.attempts[0].outcome == AttemptOutcome.PROVISIONING_FAILED
+    assert h.run.status.phase == RunPhase.PENDING
+    h.runner.reconcile(h.name)
+    assert h.run.status.attempt == 2 and h.run.status.launch_failures == []
+    assert not pods.allows_spot(h.kube.get("pod", f"{h.name}-a2"))
+    assert h.codes()["geekbench"] == (None, None)
+
+
+def test_launch_failures_of_the_on_demand_attempt_end_the_run(h):
+    h.cluster.provision_enabled = False
+    h.start(["geekbench"])
+    for attempt in (1, 2):
+        h.runner.reconcile(h.name)
+        anchor = h.kube.get("pod", f"{h.name}-a{attempt}")
+        h.cluster.fail_launch(anchor, "first", name=f"bench-a{attempt}1", status="Unknown", reason="LaunchFailed")
+        h.cluster.fail_launch(anchor, "second", name=f"bench-a{attempt}2", status="Unknown", reason="LaunchFailed")
+        h.runner.reconcile(h.name)
+    assert h.run.status.phase == RunPhase.FAILED
+    assert h.codes()["geekbench"] == (-1, "SCARPENTER_LAUNCH_FAILED: second")
 
 
 def test_the_same_failed_nodeclaim_counts_once(h):

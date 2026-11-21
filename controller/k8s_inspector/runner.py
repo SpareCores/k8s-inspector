@@ -105,6 +105,10 @@ ACTIVE = (RunPhase.PENDING, RunPhase.PROVISIONING, RunPhase.RUNNING, RunPhase.RE
 MAX_PROVISION_RETRIES = 3  # attempts lost before a node was usable (stale node, anchor deleted)
 EXTRA_ATTEMPTS = 2  # attempts beyond `max_spot_attempts` (the on-demand one plus one spare)
 MAX_LAUNCH_FAILURES = 2  # distinct NodeClaims that failed to launch in one attempt before the run gives up
+SPOT_FALLBACK_ERRORS = (
+    "SCARPENTER_LAUNCH_FAILED",
+    "SCARPENTER_BOOT_FAILURE",
+)  # a spot attempt ending so goes on-demand
 MAX_LAUNCH_FAILURES_KEPT = 5  # entries of `status.launchFailures`
 LAUNCH_FAILED_REASON = "LaunchFailed"  # reason of a NodeClaim's `Launched` condition
 BACKOFF_SECONDS = (2, 5, 15, 30, 60)
@@ -838,6 +842,8 @@ class Runner:
         failures = self._record_launch_failures(run, claims)
         if error is None and len(failures) >= MAX_LAUNCH_FAILURES:
             error = f"SCARPENTER_LAUNCH_FAILED: {failures[-1].message}"
+        # A NodeClaim that failed to launch or boot is no spot shortage (a shortage waits, or ends as ICE or quota).
+        on_demand_retry = bool(error) and error.startswith(("SCARPENTER_LAUNCH_FAILED", "SCARPENTER_BOOT_FAILURE"))
         started = self._attempt(run).start or _time(_meta(anchor).get("creationTimestamp"))
         budget = (
             timedelta(hours=cfg.settings.deadlines.provision_gpu_hours)
@@ -858,8 +864,12 @@ class Runner:
         if error is None and waited > budget:
             default = "BOOT_FAILURE" if claims else "ICE"
             error = scarpenter_error(f"no node after {int(budget.total_seconds() // 60)} minutes", default)
-        if error:
-            self._fail_run(run, error)
+        if error is None:
+            return
+        if on_demand_retry and pods.allows_spot(anchor):
+            # The next attempt (`spot.capacity_for_next_attempt`) is on-demand only.
+            return self._retry_provisioning(run, cfg, live, error)
+        self._fail_run(run, error)
 
     def _bench_pool_event(self, anchor: dict, bench_pool: str, since: datetime) -> str | None:
         """`_bench_pool_message` of the anchor's Events; an API error counts as no event."""

@@ -176,3 +176,9 @@ def test_record_interruption_never_raises():
 
 def test_key_is_configmap_safe():
     assert spot._key("aws", "Standard D2/v3") == "aws.Standard_D2_v3"
+
+
+def test_a_failed_provisioning_attempt_makes_the_next_one_on_demand_only():
+    failed = attempt(1, 0, 5, outcome=AttemptOutcome.PROVISIONING_FAILED)
+    assert spot.capacity_for_next_attempt(run([failed]), [task(spot=True)], Settings(), False) == OD
+    assert spot.capacity_for_next_attempt(run([]), [task(spot=True)], Settings(), False) == SPOT_OD

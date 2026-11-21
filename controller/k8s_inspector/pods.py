@@ -85,6 +85,17 @@ def anchor_name(run_name: str, attempt: int) -> str:
     return f"{run_name}-a{attempt}"
 
 
+def allows_spot(anchor: dict) -> bool:
+    """Whether the anchor Pod may land on a spot node (its capacity-type node affinity lists `spot`)."""
+    terms = anchor["spec"]["affinity"]["nodeAffinity"]["requiredDuringSchedulingIgnoredDuringExecution"]
+    return any(
+        "spot" in expression["values"]
+        for term in terms["nodeSelectorTerms"]
+        for expression in term["matchExpressions"]
+        if expression["key"] == "karpenter.sh/capacity-type"
+    )
+
+
 def step_pod_name(run_name: str, attempt: int, step: Step) -> str:
     """`<run name>-a<attempt>-<step.name>`; the flush step appends `-flush<n>` via `flush_pod_name`."""
     return f"{anchor_name(run_name, attempt)}-{step.name}"

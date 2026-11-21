@@ -54,8 +54,9 @@ def capacity_for_next_attempt(
 ) -> list[CapacityType]:
     """Capacity types the next anchor allows: `[spot, on-demand]` (spot preferred, falls back by itself) or
     `[on-demand]` when: vendor/run mode is `OnDemand`, `tasks.allows_spot` is False, the run used
-    `max_spot_attempts` interrupted attempts or lost more than `max_lost_minutes`, or the SKU is
-    quarantined."""
+    `max_spot_attempts` interrupted attempts or lost more than `max_lost_minutes`, the SKU is
+    quarantined, or an attempt failed to provision (launch or boot failure: a spot shortage falls back by
+    itself, so spot is not tried again after anything else went wrong)."""
     interrupted = sum(1 for a in run.status.attempts if a.outcome == AttemptOutcome.SPOT_INTERRUPTED)
     on_demand_only = (
         run.spec.capacity == CapacityMode.ON_DEMAND
@@ -63,6 +64,7 @@ def capacity_for_next_attempt(
         or interrupted >= settings.spot.max_spot_attempts
         or _lost_minutes(run) > settings.spot.max_lost_minutes
         or quarantined
+        or any(a.outcome == AttemptOutcome.PROVISIONING_FAILED for a in run.status.attempts)
     )
     return [CapacityType.ON_DEMAND] if on_demand_only else [CapacityType.SPOT, CapacityType.ON_DEMAND]
 
