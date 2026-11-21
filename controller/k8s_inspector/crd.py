@@ -237,11 +237,12 @@ def _task_to_dict(task: TaskStatus) -> dict:
 def _attempt_to_dict(attempt: AttemptStatus) -> dict:
     d = {
         "n": attempt.n,
-        "capacityType": attempt.capacity_type.value if attempt.capacity_type else None,
         "start": _format_time(attempt.start),
         "end": _format_time(attempt.end),
         "outcome": attempt.outcome.value if attempt.outcome else None,
     }
+    if attempt.capacity_type is not None:
+        d["capacityType"] = attempt.capacity_type.value
     if attempt.node_claim is not None:
         d["nodeClaim"] = attempt.node_claim
     if attempt.node is not None:

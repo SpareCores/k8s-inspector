@@ -393,3 +393,10 @@ def test_update_status_gives_up_after_five_conflicts():
 def test_update_status_missing_run_raises_not_found():
     with pytest.raises(NotFound):
         crd.update_status(FakeKube(), "nope", lambda s: None)
+
+
+def test_attempt_without_a_node_omits_the_capacity_type():
+    omitted = crd._attempt_to_dict(AttemptStatus(n=1))
+    assert "capacityType" not in omitted and crd._attempt_from_dict(omitted).capacity_type is None
+    kept = crd._attempt_to_dict(AttemptStatus(n=1, capacity_type=CapacityType.SPOT))
+    assert kept["capacityType"] == "spot"
