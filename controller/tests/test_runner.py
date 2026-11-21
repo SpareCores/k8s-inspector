@@ -571,11 +571,31 @@ def test_launch_failures_of_a_spot_attempt_fall_back_to_an_on_demand_attempt(h):
     _launch_failed(h, "bench-aaaaa", "first")
     _launch_failed(h, "bench-bbbbb", "second")
     h.runner.reconcile(h.name)
-    assert h.run.status.attempts[0].outcome == AttemptOutcome.PROVISIONING_FAILED
+    assert h.run.status.attempts[0].outcome == AttemptOutcome.LAUNCH_FAILED
     assert h.run.status.phase == RunPhase.PENDING
     h.runner.reconcile(h.name)
     assert h.run.status.attempt == 2 and h.run.status.launch_failures == []
     assert not pods.allows_spot(h.kube.get("pod", f"{h.name}-a2"))
+    assert h.codes()["geekbench"] == (None, None)
+
+
+def test_launch_failures_after_lost_attempts_still_fall_back_with_a_clean_record(h):
+    h.cluster.provision_enabled = False
+    h.start(["geekbench"])
+    for attempt in (1, 2):  # attempts lost to a stale node: not a reason to leave spot
+        h.runner.reconcile(h.name)
+        h.cluster.provision(h.kube.get("pod", f"{h.name}-a{attempt}"), node_created=START - timedelta(hours=1))
+        h.runner.reconcile(h.name)
+        assert h.run.status.attempts[-1].outcome == AttemptOutcome.PROVISIONING_FAILED
+    h.runner.reconcile(h.name)
+    assert pods.allows_spot(h.kube.get("pod", f"{h.name}-a3"))
+    anchor = h.kube.get("pod", f"{h.name}-a3")
+    h.cluster.fail_launch(anchor, "first", name="bench-c1", status="Unknown", reason="LaunchFailed")
+    h.cluster.fail_launch(anchor, "second", name="bench-c2", status="Unknown", reason="LaunchFailed")
+    h.runner.reconcile(h.name)
+    assert h.run.status.attempts[2].outcome == AttemptOutcome.LAUNCH_FAILED and h.run.status.phase == RunPhase.PENDING
+    h.runner.reconcile(h.name)
+    assert not pods.allows_spot(h.kube.get("pod", f"{h.name}-a4"))
     assert h.codes()["geekbench"] == (None, None)
 
 

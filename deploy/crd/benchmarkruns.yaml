@@ -129,7 +129,7 @@ spec:
                     outcome:
                       type: string
                       nullable: true
-                      enum: [Completed, SpotInterrupted, NodeLost, ProvisioningFailed, Cancelled, HarnessError]
+                      enum: [Completed, SpotInterrupted, NodeLost, ProvisioningFailed, LaunchFailed, Cancelled, HarnessError]
               launchFailures:
                 type: array
                 items:
