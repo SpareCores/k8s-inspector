@@ -333,7 +333,7 @@ def _step_container(
     gpu_runtime: bool,
     gpu_count: int,
     single: bool,
-    memory_bytes: int,
+    allocatable: int,
     cpu_millicores: int,
 ) -> dict:
     task = container.task
@@ -377,7 +377,7 @@ def _step_container(
         mounts.append({"name": "dshm", "mountPath": "/dev/shm"})
     resources: dict = {"requests": {"cpu": f"{cpu_millicores}m", "memory": "0"}}
     if task.memory_cap is not None:
-        resources["limits"] = {"memory": str(int(task.memory_cap * memory_bytes))}
+        resources["limits"] = {"memory": str(int(task.memory_cap * allocatable))}
     if gpu_runtime and gpu_count and single:
         # Extended resources are exclusive: only a single-container step can claim every GPU.
         resources.setdefault("limits", {})["nvidia.com/gpu"] = str(gpu_count)
@@ -414,7 +414,7 @@ def render_step(
     cfg: Config,
     *,
     node_name: str,
-    node_memory_bytes: int,
+    node_allocatable_memory_bytes: int,
     owner: OwnerRef,
     gpu_count: int = 0,
     cpu_millicores: int = CPU_FLOOR_M,
@@ -426,9 +426,9 @@ def render_step(
     image `container.image`, `command: [/k8si/bin/sc-run, exec, --task <key>, --timeout <t>, --spool
     /k8si/runs/<run_id>/<key>, --urls /k8si-urls/urls.json, --version-cmd ..., --collect ..., --, <entrypoint
     + resource-tracker/nice wrapper + command>]`, `privileged` + `seccompProfile: Unconfined`, requests
-    `cpu <cpu_millicores split evenly over the containers>, memory 0`
-    (explicit: no LimitRange default request applies), memory limit =
-    `task.memory_cap * node_memory_bytes` (capacity) when set (no CPU limits ever), `terminationMessagePolicy:
+    `cpu <cpu_millicores split evenly over the containers>, memory 0` (explicit: no LimitRange default request
+    applies), memory limit =
+    `task.memory_cap * node_allocatable_memory_bytes` when set (no CPU limits ever), `terminationMessagePolicy:
     File`, env: `TRACKER_*` (project, job name, external run id
     = `run_id`, output path in the spool) + `HF_TOKEN` for llm/vllm only + secrets from `inspector-secrets`
     (`task.secrets`) + `task.env` + `container.env`. Volumes: hostPath `/var/lib/k8s-inspector`, the urls
@@ -471,7 +471,7 @@ def render_step(
                     gpu_runtime=step.gpu_runtime,
                     gpu_count=gpu_count,
                     single=single,
-                    memory_bytes=node_memory_bytes,
+                    allocatable=node_allocatable_memory_bytes,
                     cpu_millicores=max(CONTAINER_FLOOR_M, max(CPU_FLOOR_M, cpu_millicores) // len(step.containers)),
                 )
                 for c in step.containers

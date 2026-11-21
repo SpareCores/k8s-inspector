@@ -40,7 +40,7 @@ Legend: **P** planner, **R** run loop, **C** classification, **Pub** publisher, 
 | `DB_DOCKER_OPTS` seccomp, `nofile`, `memlock` | **S** `Unconfined`; **W** `--rlimit` |
 | `nice -n -20` per command | unchanged in commands; additionally **W** `--nice -20` for every task (generic rule) |
 | `pid_mode=host` (storage) | **S** `hostPID` on that step |
-| 0.85 × available memory cap, `shm_size` 4 GiB | **S** memory limit from Node capacity; memory-backed `/dev/shm` |
+| 0.85 × available memory cap, `shm_size` 4 GiB | **S** memory limit from Node allocatable; memory-backed `/dev/shm` |
 | per-task timeout, output discarded on timeout | **W** timeout with partial output kept, `-6` |
 | GPU-first-then-CPU retry, vLLM probe ladder, nvbandwidth `-b` | **R** ported ([GPU](../explanation/gpu.md)) |
 | `GPU_VRAM_MIB`, `GPU_COMPUTE_CAP` from the host | `gpu_facts` container in the probe step |

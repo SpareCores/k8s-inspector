@@ -1905,10 +1905,10 @@ def test_a_daily_limit_waits_until_the_offered_until(h):
     assert datetime.fromisoformat(h.entry()["next"]) == until
 
 
-def test_step_pod_requests_no_memory_and_limits_from_the_node_capacity(h):
+def test_step_pod_requests_no_memory_and_limits_from_the_node_allocatable(h):
     h.cluster.node_allocatable = {"memory": "77Mi", "cpu": "1"}  # capacity of the fake node is 16Gi
     h.start(["geekbench"])
     h.drive(stop=lambda run: any(n.endswith("geekbench") for n in h.pod_names("step")))
     resources = h.kube.get("pod", geekbench_pod(h))["spec"]["containers"][0]["resources"]
     assert resources["requests"]["memory"] == "0"
-    assert resources["limits"]["memory"] == str(int(0.85 * 16 * 1024**3))
+    assert resources["limits"]["memory"] == str(int(0.85 * 77 * 1024**2))

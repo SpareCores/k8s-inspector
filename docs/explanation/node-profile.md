@@ -80,7 +80,7 @@ Measured on the `Lean` E5.Flex.2-8 node.
 | `seccomp=unconfined`, `nofile=1048576`, `memlock=-1` for DB tasks | `seccompProfile: Unconfined` for all; rlimits set by `sc-run` |
 | `--pid=host` for storage | `hostPID: true` on the storage step only |
 | no CPU limits | no CPU limits (no CFS quota, so `nproc` and cgroup-aware tools see the whole node); the step Pod's CPU **request** is what the other Pods leave ([CPU weight](#cpu-weight)) |
-| memory cap 0.85 × available for geekbench and vLLM | `limits.memory` = 0.85 × Node memory capacity for those two (decision K9); everything else under the `kubepods.slice` limit |
+| memory cap 0.85 × available for geekbench and vLLM | `limits.memory` = 0.85 × Node allocatable for those two (decision K9); everything else under the `kubepods.slice` limit |
 | `shm_size=4g` for vLLM | emptyDir `medium: Memory`, `sizeLimit: 4Gi` at `/dev/shm`, vLLM only |
 | `nice -n -20` in commands and images | unchanged, and every task also runs at nice -20 via `sc-run exec --nice -20` (generic rule: benchmarks get as much CPU as possible; the legacy per-command `nice` stays, as nice clamps at -20) |
 
@@ -130,11 +130,17 @@ LimitRange default request cannot add one). A 512 MB node has about 77 MiB alloc
 already request most of it; any fixed request would be rejected at kubelet admission ("Node didn't have enough
 resource: memory") and every task of the run would fail without running. Step Pods are bound to the node with
 `nodeName`, so the scheduler does not place them, and the CPU request keeps them Burstable. Without a memory request
-they are OOM-killed or evicted before the anchor and the DaemonSets. The memory limit of the two capped tasks
-(`memory_cap`, geekbench and vLLM) is `memory_cap` × the node's `status.capacity.memory`: allocatable would leave about
-65 MiB of a 512 MB node, where about 470 MiB are physically there. A limit above allocatable is fine, the kubelet
-admits on requests only. A task killed by the OOM killer ends with exit code 137 and `OOMKilled`; under node memory
-pressure the kubelet can instead evict the Pod, which is recorded as `-4` with `EVICTED`.
+a step Pod is always the first Pod the kubelet evicts or the kernel OOM-kills, and the anchor
+(request 16Mi) survives. The memory limit of the two capped tasks (`memory_cap`, geekbench and vLLM) is `memory_cap` ×
+the node's allocatable memory; a limit above what the node can give is fine, the kubelet admits on requests only. A
+task killed by the OOM killer ends with exit code 137 and `OOMKilled`; under node memory pressure the kubelet can
+instead evict the Pod, which is recorded as `-4` with `EVICTED`.
+
+Measured on Vultr nodes of 0.5, 1, 2 and 4 GiB (a request-0 Pod eating memory next to a 16Mi-request Pod): the
+request-0 Pod was always the one killed or evicted. Allocatable was 78, 581, 1587 and 3535 MiB, and a benchmark could
+use about 45, 600, 1600 and 3510 MiB. On the smallest nodes the kubelet's memory eviction (`memory.available`
+counts active page cache) limits a benchmark before physical memory does. The `kubepods.slice` `memory.max` is
+allocatable plus the 50 MiB eviction threshold.
 
 ## Comparability with the VM era
 

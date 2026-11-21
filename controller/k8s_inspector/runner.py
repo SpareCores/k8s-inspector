@@ -1270,7 +1270,7 @@ class Runner:
             step,
             cfg,
             node_name=nd.facts.node_name,
-            node_memory_bytes=nd.facts.memory_bytes or nd.facts.allocatable_memory_bytes,
+            node_allocatable_memory_bytes=nd.facts.allocatable_memory_bytes,
             owner=self._anchor_owner(run, live),
             gpu_count=nd.gpu_count,
             cpu_millicores=self._step_cpu_millicores(nd, floor=_cpu_refusals(annotations) >= CPU_REFUSALS_FLOOR),

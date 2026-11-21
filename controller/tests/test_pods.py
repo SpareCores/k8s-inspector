@@ -123,7 +123,9 @@ def test_deadlines(cfg):
 
 
 def test_step_pod_like_spike(run, cfg):
-    pod = pods.render_step(run, 1, step(container(task())), cfg, node_name="n1", node_memory_bytes=1000, owner=OWNER)
+    pod = pods.render_step(
+        run, 1, step(container(task())), cfg, node_name="n1", node_allocatable_memory_bytes=1000, owner=OWNER
+    )
     spec = pod["spec"]
     assert spec["nodeName"] == "n1"
     assert spec["activeDeadlineSeconds"] == 4260
@@ -224,7 +226,7 @@ def test_step_cpu_never_drops_below_the_floor():
 
 
 def test_step_pod_requests_the_given_cpu_split_over_containers_without_limit(run, cfg):
-    kw = {"node_name": "n", "node_memory_bytes": 1, "owner": OWNER}
+    kw = {"node_name": "n", "node_allocatable_memory_bytes": 1, "owner": OWNER}
     pod = pods.render_step(run, 1, step(container(task())), cfg, cpu_millicores=3900, **kw)
     assert pod["spec"]["containers"][0]["resources"] == {"requests": {"cpu": "3900m", "memory": "0"}}
     a, b = task("lscpu", parallel=True), task("lstopo", parallel=True)
@@ -267,7 +269,7 @@ def test_memory_cap_models_shm_secrets_rlimits_hostpid(run, cfg):
         step(container(t, env=(("A", "2"),))),
         cfg,
         node_name="n",
-        node_memory_bytes=1000,
+        node_allocatable_memory_bytes=1000,
         owner=OWNER,
     )
     spec = pod["spec"]
@@ -295,7 +297,7 @@ def test_memory_cap_models_shm_secrets_rlimits_hostpid(run, cfg):
 def test_probe_pod_has_no_tracker(run, cfg):
     a, b = task("lscpu", parallel=True), task("lstopo", parallel=True)
     pod = pods.render_step(
-        run, 1, step(container(a), container(b)), cfg, node_name="n", node_memory_bytes=1, owner=OWNER
+        run, 1, step(container(a), container(b)), cfg, node_name="n", node_allocatable_memory_bytes=1, owner=OWNER
     )
     assert pod["metadata"]["labels"]["inspector.sparecores.com/task"] == "probe"
     assert [c["name"] for c in pod["spec"]["containers"]] == ["lscpu", "lstopo"]
@@ -304,7 +306,7 @@ def test_probe_pod_has_no_tracker(run, cfg):
 
 def test_gpu_step(run, cfg):
     s = step(container(task("nvbandwidth", gpu=True)), gpu_runtime=True)
-    pod = pods.render_step(run, 1, s, cfg, node_name="n", node_memory_bytes=1, owner=OWNER, gpu_count=4)
+    pod = pods.render_step(run, 1, s, cfg, node_name="n", node_allocatable_memory_bytes=1, owner=OWNER, gpu_count=4)
     assert pod["spec"]["runtimeClassName"] == "nvidia"
     c = pod["spec"]["containers"][0]
     assert c["resources"]["limits"] == {"nvidia.com/gpu": "4"}
@@ -314,7 +316,7 @@ def test_gpu_step(run, cfg):
 def test_vllm_probe_key_container_name(run, cfg):
     t = task("vllm")
     s = step(container(t, key="vllm-probe-benchmark-vllm-gpu", command="--probe-only"))
-    pod = pods.render_step(run, 1, s, cfg, node_name="n", node_memory_bytes=1, owner=OWNER)
+    pod = pods.render_step(run, 1, s, cfg, node_name="n", node_allocatable_memory_bytes=1, owner=OWNER)
     c = pod["spec"]["containers"][0]
     assert c["name"] == "vllm-probe-benchmark-vllm-gpu"
     assert c["command"][-1] == "--probe-only"
