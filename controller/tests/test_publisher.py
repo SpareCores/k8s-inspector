@@ -10,7 +10,7 @@ from pathlib import Path
 
 import pytest
 
-from k8s_inspector import crd, publisher
+from k8s_inspector import crd, launch, publisher
 from k8s_inspector import storage as storage_keys
 from k8s_inspector.model import (
     BenchmarkRun,
@@ -125,6 +125,12 @@ class FakeCluster:
 
     def __init__(self, monkeypatch):
         self.runs: dict[str, BenchmarkRun] = {}
+        self.deferred: list[tuple[str, str, str]] = []  # (vendor, sku, reason) of `launch.record_failure`
+        monkeypatch.setattr(
+            launch,
+            "record_failure",
+            lambda kube, vendor, sku, reason, now, until=None: self.deferred.append((vendor, sku, reason)) or 1,
+        )
         monkeypatch.setattr(crd, "list_runs", lambda kube: list(self.runs.values()))
         monkeypatch.setattr(
             crd, "run_key", lambda r: RunKey(r.spec.vendor, r.spec.sku, r.created.date(), r.spec.run_id)
@@ -820,7 +826,9 @@ def test_run_whose_lscpu_failed_files_its_failures_in_the_schedule_and_finishes(
     }
     assert {m["exit_code"] for m in metas.values()} == {256}
     assert metas["openssl"]["error_msg"].startswith("Pod was rejected")  # what autoPlan's due/backoff logic reads
-    assert [r.levelname for r in caplog.records if "no lscpu result will come" in r.message] == ["WARNING"]
+    assert [r.levelname for r in caplog.records if "its lscpu task failed" in r.message] == ["WARNING"]
+    assert cluster.deferred == [("hcloud", "cax31", "NO_LSCPU")]  # the SKU waits before the planner starts it again
+    assert not publisher.publishing_stalled(ENABLED, "hcloud", list(cluster.runs.values()))
 
 
 def test_success_of_a_run_whose_lscpu_failed_is_not_filed_under_a_guessed_variant(tmp_path, origin, cluster):
@@ -842,20 +850,71 @@ def test_success_of_a_run_whose_lscpu_failed_is_not_filed_under_a_guessed_varian
     assert json.loads((inst / "2/openssl/meta.json").read_text()) == {"exit_code": 0}  # untouched
     assert sorted(p.name for p in inst.iterdir()) == ["2", "schedule"]
     assert not (inst / "schedule/openssl").exists()
+    assert cluster.deferred == [("hcloud", "cax31", "NO_LSCPU")]
+    assert not publisher.publishing_stalled(ENABLED, "hcloud", list(cluster.runs.values()))
 
 
 def test_lscpu_that_succeeded_on_attempt_2_does_not_fall_back(tmp_path, origin, storage, cluster):
+    # attempt 1: lscpu and openssl failed; attempt 2 retries lscpu, which is still running
+    now = datetime.now(UTC).replace(tzinfo=None).isoformat()
+    failed = golden_status("openssl") | {"exit_code": 256, "error_msg": "rejected", "end": now}
+    storage.put_task("openssl", failed)
+    storage.put_task("lscpu", failed)
+    storage.objects[okey(KEY, "run.json")] = json.dumps({"attempts": [{"attempt": 1, "node": "n1"}]}).encode()
+    run = cluster.add_run(["lscpu", "openssl"])
+    run.status.tasks[0].exit_code, run.status.tasks[0].state = 256, TaskState.RUNNING
+    assert make_publisher(tmp_path, origin, storage).publish_once(ENABLED).tasks_published == 0
+    # attempt 2: lscpu succeeded, and run.json holds its output
     lscpu_out = (GOLDEN / "lscpu/stdout").read_text()
     attempts = [{"attempt": 1, "node": "n1"}, {"attempt": 2, "node": "n2", "lscpu_stdout": lscpu_out}]
     storage.objects[okey(KEY, "run.json")] = json.dumps({"attempts": attempts}).encode()
     for name in ("lscpu", "openssl"):
         storage.put_task(name, golden_status(name) | {"attempt": 2})
-    run = cluster.add_run(["lscpu", "openssl"])
     for task in run.status.tasks:
-        task.attempt = 2  # attempt 1 had failed its tasks; lscpu of attempt 2 is the result
+        task.exit_code, task.state, task.attempt = 0, TaskState.DONE, 2
     assert not publisher._no_lscpu_coming(run)
     make_publisher(tmp_path, origin, storage).publish_once(ENABLED)
     assert (clone(origin, tmp_path) / "data/hcloud/cax31/0/openssl/meta.json").exists()
+    assert cluster.deferred == []
+
+
+def test_tasks_of_a_good_attempt_still_go_to_their_variant_when_lscpu_failed_on_attempt_2(
+    tmp_path, origin, storage, cluster
+):
+    lscpu_out = (GOLDEN / "lscpu/stdout").read_text()
+    attempts = [{"attempt": 1, "node": "n1", "lscpu_stdout": lscpu_out}, {"attempt": 2, "node": "n2"}]
+    storage.objects[okey(KEY, "run.json")] = json.dumps({"attempts": attempts}).encode()
+    now = datetime.now(UTC).replace(tzinfo=None).isoformat()
+    failed = {"exit_code": 256, "error_msg": "rejected", "attempt": 2, "end": now}
+    storage.put_task("lscpu", golden_status("lscpu") | failed)
+    storage.put_task("geekbench", golden_status("geekbench") | failed)
+    storage.put_task("openssl", golden_status("openssl") | {"end": now}, (GOLDEN / "openssl/stdout").read_bytes())
+    run = cluster.add_run(["lscpu", "geekbench", "openssl"])
+    for task in run.status.tasks[:2]:
+        task.exit_code, task.attempt = 256, 2
+    result = make_publisher(tmp_path, origin, storage).publish_once(ENABLED)
+    assert all(t.published for t in run.status.tasks) and result.unpublishable == 0
+    inst = clone(origin, tmp_path) / "data/hcloud/cax31"
+    assert (inst / "0/openssl/meta.json").exists()  # attempt 1 had an lscpu result: its variant
+    assert not (inst / "0/geekbench").exists() and not (inst / "0/lscpu").exists()
+    assert json.loads((inst / "schedule/geekbench/meta.json").read_text())["exit_code"] == 256
+
+
+def test_forced_run_of_an_unknown_sku_whose_lscpu_failed_publishes_nothing(tmp_path, origin, cluster):
+    storage = FakeStorage()
+    run = _rejected_run(cluster, storage)
+    run.spec.force = True  # data/hcloud/cax31 is not in git
+    make_publisher(tmp_path, origin, storage).publish_once(ENABLED)
+    assert all(t.published and t.commit is None for t in run.status.tasks)
+    assert not (clone(origin, tmp_path) / "data").exists()
+
+
+def test_run_whose_tasks_were_all_published_while_releasing_ends_done(tmp_path, origin, cluster):
+    run = cluster.add_run(["openssl"], phase=RunPhase.PUBLISHING)
+    run.status.tasks[0].published = True
+    make_publisher(tmp_path, origin, FakeStorage()).publish_once(ENABLED)
+    assert run.status.phase == RunPhase.DONE
+    assert [c["type"] for c in run.status.conditions] == ["Published"]
 
 
 def test_run_waits_while_lscpu_or_another_task_is_still_to_end(tmp_path, origin, cluster):

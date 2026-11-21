@@ -101,10 +101,13 @@ The publisher runs in the controller every 5 minutes and on demand. It never mov
      a negative exit code and no usable `lscpu` result goes to `schedule/<task>/meta.json` only; one with exit code
      0 or above waits for the next cycle rather than land in the wrong variant, until `keepRunHours` after its end,
      unless the run's `lscpu` task failed (or was rejected) and every task of the run is done: no `lscpu` result will
-     come, so a failed task goes to `schedule/<task>/meta.json` only (autoPlan's due and backoff logic sees it), and a
-     successful task, whose hardware is unknown, is given up at once instead of being filed under a guessed variant.
-     A warning is logged for the run. A task that is given up is marked published without a commit, logged as an
-     error and counted in `k8s_inspector_unpublishable_tasks_total`, so the run no longer holds the SKU lease. The run is deleted `keepRunHours` after that, so such a run holds
+     come, so a failed task without an `lscpu` result of its attempt goes to `schedule/<task>/meta.json` only (the
+     planner then plans by its exit code: `-4` is retried after its wait, `256` is final), and a successful one,
+     whose hardware is unknown, is given up at once instead of being filed under a guessed variant. Tasks of an earlier
+     attempt that did have an `lscpu` result still go to their variant. A warning is logged for the run, and its SKU
+     waits for the launch backoff (reason `NO_LSCPU`, [launch retries](launch-retries.md)) before the planner starts
+     it again. A task that is given up is marked published without a commit, logged as an error and counted in
+     `k8s_inspector_unpublishable_tasks_total`, so the run no longer holds the SKU lease. The run is deleted `keepRunHours` after that, so such a run holds
 the lease about twice `keepRunHours` after its end.
    - The **timing** files come from the attempt of the task: the latest `run.json` `attempts[]` entry with an lscpu
      result (else its `timing` map) gives `api_start` (the attempt's anchor created), `api_end`, `machine_start`,

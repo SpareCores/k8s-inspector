@@ -125,22 +125,24 @@ the recreated Pod, and every relaunch (also after a DiskPressure rejection) carr
 
 ### Memory request
 
-Step Pods request no memory: every step container has an explicit `requests.memory: "0"` (explicit, so a
-LimitRange default request cannot add one). A 512 MB node has about 77 MiB allocatable, and its anchor and DaemonSets
-already request most of it; any fixed request would be rejected at kubelet admission ("Node didn't have enough
-resource: memory") and every task of the run would fail without running. Step Pods are bound to the node with
-`nodeName`, so the scheduler does not place them, and the CPU request keeps them Burstable. Without a memory request
-a step Pod is always the first Pod the kubelet evicts or the kernel OOM-kills, and the anchor
-(request 16Mi) survives. The memory limit of the two capped tasks (`memory_cap`, geekbench and vLLM) is `memory_cap` ×
-the node's allocatable memory; a limit above what the node can give is fine, the kubelet admits on requests only. A
-task killed by the OOM killer ends with exit code 137 and `OOMKilled`; under node memory pressure the kubelet can
-instead evict the Pod, which is recorded as `-4` with `EVICTED`.
+Step Pods and flush Pods request no memory: every container has an explicit `requests.memory: "0"`. It is explicit
+mainly because a container with `limits.memory` and no request gets a request equal to the limit (geekbench and vLLM
+have a limit), and a LimitRange default request would be added to a missing one too. A fixed request would be
+rejected at kubelet admission on a small node ("Pod was rejected: Node didn't have enough resource: memory", reason
+`OutOfmemory`), and every task of the run would fail without running; the controller records such a rejection as
+`-4` with the message, like `OutOfcpu` and DiskPressure, so the planner retries it after its wait. Step Pods are
+bound to the node with `nodeName`, so the scheduler does not place them, and the CPU request keeps them Burstable.
+The anchor keeps its 16Mi request. The memory limit of the two capped tasks (`memory_cap`, geekbench and vLLM) is
+`memory_cap` × the node's allocatable memory; a limit above what the node can give is fine, the kubelet admits on
+requests only. A task killed by the OOM killer ends with exit code 137 and `OOMKilled`; under node memory pressure the
+kubelet can instead evict the Pod, which is recorded as `-4` with `EVICTED`.
 
-Measured on Vultr nodes of 0.5, 1, 2 and 4 GiB (a request-0 Pod eating memory next to a 16Mi-request Pod): the
-request-0 Pod was always the one killed or evicted. Allocatable was 78, 581, 1587 and 3535 MiB, and a benchmark could
-use about 45, 600, 1600 and 3510 MiB. On the smallest nodes the kubelet's memory eviction (`memory.available`
-counts active page cache) limits a benchmark before physical memory does. The `kubepods.slice` `memory.max` is
-allocatable plus the 50 MiB eviction threshold.
+Measured on Vultr nodes of 0.5, 1, 2 and 4 GiB, with one 16Mi-request Pod and one request-0 Pod eating memory: the
+request-0 Pod was the one killed or evicted in every measurement, and the 16Mi Pod survived. Allocatable was 78, 581,
+1587 and 3535 MiB (a 512 MB node has about 77 MiB, which its anchor and DaemonSets already largely request), and a
+benchmark could use about 45, 600, 1600 and 3510 MiB. On the smallest nodes the kubelet's memory eviction
+(`memory.available` counts active page cache) limits a benchmark before physical memory does. The numbers depend on
+SCarpenter's reservations for the Lean small nodes and change with them.
 
 ## Comparability with the VM era
 

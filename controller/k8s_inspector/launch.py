@@ -33,7 +33,7 @@ CLASS_REASONS = {
 }
 # NO_OFFERING (no instance type for the SKU, or an anchor nobody schedules): SCarpenter's mark is usually short, but
 # where the offered-types filter fails open nothing else stops the retries, so the wait is a flat 24 h.
-TEMPORARY = ("ICE", "QUOTA", "DAILY_LIMIT", "VENDOR", "NO_OFFERING")
+TEMPORARY = ("ICE", "QUOTA", "DAILY_LIMIT", "VENDOR", "NO_OFFERING", "NO_LSCPU")
 # Reasons of `-1` schedule metas written before the classes existed; they were temporary too.
 LEGACY_TEMPORARY = ("QUOTA_ZERO", "LAUNCH_FAILED")
 NO_NODE_MESSAGE = ": no node after "  # the old BOOT_FAILURE of a run that merely waited out its budget
@@ -48,6 +48,7 @@ MAX_WAIT = {
     "VENDOR": timedelta(hours=6),
     "BOOT_FAILURE": timedelta(hours=6),
     "DAILY_LIMIT": timedelta(hours=6),  # without SCarpenter's `until`
+    "NO_LSCPU": timedelta(hours=6),  # the publisher: a run ended without an lscpu result (not a launch failure)
 }
 NO_OFFERING_WAIT = timedelta(hours=24)
 RETRY_AFTER_PERMANENT = timedelta(days=30)

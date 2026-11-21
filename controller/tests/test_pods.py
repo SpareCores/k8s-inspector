@@ -252,6 +252,17 @@ def test_out_of_cpu_rejection_is_recognised_and_classified_with_its_message():
     assert not pods.is_out_of_cpu(ran)
 
 
+def test_every_admission_rejection_is_classified_minus_four_with_its_message():
+    message = "Pod was rejected: Node didn't have enough resource: memory, requested: 335544320, used: 1, capacity: 2"
+    for reason in ("OutOfmemory", "OutOfpods", "Evicted", "NodeAffinity"):
+        rejected = {"status": {"phase": "Failed", "reason": reason, "message": message}}
+        out = pods.classify(rejected, [container(task())])["membench"]
+        assert (out.exit_code, out.error_msg, out.container_start_error) == (-4, message, True), reason
+    ran = finished_pod({"name": "membench", "state": {"terminated": {"exitCode": 1}}}, reason="OutOfmemory")
+    ran["status"]["message"] = message
+    assert not pods.is_refused(ran)  # a container ran: not an admission rejection
+
+
 def test_memory_cap_models_shm_secrets_rlimits_hostpid(run, cfg):
     t = task(
         "vllm",
@@ -330,6 +341,8 @@ def test_flush_and_secret(run, cfg):
     assert pod["metadata"]["labels"]["inspector.sparecores.com/role"] == "flush"
     assert pod["spec"]["containers"][1]["args"][:4] == ["flush", "--task", "lstopo", "--spool"]
     assert "securityContext" not in pod["spec"]["containers"][0]
+    # no memory request: a 0.5 GiB node cannot admit 16Mi per container next to the anchor and the DaemonSets
+    assert {c["resources"]["requests"]["memory"] for c in pod["spec"]["containers"]} == {"0"}
     owner = OwnerRef("inspector.sparecores.com/v1alpha1", "BenchmarkRun", run.name, "u")
     secret = pods.render_urls_secret(run, "{}", owner)
     assert secret["stringData"] == {"urls.json": "{}"}

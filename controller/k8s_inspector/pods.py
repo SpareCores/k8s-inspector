@@ -509,7 +509,7 @@ def render_flush_step(
                 "--multipart-mib",
                 str(cfg.settings.uploads.single_put_max_mib),
             ],
-            "resources": {"requests": {"cpu": "1m", "memory": "16Mi"}},
+            "resources": {"requests": {"cpu": "1m", "memory": "0"}},  # none: a small node cannot admit more
             "terminationMessagePolicy": "File",
             "volumeMounts": [
                 {"name": "k8si", "mountPath": MOUNT_DIR},
@@ -727,6 +727,19 @@ def is_rejected(pod: dict) -> bool:
     )
 
 
+def is_refused(pod: dict) -> bool:
+    """The kubelet refused the Pod at admission for any reason (`Failed`, "Pod was rejected: ...": `Evicted` under
+    DiskPressure, `OutOfcpu`, `OutOfmemory`, `OutOfpods`, ...): no container ever started."""
+    status = pod.get("status", {})
+    return (
+        status.get("phase") == "Failed"
+        and str(status.get("message", "")).startswith("Pod was rejected")
+        and not any(
+            "running" in s.get("state", {}) or "terminated" in s.get("state", {}) for s in _container_statuses(pod)
+        )
+    )
+
+
 def unfinished_containers(pod: dict) -> set[str]:
     """Names of the containers that have not terminated."""
     return {s["name"] for s in _container_statuses(pod) if "terminated" not in s.get("state", {})}
@@ -802,7 +815,7 @@ def _outcome_from_state(key: str, status: dict | None, pod: dict) -> TaskOutcome
         outcome.error_msg, outcome.container_start_error = detail, True
     elif pod_reason == "DeadlineExceeded":
         outcome.exit_code, outcome.error_msg = ExitCode.NEVER_FINISHED, Reason.DEADLINE_EXCEEDED.value
-    elif is_rejected(pod) or is_out_of_cpu(pod):
+    elif is_refused(pod):
         outcome.exit_code, outcome.error_msg = ExitCode.NEVER_FINISHED, pod["status"]["message"]
         outcome.container_start_error = True  # never started: nothing to flush
     elif pod_reason == "Evicted":

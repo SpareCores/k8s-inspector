@@ -26,10 +26,11 @@ Decisions:
   (and is retried every cycle) rather than being filed under the wrong variant, until `publish.keep_run_hours`
   after its end: then it is marked published without a commit, logged as an error and counted in
   `PublishResult.unpublishable` (`k8s_inspector_unpublishable_tasks_total`), so the run frees its lease. When the
-  run's `lscpu` task failed and every task is done, no lscpu result will come: its failed tasks go to
-  `schedule/<task>/meta.json` only (like a negative code), so autoPlan's due and backoff logic sees them, and its
-  successful tasks are given up at once (marked published without a commit, counted as unpublishable): their
-  hardware is unknown, so they are never filed under a guessed variant. A forced
+  run's `lscpu` task failed and every task is done, no lscpu result will come: a failed task without an lscpu
+  result of its attempt goes to `schedule/<task>/meta.json` only (like a negative code; the planner then plans by
+  its exit code: -4 retried after its wait, 256 final), and a successful one is given up at once (marked
+  published without a commit, counted as unpublishable): its hardware is unknown, so it is never filed under a
+  guessed variant. The SKU then waits for the launch backoff (`NO_LSCPU`). A forced
   run of a SKU that git does not know, without lscpu (a typo), publishes nothing and is marked published
   without a commit.
 - A task whose rendering keeps failing is published without parser output after `MAX_RENDER_FAILURES` cycles.
@@ -227,6 +228,10 @@ class Publisher:
             if settings is None:
                 return PublishResult(0, None, ())
             runs = self._delete_temporary_failures(crd.list_runs(self._kube))
+            for run in runs:
+                if run.status.phase == RunPhase.PUBLISHING and _all_published(run):
+                    # everything was published while the run was still releasing: nothing is left to publish
+                    crd.update_status(self._kube, run.name, partial(_mark, seen={}, sha=None, variant=None))
             items = []
             for run in runs:
                 items.extend(self._items_of(run, settings))
@@ -341,11 +346,21 @@ class Publisher:
         no_lscpu_coming = _no_lscpu_coming(run)
         if no_lscpu_coming:
             log.warning(
-                "run %s: its lscpu task failed, no lscpu result will come: failures go to schedule/ only", run.name
+                "run %s: its lscpu task failed and every task is done: tasks without an lscpu result of their "
+                "attempt go to schedule/ only (failures) or are given up (successes)",
+                run.name,
             )
         return [
             _Item(
-                key, t.name, run.name, run.spec.database, run.spec.force, t.end, t.attempt, times, None, no_lscpu_coming
+                key,
+                t.name,
+                run.name,
+                run.spec.database,
+                run.spec.force,
+                t.end,
+                t.attempt,
+                times,
+                no_lscpu_coming=no_lscpu_coming,
             )
             for t in pending
         ]
@@ -434,15 +449,24 @@ class Publisher:
             raise RuntimeError(f"push rejected {MAX_PUSH_ATTEMPTS} times")
         self._mark_published(rendered, sha)
         self._mark_published(discarded + unpublishable, None)
+        self._defer_skus_without_lscpu([one for one, _ in rendered] + unpublishable)
         run_ids = tuple(sorted({r[0].item.run.run_id for r in rendered}))
         return PublishResult(len(rendered), commit, run_ids, sum(1 for one in unpublishable if one.item.run_name))
+
+    def _defer_skus_without_lscpu(self, published: list[_Loaded]) -> None:
+        """A run ended without an lscpu result: its SKU waits for the launch backoff (`NO_LSCPU`) before the planner
+        starts it again, as its successful tasks left no result for the planner to see."""
+        runs = {(one.item.run, one.item.run_name) for one in published if one.item.no_lscpu_coming}
+        for run, run_name in runs:
+            if run_name:
+                launch.record_failure(self._kube, run.vendor, run.sku, "NO_LSCPU", datetime.now(UTC))
 
     def _render_all(
         self, loaded: list[_Loaded], keep: timedelta
     ) -> tuple[list[tuple[_Loaded, int | None]], list[_Loaded], list[_Loaded]]:
         """Render into the checkout; returns the tasks that are done (rendered, or skipped as stale), the ones
-        to mark published without a commit (nothing to publish) and the unpublishable ones (no variant to
-        file them under, `keep` after their end)."""
+        to mark published without a commit (nothing to publish) and the unpublishable ones (no variant to file
+        them under: `keep` after their end, or at once when the run's lscpu task failed)."""
         rendered = []
         discarded = []
         unpublishable = []
@@ -464,7 +488,10 @@ class Publisher:
                 discarded.append(one)
             elif variant is _SKIPPED:
                 end = _parse_status_time(one.inp.status.get("end"))
-                if item.no_lscpu_coming or (end and datetime.now(UTC) - end >= keep):
+                if item.no_lscpu_coming:
+                    log.error("%s/%s: succeeded without an lscpu result, not publishable", item.run.run_id, item.key)
+                    unpublishable.append(one)
+                elif end and datetime.now(UTC) - end >= keep:
                     log.error("%s/%s: no lscpu result after %s, not publishable", item.run.run_id, item.key, keep)
                     unpublishable.append(one)
             else:
@@ -490,11 +517,9 @@ class Publisher:
         if one.lscpu is not None:
             fields = variants.parse_lscpu_stdout(one.lscpu)
             variant = variants.pick_variant(self._existing_variants(run.vendor, run.sku), fields)
-        elif inp.status.get("exit_code", 0) >= 0 and not _harness_error_without_node(inp.status, one.run_json):
-            if not item.no_lscpu_coming or inp.status.get("exit_code") == ExitCode.OK:
-                log.warning("%s/%s: no lscpu result for the run, cannot pick a variant yet", run.run_id, item.key)
-                return _SKIPPED  # a success of unknown hardware is never filed under a guessed variant
-            # a failure of a run that will have no lscpu result: schedule/<task>/meta.json only (variant None)
+        elif _waits_for_lscpu(one):
+            log.warning("%s/%s: no lscpu result for the task's attempt, cannot pick a variant", run.run_id, item.key)
+            return _SKIPPED  # a success of unknown hardware is never filed under a guessed variant
         elif item.forced and not (self._repo / "data" / run.vendor / run.sku).exists():
             log.warning("%s/%s: forced run of a SKU git does not know, not publishing", run.run_id, item.key)
             return _DISCARDED
@@ -731,6 +756,14 @@ def _no_lscpu_coming(run: BenchmarkRun) -> bool:
         and lscpu.exit_code != ExitCode.OK
         and all(t.state == TaskState.DONE for t in run.status.tasks)
     )
+
+
+def _waits_for_lscpu(one: _Loaded) -> bool:
+    """A task without an lscpu result that can only be filed once there is one (`_SKIPPED`): exit code 0 or above
+    on a node. Not a failure of a run whose lscpu will never come: it goes to `schedule/` only, like a negative code."""
+    status = one.inp.status
+    failed = one.item.no_lscpu_coming and status.get("exit_code") != ExitCode.OK
+    return status.get("exit_code", 0) >= 0 and not _harness_error_without_node(status, one.run_json) and not failed
 
 
 def _harness_error_without_node(status: dict, run_json: dict | None) -> bool:

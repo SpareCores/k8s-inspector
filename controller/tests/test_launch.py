@@ -180,3 +180,9 @@ def test_damaged_entries_are_dropped_and_damaged_times_block_nothing():
     assert set(launch.read(kube, "oci")) == set(skus) - {"list"}
     assert launch.deferred(kube, "oci", list(skus), NOW) == {"good", "count"}
     assert launch.record_failure(kube, "oci", "count", "ICE", NOW) == 1  # an unusable count starts again
+
+
+def test_no_lscpu_wait_doubles_from_one_hour_up_to_six():
+    waits = [launch.wait_after("NO_LSCPU", n) for n in (1, 2, 3, 4, 9)]
+    assert waits == [timedelta(hours=h) for h in (1, 2, 4, 6, 6)]
+    assert "NO_LSCPU" in launch.REASONS
