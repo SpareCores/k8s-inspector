@@ -202,3 +202,25 @@ def test_http_endpoints(runs, metrics):
         server.shutdown()
         server.server_close()
         thread.join(5)
+
+
+def test_launch_gauges_and_failure_counter():
+    from fakes import Clock, FakeKube
+
+    from k8s_inspector import launch
+
+    kube = FakeKube(Clock(NOW))
+    launch.record_failure(kube, "oci", "a", "ICE", NOW)
+    launch.record_failure(kube, "oci", "b", "ICE", NOW - timedelta(days=1))  # retry due: deferred, not blocked
+    launch.record_failure(kube, "oci", "c", "QUOTA", NOW)
+    metrics = Metrics(kube, lambda: SETTINGS, clock=lambda: NOW)
+    metrics.record_launch_failure("oci", "ICE")
+    metrics.record_launch_failure("oci", "ICE")
+    metrics.record_launch_failure("aws", "something unbounded")
+    text = metrics.render()
+    assert 'k8s_inspector_launch_deferred_skus{reason="ICE",vendor="oci"} 2' in text
+    assert 'k8s_inspector_launch_blocked{reason="ICE",vendor="oci"} 1' in text
+    assert 'k8s_inspector_launch_blocked{reason="QUOTA",vendor="oci"} 1' in text
+    assert 'k8s_inspector_launch_blocked{reason="DAILY_LIMIT",vendor="aws"} 0' in text
+    assert 'k8s_inspector_launch_failures_total{reason="ICE",vendor="oci"} 2' in text
+    assert 'k8s_inspector_launch_failures_total{reason="OTHER",vendor="aws"} 1' in text

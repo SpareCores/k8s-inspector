@@ -14,6 +14,7 @@ Status: **design**. Pages marked *planned* describe procedures that will exist o
 | [State model](explanation/state.md) | where state lives, how a restarted controller knows what is running |
 | [Output pipeline](explanation/outputs.md) | spool, presigned multipart upload to the final location, git publishing |
 | [Spot strategy](explanation/spot.md) | using spot capacity without endless retries |
+| [Launch retries](explanation/launch-retries.md) | temporary and permanent launch failures, backoff |
 | [Managed databases](explanation/dbaas.md) | how DBaaS benchmarks provision and remove a database |
 | [GPU nodes](explanation/gpu.md) | NVIDIA drivers on Flatcar, runtime, driver selection |
 | [Security](explanation/security.md) | credentials, instance metadata, privileged benchmarks |

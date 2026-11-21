@@ -8,7 +8,7 @@ A benchmark needs the whole machine and a clean state, so a node is never shared
 The bench NodePool has billing retention off, and the controller checks that the anchor's node was created after the
 anchor (otherwise it deletes the anchor and that NodeClaim and tries again; the third failed attempt ends the run).
 A NodeClaim that fails to launch (`LaunchFailed`) is replaced by Karpenter with a new one; the second distinct
-launch failure of an attempt ends the run `-1 SCARPENTER_LAUNCH_FAILED` ([exit codes](../reference/exit-codes.md)).
+launch failure of an attempt ends the run; a temporary one leaves no record, a final one is `-1 SCARPENTER_LAUNCH_REJECTED` ([launch retries](launch-retries.md), [exit codes](../reference/exit-codes.md)).
 
 ## Anchor
 

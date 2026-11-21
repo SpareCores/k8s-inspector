@@ -765,3 +765,17 @@ def test_rescan_routes_dbaas_runs_by_run_json(tmp_path, origin, cluster):
     pub = publisher.Publisher(None, storage, env, tmp_path / "work", get_task=tasks.__getitem__)
     assert pub.rescan(1, settings=ENABLED).tasks_published == 1
     assert (clone(origin, tmp_path) / "dbaas/hcloud/db1/postgres/16/standalone/pgbench/meta.json").exists()
+
+
+def test_old_failed_runs_of_temporary_launch_reasons_are_deleted_unpublished(tmp_path, origin, storage, cluster):
+    def failed(sku, error_msg, code=-1):
+        run = cluster.add_run(["geekbench"], phase=RunPhase.FAILED, sku=sku)
+        run.status.tasks[0].exit_code, run.status.tasks[0].error_msg = code, error_msg
+        return run
+
+    failed("ice", "SCARPENTER_ICE: x")
+    failed("legacy", "SCARPENTER_LAUNCH_FAILED: y")
+    failed("rejected", "SCARPENTER_LAUNCH_REJECTED: Fatal (X): z")  # permanent: published as before
+    failed("other", "NODE_LOST", code=-4)
+    make_publisher(tmp_path, origin, storage).publish_once(ENABLED)
+    assert sorted(cluster.runs) == ["hcloud-other", "hcloud-rejected"]

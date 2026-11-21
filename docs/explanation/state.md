@@ -8,6 +8,7 @@
 | Task outputs and the per-task result (`status.json`) | object storage, at the final location | `sc-run` (outputs), controller (`status.json`) | bucket lifecycle (as today's task logs) |
 | Published results, history, retry counters, failure records | git: sc-inspector-data `meta.json` files | publisher (the only git writer) | forever |
 | Spot interruption statistics per SKU | ConfigMap `k8s-inspector-spot` | controller | best effort; losing it only means trying spot again |
+| Launch failures per SKU: reason, count, next try | ConfigMap `k8s-inspector-launch-<vendor>` ([launch retries](launch-retries.md)) | controller | best effort; losing it only means an earlier retry |
 | Offerings, capacity and quota errors | SCarpenter | SCarpenter | |
 | Settings | ConfigMap `k8s-inspector` ([configuration](../reference/configuration.md)) | platform | |
 

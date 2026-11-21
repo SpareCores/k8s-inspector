@@ -173,8 +173,8 @@ def serve(kube: Kube, provider: ConfigProvider, stop: threading.Event, metrics_p
     cfg = provider()
     env = cfg.env
     storage = Storage(env, cfg.settings.uploads)
-    runner = Runner(kube, storage, provider, env.namespace)
     metrics = Metrics(kube, lambda: provider().settings)
+    runner = Runner(kube, storage, provider, env.namespace, on_launch_failure=metrics.record_launch_failure)
     publisher = _MeteredPublisher(
         kube,
         storage,

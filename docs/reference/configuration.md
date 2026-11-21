@@ -77,9 +77,11 @@ after `noOfferingFastMinutes`; this needs `list` on `events`.
 
 Karpenter replaces a NodeClaim that fails to launch (`Launched` condition reason `LaunchFailed`, status Unknown or
 False) with a new one every few minutes, so the deadlines above would not fire. The controller remembers each failed
-NodeClaim of the attempt in `status.launchFailures` and, at the second distinct one, ends the remaining tasks
-`-1 SCARPENTER_LAUNCH_FAILED: <last message>` and deletes the anchor; when the attempt allowed spot, it instead ends
-`LaunchFailed` and the next attempt is on-demand only ([spot](../explanation/spot.md)). A single transient failure is tolerated.
+NodeClaim of the attempt in `status.launchFailures` and, at the second distinct one (or when the provisioning
+budget passes after a failure), ends the run with the reason of the class SCarpenter put in the last message
+([launch retries](../explanation/launch-retries.md)) and deletes the anchor; when the attempt allowed spot and the
+reason is `LAUNCH_REJECTED` or `BOOT_FAILURE`, it instead ends `LaunchFailed` and the next attempt is on-demand only
+([spot](../explanation/spot.md)). A single transient failure is tolerated.
 
 Only vendors listed with `enabled: true` are touched, and their results reach sc-inspector-data only with
 `publish: true` or a list of SKUs (default `false`: runs and outputs happen, git stays untouched, and the runs of
@@ -112,11 +114,14 @@ it is due and the vendor has room. Per vendor:
    blocked by Keeper except on its allowlist, so they run only where Keeper allows them) and its
    `data/<vendor>/<sku>/schedule/<task>/meta.json` in sc-inspector-data `main` says so: no meta yet, or a
    `task_hash` different from the catalogue's (a changed task, a bumped `revision`, a `RERUN_` prefix), or a failure
-   that is retried and whose wait has passed (`-1`: 2 h, or 24 h for `SCARPENTER_QUOTA_ZERO`,
-   `SCARPENTER_NO_OFFERING` and `SCARPENTER_LAUNCH_FAILED`; `-4`: 2 h after the first, 6 h after the second). Anything else with the current hash is
+   that is retried and whose wait has passed (`-1`: 2 h, 24 h for `SCARPENTER_NO_OFFERING`, 30 days
+   for `SCARPENTER_LAUNCH_REJECTED` and `SCARPENTER_BOOT_FAILURE`, and no wait for the older metas of temporary
+   reasons; `-4`: 2 h after the first, 6 h after the second). Anything else with the current hash is
    final: success, a task's own exit code above 0, `-3`, `-6`, `256` and `-5` ("exceeded retries") stay until the
    hash changes ([exit codes](exit-codes.md)). GPU tasks are dropped for a SKU whose `nvidia_smi` Keeper blocks (no
    GPU), and a SKU whose due tasks are only GPU tasks is not planned.
+   A SKU waiting in the launch ConfigMap (`next` ahead) or marked unavailable in SCarpenter's offered-types
+   ConfigMap (`until` ahead) is skipped ([launch retries](../explanation/launch-retries.md)).
 5. The first SKU in that order with at least one due task gets a run with exactly those tasks (not forced:
    Keeper's rules were applied). Then the caps are checked again; below them the next SKU follows.
 

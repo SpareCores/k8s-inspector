@@ -9,7 +9,10 @@ Exposed: `k8s_inspector_runs`, `_tasks_total`, `_run_attempts_total`, `_node_age
 `_publish_lag_seconds` (age of the oldest done, unpublished task), `_unpublishable_tasks_total` (tasks given up
 on: no lscpu result), `_last_publish_timestamp_seconds`
 (last publish cycle that did not fail, set by `record_publish`; process start before the first one),
-`_spend_usd_per_hour`, `_task_duration_seconds` (summary sum/count). Not yet: `_dbaas_instances` (P4).
+`_spend_usd_per_hour`, `_task_duration_seconds` (summary sum/count), `_launch_failures_total{vendor,reason}`
+(runs that ended because no node could be launched, counted by the runner), `_launch_deferred_skus{vendor,reason}`
+and `_launch_blocked{vendor,reason}` (SKUs in the launch ConfigMap, and those of them still waiting for their
+retry). Not yet: `_dbaas_instances` (P4).
 `/healthz` answers 200 as long as the process serves.
 """
 
@@ -21,7 +24,7 @@ from collections.abc import Callable
 from datetime import UTC, datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from k8s_inspector import crd
+from k8s_inspector import crd, launch
 from k8s_inspector.kube import Kube
 from k8s_inspector.model import AttemptOutcome, ExitCode, RunPhase, Settings, TaskState
 from k8s_inspector.planner import ACTIVE_PHASES, spend_per_hour
@@ -41,6 +44,8 @@ _ATTEMPT_LABEL = {
     AttemptOutcome.CANCELLED: "cancelled",
     AttemptOutcome.HARNESS_ERROR: "harness_error",
 }
+
+LAUNCH_REASONS = (*launch.REASONS, *launch.PERMANENT, "NO_OFFERING")  # the bounded `reason` label values
 
 Labels = tuple[tuple[str, str], ...]  # sorted (name, value) pairs: hashable key of one series
 
@@ -90,6 +95,12 @@ class Metrics:
         """A publish cycle finished without error."""
         with self._lock:
             self._last_publish = time.time()
+
+    def record_launch_failure(self, vendor: str, reason: str) -> None:
+        """A run ended because no node could be launched. Reasons outside `LAUNCH_REASONS` count as OTHER."""
+        reason = reason if reason in LAUNCH_REASONS else "OTHER"
+        with self._lock:
+            self._counters["launch_failures_total"][_labels(vendor=vendor, reason=reason)] += 1
 
     def record_unpublishable(self, count: int) -> None:
         """Tasks the publisher gave up on (finished, but no lscpu result to pick a variant from)."""
@@ -166,6 +177,15 @@ class Metrics:
                     self._counters["task_duration_seconds_sum"][duration] += (task.end - task.start).total_seconds()
                     self._counters["task_duration_seconds_count"][duration] += 1
 
+        deferred: dict[tuple[str, str], int] = {(v, r): 0 for v in settings.vendors for r in launch.REASONS}
+        blocked = dict(deferred)
+        for vendor in settings.vendors:
+            for entry in launch.read(self._kube, vendor).values():
+                key = (vendor, entry.get("reason"))
+                if key in deferred:
+                    deferred[key] += 1
+                    blocked[key] += launch.is_waiting(entry, now)
+
         lines = [f"# TYPE {PREFIX}runs gauge"]
         lines += [_line("runs", _labels(vendor=v, phase=p), n) for (v, p), n in sorted(phases.items())]
         lines.append(f"# TYPE {PREFIX}spend_usd_per_hour gauge")
@@ -180,6 +200,9 @@ class Metrics:
         lines.append(f"# TYPE {PREFIX}publish_lag_seconds gauge")
         lag = (now - oldest_unpublished).total_seconds() if oldest_unpublished else 0
         lines.append(_line("publish_lag_seconds", (), lag))
+        for name, counts in (("launch_deferred_skus", deferred), ("launch_blocked", blocked)):
+            lines.append(f"# TYPE {PREFIX}{name} gauge")
+            lines += [_line(name, _labels(vendor=v, reason=r), n) for (v, r), n in sorted(counts.items())]
         self._gauges = lines
 
 
