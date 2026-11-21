@@ -117,11 +117,10 @@ def test_values_override_defaults():
     assert aws.capacity == CapacityMode.SPOT_FIRST and not aws.publish and aws.auto_plan is None
 
 
-def test_scarpenter_offered_types_settings():
+def test_bench_class_setting():
     settings = parse_settings({})
-    assert (settings.bench_class, settings.scarpenter_namespace) == ("bench", "scarpenter-system")
-    settings = parse_settings({"benchClass": "b", "scarpenterNamespace": "ns"})
-    assert (settings.bench_class, settings.scarpenter_namespace) == ("b", "ns")
+    assert settings.bench_class == "bench"
+    assert parse_settings({"benchClass": "b"}).bench_class == "b"
 
 
 def test_bench_pool_defaults_and_overrides(caplog):

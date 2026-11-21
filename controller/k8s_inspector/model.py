@@ -470,7 +470,6 @@ class Settings:
     auto_plan: bool = False
     bench_pool: str = "bench"  # the one NodePool every vendor shares
     bench_class: str = "bench"  # the SCNodeClass of that pool: names SCarpenter's offered-types ConfigMaps
-    scarpenter_namespace: str = "scarpenter-system"  # where those ConfigMaps live
     vendors: dict[str, VendorSettings] = field(default_factory=dict)
     defaults: Defaults = field(default_factory=Defaults)
     spot: SpotSettings = field(default_factory=SpotSettings)

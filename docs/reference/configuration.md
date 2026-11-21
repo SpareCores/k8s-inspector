@@ -29,7 +29,6 @@ warning and ignored; an invalid value is an error and the controller keeps the l
 ```yaml
 benchPool: bench                 # the one NodePool every vendor's bench nodes come from
 benchClass: bench                # the SCNodeClass of that pool (names SCarpenter's offered-types ConfigMaps, see autoPlan)
-scarpenterNamespace: scarpenter-system  # namespace of those ConfigMaps
 planner:
   intervalMinutes: 5
   autoPlan: false                # true: the controller picks SKUs itself (below); false: only forced runs
@@ -128,11 +127,13 @@ checkout; with `--dry-run` it creates nothing and prints the first SKU that woul
 ### Offered types
 
 SCarpenter publishes which instance types it can launch in ConfigMap `scarpenter-offered-<benchClass>-<vendor>`
-(for example `scarpenter-offered-bench-oci`) in namespace `scarpenterNamespace`, key `types.json`. Once per vendor and
+(for example `scarpenter-offered-bench-oci`) in namespace `scarpenter-system`, key `types.json`. Once per vendor and
 cycle autoPlan reads it (the controller needs `get` on ConfigMaps there, `deploy/controller/rbac.yaml`) and skips a
-SKU, matched by the entry's `apiReference`, when:
+SKU, matched by the entry's `apiReference` (entries without one are ignored; of two with the same one the available
+wins), when:
 
 - its entry is missing or `available` is false (e.g. a tenancy quota), or
+- the entry has `available: true` but no `capacityTypes`, or
 - the vendor's `capacity` is `OnDemand` and `on-demand` is not in the entry's `capacityTypes` (`SpotFirst` takes
   either type).
 

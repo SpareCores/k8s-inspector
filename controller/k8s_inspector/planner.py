@@ -253,14 +253,16 @@ def due_reason(task: TaskDef, meta: dict | None, now: datetime) -> str | None:
     return None
 
 
+SCARPENTER_NAMESPACE = "scarpenter-system"  # keep in sync with deploy/controller/rbac.yaml
 OFFERED_MAX_AGE = timedelta(minutes=30)  # an older offered-types ConfigMap is stale: SCarpenter stopped writing it
 
 
 def not_offered(kube: Kube, cfg: Config, vendor: str, skus: list[str]) -> dict[str, str]:
     """The SKUs (of `skus`) that SCarpenter's offered-types ConfigMap `scarpenter-offered-<benchClass>-<vendor>`
-    in `scarpenterNamespace` does not offer for the vendor's capacity mode, with the reason. A SKU is matched by
-    the entry's `apiReference`; it is not offered when its entry is missing or `available` is false, or when
-    the mode is OnDemand and `on-demand` is not in its `capacityTypes` (SpotFirst takes either type).
+    in `SCARPENTER_NAMESPACE` does not offer for the vendor's capacity mode, with the reason. A SKU is matched by
+    the entry's `apiReference` (entries without one are ignored; of two with the same one the available wins); it
+    is not offered when its entry is missing, `available` is false or has no capacity type, or when the mode is
+    OnDemand and `on-demand` is not in its `capacityTypes` (SpotFirst takes either type).
 
     Fails open: a ConfigMap that is absent (vendor not opted in), unreadable, malformed or stale filters
     nothing, and the reason is logged. In a truncated list a missing entry proves nothing, so only entries
@@ -268,27 +270,35 @@ def not_offered(kube: Kube, cfg: Config, vendor: str, skus: list[str]) -> dict[s
     settings = cfg.settings
     name = f"scarpenter-offered-{settings.bench_class}-{vendor}"
     try:
-        data = json.loads(kube.get_configmap_in(settings.scarpenter_namespace, name)["data"]["types.json"])
+        data = json.loads(kube.get_configmap_in(SCARPENTER_NAMESPACE, name)["data"]["types.json"])
         generated = datetime.fromisoformat(data["generatedAt"])
+        if generated.tzinfo is None:
+            raise ValueError(f"generatedAt {data['generatedAt']!r} has no timezone")
         truncated = data["truncated"] is True
-        # apiReference -> (available, capacityTypes, reason); a malformed entry fails the whole read
-        entries = {
-            e["apiReference"]: (e["available"], e["capacityTypes"], e.get("reason", "unavailable"))
-            for e in data["types"].values()
-        }
+        entries = {}  # apiReference -> (available, capacityTypes, reason); a malformed entry fails the whole read
+        for entry in data["types"].values():
+            api_reference = entry.get("apiReference")
+            if not api_reference:
+                continue
+            available, capacity_types = entry["available"], entry["capacityTypes"]
+            if not isinstance(available, bool) or not isinstance(capacity_types, list):
+                raise ValueError(f"malformed entry for {api_reference!r}")
+            if api_reference not in entries or (available and not entries[api_reference][0]):
+                entries[api_reference] = (available, capacity_types, entry.get("reason", "unavailable"))
+        stale = datetime.now(UTC) - generated > OFFERED_MAX_AGE
     except NotFound:
-        log.info("autoPlan does not filter vendor %s: ConfigMap %s not found", vendor, name)
+        log.debug("autoPlan does not filter vendor %s: ConfigMap %s not found", vendor, name)
         return {}
     except Exception as e:  # unreadable, bad JSON or a missing key: one reason, fail open
         log.warning("autoPlan does not filter vendor %s: cannot use ConfigMap %s: %r", vendor, name, e)
         return {}
-    if datetime.now(UTC) - generated > OFFERED_MAX_AGE:
+    if stale:
         log.warning("autoPlan does not filter vendor %s: ConfigMap %s is stale (generated %s)", vendor, name, generated)
         return {}
     if truncated:
         log.warning("ConfigMap %s is truncated: autoPlan skips only SKUs it lists as unavailable", name)
 
-    need = CapacityType.ON_DEMAND if settings.vendors[vendor].capacity == CapacityMode.ON_DEMAND else None
+    on_demand_only = settings.vendors[vendor].capacity == CapacityMode.ON_DEMAND
     skipped = {}
     for sku in skus:
         if sku not in entries:
@@ -298,8 +308,10 @@ def not_offered(kube: Kube, cfg: Config, vendor: str, skus: list[str]) -> dict[s
         available, capacity_types, reason = entries[sku]
         if not available:
             skipped[sku] = reason
-        elif need and need not in capacity_types:
-            skipped[sku] = f"no {need} capacity"
+        elif not capacity_types:
+            skipped[sku] = "no capacity types"
+        elif on_demand_only and CapacityType.ON_DEMAND not in capacity_types:
+            skipped[sku] = f"no {CapacityType.ON_DEMAND} capacity"
     return skipped
 
 
@@ -372,7 +384,7 @@ def plan_cycle(
         skus = sorted(blocked.get(vendor, {}), key=lambda sku: start_order(vendor, sku))
         if not skus:
             log.info("autoPlan: Keeper lists no ACTIVE servers for vendor %s", vendor)
-        skipped = not_offered(kube, cfg, vendor, skus)
+        skipped = not_offered(kube, cfg, vendor, skus) if skus else {}
         if skipped:
             examples = ", ".join(f"{sku} ({why})" for sku, why in list(skipped.items())[:3])
             log.info(

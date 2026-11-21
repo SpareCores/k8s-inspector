@@ -197,7 +197,6 @@ def parse_settings(data: Mapping) -> Settings:
     vendors = _mapping(sections.pop("vendors", None), "vendors")
     bench_pool = _str(sections.pop("benchPool", "bench"), "benchPool")
     bench_class = _str(sections.pop("benchClass", "bench"), "benchClass")
-    scarpenter_namespace = _str(sections.pop("scarpenterNamespace", "scarpenter-system"), "scarpenterNamespace")
     for key in sections:
         log.warning("unknown config key %s (ignored)", key)
 
@@ -205,7 +204,6 @@ def parse_settings(data: Mapping) -> Settings:
         **_read(sub["planner"], "planner", _PLANNER),
         bench_pool=bench_pool,
         bench_class=bench_class,
-        scarpenter_namespace=scarpenter_namespace,
         vendors={str(name): _vendor(value, f"vendors.{name}") for name, value in vendors.items()},
         defaults=Defaults(**_read(sub["defaults"], "defaults", _DEFAULTS)),
         spot=SpotSettings(**_read(sub["spot"], "spot", _SPOT)),

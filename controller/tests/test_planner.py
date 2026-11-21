@@ -2,7 +2,7 @@ import copy
 import json
 import threading
 import zlib
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, timedelta, timezone
 
 import pytest
 
@@ -595,10 +595,11 @@ def test_run_forever_survives_errors_and_stops():
 # --------------------------------------------------------------------------- SCarpenter offered types
 
 
-def offered_configmap(types: dict, *, age=timedelta(minutes=1), truncated=False) -> dict:
+def offered_configmap(types: dict, *, age=timedelta(minutes=1), truncated=False, naive_time=False) -> dict:
     """ConfigMap `scarpenter-offered-bench-oci` as SCarpenter writes it; `types` is {sku: entry fields}."""
+    generated = datetime.now(UTC) - age
     document = {
-        "generatedAt": (datetime.now(UTC) - age).isoformat().replace("+00:00", "Z"),
+        "generatedAt": generated.replace(tzinfo=None).isoformat() if naive_time else generated.isoformat(),
         "class": "bench",
         "vendor": "oci",
         "truncated": truncated,
@@ -651,13 +652,15 @@ def test_offered_types_on_demand_mode_needs_an_on_demand_offering(kube, keeper_s
         {"data": {"types.json": "{not json"}},
         {"data": {}},
         {"data": {"types.json": json.dumps({"generatedAt": "now", "truncated": False, "types": {}})}},
+        offered_configmap({"s1": QUOTA}, naive_time=True),
+        offered_configmap({"s1": {"available": True, "capacityTypes": None}}),
     ],
-    ids=["absent", "stale", "bad-json", "no-key", "bad-time"],
+    ids=["absent", "stale", "bad-json", "no-key", "bad-time", "naive-time", "null-capacity-types"],
 )
 def test_offered_types_unusable_configmap_filters_nothing(kube, keeper_skus, caplog, configmap):
     if configmap:
         publish_offered(kube, configmap)
-    with caplog.at_level("INFO"):
+    with caplog.at_level("DEBUG"):
         assert planned_skus(kube) == ["s1"]
     assert "autoPlan does not filter vendor oci" in caplog.text
 
@@ -672,3 +675,41 @@ def test_force_run_ignores_offered_types(kube):
     publish_offered(kube, offered_configmap({"s1": QUOTA}))
     run = planner.force_run(kube, make_config(), "oci", "s1", force=True)
     assert run.spec.sku == "s1"
+
+
+def test_offered_types_accept_an_offset_time_and_ignore_entries_without_api_reference(kube, keeper_skus):
+    keeper_skus["oci"] = {"quota": {}, "ok": {}}
+    configmap = offered_configmap({"quota": QUOTA, "ok": OFFERED})
+    document = json.loads(configmap["data"]["types.json"])
+    document["generatedAt"] = datetime.now(timezone(timedelta(hours=1))).isoformat()
+    document["types"]["oci.no-label-value"] = {"available": False, "capacityTypes": [], "reason": "NoPrice"}
+    publish_offered(kube, {"data": {"types.json": json.dumps(document)}})
+    assert planned_skus(kube) == ["ok"]
+
+
+def test_offered_types_duplicate_api_reference_prefers_the_available_entry(kube, keeper_skus):
+    configmap = offered_configmap({"s1": OFFERED})
+    document = json.loads(configmap["data"]["types.json"])
+    document["types"]["oci.s1-twin"] = {"apiReference": "s1", **QUOTA, "capacityTypes": []}
+    for types in (document["types"], dict(reversed(document["types"].items()))):
+        publish_offered(kube, {"data": {"types.json": json.dumps({**document, "types": types})}})
+        assert planned_skus(kube) == ["s1"]
+
+
+@pytest.mark.parametrize("capacity", [CapacityMode.SPOT_FIRST, CapacityMode.ON_DEMAND])
+def test_offered_types_available_without_capacity_types_is_skipped(kube, keeper_skus, capacity):
+    publish_offered(kube, offered_configmap({"s1": {"available": True, "capacityTypes": []}}))
+    assert planned_skus(kube, auto_config(capacity=capacity)) == []
+
+
+def test_offered_types_truncated_list_with_on_demand_mode(kube, keeper_skus):
+    keeper_skus["oci"] = {"spot-only": {}, "quota": {}, "unknown": {}, "ok": {}}
+    publish_offered(
+        kube,
+        offered_configmap(
+            {"spot-only": {"available": True, "capacityTypes": ["spot"]}, "quota": QUOTA, "ok": OFFERED}, truncated=True
+        ),
+    )
+    cfg = auto_config(capacity=CapacityMode.ON_DEMAND)
+    skipped = planner.not_offered(kube, cfg, "oci", list(keeper_skus["oci"]))
+    assert skipped == {"spot-only": "no on-demand capacity", "quota": "QuotaGate"}
