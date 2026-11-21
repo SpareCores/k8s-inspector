@@ -12,6 +12,7 @@ import pytest
 
 from k8s_inspector import crd, launch, publisher
 from k8s_inspector import storage as storage_keys
+from k8s_inspector.kube import NotFound
 from k8s_inspector.model import (
     BenchmarkRun,
     EnvConfig,
@@ -907,6 +908,44 @@ def test_forced_run_of_an_unknown_sku_whose_lscpu_failed_publishes_nothing(tmp_p
     make_publisher(tmp_path, origin, storage).publish_once(ENABLED)
     assert all(t.published and t.commit is None for t in run.status.tasks)
     assert not (clone(origin, tmp_path) / "data").exists()
+
+
+def test_forced_run_whose_lscpu_failed_records_no_launch_deferral(tmp_path, origin, cluster):
+    storage = FakeStorage()
+    run = _rejected_run(cluster, storage)
+    run.spec.force = True  # the operator's run
+    make_publisher(tmp_path, origin, storage).publish_once(ENABLED)
+    assert all(t.published for t in run.status.tasks) and cluster.deferred == []
+
+
+def test_launch_deferral_waits_until_the_whole_run_is_published(tmp_path, origin, cluster):
+    storage = FakeStorage()
+    run = _rejected_run(cluster, storage)
+    del storage.objects[okey(KEY, "tasks/geekbench/status.json")]  # not readable yet: stays unpublished
+    make_publisher(tmp_path, origin, storage).publish_once(ENABLED)
+    assert [t.published for t in run.status.tasks] == [True, False, True] and cluster.deferred == []
+    storage.put_task("geekbench", json.loads(storage.objects[okey(KEY, "tasks/openssl/status.json")]))
+    make_publisher(tmp_path, origin, storage).publish_once(ENABLED)
+    assert all(t.published for t in run.status.tasks) and cluster.deferred == [("hcloud", "cax31", "NO_LSCPU")]
+    make_publisher(tmp_path, origin, storage).publish_once(ENABLED)
+    assert cluster.deferred == [("hcloud", "cax31", "NO_LSCPU")]  # not again
+
+
+def test_failing_finalise_of_a_run_does_not_abort_the_cycle(tmp_path, origin, storage, cluster, monkeypatch):
+    done = cluster.add_run(["openssl"], phase=RunPhase.PUBLISHING)
+    done.status.tasks[0].published = True
+    done.name = "gone"
+    cluster.runs["gone"] = done
+    real = crd.update_status
+
+    def update_status(kube, name, mutate):
+        if name == "gone":
+            raise NotFound(name)
+        return real(kube, name, mutate)
+
+    monkeypatch.setattr(crd, "update_status", update_status)
+    cluster.add_run(NAMES, vendor="hcloud", sku="cax31")  # another run still has tasks to publish
+    assert make_publisher(tmp_path, origin, storage).publish_once(ENABLED).tasks_published == 4
 
 
 def test_run_whose_tasks_were_all_published_while_releasing_ends_done(tmp_path, origin, cluster):

@@ -231,7 +231,10 @@ class Publisher:
             for run in runs:
                 if run.status.phase == RunPhase.PUBLISHING and _all_published(run):
                     # everything was published while the run was still releasing: nothing is left to publish
-                    crd.update_status(self._kube, run.name, partial(_mark, seen={}, sha=None, variant=None))
+                    try:
+                        crd.update_status(self._kube, run.name, partial(_mark, seen={}, sha=None, variant=None))
+                    except Exception:
+                        log.exception("cannot finish run %s, leaving it in phase Publishing", run.name)
             items = []
             for run in runs:
                 items.extend(self._items_of(run, settings))
@@ -447,19 +450,22 @@ class Publisher:
             log.warning("push rejected (attempt %d), starting again from a fresh fetch", attempt)
         else:
             raise RuntimeError(f"push rejected {MAX_PUSH_ATTEMPTS} times")
-        self._mark_published(rendered, sha)
-        self._mark_published(discarded + unpublishable, None)
-        self._defer_skus_without_lscpu([one for one, _ in rendered] + unpublishable)
+        finished = self._mark_published(rendered, sha) | self._mark_published(discarded + unpublishable, None)
+        self._defer_skus_without_lscpu([one for one, _ in rendered] + unpublishable, finished)
         run_ids = tuple(sorted({r[0].item.run.run_id for r in rendered}))
         return PublishResult(len(rendered), commit, run_ids, sum(1 for one in unpublishable if one.item.run_name))
 
-    def _defer_skus_without_lscpu(self, published: list[_Loaded]) -> None:
-        """A run ended without an lscpu result: its SKU waits for the launch backoff (`NO_LSCPU`) before the planner
-        starts it again, as its successful tasks left no result for the planner to see."""
-        runs = {(one.item.run, one.item.run_name) for one in published if one.item.no_lscpu_coming}
-        for run, run_name in runs:
-            if run_name:
-                launch.record_failure(self._kube, run.vendor, run.sku, "NO_LSCPU", datetime.now(UTC))
+    def _defer_skus_without_lscpu(self, published: list[_Loaded], finished: set[str]) -> None:
+        """A run ended without an lscpu result and became fully published in this cycle (`finished`: run names): its
+        SKU waits for the launch backoff (`NO_LSCPU`) before the planner starts it again, as its successful tasks
+        left no result for the planner to see. Not for a forced run: it is the operator's."""
+        runs = {
+            (one.item.run, one.item.run_name)
+            for one in published
+            if one.item.no_lscpu_coming and not one.item.forced and one.item.run_name in finished
+        }
+        for run, _ in runs:
+            launch.record_failure(self._kube, run.vendor, run.sku, "NO_LSCPU", datetime.now(UTC))
 
     def _render_all(
         self, loaded: list[_Loaded], keep: timedelta
@@ -571,8 +577,10 @@ class Publisher:
 
     # ------------------------------------------------------------------ marking published
 
-    def _mark_published(self, rendered: list, sha: str | None) -> None:
-        """Mark tasks published (`rendered`: `(loaded, variant)` pairs or bare `_Loaded`s) with `sha`."""
+    def _mark_published(self, rendered: list, sha: str | None) -> set[str]:
+        """Mark tasks published (`rendered`: `(loaded, variant)` pairs or bare `_Loaded`s) with `sha`. Returns the
+        names of the runs whose tasks are all published now."""
+        finished = set()
         by_run: dict[str, list[tuple[_Item, int | None]]] = {}
         for entry in rendered:
             one, variant = entry if isinstance(entry, tuple) else (entry, None)
@@ -582,9 +590,13 @@ class Publisher:
             seen = {item.key: (item.end, item.attempt) for item, _ in entries}
             variant = next((v for _, v in entries if v is not None), None)
             try:
-                crd.update_status(self._kube, name, partial(_mark, seen=seen, sha=sha, variant=variant))
+                run = crd.update_status(self._kube, name, partial(_mark, seen=seen, sha=sha, variant=variant))
             except NotFound:
                 log.warning("run %s vanished before it could be marked published", name)
+            else:
+                if _all_published(run):
+                    finished.add(name)
+        return finished
 
     # ------------------------------------------------------------------ git
 
