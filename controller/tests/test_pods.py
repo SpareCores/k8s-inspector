@@ -147,7 +147,7 @@ def test_step_pod_like_spike(run, cfg):
     assert env["TRACKER_OUTPUT"] == "/k8si/runs/r1/membench/resource_tracker.jsonl"
     assert env["TRACKER_EXTERNAL_RUN_ID"] == "r1"
     assert c["securityContext"] == {"privileged": True, "seccompProfile": {"type": "Unconfined"}}
-    assert c["resources"] == {"requests": {"cpu": "10m", "memory": "64Mi"}}
+    assert c["resources"] == {"requests": {"cpu": "10m", "memory": "0"}}
     assert c["terminationMessagePolicy"] == "File"
     assert [v["name"] for v in spec["volumes"]] == ["k8si", "urls"]
     assert spec["volumes"][1]["secret"]["secretName"] == f"{run.name}-urls"
@@ -228,7 +228,7 @@ def test_step_cpu_never_drops_below_the_floor():
 def test_step_pod_requests_the_given_cpu_split_over_containers_without_limit(run, cfg):
     kw = {"node_name": "n", "node_allocatable_memory_bytes": 1, "owner": OWNER}
     pod = pods.render_step(run, 1, step(container(task())), cfg, cpu_millicores=3900, **kw)
-    assert pod["spec"]["containers"][0]["resources"] == {"requests": {"cpu": "3900m", "memory": "64Mi"}}
+    assert pod["spec"]["containers"][0]["resources"] == {"requests": {"cpu": "3900m", "memory": "0"}}
     a, b = task("lscpu", parallel=True), task("lstopo", parallel=True)
     pod = pods.render_step(run, 1, step(container(a), container(b)), cfg, cpu_millicores=3900, **kw)
     assert [c["resources"]["requests"]["cpu"] for c in pod["spec"]["containers"]] == ["1950m", "1950m"]
@@ -250,6 +250,17 @@ def test_out_of_cpu_rejection_is_recognised_and_classified_with_its_message():
     assert (out.exit_code, out.error_msg, out.container_start_error) == (-4, message, True)
     ran = finished_pod({"name": "membench", "state": {"running": {}}}, reason="OutOfcpu")
     assert not pods.is_out_of_cpu(ran)
+
+
+def test_every_admission_rejection_is_classified_minus_four_with_its_message():
+    message = "Pod was rejected: Node didn't have enough resource: memory, requested: 335544320, used: 1, capacity: 2"
+    for reason in ("OutOfmemory", "OutOfpods", "Evicted", "NodeAffinity"):
+        rejected = {"status": {"phase": "Failed", "reason": reason, "message": message}}
+        out = pods.classify(rejected, [container(task())])["membench"]
+        assert (out.exit_code, out.error_msg, out.container_start_error) == (-4, message, True), reason
+    ran = finished_pod({"name": "membench", "state": {"terminated": {"exitCode": 1}}}, reason="OutOfmemory")
+    ran["status"]["message"] = message
+    assert not pods.is_refused(ran)  # a container ran: not an admission rejection
 
 
 def test_memory_cap_models_shm_secrets_rlimits_hostpid(run, cfg):
@@ -330,6 +341,8 @@ def test_flush_and_secret(run, cfg):
     assert pod["metadata"]["labels"]["inspector.sparecores.com/role"] == "flush"
     assert pod["spec"]["containers"][1]["args"][:4] == ["flush", "--task", "lstopo", "--spool"]
     assert "securityContext" not in pod["spec"]["containers"][0]
+    # no memory request: a 0.5 GiB node cannot admit 16Mi per container next to the anchor and the DaemonSets
+    assert {c["resources"]["requests"]["memory"] for c in pod["spec"]["containers"]} == {"0"}
     owner = OwnerRef("inspector.sparecores.com/v1alpha1", "BenchmarkRun", run.name, "u")
     secret = pods.render_urls_secret(run, "{}", owner)
     assert secret["stringData"] == {"urls.json": "{}"}

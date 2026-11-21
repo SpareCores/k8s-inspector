@@ -375,7 +375,7 @@ def _step_container(
         mounts.append({"name": "models", "mountPath": "/models"})
     if task.shm_gib:
         mounts.append({"name": "dshm", "mountPath": "/dev/shm"})
-    resources: dict = {"requests": {"cpu": f"{cpu_millicores}m", "memory": "64Mi"}}
+    resources: dict = {"requests": {"cpu": f"{cpu_millicores}m", "memory": "0"}}
     if task.memory_cap is not None:
         resources["limits"] = {"memory": str(int(task.memory_cap * allocatable))}
     if gpu_runtime and gpu_count and single:
@@ -426,7 +426,8 @@ def render_step(
     image `container.image`, `command: [/k8si/bin/sc-run, exec, --task <key>, --timeout <t>, --spool
     /k8si/runs/<run_id>/<key>, --urls /k8si-urls/urls.json, --version-cmd ..., --collect ..., --, <entrypoint
     + resource-tracker/nice wrapper + command>]`, `privileged` + `seccompProfile: Unconfined`, requests
-    `cpu <cpu_millicores split evenly over the containers>, memory 64Mi`, memory limit =
+    `cpu <cpu_millicores split evenly over the containers>, memory 0` (explicit: no LimitRange default request
+    applies), memory limit =
     `task.memory_cap * node_allocatable_memory_bytes` when set (no CPU limits ever), `terminationMessagePolicy:
     File`, env: `TRACKER_*` (project, job name, external run id
     = `run_id`, output path in the spool) + `HF_TOKEN` for llm/vllm only + secrets from `inspector-secrets`
@@ -508,7 +509,7 @@ def render_flush_step(
                 "--multipart-mib",
                 str(cfg.settings.uploads.single_put_max_mib),
             ],
-            "resources": {"requests": {"cpu": "1m", "memory": "16Mi"}},
+            "resources": {"requests": {"cpu": "1m", "memory": "0"}},  # none: a small node cannot admit more
             "terminationMessagePolicy": "File",
             "volumeMounts": [
                 {"name": "k8si", "mountPath": MOUNT_DIR},
@@ -726,6 +727,19 @@ def is_rejected(pod: dict) -> bool:
     )
 
 
+def is_refused(pod: dict) -> bool:
+    """The kubelet refused the Pod at admission for any reason (`Failed`, "Pod was rejected: ...": `Evicted` under
+    DiskPressure, `OutOfcpu`, `OutOfmemory`, `OutOfpods`, ...): no container ever started."""
+    status = pod.get("status", {})
+    return (
+        status.get("phase") == "Failed"
+        and str(status.get("message", "")).startswith("Pod was rejected")
+        and not any(
+            "running" in s.get("state", {}) or "terminated" in s.get("state", {}) for s in _container_statuses(pod)
+        )
+    )
+
+
 def unfinished_containers(pod: dict) -> set[str]:
     """Names of the containers that have not terminated."""
     return {s["name"] for s in _container_statuses(pod) if "terminated" not in s.get("state", {})}
@@ -801,7 +815,7 @@ def _outcome_from_state(key: str, status: dict | None, pod: dict) -> TaskOutcome
         outcome.error_msg, outcome.container_start_error = detail, True
     elif pod_reason == "DeadlineExceeded":
         outcome.exit_code, outcome.error_msg = ExitCode.NEVER_FINISHED, Reason.DEADLINE_EXCEEDED.value
-    elif is_rejected(pod) or is_out_of_cpu(pod):
+    elif is_refused(pod):
         outcome.exit_code, outcome.error_msg = ExitCode.NEVER_FINISHED, pod["status"]["message"]
         outcome.container_start_error = True  # never started: nothing to flush
     elif pod_reason == "Evicted":

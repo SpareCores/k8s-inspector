@@ -33,7 +33,7 @@ CLASS_REASONS = {
 }
 # NO_OFFERING (no instance type for the SKU, or an anchor nobody schedules): SCarpenter's mark is usually short, but
 # where the offered-types filter fails open nothing else stops the retries, so the wait is a flat 24 h.
-TEMPORARY = ("ICE", "QUOTA", "DAILY_LIMIT", "VENDOR", "NO_OFFERING")
+TEMPORARY = ("ICE", "QUOTA", "DAILY_LIMIT", "VENDOR", "NO_OFFERING", "NO_LSCPU")
 # Reasons of `-1` schedule metas written before the classes existed; they were temporary too.
 LEGACY_TEMPORARY = ("QUOTA_ZERO", "LAUNCH_FAILED")
 NO_NODE_MESSAGE = ": no node after "  # the old BOOT_FAILURE of a run that merely waited out its budget
@@ -41,7 +41,7 @@ PERMANENT = ("LAUNCH_REJECTED", "BOOT_FAILURE")
 BOOT_FAILURE_LIMIT = 3  # runs that ended BOOT_FAILURE before it is final
 REASONS = (*TEMPORARY, "BOOT_FAILURE")  # the reasons an entry of the ConfigMap can have
 # Longest wait between two launches of a SKU, per reason; the wait doubles from 1 h with each failure
-# (NO_OFFERING: `NO_OFFERING_WAIT` at once).
+# (NO_OFFERING, NO_LSCPU: the flat `FLAT_WAIT` at once).
 MAX_WAIT = {
     "ICE": timedelta(hours=24),
     "QUOTA": timedelta(hours=6),
@@ -49,7 +49,10 @@ MAX_WAIT = {
     "BOOT_FAILURE": timedelta(hours=6),
     "DAILY_LIMIT": timedelta(hours=6),  # without SCarpenter's `until`
 }
-NO_OFFERING_WAIT = timedelta(hours=24)
+# Reasons with a flat wait (no doubling): NO_OFFERING, and NO_LSCPU, which the publisher records when a run ended
+# without an lscpu result (not a launch failure; `launch.clear` resets the count at every node, so doubling
+# would never grow).
+FLAT_WAIT = {"NO_OFFERING": timedelta(hours=24), "NO_LSCPU": timedelta(hours=24)}
 RETRY_AFTER_PERMANENT = timedelta(days=30)
 PATCH_RETRIES = 3
 
@@ -83,8 +86,8 @@ def is_temporary(error_msg: str | None) -> bool:
 
 def wait_after(reason: str, count: int) -> timedelta:
     """Wait before the SKU is launched again after its `count`-th failure in a row."""
-    if reason == "NO_OFFERING":
-        return NO_OFFERING_WAIT
+    if reason in FLAT_WAIT:
+        return FLAT_WAIT[reason]
     return min(timedelta(hours=2 ** min(count - 1, 10)), MAX_WAIT[reason])
 
 

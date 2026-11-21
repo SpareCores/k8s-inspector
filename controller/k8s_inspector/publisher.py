@@ -25,7 +25,12 @@ Decisions:
   the planner does not plan it again); a task with exit code >= 0 stays unpublished
   (and is retried every cycle) rather than being filed under the wrong variant, until `publish.keep_run_hours`
   after its end: then it is marked published without a commit, logged as an error and counted in
-  `PublishResult.unpublishable` (`k8s_inspector_unpublishable_tasks_total`), so the run frees its lease. A forced
+  `PublishResult.unpublishable` (`k8s_inspector_unpublishable_tasks_total`), so the run frees its lease. When the
+  run's `lscpu` task failed and every task is done, no lscpu result will come: a failed task without an lscpu
+  result of its attempt goes to `schedule/<task>/meta.json` only (like a negative code; the planner then plans by
+  its exit code: -4 retried after its wait, 256 final), and a successful one is given up at once (marked
+  published without a commit, counted as unpublishable): its hardware is unknown, so it is never filed under a
+  guessed variant. The SKU then waits for the launch backoff (`NO_LSCPU`). A forced
   run of a SKU that git does not know, without lscpu (a typo), publishes nothing and is marked published
   without a commit.
 - A task whose rendering keeps failing is published without parser output after `MAX_RENDER_FAILURES` cycles.
@@ -111,6 +116,7 @@ class _Item:
     attempt: int | None = None
     run_times: tuple[tuple[datetime | None, datetime | None], ...] = ()  # start/end of every task of the run
     status: dict | None = None  # status.json when already read (rescan)
+    no_lscpu_coming: bool = False  # the run's lscpu task failed and every task is done: no lscpu result will come
 
 
 @dataclass
@@ -222,6 +228,13 @@ class Publisher:
             if settings is None:
                 return PublishResult(0, None, ())
             runs = self._delete_temporary_failures(crd.list_runs(self._kube))
+            for run in runs:
+                if run.status.phase == RunPhase.PUBLISHING and _all_published(run):
+                    # everything was published while the run was still releasing: nothing is left to publish
+                    try:
+                        crd.update_status(self._kube, run.name, partial(_mark, seen={}, sha=None, variant=None))
+                    except Exception:
+                        log.exception("cannot finish run %s, leaving it in phase Publishing", run.name)
             items = []
             for run in runs:
                 items.extend(self._items_of(run, settings))
@@ -333,8 +346,26 @@ class Publisher:
             return []
         key = crd.run_key(run)
         times = tuple((t.start, t.end) for t in run.status.tasks)
+        no_lscpu_coming = _no_lscpu_coming(run)
+        if no_lscpu_coming:
+            log.warning(
+                "run %s: its lscpu task failed and every task is done: tasks without an lscpu result of their "
+                "attempt go to schedule/ only (failures) or are given up (successes)",
+                run.name,
+            )
         return [
-            _Item(key, t.name, run.name, run.spec.database, run.spec.force, t.end, t.attempt, times) for t in pending
+            _Item(
+                key,
+                t.name,
+                run.name,
+                run.spec.database,
+                run.spec.force,
+                t.end,
+                t.attempt,
+                times,
+                no_lscpu_coming=no_lscpu_coming,
+            )
+            for t in pending
         ]
 
     def _items_in_bucket(self, settings: Settings, vendor: str, sku: str, day: date) -> list[_Item]:
@@ -419,17 +450,29 @@ class Publisher:
             log.warning("push rejected (attempt %d), starting again from a fresh fetch", attempt)
         else:
             raise RuntimeError(f"push rejected {MAX_PUSH_ATTEMPTS} times")
-        self._mark_published(rendered, sha)
-        self._mark_published(discarded + unpublishable, None)
+        finished = self._mark_published(rendered, sha) | self._mark_published(discarded + unpublishable, None)
+        self._defer_skus_without_lscpu([one for one, _ in rendered] + unpublishable, finished)
         run_ids = tuple(sorted({r[0].item.run.run_id for r in rendered}))
         return PublishResult(len(rendered), commit, run_ids, sum(1 for one in unpublishable if one.item.run_name))
+
+    def _defer_skus_without_lscpu(self, published: list[_Loaded], finished: set[str]) -> None:
+        """A run ended without an lscpu result and became fully published in this cycle (`finished`: run names): its
+        SKU waits for the launch backoff (`NO_LSCPU`) before the planner starts it again, as its successful tasks
+        left no result for the planner to see. Not for a forced run: it is the operator's."""
+        runs = {
+            (one.item.run, one.item.run_name)
+            for one in published
+            if one.item.no_lscpu_coming and not one.item.forced and one.item.run_name in finished
+        }
+        for run, _ in runs:
+            launch.record_failure(self._kube, run.vendor, run.sku, "NO_LSCPU", datetime.now(UTC))
 
     def _render_all(
         self, loaded: list[_Loaded], keep: timedelta
     ) -> tuple[list[tuple[_Loaded, int | None]], list[_Loaded], list[_Loaded]]:
         """Render into the checkout; returns the tasks that are done (rendered, or skipped as stale), the ones
-        to mark published without a commit (nothing to publish) and the unpublishable ones (no variant to
-        file them under, `keep` after their end)."""
+        to mark published without a commit (nothing to publish) and the unpublishable ones (no variant to file
+        them under: `keep` after their end, or at once when the run's lscpu task failed)."""
         rendered = []
         discarded = []
         unpublishable = []
@@ -451,7 +494,10 @@ class Publisher:
                 discarded.append(one)
             elif variant is _SKIPPED:
                 end = _parse_status_time(one.inp.status.get("end"))
-                if end and datetime.now(UTC) - end >= keep:
+                if item.no_lscpu_coming:
+                    log.error("%s/%s: succeeded without an lscpu result, not publishable", item.run.run_id, item.key)
+                    unpublishable.append(one)
+                elif end and datetime.now(UTC) - end >= keep:
                     log.error("%s/%s: no lscpu result after %s, not publishable", item.run.run_id, item.key, keep)
                     unpublishable.append(one)
             else:
@@ -477,9 +523,9 @@ class Publisher:
         if one.lscpu is not None:
             fields = variants.parse_lscpu_stdout(one.lscpu)
             variant = variants.pick_variant(self._existing_variants(run.vendor, run.sku), fields)
-        elif inp.status.get("exit_code", 0) >= 0 and not _harness_error_without_node(inp.status, one.run_json):
-            log.warning("%s/%s: no lscpu result for the run, cannot pick a variant yet", run.run_id, item.key)
-            return _SKIPPED
+        elif _waits_for_lscpu(one):
+            log.warning("%s/%s: no lscpu result for the task's attempt, cannot pick a variant", run.run_id, item.key)
+            return _SKIPPED  # a success of unknown hardware is never filed under a guessed variant
         elif item.forced and not (self._repo / "data" / run.vendor / run.sku).exists():
             log.warning("%s/%s: forced run of a SKU git does not know, not publishing", run.run_id, item.key)
             return _DISCARDED
@@ -531,8 +577,10 @@ class Publisher:
 
     # ------------------------------------------------------------------ marking published
 
-    def _mark_published(self, rendered: list, sha: str | None) -> None:
-        """Mark tasks published (`rendered`: `(loaded, variant)` pairs or bare `_Loaded`s) with `sha`."""
+    def _mark_published(self, rendered: list, sha: str | None) -> set[str]:
+        """Mark tasks published (`rendered`: `(loaded, variant)` pairs or bare `_Loaded`s) with `sha`. Returns the
+        names of the runs whose tasks are all published now."""
+        finished = set()
         by_run: dict[str, list[tuple[_Item, int | None]]] = {}
         for entry in rendered:
             one, variant = entry if isinstance(entry, tuple) else (entry, None)
@@ -542,9 +590,13 @@ class Publisher:
             seen = {item.key: (item.end, item.attempt) for item, _ in entries}
             variant = next((v for _, v in entries if v is not None), None)
             try:
-                crd.update_status(self._kube, name, partial(_mark, seen=seen, sha=sha, variant=variant))
+                run = crd.update_status(self._kube, name, partial(_mark, seen=seen, sha=sha, variant=variant))
             except NotFound:
                 log.warning("run %s vanished before it could be marked published", name)
+            else:
+                if _all_published(run):
+                    finished.add(name)
+        return finished
 
     # ------------------------------------------------------------------ git
 
@@ -706,6 +758,24 @@ def _lscpu_of(status: dict, run_json: dict | None, legacy_status: dict | None):
         same = legacy_status and legacy_status.get("attempt") == n
         return entry["lscpu_stdout"].encode(), legacy_status if same else None
     return None, None
+
+
+def _no_lscpu_coming(run: BenchmarkRun) -> bool:
+    """The run's lscpu task failed (or was rejected) and every task is done, so no lscpu result will come."""
+    lscpu = next((t for t in run.status.tasks if t.name == "lscpu"), None)
+    return (
+        lscpu is not None
+        and lscpu.exit_code != ExitCode.OK
+        and all(t.state == TaskState.DONE for t in run.status.tasks)
+    )
+
+
+def _waits_for_lscpu(one: _Loaded) -> bool:
+    """A task without an lscpu result that can only be filed once there is one (`_SKIPPED`): exit code 0 or above
+    on a node. Not a failure of a run whose lscpu will never come: it goes to `schedule/` only, like a negative code."""
+    status = one.inp.status
+    failed = one.item.no_lscpu_coming and status.get("exit_code") != ExitCode.OK
+    return status.get("exit_code", 0) >= 0 and not _harness_error_without_node(status, one.run_json) and not failed
 
 
 def _harness_error_without_node(status: dict, run_json: dict | None) -> bool:
