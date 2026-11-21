@@ -38,6 +38,7 @@ vendors:
     autoPlan: false              # per-vendor override; needs publish
     maxInFlight: 2               # 0 pauses the vendor; unset: defaults.maxInFlight
     maxUsdPerHour: 2.0           # checked before a run starts
+    maxSkuUsdPerHour: 1.0        # autoPlan skips SKUs whose node costs more per hour (below); unset: no limit
     capacity: SpotFirst          # SpotFirst (the default) | OnDemand
     publish: false               # true, or a list of SKUs: the publisher pushes these results to sc-inspector-data
 defaults:
@@ -105,8 +106,8 @@ it is due and the vendor has room. Per vendor:
    lease, also while it is finished and not yet published) is skipped, and so is a SKU whose name is not a valid label
    value (the anchor selects the SKU by label; one warning per vendor and cycle) or whose `meta.json` in git is
    malformed (logged by the publisher). If Keeper lists no servers for the vendor, the planner logs it at info level.
-   A SKU that SCarpenter does not offer is skipped too (see [Offered types](#offered-types)); forced runs are never
-   filtered.
+   A SKU that SCarpenter does not offer is skipped too (see [Offered types](#offered-types)), and so is a SKU whose
+   price exceeds `maxSkuUsdPerHour` (see [Price cap per SKU](#price-cap-per-sku)); forced runs are never filtered.
 4. A task of a SKU is due when Keeper does not block it (a block reason drops the task; the `keeper_gated` tasks are
    blocked by Keeper except on its allowlist, so they run only where Keeper allows them) and its
    `data/<vendor>/<sku>/schedule/<task>/meta.json` in sc-inspector-data `main` says so: no meta yet, or a
@@ -143,6 +144,18 @@ only end in `-1 SCARPENTER_NO_OFFERING` after the fail-fast wait.
 The filter fails open: a ConfigMap that is absent (the vendor is not opted in), unreadable, malformed or stale
 (`generatedAt` older than 30 minutes) filters nothing, and the cycle logs why. In a ConfigMap with `truncated: true`
 only entries with `available: false` are skipped; a missing entry proves nothing.
+
+### Price cap per SKU
+
+`vendors.<v>.maxSkuUsdPerHour`, when set, makes autoPlan skip every SKU whose node costs more per hour. Without it a
+vendor's most expensive SKUs are planned like any other (AWS lists SKUs of tens of USD per hour). The price is the cheapest active on-demand price in USD per hour that Keeper lists for the SKU
+(`/server/<vendor>/<sku>/prices?currency=USD&only_active=true`) over all regions it knows, including regions the
+bench class does not use, so it can be lower than the price of the node SCarpenter launches; a spot run is checked
+against it too, since it may fall back to on-demand.
+It is asked only for a SKU that has due tasks and is cached for 24 hours. A SKU without an on-demand price is skipped (the cap cannot be checked). When Keeper fails to answer, autoPlan
+skips the rest of that vendor for the cycle (one warning) instead of asking for every SKU. One info line per
+vendor and cycle gives the count and a few examples. Forced runs ignore the cap. It limits the price of one run;
+`maxUsdPerHour` bounds the sum over the runs that hold nodes.
 
 ## CLI
 

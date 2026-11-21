@@ -195,6 +195,7 @@ def _check_keeper(cfg: Config, vendor: str, sku: str, names: list[str]) -> None:
 
 
 KEEPER_CACHE_SECONDS = 30 * 60
+PRICE_CACHE_SECONDS = 24 * 3600  # list prices change rarely
 
 
 class KeeperCache:
@@ -205,12 +206,21 @@ class KeeperCache:
     def __init__(self) -> None:
         self._asked = 0.0
         self._answer: dict | None = None
+        self._prices: dict[tuple[str, str], tuple[float, float | None]] = {}  # (vendor, sku) -> (asked, USD/h)
 
     def get(self, env, task_names: list[str]) -> dict:
         if self._answer is None or time.monotonic() - self._asked >= KEEPER_CACHE_SECONDS:
             self._answer = keeper.active_servers_block_reasons(env, task_names)
             self._asked = time.monotonic()
         return self._answer
+
+    def usd_per_hour(self, env, vendor: str, sku: str) -> float | None:
+        """`keeper.ondemand_usd_per_hour`, kept for `PRICE_CACHE_SECONDS` (an error is not kept)."""
+        asked, price = self._prices.get((vendor, sku), (None, None))
+        if asked is None or time.monotonic() - asked >= PRICE_CACHE_SECONDS:
+            price = keeper.ondemand_usd_per_hour(env, vendor, sku)
+            self._prices[vendor, sku] = (time.monotonic(), price)
+        return price
 
 
 # `schedule/<task>/meta.json` of every SKU of a vendor: {sku: {task: meta}} (`Publisher.read_schedule_metas`);
@@ -315,6 +325,15 @@ def not_offered(kube: Kube, cfg: Config, vendor: str, skus: list[str]) -> dict[s
     return skipped
 
 
+def sku_price_skip(keeper_cache: KeeperCache, env, vendor: str, sku: str, cap: float) -> str | None:
+    """Why the SKU is over `cap` USD/hour (its cheapest on-demand price at Keeper), else None. A SKU without a
+    price is skipped: the cap cannot be checked. Raises `RuntimeError` when Keeper cannot tell."""
+    price = keeper_cache.usd_per_hour(env, vendor, sku)
+    if price is None:
+        return "no on-demand price"
+    return f"{price:g} USD/h" if price > cap else None
+
+
 def start_order(vendor: str, sku: str) -> tuple[int, str]:
     """Legacy `lib.instance_start_order_key`: crc32 of `vendor/sku` mixes the sizes (price order would exhaust the
     quota of a new vendor on the small SKUs first); the SKU name breaks ties."""
@@ -365,8 +384,9 @@ def plan_cycle(
         return []
 
     server_tasks = [task for task in tasks.all_tasks() if not task.dbaas]
+    keeper_cache = keeper_cache or KeeperCache()
     try:
-        blocked = (keeper_cache or KeeperCache()).get(cfg.env, [task.name for task in server_tasks])
+        blocked = keeper_cache.get(cfg.env, [task.name for task in server_tasks])
     except Exception:
         log.exception("autoPlan skips the cycle: Keeper is not reachable")
         return []
@@ -396,6 +416,7 @@ def plan_cycle(
                 "autoPlan skips %d SKUs of vendor %s whose names are not label values, e.g. %s",
                 len(bad_names), vendor, bad_names[0],
             )  # fmt: skip
+        too_expensive: dict[str, str] = {}
         for sku in skus:
             if crd.run_name(vendor, sku) in leased or not publisher.publish_allowed(settings, vendor, sku):
                 continue
@@ -413,6 +434,16 @@ def plan_cycle(
                     due[task.name] = reason
             if all(tasks.get_task(name).gpu for name in due):  # nothing due, or only GPU tasks
                 continue
+            cap = settings.vendors[vendor].max_sku_usd_per_hour
+            if cap is not None:
+                try:
+                    why = sku_price_skip(keeper_cache, cfg.env, vendor, sku, cap)
+                except RuntimeError as e:  # fail closed, and ask no more this cycle: every lookup would fail or hang
+                    log.warning("autoPlan skips the rest of vendor %s: cannot check prices: %s", vendor, e)
+                    break
+                if why:
+                    too_expensive[sku] = why
+                    continue
             if not dry_run:
                 try:
                     check_vendor_budget(kube, cfg, vendor, runs)
@@ -427,6 +458,14 @@ def plan_cycle(
             planned.append(PlannedRun(vendor, sku, tuple(due), reason))
             if dry_run:
                 break
+        if too_expensive:
+            examples = ", ".join(f"{sku} ({why})" for sku, why in list(too_expensive.items())[:3])
+            log.info(
+                "autoPlan skips %d SKUs of vendor %s over maxSkuUsdPerHour, e.g. %s",
+                len(too_expensive),
+                vendor,
+                examples,
+            )
     return planned
 
 

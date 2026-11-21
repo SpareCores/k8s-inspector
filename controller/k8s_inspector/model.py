@@ -418,6 +418,7 @@ class VendorSettings:
     auto_plan: bool | None = None  # None: inherit planner.autoPlan
     max_in_flight: int | None = None  # None: defaults.maxInFlight; 0 pauses
     max_usd_per_hour: float | None = None
+    max_sku_usd_per_hour: float | None = None  # autoPlan skips SKUs whose node costs more; None: no limit
     capacity: CapacityMode = CapacityMode.SPOT_FIRST  # same default as `RunSpec` and `crd.from_dict`
     publish: bool | tuple[str, ...] = False  # True: every SKU; a tuple: only these SKUs; False: none
 
