@@ -21,6 +21,7 @@ from k8s_inspector.kube import WatchEvent
 from k8s_inspector.model import (
     AttemptOutcome,
     CapacityMode,
+    CapacityType,
     Config,
     Deadlines,
     EnvConfig,
@@ -645,6 +646,28 @@ def test_node_older_than_the_anchor_is_replaced(h):
     assert ("nodeclaim", f"claim-node-{h.name}-a1") in h.kube.deleted
     h.runner.reconcile(h.name)  # Pending -> a new attempt
     assert h.run.status.attempt == 2 and f"{h.name}-a2" in h.pod_names("anchor")
+
+
+def test_attempt_records_the_capacity_type_of_its_node_only(h):
+    h.cluster.provision_enabled = False
+    h.start(["geekbench"])
+    h.runner.reconcile(h.name)  # the anchor allows spot, but there is no node
+    assert h.run.status.attempts[0].capacity_type is None and h.run.status.capacity_type is None
+    h.cluster.capacity = "on-demand"  # SCarpenter fell back
+    h.cluster.provision_enabled = True
+    h.drive(stop=lambda run: run.status.phase == RunPhase.RUNNING)
+    assert h.run.status.attempts[0].capacity_type == CapacityType.ON_DEMAND
+    assert h.run.status.capacity_type == CapacityType.ON_DEMAND
+
+
+def test_failed_provisioning_leaves_the_capacity_type_empty_in_run_json(h):
+    h.cluster.provision_enabled = False
+    h.start(["geekbench"], capacity=CapacityMode.ON_DEMAND)
+    h.runner.reconcile(h.name)
+    h.clock.advance(hours=2)
+    h.runner.reconcile(h.name)
+    assert h.run.status.phase == RunPhase.FAILED
+    assert [a["capacity_type"] for a in h.storage.run_json["attempts"]] == [None]
 
 
 def test_capacity_follows_the_spot_strategy(h):

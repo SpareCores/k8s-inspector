@@ -80,6 +80,24 @@ def test_dump_meta_equals_legacy_bytes(path):
         assert {k: v for k, v in json.loads(dumped).items() if k in meta} == meta
 
 
+def test_status_of_a_run_that_never_got_a_node_has_no_capacity_type():
+    t0 = datetime(2026, 11, 20, 9, 30, tzinfo=UTC)
+    run = BenchmarkRun(
+        name="n",
+        namespace="inspector",
+        uid="u",
+        resource_version="1",
+        created=t0,
+        spec=RunSpec(vendor="oci", sku="VM.Standard.E5.Flex.2-16", run_id="r1"),
+        status=RunStatus(attempts=[AttemptStatus(n=1), AttemptStatus(n=2)]),
+    )
+    task = TaskStatus(name="geekbench", state=TaskState.DONE, start=t0, end=t0, exit_code=-1, error_msg="x")
+    status = render.build_status(
+        run, task, task_hash="h", outcome=None, verification=None, node=None, attempt=run.status.attempts[1]
+    )
+    assert (status["spot"], status["capacity_type"], status["spot_attempts"]) == (None, None, 0)
+
+
 def test_status_meta_roundtrip_has_legacy_fields_first_then_added():
     meta = render.meta_from_status({"start": "2026-01-01T00:00:00", "exit_code": 0, "pod": "ignored", "run_id": "r1"})
     assert list(meta) == list(render.LEGACY_META_FIELDS) + list(render.ADDED_META_FIELDS)

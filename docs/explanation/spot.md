@@ -56,7 +56,8 @@ classification exact and the flush complete.
    2 h, 6 h, 24 h).
 7. **Long tasks run on-demand.** Tasks whose timeout exceeds `spotMaxTaskMinutes` (default 240, so `stressnglongrun`
    with 26 h) are never planned on spot; a run that contains one is on-demand.
-8. **Statistics are recorded.** `status.attempts` lists each attempt's capacity type, node, duration and outcome.
+8. **Statistics are recorded.** `status.attempts` lists each attempt's node, the capacity type of that node (none for an
+   attempt that never got one), duration and outcome.
    `meta.json` gets `capacity_type` and `spot_attempts`; the controller exports interruption counts per vendor and SKU
    as metrics ([monitoring](monitoring.md)).
 

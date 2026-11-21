@@ -156,7 +156,7 @@ def _attempt_from_dict(d: dict) -> AttemptStatus:
     outcome = d.get("outcome")
     return AttemptStatus(
         n=d["n"],
-        capacity_type=CapacityType(d.get("capacityType", CapacityType.ON_DEMAND)),
+        capacity_type=CapacityType(d["capacityType"]) if d.get("capacityType") else None,
         node_claim=d.get("nodeClaim"),
         node=d.get("node"),
         start=_parse_time(d.get("start")),
@@ -237,11 +237,12 @@ def _task_to_dict(task: TaskStatus) -> dict:
 def _attempt_to_dict(attempt: AttemptStatus) -> dict:
     d = {
         "n": attempt.n,
-        "capacityType": attempt.capacity_type.value,
         "start": _format_time(attempt.start),
         "end": _format_time(attempt.end),
         "outcome": attempt.outcome.value if attempt.outcome else None,
     }
+    if attempt.capacity_type is not None:
+        d["capacityType"] = attempt.capacity_type.value
     if attempt.node_claim is not None:
         d["nodeClaim"] = attempt.node_claim
     if attempt.node is not None:

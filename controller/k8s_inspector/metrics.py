@@ -144,7 +144,7 @@ class Metrics:
                     self._counters["run_attempts_total"][
                         _labels(
                             vendor=vendor,
-                            capacity_type=attempt.capacity_type.value,
+                            capacity_type=attempt.capacity_type.value if attempt.capacity_type else "none",
                             outcome=_ATTEMPT_LABEL[attempt.outcome],
                         )
                     ] += 1

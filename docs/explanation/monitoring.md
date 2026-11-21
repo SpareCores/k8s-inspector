@@ -34,7 +34,7 @@ Transient API errors (429, 5xx, connection errors, timeouts, a 404 on the `Bench
 |---|---|
 | `k8s_inspector_runs` | vendor, phase |
 | `k8s_inspector_tasks_total` | vendor, task, result (ok, failed, timeout, lost) |
-| `k8s_inspector_run_attempts_total` | vendor, capacity_type, outcome (completed, interrupted, node_lost, provisioning_failed, launch_failed, cancelled, harness_error) |
+| `k8s_inspector_run_attempts_total` | vendor, capacity_type (`none`: the attempt never got a node), outcome (completed, interrupted, node_lost, provisioning_failed, launch_failed, cancelled, harness_error) |
 | `k8s_inspector_node_age_seconds` | vendor, sku, run |
 | `k8s_inspector_publish_backlog` | (tasks done, not yet in git, of SKUs that may be published) |
 | `k8s_inspector_unpublishable_tasks_total` | (finished tasks given up on: no `lscpu` result to pick a variant from) |

@@ -43,7 +43,7 @@ status:
     {index: 7, name: 07-geekbench, gpuRuntime: false,
      containers: [{key: geekbench, image: …, command: …, timeoutSeconds: 3600, env: {…}}]}
   attempt: 1
-  capacityType: spot
+  capacityType: spot             # of the node in use; absent while the attempt has no node
   node: <node name>
   region: eu-frankfurt-1
   zone: <zone>
