@@ -713,3 +713,64 @@ def test_offered_types_truncated_list_with_on_demand_mode(kube, keeper_skus):
     cfg = auto_config(capacity=CapacityMode.ON_DEMAND)
     skipped = planner.not_offered(kube, cfg, "oci", list(keeper_skus["oci"]))
     assert skipped == {"spot-only": "no on-demand capacity", "quota": "QuotaGate"}
+
+
+@pytest.fixture
+def sku_prices(monkeypatch):
+    """`keeper.ondemand_usd_per_hour` answers from this dict (a missing SKU has no price; an exception is raised)."""
+    prices = {}
+    asked = []
+
+    def ondemand_usd_per_hour(env, vendor, sku):
+        asked.append(sku)
+        if isinstance(prices.get(sku), Exception):
+            raise prices[sku]
+        return prices.get(sku)
+
+    monkeypatch.setattr(keeper, "ondemand_usd_per_hour", ondemand_usd_per_hour)
+    prices["asked"] = asked
+    return prices
+
+
+def test_sku_price_cap_skips_expensive_skus(kube, keeper_skus, sku_prices, caplog):
+    keeper_skus["oci"] = {"big": {}, "cheap": {}, "equal": {}}
+    sku_prices.update({"big": 45.0, "cheap": 0.2, "equal": 1.0})
+    cfg = auto_config(max_sku_usd_per_hour=1.0, max_in_flight=5)
+    with caplog.at_level("INFO"):
+        planned = plan(kube, cfg, {})
+    assert sorted(p.sku for p in planned) == ["cheap", "equal"]
+    assert "autoPlan skips 1 SKUs of vendor oci over maxSkuUsdPerHour, e.g. big (45 USD/h)" in caplog.text
+
+
+def test_sku_price_cap_skips_skus_without_a_price_or_when_keeper_fails(kube, keeper_skus, sku_prices, caplog):
+    keeper_skus["oci"] = {"unpriced": {}, "failing": {}, "cheap": {}}
+    sku_prices.update({"failing": RuntimeError("keeper HTTP 503"), "cheap": 0.2})
+    cfg = auto_config(max_sku_usd_per_hour=1.0, max_in_flight=5)
+    with caplog.at_level("INFO"):
+        assert [p.sku for p in plan(kube, cfg, {})] == ["cheap"]
+    assert "cannot check the price of oci/failing" in caplog.text
+    assert "unpriced (no on-demand price)" in caplog.text
+
+
+def test_without_a_sku_price_cap_prices_are_not_asked(kube, keeper_skus, sku_prices):
+    sku_prices["s1"] = 1000.0
+    assert [p.sku for p in plan(kube, auto_config(), {})] == ["s1"]
+    assert sku_prices["asked"] == []
+
+
+def test_sku_price_is_asked_only_for_skus_with_due_tasks_and_cached(kube, keeper_skus, sku_prices):
+    keeper_skus["oci"] = {"done": {"stressnglongrun": ["KEEPER_NOT_ALLOWED"]}, "big": {}}
+    sku_prices.update({"done": 0.1, "big": 45.0})
+    cfg = auto_config(max_sku_usd_per_hour=1.0, max_in_flight=5)
+    cache = planner.KeeperCache()
+    stored = {"done": all_done()}
+    assert plan(kube, cfg, stored, keeper_cache=cache) == []
+    assert plan(kube, cfg, stored, keeper_cache=cache) == []
+    assert sku_prices["asked"] == ["big"]
+
+
+def test_force_run_ignores_the_sku_price_cap(kube, sku_prices):
+    sku_prices["big"] = 45.0
+    run = planner.force_run(kube, make_config(max_sku_usd_per_hour=1.0), "oci", "big", force=True)
+    assert run.spec.sku == "big"
+    assert sku_prices["asked"] == []

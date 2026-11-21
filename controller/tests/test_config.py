@@ -93,6 +93,7 @@ def test_defaults_equal_documented_example():
             auto_plan=False,
             max_in_flight=2,
             max_usd_per_hour=2.0,
+            max_sku_usd_per_hour=1.0,
             capacity=CapacityMode.SPOT_FIRST,
         )
     }
@@ -151,6 +152,7 @@ def test_unknown_keys_warn_but_load(caplog):
         ({"uploads": {"partMiB": 0}}, "uploads.partMiB"),
         ({"vendors": {"oci": {"capacity": "Spot"}}}, "vendors.oci.capacity"),
         ({"vendors": {"oci": {"maxUsdPerHour": "2"}}}, "vendors.oci.maxUsdPerHour"),
+        ({"vendors": {"oci": {"maxSkuUsdPerHour": -1}}}, "vendors.oci.maxSkuUsdPerHour"),
         ({"benchPool": 3}, "benchPool"),
         ({"vendors": {"oci": "enabled"}}, "vendors.oci"),
         ({"spot": ["maxSpotAttempts"]}, "spot"),

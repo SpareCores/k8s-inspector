@@ -24,6 +24,24 @@ def server():
                 body = json.dumps(
                     {"oci": {"s1": {"membench": [], "nvidia_smi": ["No GPUs available."]}, "s2": {}}}
                 ).encode()
+            elif path == "/server/oci/priced/prices":
+                self.send_response(200)
+                body = json.dumps(
+                    [
+                        {"allocation": "ondemand", "price": 3.0},
+                        {"allocation": "spot", "price": 0.5},
+                        {"allocation": "ondemand", "price": 2.5},
+                    ]
+                ).encode()
+            elif path == "/server/oci/spot-only/prices":
+                self.send_response(200)
+                body = json.dumps([{"allocation": "spot", "price": 0.5}]).encode()
+            elif path == "/server/oci/gone/prices":
+                self.send_response(404)
+                body = b"{}"
+            elif path == "/server/oci/garbled/prices":
+                self.send_response(200)
+                body = json.dumps({"not": "a list"}).encode()
             elif path.endswith("/broken/task_block_reason_codes"):
                 self.send_response(500)
                 body = b"oops"
@@ -121,3 +139,20 @@ def test_real_bulk_response_keeps_oci_skus_with_their_blocked_tasks(monkeypatch)
     assert set(result["oci"]) == {"BM.DenseIO.A4.Ax.72", "VM.Optimized3.Flex.1-4"}
     assert set(result["oci"]["VM.Optimized3.Flex.1-4"]) == {"stressnglongrun", "nvidia_smi"}  # lscpu, llm... eligible
     assert set(result["oci"]["BM.DenseIO.A4.Ax.72"]) == {"geekbench", "stressnglongrun", "nvidia_smi"}
+
+
+def test_ondemand_price_is_the_cheapest_ondemand_one_in_usd(server):
+    base, seen = server
+    assert keeper.ondemand_usd_per_hour(env_for(base), "oci", "priced") == 2.5
+    assert seen[0][0] == "/server/oci/priced/prices?currency=USD"
+
+
+@pytest.mark.parametrize("sku", ["spot-only", "gone"])
+def test_no_ondemand_price_is_none(server, sku):
+    assert keeper.ondemand_usd_per_hour(env_for(server[0]), "oci", sku) is None
+
+
+@pytest.mark.parametrize("sku", ["garbled", "unlisted"])
+def test_price_errors_raise(server, sku):
+    with pytest.raises(RuntimeError):
+        keeper.ondemand_usd_per_hour(env_for(server[0]), "oci", sku)
