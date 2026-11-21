@@ -974,3 +974,50 @@ def test_run_whose_lscpu_succeeded_never_falls_back(tmp_path, origin, storage, c
     run = cluster.add_run(["lscpu", "openssl"])
     assert make_publisher(tmp_path, origin, storage).publish_once(ENABLED).tasks_published == 0
     assert not any(t.published for t in run.status.tasks)
+
+
+def _cancelled_run(cluster, storage, reason="CANCELLED"):
+    """A cancelled run: lscpu and openssl finished, geekbench was unfinished (`-4 reason`)."""
+    storage.put_task("geekbench", golden_status("geekbench") | {"exit_code": -4, "error_msg": reason})
+    run = cluster.add_run(["lscpu", "geekbench", "openssl"], phase=RunPhase.CANCELLED)
+    run.status.tasks[1].exit_code, run.status.tasks[1].error_msg = -4, reason
+    return run
+
+
+def test_cancelled_task_writes_nothing_and_the_run_finishes(tmp_path, origin, storage, cluster):
+    run = _cancelled_run(cluster, storage)
+    result = make_publisher(tmp_path, origin, storage).publish_once(ENABLED)
+    assert result.unpublishable == 1 and result.tasks_published == 2
+    assert all(t.published for t in run.status.tasks) and run.status.phase == RunPhase.CANCELLED
+    assert not (clone(origin, tmp_path) / "data/hcloud/cax31/schedule/geekbench").exists()
+    assert not publisher.publishing_stalled(ENABLED, "hcloud", list(cluster.runs.values()))
+
+
+def test_cancelled_task_keeps_the_previous_schedule_meta(tmp_path, origin, storage, cluster):
+    seed = clone(origin, tmp_path, "seed2")
+    (seed / "data/hcloud/cax31/schedule/geekbench").mkdir(parents=True)
+    (seed / "data/hcloud/cax31/schedule/geekbench/meta.json").write_text('{"exit_code": 0}')
+    git(seed, "add", "-A")
+    git(seed, "commit", "-m", "previous")
+    git(seed, "push", "origin", "HEAD:main")
+    _cancelled_run(cluster, storage)
+    make_publisher(tmp_path, origin, storage).publish_once(ENABLED)
+    meta = clone(origin, tmp_path) / "data/hcloud/cax31/schedule/geekbench/meta.json"
+    assert json.loads(meta.read_text()) == {"exit_code": 0}
+
+
+def test_finished_tasks_of_a_cancelled_run_publish_normally(tmp_path, origin, storage, cluster):
+    storage.put_task("openssl", golden_status("openssl") | {"exit_code": 1, "error_msg": "boom"})
+    run = _cancelled_run(cluster, storage)
+    make_publisher(tmp_path, origin, storage).publish_once(ENABLED)
+    assert all(t.published for t in run.status.tasks)
+    metas = _published_metas(origin, tmp_path)
+    assert metas["0/lscpu/meta.json"] == 0 and metas["0/openssl/meta.json"] == 1
+    assert "schedule/geekbench/meta.json" not in metas
+
+
+def test_other_never_finished_reasons_still_publish(tmp_path, origin, storage, cluster):
+    run = _cancelled_run(cluster, storage, reason="EVICTED")
+    result = make_publisher(tmp_path, origin, storage).publish_once(ENABLED)
+    assert result.unpublishable == 0 and all(t.published for t in run.status.tasks)
+    assert _published_metas(origin, tmp_path)["schedule/geekbench/meta.json"] == -4

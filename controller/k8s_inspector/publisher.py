@@ -33,6 +33,10 @@ Decisions:
   guessed variant. The SKU then waits for the launch backoff (`NO_LSCPU`). A forced
   run of a SKU that git does not know, without lscpu (a typo), publishes nothing and is marked published
   without a commit.
+- A task of a cancelled run that never finished (`-4 CANCELLED`) is given up at once, whatever the lscpu result
+  (marked published without a commit, counted as unpublishable): nothing is written, so the SKU's previous
+  `schedule/<task>/meta.json` stays authoritative and the cancel does not count as a start retry. Other `-4`
+  reasons (eviction, rejected pod, image pull timeout, ...) are published as usual.
 - A task whose rendering keeps failing is published without parser output after `MAX_RENDER_FAILURES` cycles.
 - vLLM probe keys (`vllm-probe-<image>`) are not tasks of the data tree: they are marked published unrendered.
 - Timing files come from `run.json`: the latest attempt that has an lscpu result (`attempts[]`: `api_start`,
@@ -65,6 +69,7 @@ from k8s_inspector.model import (
     BenchmarkRun,
     EnvConfig,
     ExitCode,
+    Reason,
     RunKey,
     RunPhase,
     RunStatus,
@@ -482,6 +487,10 @@ class Publisher:
             if one.inp is None:
                 rendered.append((one, None))
                 continue
+            if _is_cancelled(one.inp.status):
+                log.warning("%s/%s: cancelled before it finished, not publishable", item.run.run_id, item.key)
+                unpublishable.append(one)  # the SKU's previous result stays authoritative
+                continue
             failed = (item.run, item.key)
             try:
                 variant = self._render_one(one, degraded=self._render_failures.get(failed, 0) >= MAX_RENDER_FAILURES)
@@ -768,6 +777,11 @@ def _no_lscpu_coming(run: BenchmarkRun) -> bool:
         and lscpu.exit_code != ExitCode.OK
         and all(t.state == TaskState.DONE for t in run.status.tasks)
     )
+
+
+def _is_cancelled(status: dict) -> bool:
+    """`-4 CANCELLED`: an operator cancelled the run before the task finished. It says nothing about the SKU."""
+    return status.get("exit_code") == ExitCode.NEVER_FINISHED and status.get("error_msg") == Reason.CANCELLED
 
 
 def _waits_for_lscpu(one: _Loaded) -> bool:
