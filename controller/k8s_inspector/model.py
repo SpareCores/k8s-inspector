@@ -59,6 +59,7 @@ class AttemptOutcome(StrEnum):
     SPOT_INTERRUPTED = "SpotInterrupted"
     NODE_LOST = "NodeLost"
     PROVISIONING_FAILED = "ProvisioningFailed"
+    LAUNCH_FAILED = "LaunchFailed"  # a NodeClaim of a spot-allowed attempt failed to launch or boot: on-demand next
     CANCELLED = "Cancelled"
     HARNESS_ERROR = "HarnessError"  # the controller gave up on the run
 

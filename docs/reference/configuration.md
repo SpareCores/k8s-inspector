@@ -79,7 +79,8 @@ after `noOfferingFastMinutes`; this needs `list` on `events`.
 Karpenter replaces a NodeClaim that fails to launch (`Launched` condition reason `LaunchFailed`, status Unknown or
 False) with a new one every few minutes, so the deadlines above would not fire. The controller remembers each failed
 NodeClaim of the attempt in `status.launchFailures` and, at the second distinct one, ends the remaining tasks
-`-1 SCARPENTER_LAUNCH_FAILED: <last message>` and deletes the anchor. A single transient failure is tolerated.
+`-1 SCARPENTER_LAUNCH_FAILED: <last message>` and deletes the anchor; when the attempt allowed spot, it instead ends
+`LaunchFailed` and the next attempt is on-demand only ([spot](../explanation/spot.md)). A single transient failure is tolerated.
 
 Only vendors listed with `enabled: true` are touched, and their results reach sc-inspector-data only with
 `publish: true` or a list of SKUs (default `false`: runs and outputs happen, git stays untouched, and the runs of

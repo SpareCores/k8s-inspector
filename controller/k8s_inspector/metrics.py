@@ -37,6 +37,7 @@ _ATTEMPT_LABEL = {
     AttemptOutcome.SPOT_INTERRUPTED: "interrupted",
     AttemptOutcome.NODE_LOST: "node_lost",
     AttemptOutcome.PROVISIONING_FAILED: "provisioning_failed",
+    AttemptOutcome.LAUNCH_FAILED: "launch_failed",
     AttemptOutcome.CANCELLED: "cancelled",
     AttemptOutcome.HARNESS_ERROR: "harness_error",
 }
