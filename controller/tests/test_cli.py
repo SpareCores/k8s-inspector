@@ -501,7 +501,7 @@ def controller(monkeypatch):
     stopped = []
 
     class FakeRunner:
-        def __init__(self, kube, storage, cfg_provider, namespace):
+        def __init__(self, kube, storage, cfg_provider, namespace, **kwargs):
             assert namespace == "inspector"
             assert cfg_provider().env is ENV
 

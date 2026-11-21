@@ -50,7 +50,7 @@ are switched over ([roadmap](../roadmap.md)).
 - The controller's RBAC is exactly what the code calls (`deploy/controller/rbac.yaml`; a test pins the sensitive
   rules). In `inspector`: Pods (create, list, watch, delete), `pods/exec` (get, create; the heartbeat `exec` between
   steps is a websocket upgrade), Secrets (create, get, update, delete; no list or watch, so it cannot enumerate
-  `inspector-secrets` or the platform Secrets), ConfigMaps (get, create, patch; `k8s-inspector-spot` is created on first
+  `inspector-secrets` or the platform Secrets), ConfigMaps (get, create, patch; `k8s-inspector-spot` and `k8s-inspector-launch-<vendor>` are created on first
   use), `benchmarkruns` (create, get, list, watch, patch, delete) and `benchmarkruns/status` (patch). Cluster-wide:
   get Nodes; list Pods (the CPU requests of the Pods on the benchmark node, see [CPU weight](node-profile.md#cpu-weight)); get, list and delete NodeClaims (the stale node of an attempt). Nothing else.
   The cluster-wide `pods list` lets the controller read every Pod spec in the cluster, including inline `env`

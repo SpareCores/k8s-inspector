@@ -40,3 +40,4 @@ Status: **accepted** (decided by the maintainers), **open** (recommendation in b
 | K34 | OCI SKU names in sc-inspector-data | accepted | Keeper's `api_reference` (`<shape>.<ocpus>-<gb>` for flexible shapes), the names sc-crawler already uses |
 | K35 | `apps` pool vendor | accepted (target) | UpCloud once SCarpenter's UpCloud worker support (being finished) has passed a real-cloud run; cluster-platform change |
 | K36 | Web UI for runs | open (postponed) | later; `BenchmarkRun` printer columns serve `kubectl` meanwhile |
+| K37 | Launch failures | accepted | SCarpenter's error class decides: temporary ones (`ICE`, `QUOTA`, `DAILY_LIMIT`, `VENDOR`) are retried with a backoff and leave nothing in sc-inspector-data, permanent ones (`LAUNCH_REJECTED`, `BOOT_FAILURE` the third time) are `-1` and re-checked after 30 days ([launch retries](explanation/launch-retries.md)) |

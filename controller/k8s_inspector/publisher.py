@@ -52,7 +52,7 @@ from datetime import UTC, date, datetime, timedelta
 from functools import partial
 from pathlib import Path
 
-from k8s_inspector import crd, render, tasks
+from k8s_inspector import crd, launch, render, tasks
 from k8s_inspector import storage as storage_keys
 from k8s_inspector import variant as variants
 from k8s_inspector.kube import Kube, NotFound
@@ -221,7 +221,7 @@ class Publisher:
             settings = self._settings(settings)
             if settings is None:
                 return PublishResult(0, None, ())
-            runs = crd.list_runs(self._kube)
+            runs = self._delete_temporary_failures(crd.list_runs(self._kube))
             items = []
             for run in runs:
                 items.extend(self._items_of(run, settings))
@@ -252,6 +252,23 @@ class Publisher:
                     for days_back in range(since_days + 1):
                         items.extend(self._items_in_bucket(settings, vendor, sku, today - timedelta(days=days_back)))
             return self._publish(items, settings)
+
+    def _delete_temporary_failures(self, runs: list[BenchmarkRun]) -> list[BenchmarkRun]:
+        """Delete the Failed runs of earlier versions whose tasks all ended `-1` with a temporary launch reason
+        (now such a run is deleted by the runner and never recorded). Returns the other runs."""
+        kept = []
+        for run in runs:
+            tasks_ = run.status.tasks
+            if (
+                run.status.phase == RunPhase.FAILED
+                and tasks_
+                and all(t.exit_code == ExitCode.NO_NODE and launch.is_temporary(t.error_msg) for t in tasks_)
+            ):
+                crd.delete_run(self._kube, run.name)
+                log.info("deleted run %s: temporary launch failure, nothing to publish", run.name)
+            else:
+                kept.append(run)
+        return kept
 
     def delete_expired_runs(self, settings: Settings) -> int:
         """Delete BenchmarkRuns whose tasks are all published, `publish.keep_run_hours` after the last one,

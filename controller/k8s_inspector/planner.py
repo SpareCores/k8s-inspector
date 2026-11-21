@@ -14,7 +14,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
-from k8s_inspector import crd, keeper, pods, publisher, tasks
+from k8s_inspector import crd, keeper, launch, pods, publisher, tasks
 from k8s_inspector.kube import Kube, NotFound
 from k8s_inspector.model import (
     BenchmarkRun,
@@ -218,13 +218,12 @@ class KeeperCache:
 ScheduleReader = Callable[[str], dict[str, dict[str, dict | None]]]
 
 # Wait after a failure before the task is due again (exit-codes.md "Planner retry"): a `-4` by its `start_retries`
-# (the third `-4` is `-5`, final), a `-1` flat; no capacity, quota or launch at all (`QUOTA_ZERO`, `NO_OFFERING`,
-# `LAUNCH_FAILED`) only daily.
+# (the third `-4` is `-5`, final), a `-1` flat, a permanent launch failure
+# (`launch.PERMANENT`) after 30 days. A `-1` of a temporary reason (`launch.is_temporary`; no longer written, but
+# older metas have them) is ignored: the launch ConfigMap and SCarpenter's offered-types marks pace the retries.
 RETRY_AFTER_NEVER_FINISHED = (timedelta(hours=2), timedelta(hours=6))
 RETRY_AFTER_NO_NODE = timedelta(hours=2)
-RETRY_AFTER_NO_NODE_DAILY = timedelta(hours=24)
 GPU_PROBE_TASK = "nvidia_smi"  # Keeper blocks it for a SKU without an NVIDIA GPU
-DAILY_NO_NODE_REASONS = ("SCARPENTER_QUOTA_ZERO", "SCARPENTER_NO_OFFERING", "SCARPENTER_LAUNCH_FAILED")
 
 
 def due_reason(task: TaskDef, meta: dict | None, now: datetime) -> str | None:
@@ -241,8 +240,11 @@ def due_reason(task: TaskDef, meta: dict | None, now: datetime) -> str | None:
         return "no result"
     code = int(code)
     if code == ExitCode.NO_NODE:
-        daily = str(meta.get("error_msg") or "").startswith(DAILY_NO_NODE_REASONS)
-        wait = RETRY_AFTER_NO_NODE_DAILY if daily else RETRY_AFTER_NO_NODE
+        error_msg = meta.get("error_msg")
+        if launch.is_temporary(error_msg):
+            return "temporary launch failure"
+        reason = launch.reason_of_error(error_msg)
+        wait = launch.RETRY_AFTER_PERMANENT if reason in launch.PERMANENT else RETRY_AFTER_NO_NODE
     elif code == ExitCode.NEVER_FINISHED:
         retries = min(max(int(meta.get("start_retries") or 1), 1), len(RETRY_AFTER_NEVER_FINISHED))
         wait = RETRY_AFTER_NEVER_FINISHED[retries - 1]
@@ -257,11 +259,37 @@ SCARPENTER_NAMESPACE = "scarpenter-system"  # keep in sync with deploy/controlle
 OFFERED_MAX_AGE = timedelta(minutes=30)  # an older offered-types ConfigMap is stale: SCarpenter stopped writing it
 
 
+def _mark_expired(until: str | None, now: datetime) -> bool:
+    """The `until` (RFC3339) of a marked offering has passed. Absent, damaged or without timezone: not expired
+    (an older SCarpenter writes none)."""
+    try:
+        return datetime.fromisoformat(until or "") <= now
+    except ValueError, TypeError:
+        return False
+
+
+def offered_until(kube: Kube, cfg: Config, vendor: str, sku: str) -> datetime | None:
+    """The `until` SCarpenter's offered-types ConfigMap puts on the SKU's marked offering, else None (also when
+    the ConfigMap is absent or unreadable)."""
+    name = f"scarpenter-offered-{cfg.settings.bench_class}-{vendor}"
+    try:
+        data = json.loads(kube.get_configmap_in(SCARPENTER_NAMESPACE, name)["data"]["types.json"])
+        untils = [
+            datetime.fromisoformat(entry["until"])
+            for entry in data["types"].values()
+            if entry.get("apiReference") == sku and entry.get("until")
+        ]
+        return max((u for u in untils if u.tzinfo), default=None)
+    except Exception:
+        return None
+
+
 def not_offered(kube: Kube, cfg: Config, vendor: str, skus: list[str]) -> dict[str, str]:
     """The SKUs (of `skus`) that SCarpenter's offered-types ConfigMap `scarpenter-offered-<benchClass>-<vendor>`
     in `SCARPENTER_NAMESPACE` does not offer for the vendor's capacity mode, with the reason. A SKU is matched by
     the entry's `apiReference` (entries without one are ignored; of two with the same one the available wins); it
-    is not offered when its entry is missing, `available` is false or has no capacity type, or when the mode is
+    is not offered when its entry is missing, `available` is false (and its `until`, when it has one, has not
+    passed: SCarpenter marks an offering with `reason` and `until`) or has no capacity type, or when the mode is
     OnDemand and `on-demand` is not in its `capacityTypes` (SpotFirst takes either type).
 
     Fails open: a ConfigMap that is absent (vendor not opted in), unreadable, malformed or stale filters
@@ -275,6 +303,7 @@ def not_offered(kube: Kube, cfg: Config, vendor: str, skus: list[str]) -> dict[s
         if generated.tzinfo is None:
             raise ValueError(f"generatedAt {data['generatedAt']!r} has no timezone")
         truncated = data["truncated"] is True
+        now = datetime.now(UTC)
         entries = {}  # apiReference -> (available, capacityTypes, reason); a malformed entry fails the whole read
         for entry in data["types"].values():
             api_reference = entry.get("apiReference")
@@ -283,9 +312,11 @@ def not_offered(kube: Kube, cfg: Config, vendor: str, skus: list[str]) -> dict[s
             available, capacity_types = entry["available"], entry["capacityTypes"]
             if not isinstance(available, bool) or not isinstance(capacity_types, list):
                 raise ValueError(f"malformed entry for {api_reference!r}")
+            if not available and _mark_expired(entry.get("until"), now):
+                available = True  # a mark SCarpenter has not yet cleaned up
             if api_reference not in entries or (available and not entries[api_reference][0]):
                 entries[api_reference] = (available, capacity_types, entry.get("reason", "unavailable"))
-        stale = datetime.now(UTC) - generated > OFFERED_MAX_AGE
+        stale = now - generated > OFFERED_MAX_AGE
     except NotFound:
         log.debug("autoPlan does not filter vendor %s: ConfigMap %s not found", vendor, name)
         return {}
@@ -337,7 +368,8 @@ def plan_cycle(
     Keeper does not block, until the caps are reached: usually one run per vendor and cycle. GPU tasks are dropped
     for a SKU whose `nvidia_smi` Keeper blocks (no GPU); a SKU with only GPU tasks due is not planned. A vendor
     whose publishing is stalled (`publisher.publishing_stalled`) is skipped: new runs would only pile up
-    unpublished. SKUs SCarpenter does not offer (`not_offered`) are skipped.
+    unpublished. SKUs SCarpenter does not offer (`not_offered`) and SKUs waiting for a launch retry
+    (`launch.deferred`) are skipped.
     With `dry_run` nothing is created and the first such SKU of each vendor is returned.
 
     Fails closed: when Keeper or git cannot be read the cycle plans nothing (for git: nothing for that vendor)
@@ -385,6 +417,7 @@ def plan_cycle(
         if not skus:
             log.info("autoPlan: Keeper lists no ACTIVE servers for vendor %s", vendor)
         skipped = not_offered(kube, cfg, vendor, skus) if skus else {}
+        waiting = launch.deferred(kube, vendor, skus, datetime.now(UTC))  # also drops SKUs Keeper no longer lists
         if skipped:
             examples = ", ".join(f"{sku} ({why})" for sku, why in list(skipped.items())[:3])
             log.info(
@@ -399,7 +432,7 @@ def plan_cycle(
         for sku in skus:
             if crd.run_name(vendor, sku) in leased or not publisher.publish_allowed(settings, vendor, sku):
                 continue
-            if sku in bad_names or sku in skipped:
+            if sku in bad_names or sku in skipped or sku in waiting:
                 continue
             if None in metas.get(sku, {}).values():  # unreadable meta.json: the publisher logged which
                 continue

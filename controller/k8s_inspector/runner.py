@@ -24,8 +24,9 @@ Phases:
 - Provisioning: anchor Running+ready on a Node created after it -> record region, zone, capacity type, price
   and node timings, phase Running. A Node older than the anchor: delete anchor and NodeClaim, new attempt.
   A NodeClaim capacity/quota error, 2 distinct NodeClaims of the attempt that failed to launch
-  (`LaunchFailed`, kept in `status.launchFailures`) or the provisioning deadline: remaining tasks end
-  `-1 SCARPENTER_*`, Failed.
+  (`LaunchFailed`, kept in `status.launchFailures`) or the provisioning deadline: the reason comes from the class
+  SCarpenter put in the NodeClaim message (`launch.reason_of_class`). A temporary reason (`launch.TEMPORARY`)
+  deletes the run without a record (`_defer_launch`); otherwise remaining tasks end `-1 SCARPENTER_*`, Failed.
 - Running: no step in flight -> prechecks (`-3`), vLLM ladder failures, next step (`steps.probe_step` first,
   which always contains `lscpu`, then `steps.next_step`): sign URLs into the Secret, heartbeat, create the Pod.
   Step Pod finished -> `pods.classify`, `storage.finish_task`, a `flush` Pod (max 2) while uploads are
@@ -70,7 +71,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 
-from k8s_inspector import crd, pods, render, spot, steps, tasks, variant
+from k8s_inspector import crd, launch, planner, pods, render, spot, steps, tasks, variant
 from k8s_inspector.kube import AlreadyExists, Forbidden, Kube, NotFound, backoff_delay, retry_until_ok
 from k8s_inspector.model import (
     AttemptOutcome,
@@ -106,6 +107,7 @@ MAX_PROVISION_RETRIES = 3  # attempts lost before a node was usable (stale node,
 EXTRA_ATTEMPTS = 2  # attempts beyond `max_spot_attempts` (the on-demand one plus one spare)
 MAX_LAUNCH_FAILURES = 2  # distinct NodeClaims that failed to launch in one attempt before the run gives up
 SPOT_FALLBACK_ERRORS = (
+    "SCARPENTER_LAUNCH_REJECTED",
     "SCARPENTER_LAUNCH_FAILED",
     "SCARPENTER_BOOT_FAILURE",
 )  # a spot attempt ending so goes on-demand (not a capacity error: those wait, or end as ICE or quota)
@@ -235,25 +237,9 @@ def _interrupted(claim: dict | None) -> bool:
     )
 
 
-def scarpenter_error(message: str, default: str = "ICE") -> str:
-    """`SCARPENTER_<ICE|QUOTA|QUOTA_ZERO|NO_OFFERING|BOOT_FAILURE>: <message>` from a NodeClaim message. The
-    code is a keyword guess; `default` applies when nothing matches."""
-    text = message.lower()
-    if re.search(r"no (matching )?offering|no instance type", text):
-        code = "NO_OFFERING"
-    elif "quota" in text and re.search(r"\b(zero|0)\b", text):
-        code = "QUOTA_ZERO"
-    elif "quota" in text or "limit exceeded" in text or "limitexceeded" in text:
-        code = "QUOTA"
-    elif re.search(r"capacity|insufficient|out of host", text):
-        code = "ICE"
-    else:
-        code = default
-    return f"SCARPENTER_{code}: {message}"
-
-
 def _claim_error(claims: list[dict]) -> str | None:
-    """The error of a NodeClaim that failed to launch or register, else None."""
+    """The error of a NodeClaim that failed to launch or register, else None. The reason is the class in the
+    condition message; without one a launch failure is ICE and a registration failure BOOT_FAILURE."""
     for claim in claims:
         for condition in claim.get("status", {}).get("conditions") or []:
             if condition.get("status") != "False" or condition.get("type") not in ("Launched", "Registered"):
@@ -261,8 +247,19 @@ def _claim_error(claims: list[dict]) -> str | None:
             if condition.get("reason") == LAUNCH_FAILED_REASON:
                 continue  # counted by `_launch_failures`: Karpenter retries with a new NodeClaim
             message = condition.get("message") or condition.get("reason") or "NodeClaim failed"
-            return scarpenter_error(message, "BOOT_FAILURE" if condition["type"] == "Registered" else "ICE")
+            default = "BOOT_FAILURE" if condition["type"] == "Registered" else "ICE"
+            return launch.error_message(launch.reason_of_class(message, default), message)
     return None
+
+
+def _launched_unregistered(claims: list[dict]) -> bool:
+    """A NodeClaim reached `Launched` but never `Registered`: the node was created and did not join. (A claim
+    that never launched is capacity or quota: Karpenter keeps creating new ones.)"""
+    for claim in claims:
+        conditions = {c.get("type"): c.get("status") for c in claim.get("status", {}).get("conditions") or []}
+        if conditions.get("Launched") == "True" and conditions.get("Registered") != "True":
+            return True
+    return False
 
 
 def _launch_failed_message(claim: dict) -> str | None:
@@ -367,17 +364,20 @@ class Runner:
         *,
         clock: Callable[[], datetime] | None = None,
         is_gpu: Callable[[str, str], bool] | None = None,
+        on_launch_failure: Callable[[str, str], None] | None = None,
     ) -> None:
         """`cfg_provider`: zero-argument callable returning the current `Config` (settings are re-read from the
         ConfigMap every cycle, so a callable is passed instead of a snapshot). `clock` (tests) returns the
         current UTC time. `is_gpu(vendor, sku)` picks the GPU provisioning deadline; the default is the CPU
-        deadline (the planner knows the SKU, the runner does not)."""
+        deadline (the planner knows the SKU, the runner does not). `on_launch_failure(vendor, reason)` is called
+        for each run that ends because no node could be launched (metrics)."""
         self.kube = kube
         self.storage = storage
         self.namespace = namespace
         self._cfg = cfg_provider
         self._clock = clock or (lambda: datetime.now(UTC))
         self._is_gpu = is_gpu or (lambda vendor, sku: False)
+        self._on_launch_failure = on_launch_failure
         self._queue: queue.Queue[str] = queue.Queue()
         self._lock = threading.Lock()
         self._queued: set[str] = set()
@@ -737,8 +737,38 @@ class Runner:
         self._delete_secret(run)
 
     def _fail_run(self, run: BenchmarkRun, message: str) -> None:
-        """No usable node: unfinished tasks end `-1`."""
-        self._end_run(run, ExitCode.NO_NODE, message, AttemptOutcome.PROVISIONING_FAILED)
+        """No usable node: unfinished tasks end `-1`, unless the failure is temporary (`_defer_launch`)."""
+        if not self._defer_launch(run, message):
+            self._end_run(run, ExitCode.NO_NODE, message, AttemptOutcome.PROVISIONING_FAILED)
+
+    def _defer_launch(self, run: BenchmarkRun, message: str) -> bool:
+        """Count a launch failure and remember when the SKU may be launched again (`launch`). A temporary one
+        (BOOT_FAILURE is temporary until its `BOOT_FAILURE_LIMIT`-th run) leaves no record in sc-inspector-data:
+        the BenchmarkRun is deleted, which frees the SKU for the planner. True when it was. A run that already
+        has finished tasks is kept (they must be published)."""
+        reason = launch.reason_of_error(message)
+        if reason is None:
+            return False
+        vendor, sku = run.spec.vendor, run.spec.sku
+        if self._on_launch_failure:
+            self._on_launch_failure(vendor, reason)
+        if reason in launch.PERMANENT and reason != "BOOT_FAILURE":
+            launch.clear(self.kube, vendor, [sku])
+            return False
+        if reason not in launch.REASONS or run.spec.force:  # a forced run is the operator's: it records its result
+            return False
+        until = planner.offered_until(self.kube, self._cfg(), vendor, sku) if reason == "DAILY_LIMIT" else None
+        count = launch.record_failure(self.kube, vendor, sku, reason, self._now(), until)
+        if reason == "BOOT_FAILURE" and count >= launch.BOOT_FAILURE_LIMIT:
+            launch.clear(self.kube, vendor, [sku])
+            return False
+        if any(t.state == TaskState.DONE for t in run.status.tasks):
+            return False
+        log.warning("run %s: %s, launch of %s/%s deferred (failure %d)", run.name, message, vendor, sku, count)
+        self._delete_secret(run)
+        crd.delete_run(self.kube, run.name)
+        self._forget(run.name)  # deletes the anchor with the Pods
+        return True
 
     # ----------------------------------------------------------------------- run.json
 
@@ -851,7 +881,7 @@ class Runner:
         error = _claim_error(claims)
         failures = self._record_launch_failures(run, claims)
         if error is None and len(failures) >= MAX_LAUNCH_FAILURES:
-            error = f"SCARPENTER_LAUNCH_FAILED: {failures[-1].message}"
+            error = self._launch_error(failures[-1].message)
         on_demand_retry = bool(error) and error.startswith(SPOT_FALLBACK_ERRORS)
         started = self._attempt(run).start or _time(_meta(anchor).get("creationTimestamp"))
         budget = (
@@ -871,14 +901,21 @@ class Runner:
             message = self._bench_pool_event(anchor, cfg.settings.bench_pool, started)
             error = f"SCARPENTER_NO_OFFERING: {message}" if message else None
         if error is None and waited > budget:
-            default = "BOOT_FAILURE" if claims else "ICE"
-            error = scarpenter_error(f"no node after {int(budget.total_seconds() // 60)} minutes", default)
+            if failures:  # the launch kept failing: that is the error, not a node that never came up
+                error = self._launch_error(failures[-1].message)
+            else:
+                message = f"no node after {int(budget.total_seconds() // 60)} minutes"
+                error = launch.error_message("BOOT_FAILURE" if _launched_unregistered(claims) else "ICE", message)
         if error is None:
             return
         if on_demand_retry and pods.allows_spot(anchor):
             # The next attempt (`spot.capacity_for_next_attempt`) is on-demand only.
             return self._retry_on_demand(run, live, error)
         self._fail_run(run, error)
+
+    @staticmethod
+    def _launch_error(message: str) -> str:
+        return launch.error_message(launch.reason_of_class(message, "ICE"), message)
 
     def _bench_pool_event(self, anchor: dict, bench_pool: str, since: datetime) -> str | None:
         """`_bench_pool_message` of the anchor's Events; an API error counts as no event."""
@@ -961,6 +998,7 @@ class Runner:
             return self._retry_provisioning(run, cfg, live, "the node is older than the anchor")
         nd = self._build_node(run, node, anchor)
         self._nodes[run.name] = nd
+        launch.clear(self.kube, run.spec.vendor, [run.spec.sku])  # launched: forget earlier failures
         facts = nd.facts
         if not facts.price_per_hour:
             log.warning(

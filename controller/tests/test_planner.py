@@ -6,7 +6,7 @@ from datetime import UTC, datetime, timedelta, timezone
 
 import pytest
 
-from k8s_inspector import crd, keeper, planner
+from k8s_inspector import crd, keeper, launch, planner
 from k8s_inspector.crd import RunExists, from_dict
 from k8s_inspector.kube import AlreadyExists, NotFound
 from k8s_inspector.model import (
@@ -32,6 +32,7 @@ class FakeKube:
         self.pods: list[dict] = []
         self.nodeclaims: list[dict] = []
         self.foreign_configmaps: dict[tuple[str, str], dict] = {}  # (namespace, name) -> ConfigMap
+        self.configmaps: dict[str, dict] = {}  # own namespace
 
     def get_configmap_in(self, namespace, name):
         if (namespace, name) not in self.foreign_configmaps:
@@ -40,6 +41,9 @@ class FakeKube:
 
     def create(self, kind, manifest):
         name = manifest["metadata"]["name"]
+        if kind == "configmap":
+            self.configmaps[name] = copy.deepcopy(manifest) | {"metadata": {"name": name, "resourceVersion": "1"}}
+            return copy.deepcopy(self.configmaps[name])
         if name in self.objects:
             raise AlreadyExists(name)
         obj = copy.deepcopy(manifest)
@@ -48,6 +52,10 @@ class FakeKube:
         return copy.deepcopy(obj)
 
     def get(self, kind, name):
+        if kind == "configmap":
+            if name not in self.configmaps:
+                raise NotFound(name)
+            return copy.deepcopy(self.configmaps[name])
         if name not in self.objects:
             raise NotFound(name)
         return copy.deepcopy(self.objects[name])
@@ -60,6 +68,9 @@ class FakeKube:
         return [copy.deepcopy(o) for o in self.objects.values()]
 
     def merge_patch(self, kind, name, body, subresource_status=False):
+        if kind == "configmap":
+            self.configmaps[name]["data"].update(body["data"])
+            return copy.deepcopy(self.configmaps[name])
         obj = self.objects[name]
         obj.setdefault("status", {}).update({k: v for k, v in body["status"].items() if v is not None})
         return copy.deepcopy(obj)
@@ -399,11 +410,19 @@ def test_exit_code_minus_5_is_final_until_the_hash_changes(kube, keeper_skus):
 @pytest.mark.parametrize(
     ("meta_fields", "ago", "due"),
     [
-        ({"code": -1, "error_msg": "SCARPENTER_ICE: no capacity"}, timedelta(hours=1), False),
-        ({"code": -1, "error_msg": "SCARPENTER_ICE: no capacity"}, timedelta(hours=3), True),
-        ({"code": -1, "error_msg": "SCARPENTER_NO_OFFERING: none"}, timedelta(hours=3), False),
-        ({"code": -1, "error_msg": "SCARPENTER_LAUNCH_FAILED: x"}, timedelta(hours=3), False),
-        ({"code": -1, "error_msg": "SCARPENTER_QUOTA_ZERO: none"}, timedelta(hours=25), True),
+        # a temporary reason is ignored: the launch ConfigMap paces the retries
+        *[
+            ({"code": -1, "error_msg": f"SCARPENTER_{reason}: x"}, timedelta(minutes=1), True)
+            for reason in ("ICE", "QUOTA", "DAILY_LIMIT", "VENDOR", "NO_OFFERING", "QUOTA_ZERO", "LAUNCH_FAILED")
+        ],
+        ({"code": -1, "error_msg": "SCARPENTER_BOOT_FAILURE: no node after 60 minutes"}, timedelta(minutes=1), True),
+        # permanent: final for 30 days
+        ({"code": -1, "error_msg": "SCARPENTER_LAUNCH_REJECTED: Fatal (X): y"}, timedelta(days=29), False),
+        ({"code": -1, "error_msg": "SCARPENTER_LAUNCH_REJECTED: Fatal (X): y"}, timedelta(days=31), True),
+        ({"code": -1, "error_msg": "SCARPENTER_BOOT_FAILURE: z"}, timedelta(days=29), False),
+        ({"code": -1, "error_msg": "SCARPENTER_BOOT_FAILURE: z"}, timedelta(days=31), True),
+        ({"code": -1, "error_msg": "something else"}, timedelta(hours=1), False),
+        ({"code": -1, "error_msg": "something else"}, timedelta(hours=3), True),
         ({"code": -4, "error_msg": "NODE_LOST", "start_retries": 1}, timedelta(hours=1), False),
         ({"code": -4, "error_msg": "NODE_LOST", "start_retries": 1}, timedelta(hours=3), True),
         ({"code": -4, "error_msg": "NODE_LOST", "start_retries": 2}, timedelta(hours=3), False),
@@ -713,3 +732,48 @@ def test_offered_types_truncated_list_with_on_demand_mode(kube, keeper_skus):
     cfg = auto_config(capacity=CapacityMode.ON_DEMAND)
     skipped = planner.not_offered(kube, cfg, "oci", list(keeper_skus["oci"]))
     assert skipped == {"spot-only": "no on-demand capacity", "quota": "QuotaGate"}
+
+
+# --------------------------------------------------------------------------- launch retries
+
+
+NOW = datetime.now(UTC)
+
+
+def test_a_sku_waiting_for_its_launch_retry_is_skipped_until_next(kube, keeper_skus):
+    launch.record_failure(kube, "oci", "s1", "ICE", NOW)
+    assert planned_skus(kube) == []
+    launch.record_failure(kube, "oci", "s1", "ICE", NOW - timedelta(hours=2))  # next was 2 h ago + 2 h
+    entry = launch.read(kube, "oci")["s1"]
+    assert entry["count"] == 2
+    kube.configmaps["k8s-inspector-launch-oci"]["data"]["skus"] = json.dumps(
+        {"s1": {**entry, "next": (NOW - timedelta(minutes=1)).isoformat()}}
+    )
+    assert planned_skus(kube) == ["s1"]
+
+
+def test_entries_of_skus_keeper_no_longer_lists_are_pruned(kube, keeper_skus):
+    launch.record_failure(kube, "oci", "gone", "ICE", NOW)
+    launch.record_failure(kube, "oci", "s1", "ICE", NOW)
+    planned_skus(kube)
+    assert set(launch.read(kube, "oci")) == {"s1"}
+
+
+def test_a_stale_temporary_meta_does_not_block_and_a_current_permanent_one_does(kube, keeper_skus):
+    keeper_skus["oci"]["s1"] = {"stressnglongrun": ["x"]}
+    old = done_meta("lscpu", ago=timedelta(minutes=5), code=-1, error_msg="SCARPENTER_ICE: x")
+    assert plan(kube, auto_config(), {"s1": all_done(lscpu=old)})[0].tasks == ("lscpu",)
+    rejected = {**old, "error_msg": "SCARPENTER_LAUNCH_REJECTED: Fatal (X): y"}
+    assert plan(kube, auto_config(), {"s1": all_done(lscpu=rejected)}) == []
+
+
+def test_a_marked_offering_is_skipped_until_its_until(kube, keeper_skus):
+    marked = {**QUOTA, "reason": "DailyLimit", "until": (NOW + timedelta(hours=3)).isoformat()}
+    publish_offered(kube, offered_configmap({"s1": {**marked, "capacityTypes": ["on-demand"]}}))
+    assert planned_skus(kube) == []
+    expired = {**marked, "until": (NOW - timedelta(minutes=1)).isoformat(), "capacityTypes": ["on-demand"]}
+    publish_offered(kube, offered_configmap({"s1": expired}))
+    assert planned_skus(kube) == ["s1"]
+    broken = {**marked, "until": "tomorrow", "capacityTypes": ["on-demand"]}  # tolerated: stays marked
+    publish_offered(kube, offered_configmap({"s1": broken}))
+    assert planned_skus(kube) == []

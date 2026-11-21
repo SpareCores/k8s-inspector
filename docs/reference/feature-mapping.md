@@ -16,7 +16,7 @@ Legend: **P** planner, **R** run loop, **C** classification, **Pub** publisher, 
 | 2 h `WAIT_SINCE_LAST_START`, boot placeholder commits as a lease | — replaced by the `BenchmarkRun` lease ([state model](../explanation/state.md)) |
 | `FAIL_ON_ERROR` (3 d) raising | — failing tasks via `status --failing` and alerts |
 | `task.rerun`, hash change, `RERUN_` edit | `revision`; hash unchanged; `RERUN_` still works ([tasks](tasks.md)) |
-| `-1` with retryable markers | **C** SCarpenter reasons; **P** retry after 2 h (24 h for `QUOTA_ZERO`, `NO_OFFERING`) |
+| `-1` with retryable markers | **C** SCarpenter reasons; **P** temporary reasons retried with a backoff and not recorded, permanent ones re-checked after 30 days ([launch retries](../explanation/launch-retries.md)) |
 | AWS spot self-heal | [spot strategy](../explanation/spot.md) |
 | stale reconcile, `MAX_START_RETRIES` 3 → `-5` | **P** `start_retries` on `-4`, cap 3 → `-5` |
 | `meta.json` / `schedule/` union, naive UTC | **Pub** same layout and union logic |

@@ -14,7 +14,7 @@ import pytest
 from fakes import Clock, Cluster, FakeKube, FakeStorage, iso
 from lightkube import ApiError
 
-from k8s_inspector import crd, pods, steps, tasks
+from k8s_inspector import crd, launch, pods, steps, tasks
 from k8s_inspector import kube as kube_mod
 from k8s_inspector import runner as runner_mod
 from k8s_inspector.kube import WatchEvent
@@ -31,6 +31,7 @@ from k8s_inspector.model import (
     RunSpec,
     Settings,
     TaskState,
+    TaskStatus,
     UploadSettings,
     VendorSettings,
 )
@@ -56,11 +57,23 @@ class Harness:
         self.storage = FakeStorage()
         self.cluster = Cluster(self.kube, self.clock)
         self.cfg = cfg or make_config()
+        self.failures: list[tuple[str, str]] = []  # (vendor, reason) of `on_launch_failure`
         self.runner = self.new_runner()
         self.name = ""
 
     def new_runner(self) -> Runner:
-        return Runner(self.kube, self.storage, lambda: self.cfg, "inspector", clock=self.clock)
+        return Runner(
+            self.kube,
+            self.storage,
+            lambda: self.cfg,
+            "inspector",
+            clock=self.clock,
+            on_launch_failure=lambda vendor, reason: self.failures.append((vendor, reason)),
+        )
+
+    def entry(self, sku: str = "VM.Standard.E5.Flex.2-16") -> dict:
+        """The launch ConfigMap entry of the SKU (a vendor oci run)."""
+        return launch.read(self.kube, "oci")[sku]
 
     def start(self, tasks: list[str], **spec) -> None:
         sku = spec.pop("sku", "VM.Standard.E5.Flex.2-16")
@@ -211,17 +224,13 @@ def test_timeout_step_is_minus_six(h):
     assert h.codes()["geekbench"] == (-6, "Execution timed out after 3600s")
 
 
-def test_unlaunched_nodeclaim_at_the_deadline_is_boot_failure_not_ice(h):
-    h.cluster.provision_enabled = False
-    h.start(["geekbench"])
-    h.runner.reconcile(h.name)
-    anchor = h.kube.get("pod", f"{h.name}-a1")
+def _unlaunched_claim(h, anchor, name):
     selector = anchor["spec"]["nodeSelector"]
     h.kube.create(  # as Karpenter creates it: pool label only, vendor and SKU in spec.requirements
         "nodeclaim",
         {
             "metadata": {
-                "name": "claim-unlaunched",
+                "name": name,
                 "labels": {"karpenter.sh/nodepool": selector["karpenter.sh/nodepool"]},
                 "creationTimestamp": iso(h.clock.now + timedelta(seconds=1)),
             },
@@ -233,9 +242,16 @@ def test_unlaunched_nodeclaim_at_the_deadline_is_boot_failure_not_ice(h):
             },
         },
     )
+
+
+def test_unlaunched_nodeclaim_at_the_deadline_is_ice_not_boot_failure(h):
+    h.cluster.provision_enabled = False
+    h.start(["geekbench"])
+    h.runner.reconcile(h.name)
+    _unlaunched_claim(h, h.kube.get("pod", f"{h.name}-a1"), "claim-unlaunched")
     h.clock.advance(hours=3)
     h.runner.reconcile(h.name)
-    assert h.codes()["geekbench"][1].startswith("SCARPENTER_BOOT_FAILURE")
+    assert h.entry()["reason"] == "ICE"  # Karpenter keeps replacing claims that never launched: capacity or quota
 
 
 def test_image_pull_stuck_becomes_minus_four_and_the_run_continues(h):
@@ -342,19 +358,16 @@ def test_vllm_ladder_failure_is_recorded_with_the_probe_errors(h):
 # --------------------------------------------------------------------------- provisioning
 
 
-def test_capacity_error_on_the_nodeclaim_fails_the_run_with_minus_one(h):
+def test_capacity_error_on_the_nodeclaim_defers_the_launch_and_deletes_the_run(h):
     h.cluster.provision_enabled = False
     h.start(["geekbench"])
     h.runner.reconcile(h.name)
     h.cluster.fail_launch(h.kube.get("pod", f"{h.name}-a1"), "InsufficientInstanceCapacity in zone")
     h.runner.reconcile(h.name)
-    run = h.run
-    assert run.status.phase == RunPhase.FAILED
-    assert h.codes()["geekbench"] == (-1, "SCARPENTER_ICE: InsufficientInstanceCapacity in zone")
-    assert h.pod_names() == [f"{h.name}-a1"]  # recorded first, the anchor goes with the next pass
-    h.runner.reconcile(h.name)
-    assert h.pod_names() == []
-    assert run.status.attempts[0].outcome == AttemptOutcome.PROVISIONING_FAILED
+    assert h.kube.list("benchmarkrun") == [] and h.pod_names() == []
+    assert h.storage.status == {}  # nothing to publish
+    assert h.entry()["reason"] == "ICE" and h.entry()["count"] == 1
+    assert h.failures == [("oci", "ICE")]
 
 
 def test_provisioning_deadline_fails_the_run(h):
@@ -366,20 +379,29 @@ def test_provisioning_deadline_fails_the_run(h):
     assert h.run.status.phase == RunPhase.PROVISIONING
     h.clock.advance(minutes=2)
     h.runner.reconcile(h.name)
-    assert h.run.status.phase == RunPhase.FAILED
-    assert h.task("geekbench").exit_code == -1 and "no node after 60 minutes" in h.task("geekbench").error_msg
+    assert h.kube.list("benchmarkrun") == []
+    assert h.entry()["reason"] == "ICE"
 
 
-def _unschedulable_anchor(h, message="0/3 nodes are available: 3 node(s) didn't match Pod's node affinity/selector."):
+def _unschedulable_anchor(
+    h, message="0/3 nodes are available: 3 node(s) didn't match Pod's node affinity/selector.", force=False
+):
     h.cluster.provision_enabled = False
-    h.start(["geekbench"])
+    h.start(["geekbench"], force=force)
     h.runner.reconcile(h.name)
     condition = {"type": "PodScheduled", "status": "False", "reason": "Unschedulable", "message": message}
     h.kube.merge_patch("pod", f"{h.name}-a1", {"status": {"conditions": [condition]}})
 
 
-def test_no_nodeclaim_and_unschedulable_anchor_fails_fast_with_no_offering(h):
+def test_no_offering_is_temporary_unless_the_run_is_forced(h):
     _unschedulable_anchor(h)
+    h.clock.advance(minutes=11)
+    h.runner.reconcile(h.name)
+    assert h.kube.list("benchmarkrun") == [] and h.entry()["reason"] == "NO_OFFERING"
+
+
+def test_no_nodeclaim_and_unschedulable_anchor_fails_fast_with_no_offering(h):
+    _unschedulable_anchor(h, force=True)
     h.clock.advance(minutes=9)
     h.runner.reconcile(h.name)
     assert h.run.status.phase == RunPhase.PROVISIONING
@@ -422,7 +444,7 @@ BENCH_MESSAGE = (
 
 
 def test_karpenter_event_for_bench_pool_fails_after_fast_deadline(h):
-    _unschedulable_anchor(h)
+    _unschedulable_anchor(h, force=True)
     _karpenter_event(h, BENCH_MESSAGE)
     h.clock.advance(minutes=1)
     h.runner.reconcile(h.name)
@@ -438,7 +460,7 @@ def test_karpenter_event_for_bench_pool_fails_after_fast_deadline(h):
 
 
 def test_bench_clause_in_the_first_position_is_found(h):
-    _unschedulable_anchor(h)
+    _unschedulable_anchor(h, force=True)
     _karpenter_event(h, f"Failed to schedule pod, {BENCH_CLAUSE}; {OTHER_CLAUSE}")
     h.clock.advance(minutes=2)
     h.runner.reconcile(h.name)
@@ -498,7 +520,7 @@ def test_event_not_from_karpenter_is_ignored(h):
 
 
 def test_events_api_error_falls_back_to_the_long_deadline(h):
-    _unschedulable_anchor(h)
+    _unschedulable_anchor(h, force=True)
     _karpenter_event(h, BENCH_MESSAGE)
     h.kube.events_forbidden = True
     h.clock.advance(minutes=5)
@@ -511,7 +533,7 @@ def test_events_api_error_falls_back_to_the_long_deadline(h):
 
 def test_no_offering_wait_is_configurable(h):
     h.cfg = make_config(deadlines=Deadlines(no_offering_minutes=3))
-    _unschedulable_anchor(h)
+    _unschedulable_anchor(h, force=True)
     h.clock.advance(minutes=4)
     h.runner.reconcile(h.name)
     assert h.run.status.phase == RunPhase.FAILED
@@ -560,7 +582,7 @@ def test_two_distinct_launch_failures_end_the_run_even_when_claims_are_replaced(
     code, message = h.codes()["geekbench"]
     assert (
         code == -1
-        and message == "SCARPENTER_LAUNCH_FAILED: Fatal (InvalidParameter): Error returned by Compute Service. 400"
+        and message == "SCARPENTER_LAUNCH_REJECTED: Fatal (InvalidParameter): Error returned by Compute Service. 400"
     )
 
 
@@ -569,8 +591,8 @@ def test_launch_failures_of_a_spot_attempt_fall_back_to_an_on_demand_attempt(h):
     h.start(["geekbench"])
     h.runner.reconcile(h.name)
     assert pods.allows_spot(h.kube.get("pod", f"{h.name}-a1"))
-    _launch_failed(h, "bench-aaaaa", "first")
-    _launch_failed(h, "bench-bbbbb", "second")
+    _launch_failed(h, "bench-aaaaa", "Fatal (X): first")
+    _launch_failed(h, "bench-bbbbb", "Fatal (X): second")
     h.runner.reconcile(h.name)
     assert h.run.status.attempts[0].outcome == AttemptOutcome.LAUNCH_FAILED
     assert h.run.status.phase == RunPhase.PENDING
@@ -591,8 +613,8 @@ def test_launch_failures_after_lost_attempts_still_fall_back_with_a_clean_record
     h.runner.reconcile(h.name)
     assert pods.allows_spot(h.kube.get("pod", f"{h.name}-a3"))
     anchor = h.kube.get("pod", f"{h.name}-a3")
-    h.cluster.fail_launch(anchor, "first", name="bench-c1", status="Unknown", reason="LaunchFailed")
-    h.cluster.fail_launch(anchor, "second", name="bench-c2", status="Unknown", reason="LaunchFailed")
+    h.cluster.fail_launch(anchor, "Fatal (X): first", name="bench-c1", status="Unknown", reason="LaunchFailed")
+    h.cluster.fail_launch(anchor, "Fatal (X): second", name="bench-c2", status="Unknown", reason="LaunchFailed")
     h.runner.reconcile(h.name)
     assert h.run.status.attempts[2].outcome == AttemptOutcome.LAUNCH_FAILED and h.run.status.phase == RunPhase.PENDING
     h.runner.reconcile(h.name)
@@ -606,11 +628,115 @@ def test_launch_failures_of_the_on_demand_attempt_end_the_run(h):
     for attempt in (1, 2):
         h.runner.reconcile(h.name)
         anchor = h.kube.get("pod", f"{h.name}-a{attempt}")
-        h.cluster.fail_launch(anchor, "first", name=f"bench-a{attempt}1", status="Unknown", reason="LaunchFailed")
-        h.cluster.fail_launch(anchor, "second", name=f"bench-a{attempt}2", status="Unknown", reason="LaunchFailed")
+        for n, text in ((1, "first"), (2, "second")):
+            h.cluster.fail_launch(
+                anchor, f"Fatal (X): {text}", name=f"bench-a{attempt}{n}", status="Unknown", reason="LaunchFailed"
+            )
         h.runner.reconcile(h.name)
     assert h.run.status.phase == RunPhase.FAILED
-    assert h.codes()["geekbench"] == (-1, "SCARPENTER_LAUNCH_FAILED: second")
+    assert h.codes()["geekbench"] == (-1, "SCARPENTER_LAUNCH_REJECTED: Fatal (X): second")
+
+
+def _ice(h):
+    anchor = h.kube.get("pod", f"{h.name}-a1")
+    h.cluster.fail_launch(anchor, "InsufficientCapacity (X): no capacity")
+
+
+def test_each_temporary_class_defers_with_its_reason_and_backoff(h):
+    for message, reason in (
+        ("QuotaExceeded (X): vCPU limit", "QUOTA"),
+        ("DailyLimit (LimitExceeded): daily limit", "DAILY_LIMIT"),
+        ("Retryable (RequestLimitExceeded): slow", "VENDOR"),
+    ):
+        h.cluster.provision_enabled = False
+        h.start(["geekbench"])
+        h.runner.reconcile(h.name)
+        h.cluster.fail_launch(h.kube.get("pod", f"{h.name}-a1"), message)
+        h.runner.reconcile(h.name)
+        assert h.kube.list("benchmarkrun") == [] and h.storage.status == {}
+        assert h.entry()["reason"] == reason
+        launch.clear(h.kube, "oci", ["VM.Standard.E5.Flex.2-16"])
+        h.kube.objects.clear()
+        h.cluster.provision_enabled = False
+        h.runner = h.new_runner()
+
+
+def test_repeated_ice_doubles_the_wait_and_a_node_clears_the_entry(h):
+    for count, hours in ((1, 1), (2, 2), (3, 4)):
+        h.cluster.provision_enabled = False
+        h.start(["geekbench"])
+        h.runner.reconcile(h.name)
+        _ice(h)
+        h.runner.reconcile(h.name)
+        entry = h.entry()
+        assert entry["count"] == count
+        assert datetime.fromisoformat(entry["next"]) - h.clock.now == timedelta(hours=hours)
+        h.kube.objects.pop("nodeclaim", None)
+        h.runner = h.new_runner()
+    h.cluster.provision_enabled = True
+    h.start(["geekbench"])
+    h.drive(stop=lambda run: run.status.phase == RunPhase.RUNNING)
+    assert launch.read(h.kube, "oci") == {}
+
+
+def test_a_failed_launch_keeps_a_run_that_has_finished_tasks(h):
+    h.start(["geekbench"])
+    h.drive(stop=lambda run: run.status.phase == RunPhase.RUNNING)
+    run = h.run
+    run.status.tasks.append(TaskStatus("lscpu", TaskState.DONE, 1, START, START, 0))
+    h.runner._defer_launch(run, "SCARPENTER_ICE: x")
+    assert [r["metadata"]["name"] for r in h.kube.list("benchmarkrun")] == [h.name]
+    assert h.entry()["reason"] == "ICE"
+
+
+def _launched_claim(h, anchor, name):
+    """A NodeClaim that launched (the node exists) and never registered."""
+    _unlaunched_claim(h, anchor, name)
+    status = {"conditions": [{"type": "Launched", "status": "True"}, {"type": "Registered", "status": "Unknown"}]}
+    h.kube.merge_patch("nodeclaim", name, {"status": status})
+
+
+def test_boot_failure_is_temporary_twice_and_final_the_third_time(h):
+    for count in (1, 2, 3):
+        h.cluster.provision_enabled = False
+        h.start(["geekbench"])
+        h.runner.reconcile(h.name)
+        _launched_claim(h, h.kube.get("pod", f"{h.name}-a1"), f"claim-{count}")
+        h.clock.advance(hours=3)
+        h.runner.reconcile(h.name)
+        if count < 3:
+            assert h.kube.list("benchmarkrun") == [] and h.entry()["count"] == count
+        else:
+            assert h.run.status.phase == RunPhase.FAILED
+            assert h.codes()["geekbench"][1].startswith("SCARPENTER_BOOT_FAILURE")
+            assert launch.read(h.kube, "oci") == {}
+        h.kube.objects.pop("nodeclaim", None)
+        h.runner = h.new_runner()
+
+
+def test_the_deadline_after_launch_failures_is_the_launch_error_not_boot_failure(h):
+    h.cluster.provision_enabled = False
+    h.start(["geekbench"], capacity=CapacityMode.ON_DEMAND)
+    h.runner.reconcile(h.name)
+    _launch_failed(h, "bench-aaaaa", "Fatal (InvalidParameter): 400")
+    h.runner.reconcile(h.name)
+    assert h.run.status.phase == RunPhase.PROVISIONING
+    h.kube.delete("nodeclaim", "bench-aaaaa")
+    h.clock.advance(hours=2)
+    h.runner.reconcile(h.name)
+    assert h.codes()["geekbench"] == (-1, "SCARPENTER_LAUNCH_REJECTED: Fatal (InvalidParameter): 400")
+
+
+def test_a_temporary_launch_error_after_the_deadline_is_deferred_not_recorded(h):
+    h.cluster.provision_enabled = False
+    h.start(["geekbench"], capacity=CapacityMode.ON_DEMAND)
+    h.runner.reconcile(h.name)
+    _launch_failed(h, "bench-aaaaa", "InsufficientCapacity (X): none")
+    h.runner.reconcile(h.name)
+    h.kube.delete("nodeclaim", "bench-aaaaa")
+    h.clock.advance(hours=2)
+    h.runner.reconcile(h.name)
+    assert h.kube.list("benchmarkrun") == [] and h.entry()["reason"] == "ICE"
 
 
 def test_the_same_failed_nodeclaim_counts_once(h):
@@ -664,7 +790,8 @@ def test_failed_provisioning_leaves_the_capacity_type_empty_in_run_json(h):
     h.cluster.provision_enabled = False
     h.start(["geekbench"], capacity=CapacityMode.ON_DEMAND)
     h.runner.reconcile(h.name)
-    h.clock.advance(hours=2)
+    _launch_failed(h, "bench-aaaaa", "Fatal (X): first")
+    _launch_failed(h, "bench-bbbbb", "Fatal (X): second")
     h.runner.reconcile(h.name)
     assert h.run.status.phase == RunPhase.FAILED
     assert [a["capacity_type"] for a in h.storage.run_json["attempts"]] == [None]
@@ -1109,10 +1236,6 @@ def test_helpers():
     assert runner_mod._quantity("15Gi") == 15 * 2**30 and runner_mod._quantity("3920m") == 3
     assert runner_mod.parse_gpu_facts(b"15360, 7.5\n81920, 8.0\n") == (15360, (7, 5))
     assert runner_mod.parse_gpu_facts(b"garbage") == (None, None)
-    assert runner_mod.scarpenter_error("quota exceeded: limit 0").startswith("SCARPENTER_QUOTA_ZERO")
-    assert runner_mod.scarpenter_error("no offering matches").startswith("SCARPENTER_NO_OFFERING")
-    assert runner_mod.scarpenter_error("vCPU quota exceeded").startswith("SCARPENTER_QUOTA:")
-    assert runner_mod.scarpenter_error("boom", "BOOT_FAILURE").startswith("SCARPENTER_BOOT_FAILURE")
 
 
 # --------------------------------------------------------------------------- the step in flight is stored
@@ -1700,3 +1823,60 @@ def test_relaunch_markers_carry_over_so_mixed_refusals_stay_bounded(h):
     # CPU refusal, DiskPressure rejection (keeps the CPU count), CPU refusal (floor), DiskPressure again: no more
     assert len(pods_created) == 4
     assert h.codes()["geekbench"][0] == -4
+
+
+def test_a_different_reason_restarts_the_count_so_ice_never_makes_boot_failure_final(h):
+    for reason_claim in (_unlaunched_claim, _unlaunched_claim, _launched_claim):
+        h.cluster.provision_enabled = False
+        h.start(["geekbench"])
+        h.runner.reconcile(h.name)
+        reason_claim(h, h.kube.get("pod", f"{h.name}-a1"), "claim")
+        h.clock.advance(hours=3)
+        h.runner.reconcile(h.name)
+        h.kube.objects.pop("nodeclaim", None)
+        h.runner = h.new_runner()
+    assert h.kube.list("benchmarkrun") == []
+    assert h.entry()["reason"] == "BOOT_FAILURE" and h.entry()["count"] == 1
+
+
+def test_a_permanent_rejection_removes_the_skus_entry(h):
+    launch.record_failure(h.kube, "oci", "VM.Standard.E5.Flex.2-16", "ICE", h.clock.now)
+    h.cluster.provision_enabled = False
+    h.start(["geekbench"], capacity=CapacityMode.ON_DEMAND)
+    h.runner.reconcile(h.name)
+    _launch_failed(h, "bench-aaaaa", "Fatal (X): first")
+    _launch_failed(h, "bench-bbbbb", "Fatal (X): second")
+    h.runner.reconcile(h.name)
+    assert h.run.status.phase == RunPhase.FAILED
+    assert launch.read(h.kube, "oci") == {}
+
+
+def test_a_forced_run_records_its_temporary_failure(h):
+    h.cluster.provision_enabled = False
+    h.start(["geekbench"], force=True)
+    h.runner.reconcile(h.name)
+    h.cluster.fail_launch(h.kube.get("pod", f"{h.name}-a1"), "InsufficientCapacity (X): none")
+    h.runner.reconcile(h.name)
+    assert h.run.status.phase == RunPhase.FAILED
+    assert h.codes()["geekbench"][1].startswith("SCARPENTER_ICE")
+
+
+def test_a_daily_limit_waits_until_the_offered_until(h):
+    until = h.clock.now + timedelta(hours=9)
+    document = {
+        "generatedAt": h.clock.now.isoformat(),
+        "truncated": False,
+        "types": {"oci.x": {"apiReference": "VM.Standard.E5.Flex.2-16", "until": until.isoformat()}},
+    }
+    h.kube.objects["configmap/scarpenter-system"] = {
+        "scarpenter-offered-bench-oci": {
+            "metadata": {"name": "scarpenter-offered-bench-oci"},
+            "data": {"types.json": json.dumps(document)},
+        }
+    }
+    h.cluster.provision_enabled = False
+    h.start(["geekbench"])
+    h.runner.reconcile(h.name)
+    h.cluster.fail_launch(h.kube.get("pod", f"{h.name}-a1"), "DailyLimit (LimitExceeded): daily limit")
+    h.runner.reconcile(h.name)
+    assert datetime.fromisoformat(h.entry()["next"]) == until
