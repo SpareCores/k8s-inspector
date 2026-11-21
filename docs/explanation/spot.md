@@ -24,6 +24,7 @@ no SKU can loop on struggling spot capacity.**
 |---|---|
 | The drain evicts the step Pod (SIGTERM, grace = the step's `terminationGracePeriodSeconds`, 20 s) | `sc-run` stops the task and flushes within `--grace` (15 s, counted from the SIGTERM): `result.json` (`cancelled: true`), the spool's last state and `manifest.json` reach object storage if the link allows, and the termination message is written first either way. |
 | Interruption reason on the NodeClaim or Node | The controller classifies the attempt as `SPOT_INTERRUPTED` (not a generic node loss), records it, and starts the next attempt. |
+| A task ends cancelled or evicted on a spot node that does not look reclaimed yet (an OS shutdown can end the container before the Node is deleted or the NodeClaim is marked) | The controller holds the outcome back for 5 minutes after the task's end (15 minutes while the Node's Ready condition is not True), looking again every 30 seconds. If the Node vanishes or shows the reason in that time, it is an interruption as above and the task runs again; otherwise the outcome is recorded (`-4 CANCELLED` or `-4 EVICTED`). |
 | Node vanished without a notice (before the SCarpenter feature, or a missed notice) | Same classification from the capacity type of the lost node. |
 | The anchor ended while its node is healthy | `NODE_LOST`: no spot record, no new attempt. |
 

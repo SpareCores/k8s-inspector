@@ -166,6 +166,16 @@ func TestSIGTERMStopsTaskAndFlushes(t *testing.T) {
 	}
 }
 
+func TestTaskKilledBySIGTERMIsCancelledBeforeScRunSawTheSignal(t *testing.T) {
+	// The shutdown's SIGTERM can reach the task before sc-run: sc-run's own channel stays silent here.
+	cfg, _ := setup(t, "sh", "-c", "echo started; kill -TERM $$")
+	run(cfg, make(chan os.Signal))
+	tm := termMsg(t, cfg)
+	if !tm.Cancelled || tm.ExitCode != 143 || tm.ErrorMsg != "cancelled" {
+		t.Fatalf("termination message = %+v", tm)
+	}
+}
+
 func TestSIGTERMReachesGrandchildren(t *testing.T) {
 	cfg, _ := setup(t, "sh", "-c", "sleep 30 & wait")
 	start := time.Now()

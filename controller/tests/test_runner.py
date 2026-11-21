@@ -750,6 +750,68 @@ def test_interruption_notice_relabels_the_evicted_step_as_spot_interrupted(h):
     assert h.pod_names() == []  # anchor released
 
 
+def test_cancelled_task_on_a_spot_node_waits_for_the_reclaim_and_is_retried(h):
+    h.cluster.behaviour["geekbench"] = [{"exit_code": -1, "cancelled": True}]
+    h.start(["geekbench"])
+    h.drive(stop=in_step("02-geekbench"))
+    h.cluster.react()  # the container ends with sc-run's cancelled result, the Node is not marked or deleted yet
+    h.runner.reconcile(h.name)
+    assert h.task("geekbench").state == TaskState.RUNNING and h.run.status.phase == RunPhase.RUNNING
+    lose_node(h)  # the reclaim shows
+    h.runner.reconcile(h.name)
+    assert h.run.status.attempts[0].outcome == AttemptOutcome.SPOT_INTERRUPTED
+    assert h.task("geekbench").state == TaskState.PENDING and h.run.status.phase == RunPhase.PENDING
+
+
+def test_cancelled_task_on_a_spot_node_that_stays_healthy_is_recorded_after_the_wait(h):
+    h.cluster.behaviour["geekbench"] = [{"exit_code": -1, "cancelled": True}]
+    h.start(["geekbench"])
+    h.drive(stop=in_step("02-geekbench"))
+    h.cluster.react()
+    h.clock.advance(minutes=1 + 4)  # the fake task ended a minute after the Pod ran
+    h.runner.reconcile(h.name)
+    assert h.task("geekbench").state == TaskState.RUNNING
+    h.clock.advance(minutes=1)
+    h.runner.reconcile(h.name)
+    assert h.codes()["geekbench"] == (-4, "CANCELLED")
+
+
+def test_cancelled_task_waits_longer_while_the_spot_node_is_not_ready(h):
+    h.cluster.behaviour["geekbench"] = [{"exit_code": -1, "cancelled": True}]
+    h.start(["geekbench"])
+    h.drive(stop=in_step("02-geekbench"))
+    h.cluster.react()
+    node = f"node-{h.name}-a1"
+    h.kube.merge_patch("node", node, {"status": {"conditions": [{"type": "Ready", "status": "Unknown"}]}})
+    h.clock.advance(minutes=1 + 10)
+    h.runner.reconcile(h.name)
+    assert h.task("geekbench").state == TaskState.RUNNING
+    h.clock.advance(minutes=5)
+    h.runner.reconcile(h.name)
+    assert h.codes()["geekbench"] == (-4, "CANCELLED")
+
+
+def test_reclaim_wait_schedules_a_recheck(h, monkeypatch):
+    h.cluster.behaviour["geekbench"] = [{"exit_code": -1, "cancelled": True}]
+    h.start(["geekbench"])
+    h.drive(stop=in_step("02-geekbench"))
+    h.cluster.react()
+    later = []
+    monkeypatch.setattr(h.runner, "_enqueue_later", lambda name, delay: later.append((name, delay)))
+    h.runner.reconcile(h.name)
+    assert later == [(h.name, runner_mod.RECLAIM_RECHECK_SECONDS)]
+
+
+def test_cancelled_task_on_an_on_demand_node_is_recorded_at_once(h):
+    h.cluster.capacity = "on-demand"
+    h.cluster.behaviour["geekbench"] = [{"exit_code": -1, "cancelled": True}]
+    h.start(["geekbench"])
+    h.drive(stop=in_step("02-geekbench"))
+    h.cluster.react()
+    h.runner.reconcile(h.name)
+    assert h.codes()["geekbench"] == (-4, "CANCELLED")
+
+
 INTERRUPTION = {"metadata": {"annotations": {"scarpenter.sparecores.com/interruption": "SpotInterrupted"}}}
 
 

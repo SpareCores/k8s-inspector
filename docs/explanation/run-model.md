@@ -67,7 +67,8 @@ task (SIGTERM, SIGKILL after 5 s, also during the version command), the final up
 the last quarter. `result.json` and the termination message are written before the upload starts, and the termination
 message is updated afterwards if time allows. Step Pods use `terminationGracePeriodSeconds: 20`. Permanent upload
 errors (no URL for a file, a 4xx other than 403, 408 and 429) are not retried: the file is listed as missing in the
-manifest. `exec` starts with an empty spool, so a rerun never mixes its output with an earlier attempt's.
+manifest. A task that ends killed by SIGTERM counts as cancelled (`cancelled: true`, 143) even when sc-run has not seen the
+signal yet: a shutdown signals the whole container at once. `exec` starts with an empty spool, so a rerun never mixes its output with an earlier attempt's.
 
 ## Disk pressure
 

@@ -297,6 +297,7 @@ class Cluster:
                 "status": {
                     "allocatable": self.node_allocatable,
                     "capacity": {"cpu": "2", "memory": "16Gi"},
+                    "conditions": [{"type": "Ready", "status": "True"}],
                     "nodeInfo": {
                         "osImage": "Flatcar 4000",
                         "kubeletVersion": "v1.34.0",
