@@ -128,7 +128,7 @@ checkout; with `--dry-run` it creates nothing and prints the first SKU that woul
 
 SCarpenter publishes which instance types it can launch in ConfigMap `scarpenter-offered-<benchClass>-<vendor>`
 (for example `scarpenter-offered-bench-oci`) in namespace `scarpenter-system`, key `types.json`. Once per vendor and
-cycle autoPlan reads it (the controller needs `get` on ConfigMaps there, `deploy/controller/rbac.yaml`) and skips a
+cycle autoPlan reads it (the controller may `get` only the ConfigMaps named in `deploy/controller/rbac.yaml`: the default `bench` class of every SCarpenter vendor, so a non-default `benchClass` or a new vendor needs that list updated) and skips a
 SKU, matched by the entry's `apiReference` (entries without one are ignored; of two with the same one the available
 wins), when:
 

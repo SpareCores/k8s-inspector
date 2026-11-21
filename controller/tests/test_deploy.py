@@ -14,6 +14,7 @@ from k8s_inspector.model import (
     RunPhase,
     RunSpec,
     RunStatus,
+    Settings,
     TaskState,
     TaskStatus,
 )
@@ -132,7 +133,11 @@ def test_rbac_is_least_privilege_for_what_the_controller_calls():
 def test_rbac_reads_scarpenter_offered_types_in_its_namespace():
     docs = list(yaml.safe_load_all((CRD_PATH.parents[1] / "controller" / "rbac.yaml").read_text()))
     (role,) = [d for d in docs if d["kind"] == "Role" and d["metadata"]["namespace"] == "scarpenter-system"]
-    assert [(r["resources"], r["verbs"]) for r in role["rules"]] == [(["configmaps"], ["get"])]
+    (rule,) = role["rules"]
+    assert (rule["resources"], rule["verbs"]) == (["configmaps"], ["get"])
+    # Only the offered-types ConfigMaps of the default benchClass, one per SCarpenter vendor.
+    vendors = ["aws", "gcp", "azure", "oci", "upcloud", "ovh", "hcloud", "vultr", "alibaba"]
+    assert rule["resourceNames"] == [f"scarpenter-offered-{Settings().bench_class}-{v}" for v in vendors]
     (binding,) = [d for d in docs if d["kind"] == "RoleBinding" and d["metadata"]["namespace"] == "scarpenter-system"]
     assert binding["roleRef"]["name"] == role["metadata"]["name"]
     assert binding["subjects"] == [{"kind": "ServiceAccount", "name": "k8s-inspector", "namespace": "inspector"}]

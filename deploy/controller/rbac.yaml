@@ -41,8 +41,9 @@ subjects:
   name: k8s-inspector
   namespace: inspector
 ---
-# SCarpenter's offered-types ConfigMaps (planner.not_offered). Plain get: the names depend on the configured
-# benchClass and the enabled vendors.
+# SCarpenter's offered-types ConfigMaps (planner.not_offered), named scarpenter-offered-<benchClass>-<vendor>. Only
+# these are readable; the node bootstrap and credential ConfigMaps of the namespace are not. A non-default benchClass
+# or a new SCarpenter vendor needs this list updated.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
@@ -51,6 +52,16 @@ metadata:
 rules:
 - apiGroups: [""]
   resources: [configmaps]
+  resourceNames:
+  - scarpenter-offered-bench-aws
+  - scarpenter-offered-bench-gcp
+  - scarpenter-offered-bench-azure
+  - scarpenter-offered-bench-oci
+  - scarpenter-offered-bench-upcloud
+  - scarpenter-offered-bench-ovh
+  - scarpenter-offered-bench-hcloud
+  - scarpenter-offered-bench-vultr
+  - scarpenter-offered-bench-alibaba
   verbs: [get]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
