@@ -225,7 +225,7 @@ class AttemptStatus:
     """`status.attempts[]`."""
 
     n: int
-    capacity_type: CapacityType
+    capacity_type: CapacityType | None = None  # of the node the attempt got; None while it has none
     node_claim: str | None = None
     node: str | None = None
     start: datetime | None = None

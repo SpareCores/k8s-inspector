@@ -106,6 +106,7 @@ def test_attempt_counters(runs, metrics):
         AttemptStatus(2, CapacityType.ON_DEMAND, outcome=AttemptOutcome.COMPLETED),
         AttemptStatus(3, CapacityType.ON_DEMAND, outcome=AttemptOutcome.HARNESS_ERROR),
         AttemptStatus(4, CapacityType.ON_DEMAND),  # open: not counted
+        AttemptStatus(5, None, outcome=AttemptOutcome.PROVISIONING_FAILED),  # never got a node
     ]
     runs.append(make_run("a", RunPhase.RUNNING, attempts=attempts))
     text = metrics.render()
@@ -113,7 +114,8 @@ def test_attempt_counters(runs, metrics):
     assert 'k8s_inspector_run_attempts_total{capacity_type="spot",outcome="interrupted",vendor="oci"} 1' in text
     assert 'k8s_inspector_run_attempts_total{capacity_type="on-demand",outcome="completed",vendor="oci"} 1' in text
     assert 'outcome="harness_error"' in text
-    assert text.count("run_attempts_total{") == 3
+    assert 'capacity_type="none",outcome="provisioning_failed"' in text
+    assert text.count("run_attempts_total{") == 4
 
 
 def test_backlog_lag_spend_and_node_age(runs, metrics):

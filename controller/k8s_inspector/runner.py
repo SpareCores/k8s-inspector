@@ -755,7 +755,7 @@ class Runner:
             entry |= {"lscpu_stdout": None} | before.get(a.n, {})
             entry |= {
                 "attempt": a.n,
-                "capacity_type": a.capacity_type.value,
+                "capacity_type": a.capacity_type.value if a.capacity_type else None,
                 "node": a.node,
                 "node_claim": a.node_claim,
                 "api_start": render.format_timing_utc(a.start) if a.start else None,
@@ -827,10 +827,10 @@ class Runner:
             status.attempt = attempt
             status.launch_failures = []
             status.phase = RunPhase.PROVISIONING
-            status.capacity_type = capacity[0]
+            status.capacity_type = None  # the node's, once the attempt has one
             status.current_step = status.step = status.node = None
             if not any(a.n == attempt for a in status.attempts):
-                status.attempts.append(AttemptStatus(n=attempt, capacity_type=capacity[0], start=now))
+                status.attempts.append(AttemptStatus(n=attempt, start=now))
 
         self._update(run, mutate)
 

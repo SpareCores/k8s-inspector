@@ -82,7 +82,8 @@ match the legacy layout; P0 spikes never publish. OCI SKU directories use Keeper
 
 Unchanged fields and semantics, naive UTC timestamps, no trailing newline:
 `start, end, exit_code, error_msg, task_hash, version, kernel_version, stdout_bytes, stderr_bytes, outputs,
-start_retries, spot, region`. `spot` and `region` are always written (`null` when unknown).
+start_retries, spot, region`. `spot` and `region` are always written (`null` when unknown; `spot` and `capacity_type` are
+the capacity type of the node the task ran on, and `null` for a task that never got a node).
 
 Added fields (sc-crawler reads `meta.json` as a dict and ignores unknown keys):
 `run_id, image, zone, capacity_type, price, spot_attempts, node_os, kubelet, runtime, nodeclass_hash, nice` (`nice`: the nice
