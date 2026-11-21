@@ -139,7 +139,7 @@ spec:
                     nodeClaim: {type: string}
                     message: {type: string}
                     time: {type: string, format: date-time}
-              unregisteredClaims:
+              uninitializedClaims:
                 type: array
                 items:
                   type: object

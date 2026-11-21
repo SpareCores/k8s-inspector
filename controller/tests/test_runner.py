@@ -14,7 +14,7 @@ import pytest
 from fakes import Clock, Cluster, FakeKube, FakeStorage, iso
 from lightkube import ApiError
 
-from k8s_inspector import crd, launch, pods, steps, tasks
+from k8s_inspector import crd, launch, pods, spot, steps, tasks
 from k8s_inspector import kube as kube_mod
 from k8s_inspector import runner as runner_mod
 from k8s_inspector.kube import WatchEvent
@@ -738,7 +738,7 @@ def test_an_unregistered_claim_past_the_limit_ends_the_run_at_once_and_is_delete
     h.clock.advance(minutes=7)
     h.runner.reconcile(h.name)
     assert h.run.status.phase == RunPhase.PROVISIONING
-    assert [c.node_claim for c in h.run.status.unregistered_claims] == ["claim-1"]
+    assert [c.node_claim for c in h.run.status.uninitialized_claims] == ["claim-1"]
     h.clock.advance(minutes=1)
     h.runner.reconcile(h.name)
     assert h.kube.list("benchmarkrun") == []
@@ -783,7 +783,7 @@ def test_a_registered_claim_that_is_replaced_is_not_a_boot_failure(h):
     _boot_run(h)
     _set_conditions(h, "claim-1", Launched=True, Registered=True, Initialized=True)
     h.runner.reconcile(h.name)
-    assert h.run.status.unregistered_claims == []
+    assert h.run.status.uninitialized_claims == []
     h.kube.objects.pop("nodeclaim")
     h.clock.advance(minutes=2)
     h.runner.reconcile(h.name)
@@ -867,6 +867,35 @@ def test_a_registered_tainted_gpu_node_that_never_initializes_ends_boot_failure(
     _registered_run(h, 46, labels=labels)
     assert h.kube.list("benchmarkrun") == [] and h.entry()["reason"] == "BOOT_FAILURE"
     assert ("nodeclaim", "claim-1") in h.kube.deleted
+
+
+def test_a_registered_gpu_claim_deleted_before_it_initializes_ends_the_run_after_one_claim(h):
+    """SCarpenter deletes a GPU NodeClaim whose NVIDIA check failed; the anchor would only get a new one."""
+    labels = {"scarpenter.sparecores.com/accelerator-count": "1"}
+    _registered_run(h, 5, labels=labels)
+    assert h.run.status.phase == RunPhase.PROVISIONING
+    h.kube.objects.pop("nodeclaim")
+    h.clock.advance(minutes=1)
+    h.runner.reconcile(h.name)
+    assert h.kube.list("benchmarkrun") == [] and h.entry()["reason"] == "BOOT_FAILURE" and h.entry()["count"] == 1
+
+
+def test_a_registered_claim_being_deleted_before_it_initializes_ends_the_run(h):
+    _registered_run(h, 5)
+    h.kube.merge_patch("nodeclaim", "claim-1", {"metadata": {"deletionTimestamp": iso(h.clock.now)}})
+    h.runner.reconcile(h.name)
+    assert h.kube.list("benchmarkrun") == [] and h.entry()["reason"] == "BOOT_FAILURE"
+
+
+def test_a_claim_deleted_for_a_spot_interruption_is_not_a_boot_failure(h):
+    _registered_run(h, 5)
+    h.kube.merge_patch(
+        "nodeclaim",
+        "claim-1",
+        {"metadata": {"deletionTimestamp": iso(h.clock.now), "annotations": {spot.INTERRUPTION_ANNOTATION: "x"}}},
+    )
+    h.runner.reconcile(h.name)
+    assert h.run.status.phase == RunPhase.PROVISIONING
 
 
 def test_a_run_with_a_gpu_task_is_a_gpu_run_before_its_claim_has_labels(h):

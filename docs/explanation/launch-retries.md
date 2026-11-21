@@ -31,13 +31,16 @@ pre-launch budget:
 
 - a NodeClaim is `Launched=True` and not `Registered` and either has a deletion timestamp or the registration limit has
   passed since its Launched transition (`registrationMinutes`, 8 for a plain VM; `registrationMinutesBareMetal`, 14);
-- a NodeClaim the run saw launched and unregistered is gone (Karpenter deletes a claim that does not register within
-  its own fixed 15 minutes, leaves no `Registered=False` and no Event, and creates a new claim for the pending
-  anchor). The run keeps the claim name and its Launched time in `status.unregisteredClaims` for this; a claim
-  that registers is dropped from the list;
 - a NodeClaim is `Registered` and not `Initialized` (node Ready, startup taints removed, extended resources such as
   `nvidia.com/gpu` registered) the ready limit after it registered (`readyMinutes` 15, `readyMinutesBareMetal` 30,
-  `readyMinutesGpu` 45). A GPU node whose driver check fails stays registered and tainted, so it ends here.
+  `readyMinutesGpu` 45);
+- a NodeClaim that is Launched and not yet Initialized gets a deletion timestamp or is gone, registered or not, unless
+  it carries a spot interruption notice (a reclaim is not a boot failure). Karpenter deletes a claim that does not
+  register within its own fixed 15 minutes, silently (no `Registered=False`, no Event) and creates a new claim for
+  the pending anchor; SCarpenter deletes a GPU claim whose NVIDIA check fails or whose `gpu-pending` taint stays 30
+  minutes, which the 45 min GPU limit backs up. The run keeps the names and Launched times of such claims in
+  `status.uninitializedClaims` to notice a claim that vanished between reconciles; a claim that initializes is
+  dropped from the list.
 
 The controller deletes the NodeClaim and queues the run again for the moment the limit expires. A spot attempt does
 not fall back to on-demand for it: a node that never joined is not a capacity problem. How a SKU is classified is in

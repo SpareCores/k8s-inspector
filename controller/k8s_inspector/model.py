@@ -243,8 +243,8 @@ class LaunchFailure:
 
 
 @dataclass
-class UnregisteredClaim:
-    """`status.unregisteredClaims[]`: a NodeClaim of the current attempt seen `Launched` and not yet `Registered`.
+class UninitializedClaim:
+    """`status.uninitializedClaims[]`: a NodeClaim of the current attempt seen `Launched` and not yet `Registered`.
     Karpenter deletes a claim that never registers, so the run remembers it to notice that it is gone."""
 
     node_claim: str
@@ -270,7 +270,7 @@ class RunStatus:
     tasks: list[TaskStatus] = field(default_factory=list)
     attempts: list[AttemptStatus] = field(default_factory=list)
     launch_failures: list[LaunchFailure] = field(default_factory=list)  # of the current attempt, last 5
-    unregistered_claims: list[UnregisteredClaim] = field(default_factory=list)  # of the current attempt
+    uninitialized_claims: list[UninitializedClaim] = field(default_factory=list)  # of the current attempt
     conditions: list[dict] = field(default_factory=list)
 
 

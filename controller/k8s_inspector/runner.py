@@ -92,7 +92,7 @@ from k8s_inspector.model import (
     TaskOutcome,
     TaskState,
     TaskStatus,
-    UnregisteredClaim,
+    UninitializedClaim,
     Verification,
 )
 from k8s_inspector.storage import Storage, UrlsTooLarge, object_key, render_urls_json, run_json_key, split_urls_key
@@ -866,7 +866,7 @@ class Runner:
                 status.tasks = [TaskStatus(t.name) for t in selected]
             status.attempt = attempt
             status.launch_failures = []
-            status.unregistered_claims = []
+            status.uninitialized_claims = []
             status.phase = RunPhase.PROVISIONING
             status.capacity_type = None  # the node's, once the attempt has one
             status.current_step = status.step = status.node = None
@@ -933,10 +933,12 @@ class Runner:
         return any(tasks.get_task(name).gpu for name in run.spec.tasks) or any(_has_gpu(c) for c in claims)
 
     def _boot_error(self, run: BenchmarkRun, cfg: Config, claims: list[dict]) -> str | None:
-        """BOOT_FAILURE for the first node of the attempt that does not come up: launched and not registered within
-        the registration limit (or its NodeClaim is deleted, or gone: Karpenter deletes a claim after its own fixed
-        15 minutes), or registered and not Ready within the ready limit. The NodeClaim is deleted. While a limit
-        is running, the run is queued again for the moment it expires."""
+        """BOOT_FAILURE for the first node of the attempt that does not come up. A NodeClaim that launched and is not
+        yet Initialized fails the run when it is deleted or gone (Karpenter deletes a claim that does not register
+        within its own fixed 15 minutes; SCarpenter one whose GPU check fails), unless a spot interruption notice
+        explains it; when it is not Registered the registration limit after it launched; when it is Registered and not
+        Initialized the ready limit after it registered. The NodeClaim is deleted. While a limit is running, the run
+        is queued again for the moment it expires."""
         deadlines = cfg.settings.deadlines
         bare_metal = bool(BARE_METAL_SKU.search(run.spec.sku))
         registration = timedelta(
@@ -949,26 +951,27 @@ class Runner:
         else:
             ready = timedelta(minutes=deadlines.ready_minutes)
         now = self._now()
-        unregistered = [c for c in claims if _is_true(c, "Launched") and not _is_true(c, "Registered")]
-        remembered = self._remember_unregistered(run, unregistered, claims)
+        coming_up = [c for c in claims if _is_true(c, "Launched") and not _is_true(c, "Initialized")]
+        remembered = self._remember_uninitialized(run, coming_up, claims)
         expiries = []
-        for claim in unregistered:
+        for claim in coming_up:
             name = _meta(claim)["name"]
-            limit_at = _condition_time(claim, "Launched") or remembered[name]
-            limit_at += registration
-            if _meta(claim).get("deletionTimestamp") or now >= limit_at:
-                return self._boot_failure(claim, f"node of {name} did not register within {_minutes(registration)} min")
-            expiries.append(limit_at)
-        gone = remembered.keys() - {_meta(c)["name"] for c in claims}
-        if gone:
-            return launch.error_message("BOOT_FAILURE", f"node of {min(gone)} did not register: its NodeClaim is gone")
-        for claim in claims:
-            if _is_true(claim, "Registered") and not _is_true(claim, "Initialized"):
+            registered = _is_true(claim, "Registered")
+            if registered:
                 limit_at = (_condition_time(claim, "Registered") or now) + ready
-                if now >= limit_at:
-                    name = _meta(claim)["name"]
-                    return self._boot_failure(claim, f"node of {name} was not Ready within {_minutes(ready)} min")
-                expiries.append(limit_at)
+                late = f"node of {name} was not Ready within {_minutes(ready)} min"
+                deleted = f"node of {name} was deleted before it was Ready"
+            else:
+                limit_at = (_condition_time(claim, "Launched") or remembered[name]) + registration
+                late = deleted = f"node of {name} did not register within {_minutes(registration)} min"
+            if _meta(claim).get("deletionTimestamp") and not _interrupted(claim):
+                return self._boot_failure(claim, deleted)
+            if now >= limit_at:
+                return self._boot_failure(claim, late)
+            expiries.append(limit_at)
+        gone = sorted(remembered.keys() - {_meta(c)["name"] for c in claims})
+        if gone:
+            return launch.error_message("BOOT_FAILURE", f"node of {gone[0]} was gone before it was Ready")
         if expiries:
             self._enqueue_later(run.name, max((min(expiries) - now).total_seconds(), 1))
         return None
@@ -978,20 +981,21 @@ class Runner:
             self.kube.delete("nodeclaim", _meta(claim)["name"])
         return launch.error_message("BOOT_FAILURE", message)
 
-    def _remember_unregistered(
-        self, run: BenchmarkRun, unregistered: list[dict], claims: list[dict]
+    def _remember_uninitialized(
+        self, run: BenchmarkRun, coming_up: list[dict], claims: list[dict]
     ) -> dict[str, datetime]:
-        """`status.unregisteredClaims` as `{claim: launched}`, updated: the claims seen launched and not registered
-        are added; those that registered are dropped. A remembered claim missing from `claims` was deleted."""
-        known = {c.node_claim: c.launched for c in run.status.unregistered_claims}
-        registered = {_meta(c)["name"] for c in claims if _is_true(c, "Registered")}
-        wanted = {name: launched for name, launched in known.items() if name not in registered}
-        for claim in unregistered:
+        """`status.uninitializedClaims` as `{claim: launched}`, updated: the claims seen launched and not
+        Initialized are added; those that initialized are dropped. A remembered claim missing from `claims` was
+        deleted."""
+        known = {c.node_claim: c.launched for c in run.status.uninitialized_claims}
+        initialized = {_meta(c)["name"] for c in claims if _is_true(c, "Initialized")}
+        wanted = {name: launched for name, launched in known.items() if name not in initialized}
+        for claim in coming_up:
             wanted.setdefault(_meta(claim)["name"], _condition_time(claim, "Launched") or self._now())
         if wanted != known:
 
             def mutate(status: RunStatus) -> None:
-                status.unregistered_claims = [UnregisteredClaim(n, t) for n, t in wanted.items()]
+                status.uninitialized_claims = [UninitializedClaim(n, t) for n, t in wanted.items()]
 
             self._update(run, mutate)
         return wanted
