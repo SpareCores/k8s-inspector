@@ -61,7 +61,7 @@ rules:
   - scarpenter-offered-bench-ovh
   - scarpenter-offered-bench-hcloud
   - scarpenter-offered-bench-vultr
-  - scarpenter-offered-bench-alibaba
+  - scarpenter-offered-bench-alicloud
   verbs: [get]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
