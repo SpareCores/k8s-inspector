@@ -278,6 +278,11 @@ func execute(stopCtx context.Context, cfg Config) (res Result) {
 	var waitErr error
 	select {
 	case waitErr = <-done:
+		// A shutdown SIGTERM reaches the task together with sc-run, so the task can end before this process has
+		// seen the signal (or before stopCtx is cancelled): either way it was cancelled, not a failure.
+		if waitErr != nil && (stopCtx.Err() != nil || diedOfSIGTERM(waitErr)) {
+			res.Cancelled = true
+		}
 	case <-timeout.C:
 		res.TimedOut = true
 		waitErr = terminate(pgid, done, cfg.KillAfter)
@@ -292,6 +297,16 @@ func execute(stopCtx context.Context, cfg Config) (res Result) {
 	res.OOMKills = oomKills() - oomBefore
 	res.ExitCode, res.ErrorMsg = exitStatus(waitErr, res, cfg.Timeout)
 	return res
+}
+
+// diedOfSIGTERM reports whether the process was killed by SIGTERM.
+func diedOfSIGTERM(waitErr error) bool {
+	var ee *exec.ExitError
+	if !errors.As(waitErr, &ee) {
+		return false
+	}
+	ws, ok := ee.Sys().(syscall.WaitStatus)
+	return ok && ws.Signaled() && ws.Signal() == syscall.SIGTERM
 }
 
 // terminate sends SIGTERM to the task's process group, then SIGKILL after killAfter.

@@ -112,6 +112,7 @@ SPOT_FALLBACK_ERRORS = (
 MAX_LAUNCH_FAILURES_KEPT = 5  # entries of `status.launchFailures`
 LAUNCH_FAILED_REASON = "LaunchFailed"  # reason of a NodeClaim's `Launched` condition
 BACKOFF_SECONDS = (2, 5, 15, 30, 60)
+RECLAIM_WAIT = timedelta(minutes=3)  # how long a task cancelled or evicted on a spot node waits for the reclaim to show
 DISK_PRESSURE_WAIT = timedelta(minutes=10)  # how long a step waits for a node's DiskPressure to clear
 DISK_PRESSURE_RECHECK_SECONDS = 30
 DISK_PRESSURE_TAINT = "node.kubernetes.io/disk-pressure"
@@ -1341,6 +1342,8 @@ class Runner:
             for o in outcomes.values()
         ):
             return self._attempt_lost(run, cfg, live, nd)
+        if self._reclaim_may_follow(nd, outcomes):
+            return  # the next pass sees the Node gone or draining (then the step is lost with it) or the wait over
         retry = steps.retry_without_gpu(step, outcomes)
         retried = {c.key for c in retry.containers} if retry else set()  # run again below, not recorded now
 
@@ -1412,6 +1415,20 @@ class Runner:
             return self._launch(run, cfg, live, nd, fallback_step)
         self._heartbeat(run)
         self._running(run, cfg, live)
+
+    def _reclaim_may_follow(self, nd: _Node, outcomes: dict[str, TaskOutcome]) -> bool:
+        """A task ended cancelled or evicted (the SIGTERM of a shutdown) on a spot node that does not look
+        reclaimed yet: the OS shutdown can end the container before the Node is deleted or the NodeClaim is
+        marked, so the outcome is held back for `RECLAIM_WAIT` after the task's end. Recording it now would make
+        an interrupted task final."""
+        if nd.facts.capacity_type != CapacityType.SPOT:
+            return False
+        ends = [
+            o.end
+            for o in outcomes.values()
+            if o.exit_code == ExitCode.NEVER_FINISHED and o.error_msg in (Reason.EVICTED, Reason.CANCELLED) and o.end
+        ]
+        return bool(ends) and self._now() - max(ends) < RECLAIM_WAIT
 
     def _wedged_outcome(self, key, container, verdict: Verification | None) -> TaskOutcome:
         """A container that never ended: its `result.json` when the uploads verify, else `-4`."""
