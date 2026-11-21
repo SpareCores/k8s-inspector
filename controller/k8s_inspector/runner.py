@@ -112,7 +112,9 @@ SPOT_FALLBACK_ERRORS = (
 MAX_LAUNCH_FAILURES_KEPT = 5  # entries of `status.launchFailures`
 LAUNCH_FAILED_REASON = "LaunchFailed"  # reason of a NodeClaim's `Launched` condition
 BACKOFF_SECONDS = (2, 5, 15, 30, 60)
-RECLAIM_WAIT = timedelta(minutes=3)  # how long a task cancelled or evicted on a spot node waits for the reclaim to show
+RECLAIM_WAIT = timedelta(minutes=5)  # how long a task cancelled or evicted on a spot node waits for the reclaim to show
+RECLAIM_WAIT_NOT_READY = timedelta(minutes=15)  # ... when the Node's Ready condition is already not True
+RECLAIM_RECHECK_SECONDS = 30
 DISK_PRESSURE_WAIT = timedelta(minutes=10)  # how long a step waits for a node's DiskPressure to clear
 DISK_PRESSURE_RECHECK_SECONDS = 30
 DISK_PRESSURE_TAINT = "node.kubernetes.io/disk-pressure"
@@ -172,6 +174,7 @@ class _Node:
     gpu_count: int = 0
     claim: dict | None = None
     disk_pressure: bool = False  # the kubelet rejects new Pods while it is set
+    not_ready: bool = False  # the Node's Ready condition is Unknown or False
     lscpu_stdout: str | None = None  # raw output of the attempt's lscpu task, for `run.json`
 
 
@@ -328,6 +331,12 @@ def parse_gpu_facts(stdout: bytes) -> tuple[int | None, tuple[int, int] | None]:
 
 def _find(status: RunStatus, name: str) -> TaskStatus | None:
     return next((t for t in status.tasks if t.name == name), None)
+
+
+def _not_ready(node: dict) -> bool:
+    """Condition `Ready` is not True (Unknown once the kubelet stops reporting, as in a shutdown)."""
+    conditions = node.get("status", {}).get("conditions") or []
+    return not any(c.get("type") == "Ready" and c.get("status") == "True" for c in conditions)
 
 
 def _disk_pressure(node: dict) -> bool:
@@ -1078,6 +1087,7 @@ class Runner:
             node.get("status", {}).get("allocatable", {}).get(GPU_RESOURCE, 0)
         )  # the plugin may register late
         nd.disk_pressure = _disk_pressure(node)
+        nd.not_ready = _not_ready(node)
         return nd, self._draining(node, nd.claim)
 
     # ----------------------------------------------------------------------- Running
@@ -1342,8 +1352,8 @@ class Runner:
             for o in outcomes.values()
         ):
             return self._attempt_lost(run, cfg, live, nd)
-        if self._reclaim_may_follow(nd, outcomes):
-            return  # the next pass sees the Node gone or draining (then the step is lost with it) or the wait over
+        if self._wait_for_reclaim(run, nd, outcomes):
+            return  # a later pass sees the Node gone or draining (then the step is lost with it) or the wait over
         retry = steps.retry_without_gpu(step, outcomes)
         retried = {c.key for c in retry.containers} if retry else set()  # run again below, not recorded now
 
@@ -1416,11 +1426,12 @@ class Runner:
         self._heartbeat(run)
         self._running(run, cfg, live)
 
-    def _reclaim_may_follow(self, nd: _Node, outcomes: dict[str, TaskOutcome]) -> bool:
-        """A task ended cancelled or evicted (the SIGTERM of a shutdown) on a spot node that does not look
-        reclaimed yet: the OS shutdown can end the container before the Node is deleted or the NodeClaim is
-        marked, so the outcome is held back for `RECLAIM_WAIT` after the task's end. Recording it now would make
-        an interrupted task final."""
+    def _wait_for_reclaim(self, run: BenchmarkRun, nd: _Node, outcomes: dict[str, TaskOutcome]) -> bool:
+        """True while a task that ended cancelled or evicted (the SIGTERM of a shutdown) on a spot node that does
+        not look reclaimed yet is held back: the OS shutdown can end the container before the Node is deleted or
+        the NodeClaim is marked, and recording the outcome now would make an interrupted task final. The hold
+        lasts `RECLAIM_WAIT` after the task's end (`RECLAIM_WAIT_NOT_READY` while the Node's Ready condition is not
+        True); the run is looked at again soon."""
         if nd.facts.capacity_type != CapacityType.SPOT:
             return False
         ends = [
@@ -1428,7 +1439,13 @@ class Runner:
             for o in outcomes.values()
             if o.exit_code == ExitCode.NEVER_FINISHED and o.error_msg in (Reason.EVICTED, Reason.CANCELLED) and o.end
         ]
-        return bool(ends) and self._now() - max(ends) < RECLAIM_WAIT
+        if not ends:
+            return False
+        remaining = max(ends) + (RECLAIM_WAIT_NOT_READY if nd.not_ready else RECLAIM_WAIT) - self._now()
+        if remaining <= timedelta(0):
+            return False
+        self._enqueue_later(run.name, min(RECLAIM_RECHECK_SECONDS, remaining.total_seconds()))
+        return True
 
     def _wedged_outcome(self, key, container, verdict: Verification | None) -> TaskOutcome:
         """A container that never ended: its `result.json` when the uploads verify, else `-4`."""
