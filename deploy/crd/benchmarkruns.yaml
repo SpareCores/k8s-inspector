@@ -139,6 +139,14 @@ spec:
                     nodeClaim: {type: string}
                     message: {type: string}
                     time: {type: string, format: date-time}
+              unregisteredClaims:
+                type: array
+                items:
+                  type: object
+                  required: [nodeClaim]
+                  properties:
+                    nodeClaim: {type: string}
+                    launched: {type: string, format: date-time}
               conditions:
                 type: array
                 items:

@@ -98,6 +98,7 @@ def test_anchor(run, cfg):
     }
     expr = spec["affinity"]["nodeAffinity"]["requiredDuringSchedulingIgnoredDuringExecution"]["nodeSelectorTerms"][0]
     assert expr["matchExpressions"][0]["values"] == ["spot", "on-demand"]
+    # no toleration for SCarpenter's `gpu-pending` taint: the anchor waits until the driver check removes it
     assert spec["tolerations"] == [{"key": "frankenscube/bench", "operator": "Exists"}]
     assert spec["activeDeadlineSeconds"] == 100
     assert spec["automountServiceAccountToken"] is False

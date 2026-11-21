@@ -25,6 +25,7 @@ from k8s_inspector.model import (
     RunStatus,
     TaskState,
     TaskStatus,
+    UnregisteredClaim,
 )
 
 API_VERSION = "inspector.sparecores.com/v1alpha1"
@@ -186,6 +187,9 @@ def _status_from_dict(d: dict) -> RunStatus:
             LaunchFailure(f["nodeClaim"], f.get("message", ""), _parse_time(f.get("time")))
             for f in d.get("launchFailures") or []
         ],
+        unregistered_claims=[
+            UnregisteredClaim(c["nodeClaim"], _parse_time(c.get("launched"))) for c in d.get("unregisteredClaims") or []
+        ],
         conditions=list(d.get("conditions") or []),
     )
 
@@ -271,6 +275,9 @@ def status_to_dict(status: RunStatus) -> dict:
         "launchFailures": [
             {"nodeClaim": f.node_claim, "message": f.message, "time": _format_time(f.time)}
             for f in status.launch_failures
+        ],
+        "unregisteredClaims": [
+            {"nodeClaim": c.node_claim, "launched": _format_time(c.launched)} for c in status.unregistered_claims
         ],
         "conditions": status.conditions,
     }

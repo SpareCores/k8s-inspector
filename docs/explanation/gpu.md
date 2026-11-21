@@ -41,8 +41,11 @@ vendor, region, Flatcar version and branch; it is not planned.
   ship; they stay unsupported (decision K15).
 - AMD GPUs: no sysext; unsupported.
 - arm64 GPU sysexts are not documented by Flatcar; amd64 only until verified.
-- Large images (vLLM GPU) and model downloads dominate run time; GPU runs get a 256 GiB root disk and a 6 h
-  provisioning budget (GPU capacity is scarce).
+- Large images (vLLM GPU) and model downloads dominate run time; GPU runs get a 256 GiB root disk, a 6 h
+  pre-launch budget (GPU capacity is scarce) and a 45 min `readyMinutesGpu` deadline from registration to the
+  NodeClaim's `Initialized` condition (driver install, device plugin). The node registers with the
+  `scarpenter.sparecores.com/gpu-pending` taint until the NVIDIA check passes; the anchor does not tolerate it. A node
+  whose driver check fails stays tainted and the run ends `BOOT_FAILURE` at the deadline.
 
 ## k8s-inspector side
 

@@ -137,6 +137,11 @@ _SPOT = {
 _DEADLINES = {
     "provisionCpuMinutes": ("provision_cpu_minutes", _pos_int),
     "provisionGpuHours": ("provision_gpu_hours", _pos_int),
+    "registrationMinutes": ("registration_minutes", _pos_int),
+    "registrationMinutesBareMetal": ("registration_minutes_bare_metal", _pos_int),
+    "readyMinutes": ("ready_minutes", _pos_int),
+    "readyMinutesBareMetal": ("ready_minutes_bare_metal", _pos_int),
+    "readyMinutesGpu": ("ready_minutes_gpu", _pos_int),
     "noOfferingMinutes": ("no_offering_minutes", _pos_int),
     "noOfferingFastMinutes": ("no_offering_fast_minutes", _pos_int),
     "imagePullMinutes": ("image_pull_minutes", _pos_int),

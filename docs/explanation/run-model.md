@@ -152,7 +152,7 @@ limit plus 7-8 s (10 s poll): with a 5 minute limit the anchor ended after 5 m 8
 stateDiagram-v2
   [*] --> Provisioning: anchor created
   Provisioning --> Running: anchor Running on a fresh node
-  Provisioning --> Failed: budget passed / ICE / quota (-1)
+  Provisioning --> Failed: pre-launch budget passed / ICE / quota / node did not come up (-1)
   Running --> Running: next step
   Running --> Releasing: all tasks done, uploads confirmed
   Running --> Interrupted: node or anchor gone (spot, expiry, manual delete)

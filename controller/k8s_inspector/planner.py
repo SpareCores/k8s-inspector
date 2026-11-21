@@ -388,8 +388,9 @@ def plan_cycle(
     Keeper does not block, until the caps are reached: usually one run per vendor and cycle. GPU tasks are dropped
     for a SKU whose `nvidia_smi` Keeper blocks (no GPU); a SKU with only GPU tasks due is not planned. A vendor
     whose publishing is stalled (`publisher.publishing_stalled`) is skipped: new runs would only pile up
-    unpublished. SKUs SCarpenter does not offer (`not_offered`) and SKUs waiting for a launch retry
-    (`launch.deferred`, which also drops the entries of SKUs Keeper no longer lists, except in a dry run) are skipped.
+    unpublished. A vendor that is `launch.paused` (BOOT_FAILURE on several SKUs, no node ready since) is skipped
+    too. SKUs SCarpenter does not offer (`not_offered`) and SKUs waiting for a launch retry (`launch.deferred`,
+    which also drops the entries of SKUs Keeper no longer lists, except in a dry run) are skipped.
     With `dry_run` nothing is created and the first such SKU of each vendor is returned.
 
     Fails closed: when Keeper or git cannot be read the cycle plans nothing (for git: nothing for that vendor)
@@ -411,6 +412,12 @@ def plan_cycle(
             continue
         if publisher.publishing_stalled(settings, vendor, runs):
             log.warning("autoPlan skips vendor %s: finished tasks stay unpublished, publishing is failing", vendor)
+            continue
+        if launch.paused(kube, vendor, datetime.now(UTC)):
+            log.warning(
+                "autoPlan skips vendor %s: nodes of %d SKUs did not come up within %s and none has since",
+                vendor, launch.BREAKER_LIMIT, launch.BREAKER_WINDOW,
+            )  # fmt: skip
             continue
         candidates.append(vendor)
     if not candidates:

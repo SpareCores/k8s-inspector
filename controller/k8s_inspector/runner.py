@@ -92,6 +92,7 @@ from k8s_inspector.model import (
     TaskOutcome,
     TaskState,
     TaskStatus,
+    UnregisteredClaim,
     Verification,
 )
 from k8s_inspector.storage import Storage, UrlsTooLarge, object_key, render_urls_json, run_json_key, split_urls_key
@@ -108,8 +109,11 @@ EXTRA_ATTEMPTS = 2  # attempts beyond `max_spot_attempts` (the on-demand one plu
 MAX_LAUNCH_FAILURES = 2  # distinct NodeClaims that failed to launch in one attempt before the run gives up
 SPOT_FALLBACK_ERRORS = (
     "SCARPENTER_LAUNCH_REJECTED",
-    "SCARPENTER_BOOT_FAILURE",
-)  # a spot attempt ending so goes on-demand (not a capacity error: those wait, or end as ICE or quota)
+)  # a spot attempt ending so goes on-demand (not a capacity error: those wait, or end as ICE or quota; a node that
+# never joined is no capacity problem either)
+# SKUs that are bare metal, by name: OCI `BM.`, AWS `.metal`, GCP `-metal`, Alibaba `ecs.ebm`, Vultr `vbm`/`vdm`.
+BARE_METAL_SKU = re.compile(r"^(BM\.|vbm|vdm|ecs\.ebm)|[.-]metal(-|$)")
+
 MAX_LAUNCH_FAILURES_KEPT = 5  # entries of `status.launchFailures`
 LAUNCH_FAILED_REASON = "LaunchFailed"  # reason of a NodeClaim's `Launched` condition
 BACKOFF_SECONDS = (2, 5, 15, 30, 60)
@@ -134,6 +138,7 @@ PRICE_ANNOTATION = f"{SCARPENTER}/price"
 PRICE_INCOMPLETE_ANNOTATION = f"{SCARPENTER}/price-incomplete"
 NODECLASS_HASH_ANNOTATION = f"{SCARPENTER}/nodeclass-hash"
 ACCELERATOR_MANUFACTURER_LABEL = f"{SCARPENTER}/accelerator-manufacturer"
+ACCELERATOR_COUNT_LABEL = f"{SCARPENTER}/accelerator-count"
 GPU_RESOURCE = "nvidia.com/gpu"
 
 
@@ -251,14 +256,22 @@ def _claim_error(claims: list[dict]) -> str | None:
     return None
 
 
-def _launched_unregistered(claims: list[dict]) -> bool:
-    """A NodeClaim reached `Launched` but never `Registered`: the node was created and did not join. (A claim
-    that never launched is capacity or quota: Karpenter keeps creating new ones.)"""
-    for claim in claims:
-        conditions = {c.get("type"): c.get("status") for c in claim.get("status", {}).get("conditions") or []}
-        if conditions.get("Launched") == "True" and conditions.get("Registered") != "True":
-            return True
-    return False
+def _is_true(claim: dict, kind: str) -> bool:
+    return any(
+        c.get("type") == kind and c.get("status") == "True" for c in claim.get("status", {}).get("conditions") or []
+    )
+
+
+def _has_gpu(claim: dict) -> bool:
+    """The NodeClaim's labels (Karpenter copies the instance type's) say the node has accelerators."""
+    labels = _meta(claim).get("labels") or {}
+    return _quantity(labels.get(ACCELERATOR_COUNT_LABEL, 0)) > 0 or (
+        labels.get(ACCELERATOR_MANUFACTURER_LABEL, "").lower() == "nvidia"
+    )
+
+
+def _minutes(delta: timedelta) -> int:
+    return int(delta.total_seconds() // 60)
 
 
 def _launch_failed_message(claim: dict) -> str | None:
@@ -362,20 +375,17 @@ class Runner:
         namespace: str,
         *,
         clock: Callable[[], datetime] | None = None,
-        is_gpu: Callable[[str, str], bool] | None = None,
         on_launch_failure: Callable[[str, str], None] | None = None,
     ) -> None:
         """`cfg_provider`: zero-argument callable returning the current `Config` (settings are re-read from the
         ConfigMap every cycle, so a callable is passed instead of a snapshot). `clock` (tests) returns the
-        current UTC time. `is_gpu(vendor, sku)` picks the GPU provisioning deadline; the default is the CPU
-        deadline (the planner knows the SKU, the runner does not). `on_launch_failure(vendor, reason)` is called
+        current UTC time. `on_launch_failure(vendor, reason)` is called
         for each run that ends because no node could be launched (metrics)."""
         self.kube = kube
         self.storage = storage
         self.namespace = namespace
         self._cfg = cfg_provider
         self._clock = clock or (lambda: datetime.now(UTC))
-        self._is_gpu = is_gpu or (lambda vendor, sku: False)
         self._on_launch_failure = on_launch_failure
         self._queue: queue.Queue[str] = queue.Queue()
         self._lock = threading.Lock()
@@ -761,8 +771,7 @@ class Runner:
         )
         count = launch.record_failure(self.kube, vendor, sku, reason, self._now(), until)
         if reason == "BOOT_FAILURE" and count >= launch.BOOT_FAILURE_LIMIT:
-            launch.clear(self.kube, vendor, [sku])
-            return False
+            return False  # the entry stays: it counts for the vendor's breaker until a node comes up
         if any(t.state == TaskState.DONE for t in run.status.tasks):
             return False
         log.warning("run %s: %s, launch of %s/%s deferred (failure %d)", run.name, message, vendor, sku, count)
@@ -857,6 +866,7 @@ class Runner:
                 status.tasks = [TaskStatus(t.name) for t in selected]
             status.attempt = attempt
             status.launch_failures = []
+            status.unregistered_claims = []
             status.phase = RunPhase.PROVISIONING
             status.capacity_type = None  # the node's, once the attempt has one
             status.current_step = status.step = status.node = None
@@ -884,10 +894,12 @@ class Runner:
         if error is None and len(failures) >= MAX_LAUNCH_FAILURES:
             error = self._launch_error(failures[-1].message)
         on_demand_retry = bool(error) and error.startswith(SPOT_FALLBACK_ERRORS)
+        if error is None:
+            error = self._boot_error(run, cfg, claims)
         started = self._attempt(run).start or _time(_meta(anchor).get("creationTimestamp"))
         budget = (
             timedelta(hours=cfg.settings.deadlines.provision_gpu_hours)
-            if self._is_gpu(run.spec.vendor, run.spec.sku)
+            if self._is_gpu(run, claims)
             else timedelta(minutes=cfg.settings.deadlines.provision_cpu_minutes)
         )
         waited = self._now() - started
@@ -901,18 +913,88 @@ class Runner:
         ):
             message = self._bench_pool_event(anchor, cfg.settings.bench_pool, started)
             error = f"SCARPENTER_NO_OFFERING: {message}" if message else None
-        if error is None and waited > budget:
-            if failures:  # the launch kept failing: that is the error, not a node that never came up
+        if error is None and waited > budget and not any(_is_true(c, "Launched") for c in claims):
+            if failures:  # the launch kept failing: that is the error, not a missing node
                 error = self._launch_error(failures[-1].message)
-            else:
-                message = f"no node after {int(budget.total_seconds() // 60)} minutes"
-                error = launch.error_message("BOOT_FAILURE" if _launched_unregistered(claims) else "ICE", message)
+            else:  # Karpenter keeps replacing claims that never launched: capacity or quota
+                error = launch.error_message(
+                    "ICE", f"no node launched after {int(budget.total_seconds() // 60)} minutes"
+                )
         if error is None:
             return
         if on_demand_retry and pods.allows_spot(anchor):
             # The next attempt (`spot.capacity_for_next_attempt`) is on-demand only.
             return self._retry_on_demand(run, live, error)
         self._fail_run(run, error)
+
+    @staticmethod
+    def _is_gpu(run: BenchmarkRun, claims: list[dict]) -> bool:
+        """A GPU SKU: a GPU task is planned for it, or its NodeClaim has accelerators."""
+        return any(tasks.get_task(name).gpu for name in run.spec.tasks) or any(_has_gpu(c) for c in claims)
+
+    def _boot_error(self, run: BenchmarkRun, cfg: Config, claims: list[dict]) -> str | None:
+        """BOOT_FAILURE for the first node of the attempt that does not come up: launched and not registered within
+        the registration limit (or its NodeClaim is deleted, or gone: Karpenter deletes a claim after its own fixed
+        15 minutes), or registered and not Ready within the ready limit. The NodeClaim is deleted. While a limit
+        is running, the run is queued again for the moment it expires."""
+        deadlines = cfg.settings.deadlines
+        bare_metal = bool(BARE_METAL_SKU.search(run.spec.sku))
+        registration = timedelta(
+            minutes=deadlines.registration_minutes_bare_metal if bare_metal else deadlines.registration_minutes
+        )
+        if self._is_gpu(run, claims):
+            ready = timedelta(minutes=deadlines.ready_minutes_gpu)
+        elif bare_metal:
+            ready = timedelta(minutes=deadlines.ready_minutes_bare_metal)
+        else:
+            ready = timedelta(minutes=deadlines.ready_minutes)
+        now = self._now()
+        unregistered = [c for c in claims if _is_true(c, "Launched") and not _is_true(c, "Registered")]
+        remembered = self._remember_unregistered(run, unregistered, claims)
+        expiries = []
+        for claim in unregistered:
+            name = _meta(claim)["name"]
+            limit_at = _condition_time(claim, "Launched") or remembered[name]
+            limit_at += registration
+            if _meta(claim).get("deletionTimestamp") or now >= limit_at:
+                return self._boot_failure(claim, f"node of {name} did not register within {_minutes(registration)} min")
+            expiries.append(limit_at)
+        gone = remembered.keys() - {_meta(c)["name"] for c in claims}
+        if gone:
+            return launch.error_message("BOOT_FAILURE", f"node of {min(gone)} did not register: its NodeClaim is gone")
+        for claim in claims:
+            if _is_true(claim, "Registered") and not _is_true(claim, "Initialized"):
+                limit_at = (_condition_time(claim, "Registered") or now) + ready
+                if now >= limit_at:
+                    name = _meta(claim)["name"]
+                    return self._boot_failure(claim, f"node of {name} was not Ready within {_minutes(ready)} min")
+                expiries.append(limit_at)
+        if expiries:
+            self._enqueue_later(run.name, max((min(expiries) - now).total_seconds(), 1))
+        return None
+
+    def _boot_failure(self, claim: dict, message: str) -> str:
+        with contextlib.suppress(NotFound):
+            self.kube.delete("nodeclaim", _meta(claim)["name"])
+        return launch.error_message("BOOT_FAILURE", message)
+
+    def _remember_unregistered(
+        self, run: BenchmarkRun, unregistered: list[dict], claims: list[dict]
+    ) -> dict[str, datetime]:
+        """`status.unregisteredClaims` as `{claim: launched}`, updated: the claims seen launched and not registered
+        are added; those that registered are dropped. A remembered claim missing from `claims` was deleted."""
+        known = {c.node_claim: c.launched for c in run.status.unregistered_claims}
+        registered = {_meta(c)["name"] for c in claims if _is_true(c, "Registered")}
+        wanted = {name: launched for name, launched in known.items() if name not in registered}
+        for claim in unregistered:
+            wanted.setdefault(_meta(claim)["name"], _condition_time(claim, "Launched") or self._now())
+        if wanted != known:
+
+            def mutate(status: RunStatus) -> None:
+                status.unregistered_claims = [UnregisteredClaim(n, t) for n, t in wanted.items()]
+
+            self._update(run, mutate)
+        return wanted
 
     @staticmethod
     def _launch_error(message: str) -> str:
@@ -999,7 +1081,7 @@ class Runner:
             return self._retry_provisioning(run, cfg, live, "the node is older than the anchor")
         nd = self._build_node(run, node, anchor)
         self._nodes[run.name] = nd
-        launch.clear(self.kube, run.spec.vendor, [run.spec.sku])  # launched: forget earlier failures
+        launch.node_ready(self.kube, run.spec.vendor, run.spec.sku)  # launched: forget earlier failures
         facts = nd.facts
         if not facts.price_per_hour:
             log.warning(
