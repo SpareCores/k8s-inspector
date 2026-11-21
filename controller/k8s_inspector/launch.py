@@ -37,7 +37,8 @@ CLASS_REASONS = {
 }
 # NO_OFFERING (no instance type for the SKU, or an anchor nobody schedules): SCarpenter's mark is usually short, but
 # where the offered-types filter fails open nothing else stops the retries, so the wait is a flat 24 h.
-TEMPORARY = ("ICE", "QUOTA", "DAILY_LIMIT", "VENDOR", "NO_OFFERING", "NO_LSCPU")
+# ANCHOR_FAILED: the node came up but the anchor Pod ended, vanished or never became Ready; not the node's fault.
+TEMPORARY = ("ICE", "QUOTA", "DAILY_LIMIT", "VENDOR", "NO_OFFERING", "NO_LSCPU", "ANCHOR_FAILED")
 # Reasons of `-1` schedule metas written before the classes existed; they were temporary too.
 LEGACY_TEMPORARY = ("QUOTA_ZERO", "LAUNCH_FAILED")
 NO_NODE_MESSAGE = ": no node after "  # the old BOOT_FAILURE of a run that merely waited out its budget
@@ -52,6 +53,7 @@ MAX_WAIT = {
     "ICE": timedelta(hours=24),
     "QUOTA": timedelta(hours=6),
     "VENDOR": timedelta(hours=6),
+    "ANCHOR_FAILED": timedelta(hours=6),
     "DAILY_LIMIT": timedelta(hours=6),  # without SCarpenter's `until`
 }
 # Reasons with a flat wait (no doubling): NO_OFFERING; BOOT_FAILURE (every try bills a VM that never joins); and

@@ -233,3 +233,12 @@ def test_a_ready_node_of_the_vendor_clears_the_breaker_and_keeps_the_waits():
     assert launch.paused(kube, "oci", NOW)
     launch.node_ready(kube, "oci", "a")  # the SKU's own entry goes too
     assert "a" not in launch.read(kube, "oci")
+
+
+def test_anchor_failures_are_temporary_and_do_not_feed_the_breaker():
+    kube = FakeKube(Clock(NOW))
+    for sku in "abc":
+        launch.record_failure(kube, "oci", sku, "ANCHOR_FAILED", NOW)
+    assert not launch.paused(kube, "oci", NOW)
+    assert launch.is_temporary("SCARPENTER_ANCHOR_FAILED: anchor not Ready after 60 minutes")
+    assert launch.wait_after("ANCHOR_FAILED", 1) == timedelta(hours=1)

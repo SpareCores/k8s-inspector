@@ -16,7 +16,8 @@ a reason (no keyword guessing):
 | `Retryable` | `VENDOR` | temporary |
 | no instance type for the SKU, or an anchor that stays unschedulable | `NO_OFFERING` | temporary (usually a short SCarpenter mark) |
 | `Unsupported`, `InvalidOffering`, `Fatal` | `LAUNCH_REJECTED` | permanent |
-| a node that launched but did not register, or registered but did not become Ready, within its limit | `BOOT_FAILURE` | temporary once (24 h wait), permanent the second time |
+| the node is up but the anchor ended, vanished or never became Ready | `ANCHOR_FAILED` | temporary (6 h cap) |
+| a node that launched but did not register, or registered but did not become Ready, within its limit, or was deleted before it did | `BOOT_FAILURE` | temporary once (24 h wait), permanent the second time |
 
 The class is looked up anywhere in the message (SCarpenter may wrap it: `launching X: Retryable (...)`). A message
 without a known class (an older SCarpenter) is `ICE` for a launch failure and `BOOT_FAILURE` for a registration
@@ -29,23 +30,32 @@ ends with the reason of the last one.
 The run ends `BOOT_FAILURE` at the first node of an attempt that does not come up, without waiting for Karpenter or the
 pre-launch budget:
 
-- a NodeClaim is `Launched=True` and not `Registered` and either has a deletion timestamp or the registration limit has
-  passed since its Launched transition (`registrationMinutes`, 8 for a plain VM; `registrationMinutesBareMetal`, 14);
+- a NodeClaim is `Launched=True` and not `Registered` the registration limit after its creation (`registrationMinutes`,
+  8 for a plain VM; `registrationMinutesBareMetal`, 14, also used for GPU SKUs). The count starts at the claim's
+  `creationTimestamp`, the start of Karpenter's own fixed 15 minute registration timeout, so the limit is always
+  ahead of it;
 - a NodeClaim is `Registered` and not `Initialized` (node Ready, startup taints removed, extended resources such as
   `nvidia.com/gpu` registered) the ready limit after it registered (`readyMinutes` 15, `readyMinutesBareMetal` 30,
-  `readyMinutesGpu` 45);
-- a NodeClaim that is Launched and not yet Initialized gets a deletion timestamp or is gone, registered or not, unless
-  it carries a spot interruption notice (a reclaim is not a boot failure). Karpenter deletes a claim that does not
-  register within its own fixed 15 minutes, silently (no `Registered=False`, no Event) and creates a new claim for
-  the pending anchor; SCarpenter deletes a GPU claim whose NVIDIA check fails or whose `gpu-pending` taint stays 30
-  minutes, which the 45 min GPU limit backs up. The run keeps the names and Launched times of such claims in
-  `status.uninitializedClaims` to notice a claim that vanished between reconciles; a claim that initializes is
-  dropped from the list.
+  `readyMinutesGpu` 45; the Registered transition time, else the time the run first saw the claim launched);
+- a NodeClaim that is Launched and not yet Initialized is being deleted or is gone, registered or not, unless it
+  carries a spot interruption notice (a reclaim is not a boot failure; such a claim is forgotten). Karpenter deletes
+  a claim that does not register within its own 15 minutes, silently (no `Registered=False`, no Event) and creates a
+  new claim for the pending anchor; SCarpenter deletes a GPU claim whose NVIDIA check fails or whose `gpu-pending`
+  taint stays 30 minutes, which the 45 min GPU limit backs up. `gpu-pending` is a startup taint of the bench NodePool
+  (with SCarpenter's release that adds it), which is why Karpenter's `Initialized` waits for it; the anchor does not
+  tolerate it. The run keeps the names and Launched times of such claims in `status.uninitializedClaims` to notice a
+  claim that vanished between reconciles; a claim that initializes is dropped from the list.
 
-The controller deletes the NodeClaim and queues the run again for the moment the limit expires. A spot attempt does
-not fall back to on-demand for it: a node that never joined is not a capacity problem. How a SKU is classified is in
-[configuration](../reference/configuration.md#deadlines). A
-forced run (`k8s-inspector run`) records its failure as a `-1` instead of being deleted.
+Once a claim of the attempt is Initialized, or the anchor has its node, other claims of the attempt are ignored
+(Karpenter cleans them up). When a limit has passed the controller deletes the NodeClaim; while a limit is still
+running it only queues the run again for the moment that limit expires. A spot attempt does not fall back to on-demand
+for a boot failure: a node that never joined is not a capacity problem. How a SKU is classified is in
+[configuration](../reference/configuration.md#deadlines). A forced run (`k8s-inspector run`) records its failure as a
+`-1` instead of being deleted.
+
+A node that came up but whose anchor Pod ended, vanished, or is still not Ready when the pre-launch budget has passed
+(an image pull error, a probe, a leftover taint), or a node older than the anchor, ends as `ANCHOR_FAILED`: temporary
+like `ICE` (1 h, doubling, up to 6 h), never permanent, and not counted by the vendor breaker.
 
 ## Temporary failure
 

@@ -73,18 +73,22 @@ uploads:
 ```
 
 `deadlines.provisionCpuMinutes` / `provisionGpuHours` bound the wait until a NodeClaim of the run launches. After
-launch, `registrationMinutes*` bound the time to registration (counted from the claim's Launched transition) and
+launch, `registrationMinutes*` bound the time to registration (counted from the claim's creation, like Karpenter's own limit) and
 `readyMinutes*` the time from registration to the NodeClaim's `Initialized` condition; a node that misses either ends
 the run as `BOOT_FAILURE` ([launch retries](../explanation/launch-retries.md#a-node-that-does-not-come-up)).
 
-<a id="deadlines"></a>The class of a SKU picks the limits. Bare metal is told by the SKU name: OCI `BM.`, AWS `.metal`,
-GCP `-metal`, Alibaba `ecs.ebm`, Vultr `vbm` and `vdm` (`BARE_METAL_SKU` in `runner.py`). A GPU SKU is one with a GPU
+<a id="deadlines"></a>The class of a SKU picks the limits. Bare metal is told by the SKU name: OCI `BM.`, OVH `bm-`,
+AWS `.metal`, GCP `-metal`, Alibaba `ecs.ebm`, Vultr `vbm` and `vdm` (`BARE_METAL_SKU` in `runner.py`; some Vultr
+`vcg` GPU plans are metal, but the name does not say which, so GPU SKUs get the bare-metal registration limit). A GPU SKU is one with a GPU
 task in the run or accelerator labels (`scarpenter.sparecores.com/accelerator-count`, `accelerator-manufacturer`) on
 its NodeClaim; a GPU node gets `readyMinutesGpu` even when it is also bare metal.
 
 Karpenter itself deletes a NodeClaim that has not registered 15 minutes after its creation; that limit is a constant
 in Karpenter. `registrationMinutes*` must stay below it, or the claim is gone before the controller acts (the run then
-still ends `BOOT_FAILURE`, because it remembers the claim, but only after the fact). A SKU SCarpenter cannot offer would
+still ends `BOOT_FAILURE`, because it remembers the claim, but only after the fact).
+
+Upgrade: apply the BenchmarkRun CRD before the controller. With the old CRD the API server prunes
+`status.uninitializedClaims` and the detection of a claim that vanished is off. A SKU SCarpenter cannot offer would
 hold the vendor's slot for that whole time, so the controller ends it early: when the anchor Pod is still Pending
 with `PodScheduled` False and a message, and no NodeClaim for its vendor and SKU exists `noOfferingMinutes` after the
 attempt started (Karpenter creates one within seconds for any SKU it can launch), the run ends as a temporary
