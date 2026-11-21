@@ -156,7 +156,6 @@ _VENDOR = {
     "autoPlan": ("auto_plan", _optional(_bool)),
     "maxInFlight": ("max_in_flight", _optional(_nonneg_int)),
     "maxUsdPerHour": ("max_usd_per_hour", _optional(_nonneg_float)),
-    "maxSkuUsdPerHour": ("max_sku_usd_per_hour", _optional(_nonneg_float)),
     "capacity": ("capacity", _capacity),
     "publish": ("publish", _publish),
 }

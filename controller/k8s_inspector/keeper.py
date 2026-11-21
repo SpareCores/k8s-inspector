@@ -28,8 +28,8 @@ def _read_key(env: EnvConfig) -> str | None:
         return None
 
 
-def _get(url: str, key: str | None, kind: type = dict) -> dict | list | None:
-    """Parsed JSON (an object, or a list for `kind=list`) of a GET, None on 404; `RuntimeError` for everything else."""
+def _get(url: str, key: str | None) -> dict | None:
+    """Parsed JSON object of a GET, None on 404; `RuntimeError` for everything else."""
     request = urllib.request.Request(url, headers={"Authorization": f"Bearer {key}"} if key else {})
     try:
         with urllib.request.urlopen(request, timeout=TIMEOUT_SECONDS) as response:  # noqa: S310 (configured base URL)
@@ -40,7 +40,7 @@ def _get(url: str, key: str | None, kind: type = dict) -> dict | list | None:
         raise RuntimeError(f"keeper HTTP {e.code} for {url}") from e
     except (OSError, ValueError) as e:  # URLError, timeouts, bad JSON
         raise RuntimeError(f"keeper request failed: {url}: {e}") from e
-    if not isinstance(data, kind):
+    if not isinstance(data, dict):
         raise RuntimeError(f"keeper returned unexpected JSON type for {url}")
     return data
 
@@ -90,18 +90,4 @@ def active_servers_block_reasons(
             for vendor, skus in data.items()
         }
     except (AttributeError, TypeError) as e:
-        raise RuntimeError(f"keeper returned unexpected JSON for {url}") from e
-
-
-def ondemand_usd_per_hour(env: EnvConfig, vendor: str, sku: str) -> float | None:
-    """The cheapest on-demand price of the SKU in USD per hour over every region Keeper lists it in (SCarpenter
-    launches the cheapest offering, so this is what the node costs), or None when Keeper lists no on-demand
-    price (or does not know the SKU). Raises `RuntimeError` when Keeper cannot be reached or answers unexpectedly."""
-    base = (env.keeper_api_base or DEFAULT_API_BASE).rstrip("/")
-    path = f"/server/{urllib.parse.quote(vendor, safe='')}/{urllib.parse.quote(sku, safe='')}/prices"
-    url = f"{base}{path}?currency=USD&only_active=true"
-    try:
-        prices = _get(url, _read_key(env), kind=list) or []
-        return min((p["price"] for p in prices if p["allocation"] == "ondemand"), default=None)
-    except (KeyError, TypeError) as e:
         raise RuntimeError(f"keeper returned unexpected JSON for {url}") from e
