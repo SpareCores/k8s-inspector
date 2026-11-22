@@ -27,7 +27,8 @@ whatever the API server holds:
 - **Progress is the run's status plus its Pods.** On start, and after every watch reconnect, the controller LISTs
   `BenchmarkRun`s in its namespace and Pods with label `inspector.sparecores.com/run`, rebuilds its in-memory view,
   and continues each run from where its objects say it is: the step in flight is read from `status.step` and never
-  planned again; a step Pod that ended while the controller was down is collected; an anchor without a step in flight
+  planned again; a step Pod that ended while the controller was down is collected; a step Pod of a step already recorded is
+  deleted (finished steps leave no Pod, so the kubelet can free their images); an anchor without a step in flight
   gets its next step; a vanished anchor is an interrupted attempt.
 - **Every write is idempotent.** Object names are deterministic (`AlreadyExists` = already done); `status.json`
   and the uploads are overwrites of the same keys; git rendering is a pure function of object storage and the tree.
@@ -41,7 +42,7 @@ every 5 minutes as a resync.
 | Quantity | Typical | Peak |
 |---|---|---|
 | Runs in flight | 5-20 | ~50 (per-vendor caps) |
-| Objects watched (runs + anchors + step Pods kept until the run ends) | 50-200 | ~1,000 |
+| Objects watched (runs + anchors + the step Pod in flight) | 50-200 | ~1,000 |
 | Size of a full LIST | well under 1 MB | a few MB |
 | LIST latency | milliseconds | tens of milliseconds |
 

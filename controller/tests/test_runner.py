@@ -184,11 +184,91 @@ def test_happy_path_runs_every_step_and_publishes_state(h):
     assert h.storage.planned == ["lscpu", "geekbench", "membench"]
 
 
-def test_probe_step_always_has_lscpu_and_learns_facts(h):
+def test_a_step_pod_is_deleted_once_its_result_is_recorded_so_the_kubelet_can_free_its_images(h):
+    h.start(["membench", "geekbench"])
+    h.drive(stop=in_step("02-geekbench"))
+    assert h.step_pods() == ["1-02-geekbench"]  # only the step in flight
+    assert h.pod_names("anchor") == [f"{h.name}-a1"]
+    assert h.task("lscpu").state == TaskState.DONE and h.storage.status["lscpu"]["exit_code"] == 0
+    h.drive(stop=in_step("03-membench"))
+    assert h.step_pods() == ["1-03-membench"]
+    assert h.codes()["geekbench"] == (0, None)  # the missing Pod of a recorded step is not an external delete
+    assert h.pod_names("anchor") == [f"{h.name}-a1"]
+
+
+def test_flush_pods_go_with_their_step_pod(h):
+    h.storage.incomplete["geekbench"] = 1
+    h.start(["membench", "geekbench"])
+    h.drive(stop=in_step("03-membench"))
+    assert any("flush" in n for k, n in h.kube.created if k == "pod")  # the flush really ran
+    assert h.step_pods() == ["1-03-membench"] and h.codes()["geekbench"] == (0, None)
+
+
+def test_reconciles_after_the_step_pod_is_gone_leave_the_recorded_outcome_alone(h):
     h.start(["geekbench"])
     h.drive(stop=in_step("02-geekbench"))
-    probe = h.kube.get("pod", f"{h.name}-a1-01-probes")
+    h.cluster.react()
+    h.runner.reconcile(h.name)  # records geekbench and deletes its Pod
+    assert h.step_pods() == [] and h.codes()["geekbench"] == (0, None)
+    created = [n for k, n in h.kube.created if k == "pod"]
+    for _ in range(3):  # level-triggered passes with no step Pod left
+        h.runner.reconcile(h.name)
+        assert h.codes()["geekbench"] == (0, None) and h.codes()["lscpu"] == (0, None)
+        assert h.run.status.phase != RunPhase.CANCELLED
+    assert [n for k, n in h.kube.created if k == "pod"] == created  # nothing relaunched
+    assert h.run.status.phase in (RunPhase.RELEASING, RunPhase.PUBLISHING)
+
+
+def test_a_new_controller_continues_after_the_step_pods_were_deleted(h):
+    h.start(["membench", "geekbench"])
+    h.drive(stop=in_step("03-membench"))
+    created = [n for k, n in h.kube.created if k == "pod"]
+    second = h.new_runner()  # a restart: no caches, the finished steps have no Pods
+    second.reconcile(h.name)
+    assert [n for k, n in h.kube.created if k == "pod"] == created
+    run = h.drive(runner=second)
+    assert run.status.phase == RunPhase.PUBLISHING
+    assert {t.name: t.exit_code for t in run.status.tasks} == {"lscpu": 0, "geekbench": 0, "membench": 0}
+
+
+def test_a_pod_left_by_a_crash_between_recording_and_deleting_it_is_collected_later(h):
+    h.start(["geekbench"])
+    h.drive(stop=in_step("02-geekbench"))
+    h.cluster.react()
+    delete = h.kube.delete
+
+    def failing(kind, name, grace_seconds=None):
+        raise RuntimeError("the controller died before the delete")
+
+    h.kube.delete = failing
+    with pytest.raises(RuntimeError):
+        h.runner.reconcile(h.name)
+    h.kube.delete = delete
+    assert h.codes()["geekbench"] == (0, None)  # recorded
+    assert h.step_pods() == ["1-02-geekbench"]  # not deleted yet
+    run = h.drive(runner=h.new_runner())
+    assert run.status.phase == RunPhase.PUBLISHING and h.codes()["geekbench"] == (0, None)
+    assert [n for k, n in h.kube.created if k == "pod"].count(f"{h.name}-a1-02-geekbench") == 1
+    assert ("pod", f"{h.name}-a1-02-geekbench") in h.kube.deleted
+
+
+def test_a_step_pod_that_is_not_recorded_yet_is_never_deleted(h):
+    h.start(["geekbench"])
+    h.drive(stop=in_step("02-geekbench"))
+    h.cluster.react()  # finished, but its result is not recorded
+    h.storage.crash_after_status_json = True
+    with pytest.raises(RuntimeError):
+        h.runner.reconcile(h.name)
+    assert h.task("geekbench").state == TaskState.RUNNING
+    assert h.step_pods() == ["1-02-geekbench"]  # the outcome can still be derived from it
+
+
+def test_probe_step_always_has_lscpu_and_learns_facts(h):
+    h.start(["geekbench"])
+    h.drive(stop=in_step("01-probes"))
+    probe = h.kube.get("pod", f"{h.name}-a1-01-probes")  # deleted once recorded
     assert [c["name"] for c in probe["spec"]["containers"]] == ["lscpu"]
+    h.drive(stop=in_step("02-geekbench"))
     assert h.runner._nodes[h.name].facts.lscpu["Model name:"] == "AMD EPYC 9R14"
     assert h.runner._nodes[h.name].facts.boot_time is not None
 
@@ -1323,7 +1403,7 @@ def test_urls_are_resigned_hourly_and_keep_their_multipart_uploads(h):
 def test_hold_after_keeps_the_anchor_alive_with_heartbeats(h):
     h.start(["geekbench"], hold_after=timedelta(hours=2))
     h.drive(stop=lambda run: run.status.phase == RunPhase.RELEASING)
-    assert h.pod_names("anchor") == [f"{h.name}-a1"]
+    assert h.pod_names() == [f"{h.name}-a1"]  # the held node has the anchor only
     beats = len(h.kube.heartbeats)
     h.clock.advance(hours=1)
     h.runner.reconcile(h.name)
@@ -1528,6 +1608,7 @@ def test_outage_shorter_than_half_an_hour_does_not_end_the_run(h, monkeypatch):
 def test_reconcile_failing_for_half_an_hour_ends_the_run_without_deleting_the_anchor_first(h, monkeypatch):
     h.start(["geekbench"])
     h.drive(stop=in_step("02-geekbench"))
+    deleted_before = [d for d in h.kube.deleted if d[0] == "pod"]  # the recorded probe step's Pod
     break_reconcile(h, monkeypatch)
     fail_reconciles(h, 1)
     h.clock.advance(minutes=31)
@@ -1538,7 +1619,9 @@ def test_reconcile_failing_for_half_an_hour_ends_the_run_without_deleting_the_an
     assert run.status.attempts[0].outcome == AttemptOutcome.HARNESS_ERROR  # not a node loss
     assert "geekbench" in h.storage.aborted  # the running task's open uploads
     assert h.kube.list("secret") == [] and h.storage.status["geekbench"]["exit_code"] == ExitCode.HARNESS_ERROR
-    assert not [d for d in h.kube.deleted if d[0] == "pod"]  # recorded first, no Pod deleted by the give-up
+    assert [
+        d for d in h.kube.deleted if d[0] == "pod"
+    ] == deleted_before  # recorded first, no Pod deleted by the give-up
     assert f"{h.name}-a1" in h.pod_names("anchor")
     monkeypatch.undo()
     h.runner.reconcile(h.name)  # the Failed phase releases the node
