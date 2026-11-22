@@ -32,10 +32,10 @@ Phases:
   Step Pod finished -> `pods.classify`, `storage.finish_task`, a `flush` Pod (max 2) while uploads are
   incomplete, then `status.json` per task (the commit point) and `status.tasks`. A reconcile with no step in
   flight deletes every step and flush Pod (`_delete_step_pods`), so the kubelet can free the images of finished
-  steps; the anchor stays. The containers of a step that
-  cannot start their GPU runtime are recreated once without it (the others keep their results). Containers stuck
-  pulling their image -> `-4 IMAGE_PULL_TIMEOUT`, or stuck in a waiting state that never resolves (bad image
-  name, missing Secret key) -> `-4` with the waiting message (the others of the Pod keep their results). A
+  steps; the anchor stays. The containers of a step that cannot start their GPU runtime are recreated once
+  without it (the others keep their results). Containers stuck pulling their image -> `-4 IMAGE_PULL_TIMEOUT`,
+  or stuck in a waiting state that never resolves (bad image name, missing Secret key) -> `-4` with the waiting
+  message (the others of the Pod keep their results). A
   Pod still unfinished at `activeDeadlineSeconds` + grace + 2 min (wedged containerd) is force-deleted and recorded
   (`_wedged_outcome`); a Pod stuck terminating 2 min past its grace is force-deleted. While the node has
   DiskPressure no step is launched (up to 10 min); a step Pod the kubelet rejected for it is created once more
@@ -1510,14 +1510,23 @@ class Runner:
         (it keeps an image while any container, exited ones included, uses it). Only called while no task is
         `Running`: the outcomes of the Pods' tasks are then in `status.tasks` and `status.json` is written, and
         nothing reads a Pod after that. Idempotent: a Pod that is gone is ignored (`Kube.delete`), so it also
-        collects a Pod the controller did not get to delete before it stopped. The anchor stays."""
+        collects a Pod the controller did not get to delete before it stopped. Best effort: a failing delete is
+        logged and the next reconcile retries it, so it never blocks the next step. Pods of any other role (the
+        anchor, `dbaas`) stay."""
         for name, pod in live.items():
-            if (_meta(pod).get("labels") or {}).get("inspector.sparecores.com/role") != PodRole.ANCHOR:
-                self.kube.delete("pod", name)
+            if (_meta(pod).get("labels") or {}).get(pods.LABEL_ROLE) in (PodRole.STEP, PodRole.FLUSH):
+                try:
+                    self.kube.delete("pod", name)
+                except Exception:
+                    log.warning(
+                        "cannot delete the finished Pod %s, retrying on the next reconcile", name, exc_info=True
+                    )
 
     def _fail_running(self, run: BenchmarkRun, nd: _Node | None, live: dict[str, dict], message: str) -> None:
-        """The tasks `Running` cannot be tied to a step: delete every step and flush Pod, then end them 256."""
-        self._delete_step_pods(live)
+        """The tasks `Running` cannot be tied to a step: delete every Pod but the anchor, then end them 256."""
+        for name, pod in live.items():
+            if (_meta(pod).get("labels") or {}).get(pods.LABEL_ROLE) != PodRole.ANCHOR:
+                self.kube.delete("pod", name)
         running = [t for t in run.status.tasks if t.state == TaskState.RUNNING]
         for t in running:
             self.storage.abort_open(crd.run_key(run), t.name)

@@ -27,6 +27,7 @@ from k8s_inspector.model import (
     EnvConfig,
     ExitCode,
     NodeFacts,
+    PodRole,
     RunPhase,
     RunSpec,
     Settings,
@@ -241,7 +242,7 @@ def test_a_pod_left_by_a_crash_between_recording_and_deleting_it_is_collected_la
         raise RuntimeError("the controller died before the delete")
 
     h.kube.delete = failing
-    with pytest.raises(RuntimeError):
+    with pytest.raises(RuntimeError):  # the sweep logs it; the release then deletes the anchor and raises
         h.runner.reconcile(h.name)
     h.kube.delete = delete
     assert h.codes()["geekbench"] == (0, None)  # recorded
@@ -250,6 +251,48 @@ def test_a_pod_left_by_a_crash_between_recording_and_deleting_it_is_collected_la
     assert run.status.phase == RunPhase.PUBLISHING and h.codes()["geekbench"] == (0, None)
     assert [n for k, n in h.kube.created if k == "pod"].count(f"{h.name}-a1-02-geekbench") == 1
     assert ("pod", f"{h.name}-a1-02-geekbench") in h.kube.deleted
+
+
+def test_a_failing_delete_of_a_finished_pod_is_logged_and_does_not_block_the_next_step(h, caplog):
+    h.start(["membench", "geekbench"])
+    h.drive(stop=in_step("02-geekbench"))
+    h.cluster.react()
+    delete = h.kube.delete
+
+    def failing(kind, name, grace_seconds=None):
+        if name.endswith("-02-geekbench"):
+            raise api_error(500)
+        delete(kind, name, grace_seconds)
+
+    h.kube.delete = failing
+    with caplog.at_level("WARNING"):
+        h.runner.reconcile(h.name)
+    assert f"{h.name}-a1-02-geekbench" in caplog.text
+    assert h.codes()["geekbench"] == (0, None)
+    assert f"{h.name}-a1-03-membench" in [n for k, n in h.kube.created if k == "pod"]  # the next step started
+    h.kube.delete = delete
+    run = h.drive()
+    assert run.status.phase == RunPhase.PUBLISHING
+    assert h.step_pods() == []  # a later pass retried the delete
+
+
+def test_the_sweep_between_steps_only_deletes_step_and_flush_pods(h):
+    h.start(["membench", "geekbench"])
+    h.drive(stop=in_step("02-geekbench"))
+    h.kube.create(
+        "pod",
+        {
+            "metadata": {
+                "name": f"{h.name}-a1-dbaas",
+                "labels": {crd.LABEL_RUN: h.name, pods.LABEL_ROLE: PodRole.DBAAS.value},
+            },
+            "spec": {"nodeName": "node-1"},
+        },
+    )
+    h.drive(stop=in_step("03-membench"))
+    assert h.step_pods() == ["1-03-membench"]
+    assert h.pod_names("dbaas") == [f"{h.name}-a1-dbaas"]
+    assert h.pod_names("anchor") == [f"{h.name}-a1"]
 
 
 def test_a_step_pod_that_is_not_recorded_yet_is_never_deleted(h):

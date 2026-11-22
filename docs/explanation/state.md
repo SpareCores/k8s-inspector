@@ -27,9 +27,9 @@ whatever the API server holds:
 - **Progress is the run's status plus its Pods.** On start, and after every watch reconnect, the controller LISTs
   `BenchmarkRun`s in its namespace and Pods with label `inspector.sparecores.com/run`, rebuilds its in-memory view,
   and continues each run from where its objects say it is: the step in flight is read from `status.step` and never
-  planned again; a step Pod that ended while the controller was down is collected; a step Pod of a step already recorded is
-  deleted (finished steps leave no Pod, so the kubelet can free their images); an anchor without a step in flight
-  gets its next step; a vanished anchor is an interrupted attempt.
+  planned again; a step Pod that ended while the controller was down is collected; a step Pod of a step already
+  recorded is deleted (finished steps leave no Pod, so the kubelet can free their images); an anchor without a step
+  in flight gets its next step; a vanished anchor is an interrupted attempt.
 - **Every write is idempotent.** Object names are deterministic (`AlreadyExists` = already done); `status.json`
   and the uploads are overwrites of the same keys; git rendering is a pure function of object storage and the tree.
   Two controller replicas overlapping briefly (`strategy: Recreate` during a node failure) cannot create duplicates.
