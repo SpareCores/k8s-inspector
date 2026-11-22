@@ -54,6 +54,8 @@ status:
   - {name: geekbench, state: Running, attempt: 1, start: …, end: null, exitCode: null, published: false, commit: null}   # state: Pending | Running | Done; optional: errorMsg, gpuFallback
   attempts:
   - {n: 1, capacityType: spot, nodeClaim: …, node: …, start: …, end: null, outcome: null}   # Completed | SpotInterrupted | NodeLost | ProvisioningFailed | LaunchFailed | Cancelled | HarnessError
+  spotReclaims: 0                # spot claims of the current attempt lost before they were Initialized
+  uninitializedClaims: []       # NodeClaims of the current attempt seen launched and not Initialized: [{nodeClaim, launched, capacityType}]
   launchFailures: []             # NodeClaims of the current attempt that failed to launch: [{nodeClaim, message, time}], last 5
   conditions: []
 ```

@@ -243,6 +243,18 @@ class LaunchFailure:
 
 
 @dataclass
+class UninitializedClaim:
+    """`status.uninitializedClaims[]`: a NodeClaim of the current attempt seen `Launched` and not yet `Registered`.
+    Karpenter deletes a claim that never registers, so the run remembers it to notice that it is gone."""
+
+    node_claim: str
+    launched: datetime
+    capacity_type: str | None = (
+        None  # `karpenter.sh/capacity-type` of the claim; None (older entry) counts as on-demand
+    )
+
+
+@dataclass
 class RunStatus:
     phase: RunPhase = RunPhase.PENDING
     progress: str = "0/0"
@@ -261,6 +273,8 @@ class RunStatus:
     tasks: list[TaskStatus] = field(default_factory=list)
     attempts: list[AttemptStatus] = field(default_factory=list)
     launch_failures: list[LaunchFailure] = field(default_factory=list)  # of the current attempt, last 5
+    uninitialized_claims: list[UninitializedClaim] = field(default_factory=list)  # of the current attempt
+    spot_reclaims: int = 0  # spot claims of the current attempt reclaimed or gone before they were Initialized
     conditions: list[dict] = field(default_factory=list)
 
 
@@ -439,8 +453,14 @@ class SpotSettings:
 
 @dataclass(frozen=True)
 class Deadlines:
-    provision_cpu_minutes: int = 60
-    provision_gpu_hours: int = 6
+    provision_cpu_minutes: int = 60  # until a NodeClaim launches (a launch that keeps failing is ICE)
+    provision_gpu_hours: int = 6  # ... for a GPU SKU
+    registration_minutes: int = 8  # a launched node that has not registered this long ends the run BOOT_FAILURE
+    registration_minutes_bare_metal: int = 14  # Karpenter's own limit is 15 min: keep these below it
+    ready_minutes: int = 15  # a registered node that is not Ready this long after registering ends it BOOT_FAILURE
+    ready_minutes_bare_metal: int = 30
+    ready_minutes_gpu: int = 45  # driver sysext download and install
+    anchor_ready_minutes: int = 15  # the node is Initialized and the anchor is not Ready this long: ANCHOR_FAILED
     no_offering_minutes: int = 10  # an unschedulable anchor without a NodeClaim this long ends -1 NO_OFFERING
     no_offering_fast_minutes: int = 2  # ... or this long when Karpenter's event says the bench pool cannot fit it
     image_pull_minutes: int = 15

@@ -14,7 +14,7 @@ import pytest
 from fakes import Clock, Cluster, FakeKube, FakeStorage, iso
 from lightkube import ApiError
 
-from k8s_inspector import crd, launch, pods, steps, tasks
+from k8s_inspector import crd, launch, pods, spot, steps, tasks
 from k8s_inspector import kube as kube_mod
 from k8s_inspector import runner as runner_mod
 from k8s_inspector.kube import WatchEvent
@@ -692,26 +692,231 @@ def test_a_failed_launch_keeps_a_run_that_has_finished_tasks(h):
 def _launched_claim(h, anchor, name):
     """A NodeClaim that launched (the node exists) and never registered."""
     _unlaunched_claim(h, anchor, name)
-    status = {"conditions": [{"type": "Launched", "status": "True"}, {"type": "Registered", "status": "Unknown"}]}
-    h.kube.merge_patch("nodeclaim", name, {"status": status})
+    _set_conditions(h, name, Launched=True)
 
 
-def test_boot_failure_is_temporary_twice_and_final_the_third_time(h):
-    for count in (1, 2, 3):
+def _set_conditions(h, name, *, labels=None, **conditions):
+    """Conditions of a claim, each `True` at the current time (`False`: Unknown)."""
+    status = {
+        "conditions": [
+            {"type": kind, "status": "True" if on else "Unknown", "lastTransitionTime": iso(h.clock.now)}
+            for kind, on in conditions.items()
+        ]
+    }
+    h.kube.merge_patch("nodeclaim", name, {"status": status, "metadata": {"labels": labels or {}}})
+
+
+def test_boot_failure_is_temporary_once_waits_a_day_and_is_final_the_second_time(h):
+    for count in (1, 2):
         h.cluster.provision_enabled = False
         h.start(["geekbench"])
         h.runner.reconcile(h.name)
         _launched_claim(h, h.kube.get("pod", f"{h.name}-a1"), f"claim-{count}")
-        h.clock.advance(hours=3)
+        h.clock.advance(minutes=9)
         h.runner.reconcile(h.name)
-        if count < 3:
-            assert h.kube.list("benchmarkrun") == [] and h.entry()["count"] == count
+        if count == 1:
+            assert h.kube.list("benchmarkrun") == [] and h.entry()["count"] == 1
+            assert datetime.fromisoformat(h.entry()["next"]) - h.clock.now == timedelta(hours=24)
         else:
             assert h.run.status.phase == RunPhase.FAILED
             assert h.codes()["geekbench"][1].startswith("SCARPENTER_BOOT_FAILURE")
-            assert launch.read(h.kube, "oci") == {}
+            assert h.entry()["count"] == 2  # kept for the vendor's breaker
         h.kube.objects.pop("nodeclaim", None)
         h.runner = h.new_runner()
+
+
+def _boot_run(h, claim="claim-1", sku=None, **spec):
+    """A run whose anchor is pending with a claim that launched now (not registered)."""
+    h.cluster.provision_enabled = False
+    h.start(["geekbench"], **({"sku": sku} if sku else {}), **spec)
+    h.runner.reconcile(h.name)
+    _launched_claim(h, h.kube.get("pod", f"{h.name}-a1"), claim)
+
+
+def test_an_unregistered_claim_past_the_limit_ends_the_run_at_once_and_is_deleted(h):
+    _boot_run(h)
+    h.clock.advance(minutes=7)
+    h.runner.reconcile(h.name)
+    assert h.run.status.phase == RunPhase.PROVISIONING
+    assert [c.node_claim for c in h.run.status.uninitialized_claims] == ["claim-1"]
+    h.clock.advance(minutes=1, seconds=1)  # the limit counts from the claim's creation, one second after the run
+    h.runner.reconcile(h.name)
+    assert h.kube.list("benchmarkrun") == []
+    assert ("nodeclaim", "claim-1") in h.kube.deleted
+    assert h.entry()["reason"] == "BOOT_FAILURE" and h.failures == [("oci", "BOOT_FAILURE")]
+
+
+def test_a_forced_run_records_the_boot_failure_message(h):
+    _boot_run(h, force=True)
+    h.clock.advance(minutes=8, seconds=1)
+    h.runner.reconcile(h.name)
+    assert h.codes()["geekbench"] == (-1, "SCARPENTER_BOOT_FAILURE: node of claim-1 did not register within 8 min")
+
+
+def test_the_requeue_is_scheduled_for_the_moment_the_limit_expires(h, monkeypatch):
+    _boot_run(h)
+    later = []
+    monkeypatch.setattr(h.runner, "_enqueue_later", lambda name, delay: later.append((name, delay)))
+    h.clock.advance(minutes=3)
+    h.runner.reconcile(h.name)
+    assert later == [(h.name, 5 * 60 + 1)]
+
+
+def test_a_claim_being_deleted_while_unregistered_ends_the_run_early(h):
+    _boot_run(h)
+    h.kube.merge_patch("nodeclaim", "claim-1", {"metadata": {"deletionTimestamp": iso(h.clock.now)}})
+    h.clock.advance(minutes=1)
+    h.runner.reconcile(h.name)
+    assert h.kube.list("benchmarkrun") == [] and h.entry()["reason"] == "BOOT_FAILURE"
+
+
+def test_a_claim_that_vanished_unregistered_ends_the_run(h):
+    _boot_run(h)
+    h.runner.reconcile(h.name)  # seen launched: remembered
+    h.kube.objects.pop("nodeclaim")  # Karpenter deleted it
+    h.clock.advance(minutes=2)
+    h.runner.reconcile(h.name)
+    assert h.kube.list("benchmarkrun") == [] and h.entry()["reason"] == "BOOT_FAILURE"
+
+
+def test_a_registered_claim_that_is_replaced_is_not_a_boot_failure(h):
+    _boot_run(h)
+    _set_conditions(h, "claim-1", Launched=True, Registered=True, Initialized=True)
+    h.runner.reconcile(h.name)
+    assert h.run.status.uninitialized_claims == []
+    h.kube.objects.pop("nodeclaim")
+    h.clock.advance(minutes=2)
+    h.runner.reconcile(h.name)
+    assert h.run.status.phase == RunPhase.PROVISIONING
+
+
+def test_boot_failure_of_a_spot_attempt_does_not_fall_back_to_on_demand(h):
+    _boot_run(h, capacity=CapacityMode.SPOT_FIRST)
+    h.clock.advance(minutes=9)
+    h.runner.reconcile(h.name)
+    assert h.kube.list("benchmarkrun") == [] and h.pod_names() == []  # no second, on-demand attempt
+    assert [n for k, n in h.kube.created if k == "pod"] == [f"{h.name}-a1"]
+
+
+def test_a_bare_metal_sku_gets_the_longer_registration_limit(h):
+    _boot_run(h, sku="BM.Standard3.64")
+    h.clock.advance(minutes=13)
+    h.runner.reconcile(h.name)
+    assert h.run.status.phase == RunPhase.PROVISIONING
+    h.clock.advance(minutes=1, seconds=1)
+    h.runner.reconcile(h.name)
+    assert h.kube.list("benchmarkrun") == []
+
+
+@pytest.mark.parametrize(
+    ("sku", "bare_metal"),
+    [
+        ("BM.Standard3.64", True),
+        ("m5.metal", True),
+        ("c3-standard-192-metal", True),
+        ("vbm-4c-32gb", True),
+        ("vdm-8c-32gb", True),
+        ("ecs.ebmc7.32xlarge", True),
+        ("bm-s1", True),
+        ("VM.Standard.E5.Flex.2-16", False),
+        ("vc2-1c-0.5gb-v6", False),
+        ("m5.large", False),
+    ],
+)
+def test_bare_metal_is_told_by_the_sku_name(sku, bare_metal):
+    assert bool(runner_mod.BARE_METAL_SKU.search(sku)) is bare_metal
+
+
+def _registered_run(h, minutes, sku=None, labels=None, **spec):
+    """A run whose claim registered `minutes` ago and whose node is not Ready."""
+    _boot_run(h, sku=sku, **spec)
+    _set_conditions(h, "claim-1", labels=labels, Launched=True, Registered=True)
+    h.clock.advance(minutes=minutes)
+    h.runner.reconcile(h.name)
+
+
+def test_a_registered_node_that_is_not_ready_ends_boot_failure_at_the_ready_limit(h):
+    _registered_run(h, 14)
+    assert h.run.status.phase == RunPhase.PROVISIONING
+    h.clock.advance(minutes=1)
+    h.runner.reconcile(h.name)
+    assert h.kube.list("benchmarkrun") == [] and h.entry()["reason"] == "BOOT_FAILURE"
+    assert ("nodeclaim", "claim-1") in h.kube.deleted
+
+
+def test_a_bare_metal_node_gets_the_bare_metal_ready_limit(h):
+    _registered_run(h, 29, sku="BM.Standard3.64")
+    assert h.run.status.phase == RunPhase.PROVISIONING
+    h.clock.advance(minutes=1)
+    h.runner.reconcile(h.name)
+    assert h.kube.list("benchmarkrun") == []
+
+
+def test_a_gpu_node_gets_the_gpu_ready_limit(h):
+    labels = {"scarpenter.sparecores.com/accelerator-count": "1"}
+    _registered_run(h, 44, labels=labels)
+    assert h.run.status.phase == RunPhase.PROVISIONING
+    h.clock.advance(minutes=1)
+    h.runner.reconcile(h.name)
+    assert h.kube.list("benchmarkrun") == []
+
+
+def test_a_registered_tainted_gpu_node_that_never_initializes_ends_boot_failure(h):
+    """SCarpenter's `gpu-pending` taint stays on a node whose driver check failed: the claim is never Initialized
+    and the anchor (no toleration for it, see test_pods) stays Pending."""
+    labels = {"scarpenter.sparecores.com/accelerator-count": "1"}
+    _registered_run(h, 46, labels=labels)
+    assert h.kube.list("benchmarkrun") == [] and h.entry()["reason"] == "BOOT_FAILURE"
+    assert ("nodeclaim", "claim-1") in h.kube.deleted
+
+
+def test_a_registered_gpu_claim_deleted_before_it_initializes_ends_the_run_after_one_claim(h):
+    """SCarpenter deletes a GPU NodeClaim whose NVIDIA check failed; the anchor would only get a new one."""
+    labels = {"scarpenter.sparecores.com/accelerator-count": "1"}
+    _registered_run(h, 5, labels=labels)
+    assert h.run.status.phase == RunPhase.PROVISIONING
+    h.kube.objects.pop("nodeclaim")
+    h.clock.advance(minutes=1)
+    h.runner.reconcile(h.name)
+    assert h.kube.list("benchmarkrun") == [] and h.entry()["reason"] == "BOOT_FAILURE" and h.entry()["count"] == 1
+
+
+def test_a_registered_claim_being_deleted_before_it_initializes_ends_the_run(h):
+    _registered_run(h, 5)
+    h.kube.merge_patch("nodeclaim", "claim-1", {"metadata": {"deletionTimestamp": iso(h.clock.now)}})
+    h.runner.reconcile(h.name)
+    assert h.kube.list("benchmarkrun") == [] and h.entry()["reason"] == "BOOT_FAILURE"
+
+
+def test_a_claim_deleted_for_a_spot_interruption_is_not_a_boot_failure(h):
+    _registered_run(h, 5)
+    h.kube.merge_patch(
+        "nodeclaim",
+        "claim-1",
+        {"metadata": {"deletionTimestamp": iso(h.clock.now), "annotations": {spot.INTERRUPTION_ANNOTATION: "x"}}},
+    )
+    h.runner.reconcile(h.name)
+    assert h.run.status.phase == RunPhase.PROVISIONING
+
+
+def test_a_run_with_a_gpu_task_is_a_gpu_run_before_its_claim_has_labels(h):
+    h.cluster.provision_enabled = False
+    h.start(["nvidia_smi"])
+    h.runner.reconcile(h.name)
+    _launched_claim(h, h.kube.get("pod", f"{h.name}-a1"), "claim-1")
+    _set_conditions(h, "claim-1", Launched=True, Registered=True)
+    h.clock.advance(minutes=44)
+    h.runner.reconcile(h.name)
+    assert h.run.status.phase == RunPhase.PROVISIONING
+
+
+def test_the_pre_launch_limit_still_ends_a_run_that_never_launched_as_ice(h):
+    h.cluster.provision_enabled = False
+    h.start(["geekbench"])
+    h.runner.reconcile(h.name)
+    h.clock.advance(minutes=61)
+    h.runner.reconcile(h.name)
+    assert h.entry()["reason"] == "ICE"
 
 
 def test_the_deadline_after_launch_failures_is_the_launch_error_not_boot_failure(h):
@@ -1912,3 +2117,167 @@ def test_step_pod_requests_no_memory_and_limits_from_the_node_allocatable(h):
     resources = h.kube.get("pod", geekbench_pod(h))["spec"]["containers"][0]["resources"]
     assert resources["requests"]["memory"] == "0"
     assert resources["limits"]["memory"] == str(int(0.85 * 77 * 1024**2))
+
+
+# --------------------------------------------------------------------------- review follow-ups
+
+
+def test_an_interrupted_claim_that_then_vanishes_is_not_a_boot_failure(h):
+    _registered_run(h, 5)
+    h.kube.merge_patch(
+        "nodeclaim",
+        "claim-1",
+        {"metadata": {"deletionTimestamp": iso(h.clock.now), "annotations": {spot.INTERRUPTION_ANNOTATION: "x"}}},
+    )
+    h.runner.reconcile(h.name)
+    assert h.run.status.phase == RunPhase.PROVISIONING
+    h.kube.objects.pop("nodeclaim")  # the finalizer is done
+    h.clock.advance(minutes=1)
+    h.runner.reconcile(h.name)
+    assert h.run.status.phase == RunPhase.PROVISIONING and h.run.status.uninitialized_claims == []
+
+
+def test_a_second_claim_does_not_fail_a_run_whose_first_claim_is_initialized(h):
+    _boot_run(h)
+    _set_conditions(h, "claim-1", Launched=True, Registered=True, Initialized=True)
+    _launched_claim(h, h.kube.get("pod", f"{h.name}-a1"), "claim-2")  # Karpenter made a second one
+    h.runner.reconcile(h.name)
+    h.clock.advance(minutes=9)
+    h.runner.reconcile(h.name)
+    assert h.run.status.phase == RunPhase.PROVISIONING
+    h.kube.delete("nodeclaim", "claim-2")
+    h.runner.reconcile(h.name)
+    assert h.run.status.phase == RunPhase.PROVISIONING
+
+
+def test_an_anchor_that_never_gets_ready_on_an_initialized_node_ends_at_the_anchor_ready_limit(h):
+    _boot_run(h)
+    _set_conditions(h, "claim-1", Launched=True, Registered=True, Initialized=True)
+    h.clock.advance(minutes=14)
+    h.runner.reconcile(h.name)
+    assert h.run.status.phase == RunPhase.PROVISIONING
+    h.clock.advance(minutes=2)
+    h.runner.reconcile(h.name)
+    assert h.kube.list("benchmarkrun") == [] and h.entry()["reason"] == "ANCHOR_FAILED"
+
+
+def test_a_node_initialized_just_before_the_budget_gets_its_own_anchor_ready_time(h):
+    h.cluster.provision_enabled = False
+    h.start(["geekbench"])
+    h.runner.reconcile(h.name)
+    h.clock.advance(minutes=58)
+    _launched_claim(h, h.kube.get("pod", f"{h.name}-a1"), "claim-1")
+    _set_conditions(h, "claim-1", Launched=True, Registered=True)
+    h.runner.reconcile(h.name)
+    h.clock.advance(minutes=3)  # past the 60 min budget of the attempt
+    _set_conditions(h, "claim-1", Launched=True, Registered=True, Initialized=True)
+    h.runner.reconcile(h.name)
+    assert h.run.status.phase == RunPhase.PROVISIONING  # the image is still being pulled
+    h.clock.advance(minutes=16)
+    h.runner.reconcile(h.name)
+    assert h.entry()["reason"] == "ANCHOR_FAILED"
+
+
+def test_a_spot_claim_that_vanishes_unseen_is_not_a_boot_failure(h):
+    spot_labels = {"karpenter.sh/capacity-type": "spot"}
+    _registered_run(h, 5, labels=spot_labels)  # remembered with its capacity type
+    assert h.run.status.uninitialized_claims[0].capacity_type == "spot"
+    h.kube.objects.pop("nodeclaim")  # annotated, deleted and finalised between two passes
+    h.clock.advance(minutes=1)
+    h.runner.reconcile(h.name)
+    assert h.run.status.phase == RunPhase.PROVISIONING and h.run.status.uninitialized_claims == []
+
+
+def test_a_spot_claim_being_deleted_unseen_is_not_a_boot_failure(h):
+    _registered_run(h, 5, labels={"karpenter.sh/capacity-type": "spot"})
+    h.kube.merge_patch("nodeclaim", "claim-1", {"metadata": {"deletionTimestamp": iso(h.clock.now)}})
+    h.runner.reconcile(h.name)
+    assert h.run.status.phase == RunPhase.PROVISIONING
+
+
+def test_an_on_demand_claim_that_vanishes_unseen_is_a_boot_failure(h):
+    _registered_run(h, 5, labels={"karpenter.sh/capacity-type": "on-demand"})
+    h.kube.objects.pop("nodeclaim")
+    h.clock.advance(minutes=1)
+    h.runner.reconcile(h.name)
+    assert h.kube.list("benchmarkrun") == [] and h.entry()["reason"] == "BOOT_FAILURE"
+
+
+def test_an_anchor_that_ended_before_running_is_anchor_failed_not_boot_failure(h):
+    h.cluster.provision_enabled = False
+    h.start(["geekbench"])
+    h.runner.reconcile(h.name)
+    h.kube.set_status("pod", f"{h.name}-a1", {"phase": "Failed", "reason": "Evicted"})
+    h.runner.reconcile(h.name)
+    assert h.kube.list("benchmarkrun") == [] and h.entry()["reason"] == "ANCHOR_FAILED"
+
+
+def test_a_missing_registered_time_falls_back_to_the_launch_time(h):
+    _boot_run(h)
+    h.kube.merge_patch(
+        "nodeclaim",
+        "claim-1",
+        {"status": {"conditions": [{"type": "Launched", "status": "True"}, {"type": "Registered", "status": "True"}]}},
+    )
+    h.runner.reconcile(h.name)
+    h.clock.advance(minutes=16)
+    h.runner.reconcile(h.name)
+    assert h.kube.list("benchmarkrun") == [] and h.entry()["reason"] == "BOOT_FAILURE"
+
+
+def test_unknown_task_names_and_a_bad_accelerator_label_do_not_raise(h):
+    claim = {"metadata": {"labels": {"scarpenter.sparecores.com/accelerator-count": "many"}}}
+    assert runner_mod._has_gpu(claim) is False
+    assert runner_mod._has_gpu({"metadata": {"labels": {}}}) is False  # a CPU type has no label
+    assert runner_mod._has_gpu({"metadata": {"labels": {"scarpenter.sparecores.com/accelerator-count": "8"}}})
+    assert runner_mod._has_gpu({"metadata": {"labels": {"scarpenter.sparecores.com/accelerator-count": "0"}}}) is False
+    h.start(["geekbench"])
+    run = h.run
+    run.spec.tasks.append("no_such_task")
+    assert h.runner._is_gpu(run, []) is False
+
+
+def test_a_gpu_sku_gets_the_long_registration_limit(h):
+    h.cluster.provision_enabled = False
+    h.start(["nvidia_smi"])
+    h.runner.reconcile(h.name)
+    _launched_claim(h, h.kube.get("pod", f"{h.name}-a1"), "claim-1")
+    h.clock.advance(minutes=13)
+    h.runner.reconcile(h.name)
+    assert h.run.status.phase == RunPhase.PROVISIONING
+    h.clock.advance(minutes=2)
+    h.runner.reconcile(h.name)
+    assert h.kube.list("benchmarkrun") == []
+
+
+def test_a_spot_gpu_loop_is_bounded_by_two_lost_spot_claims_then_on_demand(h):
+    """SCarpenter deletes each GPU claim whose NVIDIA check fails and Karpenter launches the next VM; a SpotFirst
+    run gives up on spot after two such claims, and the on-demand attempt ends at the first one."""
+    labels = {"scarpenter.sparecores.com/accelerator-count": "1", "karpenter.sh/capacity-type": "spot"}
+    h.cluster.provision_enabled = False
+    h.start(["nvidia_smi"], capacity=CapacityMode.SPOT_FIRST)
+    h.runner.reconcile(h.name)
+    anchor = h.kube.get("pod", f"{h.name}-a1")
+    spot_vms = 0
+    while h.run.status.attempt == 1 and h.run.status.phase == RunPhase.PROVISIONING:
+        assert spot_vms < 5, "the spot loop is not bounded"
+        spot_vms += 1
+        _launched_claim(h, anchor, f"claim-{spot_vms}")
+        _set_conditions(h, f"claim-{spot_vms}", labels=labels, Launched=True, Registered=True)
+        h.runner.reconcile(h.name)  # seen registered
+        h.clock.advance(minutes=30)
+        h.kube.delete("nodeclaim", f"claim-{spot_vms}")  # the check failed, the claim is gone
+        h.runner.reconcile(h.name)
+    assert spot_vms == 2
+    assert h.run.status.phase == RunPhase.PENDING and h.run.status.attempts[0].outcome == AttemptOutcome.LAUNCH_FAILED
+    h.runner.reconcile(h.name)  # attempt 2: on-demand only
+    assert h.run.status.attempt == 2 and h.run.status.spot_reclaims == 0
+    anchor = h.kube.get("pod", f"{h.name}-a2")
+    od_labels = {**labels, "karpenter.sh/capacity-type": "on-demand"}
+    _launched_claim(h, anchor, "claim-od")
+    _set_conditions(h, "claim-od", labels=od_labels, Launched=True, Registered=True)
+    h.runner.reconcile(h.name)
+    h.clock.advance(minutes=30)
+    h.kube.delete("nodeclaim", "claim-od")
+    h.runner.reconcile(h.name)
+    assert h.kube.list("benchmarkrun") == [] and h.entry()["reason"] == "BOOT_FAILURE"

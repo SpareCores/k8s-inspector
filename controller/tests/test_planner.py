@@ -878,3 +878,30 @@ def test_a_damaged_meta_skips_the_sku_instead_of_raising(kube, keeper_skus, dama
     metas = {"s1": all_done(lscpu={**done_meta("lscpu", ago=timedelta(hours=9), code=-1), **damage})}
     planned = plan(kube, auto_config(), metas)
     assert [p.sku for p in planned] == ["s2"]
+
+
+def boot_failed(kube, skus, ago=timedelta(0)):
+    for sku in skus:
+        launch.record_failure(kube, "oci", sku, "BOOT_FAILURE", datetime.now(UTC) - ago)
+
+
+def test_a_vendor_with_boot_failures_on_three_skus_is_paused(kube, keeper_skus, caplog):
+    boot_failed(kube, ["x", "y", "z"])
+    assert plan(kube, auto_config(), {}) == []
+    assert "autoPlan skips vendor oci" in caplog.text
+    launch.node_ready(kube, "oci", "s1")  # a node of the vendor is ready: the pause ends
+    assert [p.sku for p in plan(kube, auto_config(), {})] == ["s1"]
+
+
+def test_two_boot_failures_or_old_ones_do_not_pause_the_vendor(kube, keeper_skus):
+    boot_failed(kube, ["x", "y"])
+    assert [p.sku for p in plan(kube, auto_config(), {}, dry_run=True)] == ["s1"]
+    boot_failed(kube, ["z"], ago=timedelta(hours=25))
+    assert [p.sku for p in plan(kube, auto_config(), {}, dry_run=True)] == ["s1"]
+
+
+def test_a_forced_run_ignores_the_breaker(kube):
+    boot_failed(kube, ["x", "y", "z"])
+    assert launch.paused(kube, "oci", datetime.now(UTC))
+    run = planner.force_run(kube, make_config(), "oci", "s1")
+    assert run.spec.force is True

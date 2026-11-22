@@ -139,6 +139,16 @@ spec:
                     nodeClaim: {type: string}
                     message: {type: string}
                     time: {type: string, format: date-time}
+              spotReclaims: {type: integer}
+              uninitializedClaims:
+                type: array
+                items:
+                  type: object
+                  required: [nodeClaim, launched]
+                  properties:
+                    nodeClaim: {type: string}
+                    launched: {type: string, format: date-time}
+                    capacityType: {type: string, nullable: true}
               conditions:
                 type: array
                 items:

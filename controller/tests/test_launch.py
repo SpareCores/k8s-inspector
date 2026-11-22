@@ -87,6 +87,7 @@ def test_failures_are_counted_per_sku_and_set_next():
     assert entries["a"] == {
         "reason": "ICE",
         "since": NOW.isoformat(),
+        "last": (NOW + timedelta(hours=1)).isoformat(),
         "count": 2,
         "next": (NOW + timedelta(hours=3)).isoformat(),
     }
@@ -186,3 +187,58 @@ def test_no_lscpu_waits_a_flat_24_hours_like_no_offering():
     for reason in ("NO_LSCPU", "NO_OFFERING"):
         assert [launch.wait_after(reason, n) for n in (1, 2, 9)] == [timedelta(hours=24)] * 3
     assert "NO_LSCPU" in launch.REASONS
+
+
+def test_boot_failure_waits_a_flat_day_and_is_permanent_at_the_second():
+    assert launch.wait_after("BOOT_FAILURE", 1) == timedelta(hours=24)
+    assert launch.wait_after("BOOT_FAILURE", 2) == timedelta(hours=24)
+    assert launch.BOOT_FAILURE_LIMIT == 2
+
+
+def fail_boot(kube, vendor, skus, when):
+    for sku in skus:
+        launch.record_failure(kube, vendor, sku, "BOOT_FAILURE", when)
+
+
+def test_the_breaker_trips_at_three_distinct_skus_and_a_day_ends_it():
+    kube = FakeKube(Clock(NOW))
+    fail_boot(kube, "oci", ["a", "b"], NOW)
+    fail_boot(kube, "oci", ["a"], NOW)  # the same SKU twice is still one SKU
+    assert not launch.paused(kube, "oci", NOW)
+    fail_boot(kube, "oci", ["c"], NOW)
+    assert launch.paused(kube, "oci", NOW + timedelta(hours=23))
+    assert not launch.paused(kube, "oci", NOW + timedelta(hours=25))
+    assert not launch.paused(kube, "aws", NOW)  # per vendor
+
+
+def test_another_reason_does_not_count_for_the_breaker():
+    kube = FakeKube(Clock(NOW))
+    fail_boot(kube, "oci", ["a", "b"], NOW)
+    launch.record_failure(kube, "oci", "c", "ICE", NOW)
+    assert not launch.paused(kube, "oci", NOW)
+
+
+def test_a_ready_node_of_the_vendor_clears_the_breaker_and_keeps_the_waits():
+    kube = FakeKube(Clock(NOW))
+    fail_boot(kube, "oci", ["a", "b", "c"], NOW)
+    launch.node_ready(kube, "oci", "other")
+    assert not launch.paused(kube, "oci", NOW)
+    assert launch.read(kube, "oci")["a"]["count"] == 1 and launch.deferred(kube, "oci", ["a", "b", "c"], NOW) == {
+        "a",
+        "b",
+        "c",
+    }
+    fail_boot(kube, "oci", ["a"], NOW)  # counts again from the failure after the node
+    fail_boot(kube, "oci", ["b", "c"], NOW)
+    assert launch.paused(kube, "oci", NOW)
+    launch.node_ready(kube, "oci", "a")  # the SKU's own entry goes too
+    assert "a" not in launch.read(kube, "oci")
+
+
+def test_anchor_failures_are_temporary_and_do_not_feed_the_breaker():
+    kube = FakeKube(Clock(NOW))
+    for sku in "abc":
+        launch.record_failure(kube, "oci", sku, "ANCHOR_FAILED", NOW)
+    assert not launch.paused(kube, "oci", NOW)
+    assert launch.is_temporary("SCARPENTER_ANCHOR_FAILED: anchor not Ready after 60 minutes")
+    assert launch.wait_after("ANCHOR_FAILED", 1) == timedelta(hours=1)

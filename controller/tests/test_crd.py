@@ -20,6 +20,7 @@ from k8s_inspector.model import (
     RunStatus,
     TaskState,
     TaskStatus,
+    UninitializedClaim,
 )
 
 DNS_1123 = re.compile(r"[a-z0-9]([-a-z0-9]*[a-z0-9])?")
@@ -259,6 +260,25 @@ def test_status_round_trip():
         "status": d,
     }
     assert crd.from_dict(obj).status == status
+
+
+def test_uninitialized_claims_round_trip():
+    status = RunStatus(
+        spot_reclaims=2, uninitialized_claims=[UninitializedClaim("nc-1", T0, "spot"), UninitializedClaim("nc-2", T0)]
+    )
+    d = crd.status_to_dict(status)
+    assert d["uninitializedClaims"][0] == {
+        "nodeClaim": "nc-1",
+        "launched": "2026-11-20T09:30:00Z",
+        "capacityType": "spot",
+    }
+    obj = {
+        "metadata": {"name": "n", "creationTimestamp": "2026-11-20T09:30:00Z"},
+        "spec": crd.to_manifest(spec(), "i")["spec"],
+        "status": d,
+    }
+    assert crd.from_dict(obj).status.uninitialized_claims == status.uninitialized_claims
+    assert crd.from_dict(obj).status.spot_reclaims == 2
 
 
 def test_status_to_dict_unset_fields_are_null_for_merge_patch():

@@ -200,6 +200,11 @@ class Metrics:
         lines.append(f"# TYPE {PREFIX}publish_lag_seconds gauge")
         lag = (now - oldest_unpublished).total_seconds() if oldest_unpublished else 0
         lines.append(_line("publish_lag_seconds", (), lag))
+        lines.append(f"# TYPE {PREFIX}launch_paused gauge")
+        lines += [
+            _line("launch_paused", _labels(vendor=v), launch.paused(self._kube, v, now))
+            for v in sorted(settings.vendors)
+        ]
         for name, counts in (("launch_deferred_skus", deferred), ("launch_blocked", blocked)):
             lines.append(f"# TYPE {PREFIX}{name} gauge")
             lines += [_line(name, _labels(vendor=v, reason=r), n) for (v, r), n in sorted(counts.items())]

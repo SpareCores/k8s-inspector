@@ -225,6 +225,22 @@ def test_launch_gauges_and_failure_counter():
     assert 'k8s_inspector_launch_blocked{reason="DAILY_LIMIT",vendor="aws"} 0' in text
     assert 'k8s_inspector_launch_failures_total{reason="ICE",vendor="oci"} 2' in text
     assert 'k8s_inspector_launch_failures_total{reason="OTHER",vendor="aws"} 1' in text
+    assert 'k8s_inspector_launch_paused{vendor="oci"} 0' in text
+
+
+def test_a_vendor_paused_by_boot_failures_shows_in_the_gauge():
+    from fakes import Clock, FakeKube
+
+    from k8s_inspector import launch
+
+    kube = FakeKube(Clock(NOW))
+    for sku in "abc":
+        launch.record_failure(kube, "oci", sku, "BOOT_FAILURE", NOW)
+    metrics = Metrics(kube, lambda: SETTINGS, clock=lambda: NOW)
+    metrics.record_launch_failure("oci", "BOOT_FAILURE")
+    text = metrics.render()
+    assert 'k8s_inspector_launch_paused{vendor="oci"} 1' in text
+    assert 'k8s_inspector_launch_failures_total{reason="BOOT_FAILURE",vendor="oci"} 1' in text
 
 
 def test_launch_gauges_survive_a_damaged_launch_configmap():

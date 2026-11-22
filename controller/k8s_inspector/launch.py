@@ -8,8 +8,12 @@ launch condition; `reason_of_class` maps the class to a reason (no keyword guess
 - permanent (LAUNCH_REJECTED, BOOT_FAILURE after `BOOT_FAILURE_LIMIT` runs): a `-1 SCARPENTER_<reason>` schedule
   meta, final until the task hash changes and re-checked after 30 days (`planner.due_reason`).
 
-The ConfigMap holds `{sku: {reason, since, count, next}}` as JSON under the key `skus`. Losing it only means an
+The ConfigMap holds `{sku: {reason, since, last, count, next}}` as JSON under the key `skus`. Losing it only means an
 earlier retry. Entries go when the SKU gets a node or is no longer in Keeper's ACTIVE list.
+
+A vendor with `BREAKER_LIMIT` BOOT_FAILURE entries whose `last` is within `BREAKER_WINDOW` is paused for autoPlan
+(`paused`): its nodes do not come up, whatever the SKU. A node of the vendor becoming ready drops every `last`
+(`node_ready`), which ends the pause; the counts and waits stay.
 """
 
 import json
@@ -33,26 +37,33 @@ CLASS_REASONS = {
 }
 # NO_OFFERING (no instance type for the SKU, or an anchor nobody schedules): SCarpenter's mark is usually short, but
 # where the offered-types filter fails open nothing else stops the retries, so the wait is a flat 24 h.
-TEMPORARY = ("ICE", "QUOTA", "DAILY_LIMIT", "VENDOR", "NO_OFFERING", "NO_LSCPU")
+# ANCHOR_FAILED: the node came up but the anchor Pod ended, vanished or never became Ready; not the node's fault.
+TEMPORARY = ("ICE", "QUOTA", "DAILY_LIMIT", "VENDOR", "NO_OFFERING", "NO_LSCPU", "ANCHOR_FAILED")
 # Reasons of `-1` schedule metas written before the classes existed; they were temporary too.
 LEGACY_TEMPORARY = ("QUOTA_ZERO", "LAUNCH_FAILED")
 NO_NODE_MESSAGE = ": no node after "  # the old BOOT_FAILURE of a run that merely waited out its budget
 PERMANENT = ("LAUNCH_REJECTED", "BOOT_FAILURE")
-BOOT_FAILURE_LIMIT = 3  # runs that ended BOOT_FAILURE before it is final
+BOOT_FAILURE_LIMIT = 2  # runs that ended BOOT_FAILURE before it is final
+BREAKER_LIMIT = 3  # SKUs of a vendor with a recent BOOT_FAILURE that pause the vendor
+BREAKER_WINDOW = timedelta(hours=24)
 REASONS = (*TEMPORARY, "BOOT_FAILURE")  # the reasons an entry of the ConfigMap can have
 # Longest wait between two launches of a SKU, per reason; the wait doubles from 1 h with each failure
-# (NO_OFFERING, NO_LSCPU: the flat `FLAT_WAIT` at once).
+# (NO_OFFERING, NO_LSCPU, BOOT_FAILURE: the flat `FLAT_WAIT` at once).
 MAX_WAIT = {
     "ICE": timedelta(hours=24),
     "QUOTA": timedelta(hours=6),
     "VENDOR": timedelta(hours=6),
-    "BOOT_FAILURE": timedelta(hours=6),
+    "ANCHOR_FAILED": timedelta(hours=6),
     "DAILY_LIMIT": timedelta(hours=6),  # without SCarpenter's `until`
 }
-# Reasons with a flat wait (no doubling): NO_OFFERING, and NO_LSCPU, which the publisher records when a run ended
-# without an lscpu result (not a launch failure; `launch.clear` resets the count at every node, so doubling
-# would never grow).
-FLAT_WAIT = {"NO_OFFERING": timedelta(hours=24), "NO_LSCPU": timedelta(hours=24)}
+# Reasons with a flat wait (no doubling): NO_OFFERING; BOOT_FAILURE (every try bills a VM that never joins); and
+# NO_LSCPU, which the publisher records when a run ended without an lscpu result (not a launch failure;
+# `launch.clear` resets the count at every node, so doubling would never grow).
+FLAT_WAIT = {
+    "NO_OFFERING": timedelta(hours=24),
+    "NO_LSCPU": timedelta(hours=24),
+    "BOOT_FAILURE": timedelta(hours=24),
+}
 RETRY_AFTER_PERMANENT = timedelta(days=30)
 PATCH_RETRIES = 3
 
@@ -170,6 +181,7 @@ def record_failure(kube: Kube, vendor: str, sku: str, reason: str, now: datetime
         entries[sku] = {
             "reason": reason,
             "since": old.get("since") or now.isoformat(),
+            "last": now.isoformat(),
             "count": count,
             "next": wait.isoformat(),
         }
@@ -186,6 +198,28 @@ def clear(kube: Kube, vendor: str, skus: list[str]) -> None:
             entries.pop(sku, None)
 
     _change(kube, vendor, mutate)
+
+
+def node_ready(kube: Kube, vendor: str, sku: str) -> None:
+    """A node of the SKU is ready: forget its failures, and end the vendor's pause (drop every `last`)."""
+
+    def mutate(entries: dict[str, dict]) -> None:
+        entries.pop(sku, None)
+        for entry in entries.values():
+            entry.pop("last", None)
+
+    _change(kube, vendor, mutate)
+
+
+def paused(kube: Kube, vendor: str, now: datetime) -> bool:
+    """The vendor has `BREAKER_LIMIT` SKUs (an entry is one SKU) whose last run ended BOOT_FAILURE within
+    `BREAKER_WINDOW`, and no node has become ready since."""
+    recent = [
+        e
+        for e in read(kube, vendor).values()
+        if e.get("reason") == "BOOT_FAILURE" and _time(e.get("last")) > now - BREAKER_WINDOW
+    ]
+    return len(recent) >= BREAKER_LIMIT
 
 
 def deferred(kube: Kube, vendor: str, active: list[str], now: datetime, *, prune: bool = True) -> set[str]:
