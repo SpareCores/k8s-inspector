@@ -49,8 +49,9 @@ flowchart LR
 2. **Provision.** The controller creates the anchor Pod. SCarpenter launches the cheapest matching offering. The
    controller records region, zone, capacity type, price and node timings in the run status.
 3. **Steps.** For each step the controller signs upload URLs, creates the step Pod on the node, waits for it to end
-   (watch, not poll), confirms that every output is in object storage, writes the task's `status.json`, and decides
-   the next step (variant after the probe step, GPU fallback, vLLM image ladder).
+   (watch, not poll), confirms that every output is in object storage, writes the task's `status.json`, deletes the
+   step Pod (the kubelet can then free its images), and decides the next step (variant after the probe step, GPU
+   fallback, vLLM image ladder).
 4. **Release.** When all tasks are done and all uploads are confirmed, the controller deletes the anchor. The node is
    empty and SCarpenter removes it.
 5. **Publish.** Every few minutes the publisher renders the finished tasks from their final object storage location

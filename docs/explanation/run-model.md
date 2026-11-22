@@ -37,9 +37,16 @@ The anchor is the only Pod the scheduler and SCarpenter ever see for a run.
 
 - Each step is a bare Pod with `spec.nodeName` set to the anchor's node: no scheduler, no SCarpenter involvement. The
   kubelet still admits it on resources and `maxPods`. Step Pods are owned by the anchor, so deleting the anchor
-  removes them. A step Pod requests the node's CPU minus what the other Pods on the node request, which gives it
-  nearly all the cgroup weight in `kubepods.slice` ([CPU weight](node-profile.md#cpu-weight)); if the kubelet refuses
-  that request (`OutOfcpu`), the controller creates the Pod once more with `cpu: 10m`.
+  removes them. The controller deletes a step Pod (and its flush Pods) itself as soon as its tasks' outcomes are in
+  `status.tasks` and their `status.json` is written, before the next step starts: the kubelet keeps an image while
+  any container uses it, exited ones included, so a finished step's Pod would pin its images against image GC for the
+  rest of the run. Only the anchor (the `spec.holdAfter` hold included) lives until the run ends. A reconcile that
+  finds no step in flight deletes any step Pod still there, so a Pod the controller did not get to delete is
+  collected later; a Pod of a recorded step that is gone changes nothing. The logs and outputs of finished steps are
+  in object storage, not on Pods, so `kubectl logs` only works for the step in flight, during a `holdAfter` hold too.
+  A step Pod requests the node's CPU minus what the other Pods on the node request, which gives it nearly all the
+  cgroup weight in `kubepods.slice` ([CPU weight](node-profile.md#cpu-weight)); if the kubelet refuses that request
+  (`OutOfcpu`), the controller creates the Pod once more with `cpu: 10m`.
 - A step is one serial task, or the parallel hardware-probe group (dmidecode, lshw, lscpu, lstopo, virtualization,
   nvidia_smi, gpu_facts) as one Pod with several containers. This is today's priority-0 parallel group.
 - Before launching a step the controller waits while the node has DiskPressure (see

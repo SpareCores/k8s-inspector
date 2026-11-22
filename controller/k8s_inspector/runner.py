@@ -30,10 +30,12 @@ Phases:
 - Running: no step in flight -> prechecks (`-3`), vLLM ladder failures, next step (`steps.probe_step` first,
   which always contains `lscpu`, then `steps.next_step`): sign URLs into the Secret, heartbeat, create the Pod.
   Step Pod finished -> `pods.classify`, `storage.finish_task`, a `flush` Pod (max 2) while uploads are
-  incomplete, then `status.json` per task (the commit point) and `status.tasks`. The containers of a step that
-  cannot start their GPU runtime are recreated once without it (the others keep their results). Containers stuck
-  pulling their image -> `-4 IMAGE_PULL_TIMEOUT`, or stuck in a waiting state that never resolves (bad image
-  name, missing Secret key) -> `-4` with the waiting message (the others of the Pod keep their results). A
+  incomplete, then `status.json` per task (the commit point) and `status.tasks`. A reconcile with no step in
+  flight deletes every step and flush Pod (`_delete_step_pods`), so the kubelet can free the images of finished
+  steps; the anchor stays. The containers of a step that cannot start their GPU runtime are recreated once
+  without it (the others keep their results). Containers stuck pulling their image -> `-4 IMAGE_PULL_TIMEOUT`,
+  or stuck in a waiting state that never resolves (bad image name, missing Secret key) -> `-4` with the waiting
+  message (the others of the Pod keep their results). A
   Pod still unfinished at `activeDeadlineSeconds` + grace + 2 min (wedged containerd) is force-deleted and recorded
   (`_wedged_outcome`); a Pod stuck terminating 2 min past its grace is force-deleted. While the node has
   DiskPressure no step is launched (up to 10 min); a step Pod the kubelet rejected for it is created once more
@@ -1287,6 +1289,7 @@ class Runner:
             return self._watch_step(run, cfg, live, nd, draining)
         if draining:
             return self._attempt_lost(run, cfg, live, nd)  # the node goes away: no new step on it
+        self._delete_step_pods(live)  # no task is Running: every step Pod left is recorded (see the method)
         run = self._precheck(run, nd)
         run = self._ladder_failures(run, nd)
         step = self._plan(run, nd, _step_index(run.status.current_step) + 1)
@@ -1502,10 +1505,27 @@ class Runner:
         else:
             self._resign_if_due(run, cfg)
 
-    def _fail_running(self, run: BenchmarkRun, nd: _Node | None, live: dict[str, dict], message: str) -> None:
-        """The tasks `Running` cannot be tied to a step: delete every step and flush Pod, then end them 256."""
+    def _delete_step_pods(self, live: dict[str, dict]) -> None:
+        """Delete every step and flush Pod, so the kubelet can garbage-collect the images of the finished steps
+        (it keeps an image while any container, exited ones included, uses it). Only called while no task is
+        `Running`: the outcomes of the Pods' tasks are then in `status.tasks` and `status.json` is written, and
+        nothing reads a Pod after that. Idempotent: a Pod that is gone is ignored (`Kube.delete`), so it also
+        collects a Pod the controller did not get to delete before it stopped. Best effort: a failing delete is
+        logged and the next reconcile retries it, so it never blocks the next step. Pods of any other role (the
+        anchor, `dbaas`) stay."""
         for name, pod in live.items():
-            if (_meta(pod).get("labels") or {}).get("inspector.sparecores.com/role") != PodRole.ANCHOR:
+            if (_meta(pod).get("labels") or {}).get(pods.LABEL_ROLE) in (PodRole.STEP, PodRole.FLUSH):
+                try:
+                    self.kube.delete("pod", name)
+                except Exception:
+                    log.warning(
+                        "cannot delete the finished Pod %s, retrying on the next reconcile", name, exc_info=True
+                    )
+
+    def _fail_running(self, run: BenchmarkRun, nd: _Node | None, live: dict[str, dict], message: str) -> None:
+        """The tasks `Running` cannot be tied to a step: delete every Pod but the anchor, then end them 256."""
+        for name, pod in live.items():
+            if (_meta(pod).get("labels") or {}).get(pods.LABEL_ROLE) != PodRole.ANCHOR:
                 self.kube.delete("pod", name)
         running = [t for t in run.status.tasks if t.state == TaskState.RUNNING]
         for t in running:
