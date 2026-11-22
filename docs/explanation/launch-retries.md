@@ -40,7 +40,9 @@ pre-launch budget:
 - a NodeClaim that is Launched and not yet Initialized is being deleted or is gone, registered or not, unless it
   carries a spot interruption notice or is a spot claim (`karpenter.sh/capacity-type`; a reclaim is not a boot failure,
   and reclaimed claims are often finalised between two passes, so the run keeps each claim's capacity type; a claim
-  without one counts as on-demand). A reclaimed claim is forgotten; a spot node that never comes up is still caught by
+  without one counts as on-demand). A reclaimed claim is forgotten, but counted in `status.spotReclaims` (per attempt): at the second one the spot
+  attempt ends and the next is on-demand only, where a claim lost before Ready is a boot failure, so a spot loop (for
+  example a GPU check that fails on every VM) is bounded; a spot node that never comes up is still caught by
   the registration and ready limits while its claim exists, and by the pre-launch budget otherwise. Karpenter deletes
   a claim that does not register within its own 15 minutes, silently (no `Registered=False`, no Event) and creates a
   new claim for the pending anchor; SCarpenter deletes a GPU claim whose NVIDIA check fails or whose `gpu-pending`

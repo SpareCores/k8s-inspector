@@ -115,6 +115,7 @@ SPOT_FALLBACK_ERRORS = (
 # `vbm`/`vdm`. (Some Vultr `vcg` GPU plans are metal too, but only by plan; GPU SKUs get the long registration limit.)
 BARE_METAL_SKU = re.compile(r"^(BM\.|bm-|vbm|vdm|ecs\.ebm)|[.-]metal(-|$)")
 
+MAX_SPOT_RECLAIMS = 2  # spot claims of one attempt lost before they were Initialized; then the attempt goes on-demand
 MAX_LAUNCH_FAILURES_KEPT = 5  # entries of `status.launchFailures`
 LAUNCH_FAILED_REASON = "LaunchFailed"  # reason of a NodeClaim's `Launched` condition
 BACKOFF_SECONDS = (2, 5, 15, 30, 60)
@@ -883,6 +884,7 @@ class Runner:
             status.attempt = attempt
             status.launch_failures = []
             status.uninitialized_claims = []
+            status.spot_reclaims = 0
             status.phase = RunPhase.PROVISIONING
             status.capacity_type = None  # the node's, once the attempt has one
             status.current_step = status.step = status.node = None
@@ -913,8 +915,13 @@ class Runner:
         if error is None and len(failures) >= MAX_LAUNCH_FAILURES:
             error = self._launch_error(failures[-1].message)
         on_demand_retry = bool(error) and error.startswith(SPOT_FALLBACK_ERRORS)
+        reclaims = run.status.spot_reclaims
         if error is None and not bound:
-            error = self._boot_error(run, cfg, claims)
+            error, reclaims = self._boot_error(run, cfg, claims)
+        if error is None and not bound and reclaims >= MAX_SPOT_RECLAIMS and pods.allows_spot(anchor):
+            # Spot claims keep getting reclaimed (or deleted by SCarpenter's GPU check) before they are up: the
+            # next attempt is on-demand only, where a lost claim ends the run as BOOT_FAILURE.
+            return self._retry_on_demand(run, live, f"{reclaims} spot nodes were lost before they were Ready")
         started = self._attempt(run).start or _time(_meta(anchor).get("creationTimestamp"))
         budget = (
             timedelta(hours=cfg.settings.deadlines.provision_gpu_hours)
@@ -952,7 +959,7 @@ class Runner:
         """A GPU SKU: a GPU task is planned for it, or its NodeClaim has accelerators."""
         return any(_is_gpu_task(name) for name in run.spec.tasks) or any(_has_gpu(c) for c in claims)
 
-    def _boot_error(self, run: BenchmarkRun, cfg: Config, claims: list[dict]) -> str | None:
+    def _boot_error(self, run: BenchmarkRun, cfg: Config, claims: list[dict]) -> tuple[str | None, int]:
         """BOOT_FAILURE for the first node of the attempt that does not come up. A NodeClaim that launched and is not
         yet Initialized fails the run when it is being deleted or is gone (Karpenter deletes a claim that does not
         register within its own fixed 15 minutes; SCarpenter one whose GPU check fails); when it is not Registered
@@ -976,11 +983,11 @@ class Runner:
         coming_up = [
             c for c in claims if _is_true(c, "Launched") and not _is_true(c, "Initialized") and not _reclaimed(c)
         ]
-        remembered = self._remember_uninitialized(run, coming_up, claims)
+        remembered, reclaims = self._remember_uninitialized(run, coming_up, claims)
         alive = {_meta(c)["name"] for c in coming_up if not _meta(c).get("deletionTimestamp")}
         gone = sorted(remembered.keys() - alive)  # spot claims were dropped from `remembered` already
         if gone:
-            return launch.error_message("BOOT_FAILURE", f"node of {gone[0]} was deleted before it was Ready")
+            return launch.error_message("BOOT_FAILURE", f"node of {gone[0]} was deleted before it was Ready"), reclaims
         expiries = []
         for claim in coming_up:
             name = _meta(claim)["name"]
@@ -991,11 +998,11 @@ class Runner:
                 limit_at = (_time(_meta(claim).get("creationTimestamp")) or remembered[name].launched) + registration
                 late = f"node of {name} did not register within {_minutes(registration)} min"
             if now >= limit_at:
-                return self._boot_failure(claim, late)
+                return self._boot_failure(claim, late), reclaims
             expiries.append(limit_at)
         if expiries:
             self._enqueue_later(run.name, max((min(expiries) - now).total_seconds(), 1))
-        return None
+        return None, reclaims
 
     def _anchor_ready_error(self, run: BenchmarkRun, cfg: Config, anchor: dict, claims: list[dict]) -> str | None:
         """ANCHOR_FAILED when the anchor has its node and is not Ready `anchorReadyMinutes` after the node was
@@ -1024,15 +1031,18 @@ class Runner:
 
     def _remember_uninitialized(
         self, run: BenchmarkRun, coming_up: list[dict], claims: list[dict]
-    ) -> dict[str, UninitializedClaim]:
+    ) -> tuple[dict[str, UninitializedClaim], int]:
         """`status.uninitializedClaims` by name, updated: the claims seen launched and not Initialized are added;
-        those that initialized or are reclaimed (`_reclaimed`) are dropped, and so is a spot claim that is gone or
+        those that initialized or are reclaimed (`_reclaimed`) are dropped (a reclaimed one counts in
+        `status.spotReclaims`), and so is a spot claim that is gone or
         being deleted (a reclaim finalised between two passes; on-demand claims are not deleted by Karpenter before
         they are up, except for a boot failure)."""
         known = {c.node_claim: c for c in run.status.uninitialized_claims}
         present = {_meta(c)["name"] for c in claims if not _meta(c).get("deletionTimestamp")}
         done = {_meta(c)["name"] for c in claims if _is_true(c, "Initialized") or _reclaimed(c)}
         done |= {name for name, c in known.items() if c.capacity_type == "spot" and name not in present}
+        initialized = {_meta(c)["name"] for c in claims if _is_true(c, "Initialized")}
+        reclaims = run.status.spot_reclaims + len(done & known.keys() - initialized)  # each claim is dropped once
         wanted = {name: c for name, c in known.items() if name not in done}
         for claim in coming_up:
             name = _meta(claim)["name"]
@@ -1046,9 +1056,10 @@ class Runner:
 
             def mutate(status: RunStatus) -> None:
                 status.uninitialized_claims = list(wanted.values())
+                status.spot_reclaims = reclaims
 
             self._update(run, mutate)
-        return wanted
+        return wanted, reclaims
 
     @staticmethod
     def _launch_error(message: str) -> str:

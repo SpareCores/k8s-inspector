@@ -263,7 +263,9 @@ def test_status_round_trip():
 
 
 def test_uninitialized_claims_round_trip():
-    status = RunStatus(uninitialized_claims=[UninitializedClaim("nc-1", T0, "spot"), UninitializedClaim("nc-2", T0)])
+    status = RunStatus(
+        spot_reclaims=2, uninitialized_claims=[UninitializedClaim("nc-1", T0, "spot"), UninitializedClaim("nc-2", T0)]
+    )
     d = crd.status_to_dict(status)
     assert d["uninitializedClaims"][0] == {
         "nodeClaim": "nc-1",
@@ -276,6 +278,7 @@ def test_uninitialized_claims_round_trip():
         "status": d,
     }
     assert crd.from_dict(obj).status.uninitialized_claims == status.uninitialized_claims
+    assert crd.from_dict(obj).status.spot_reclaims == 2
 
 
 def test_status_to_dict_unset_fields_are_null_for_merge_patch():

@@ -2248,3 +2248,36 @@ def test_a_gpu_sku_gets_the_long_registration_limit(h):
     h.clock.advance(minutes=2)
     h.runner.reconcile(h.name)
     assert h.kube.list("benchmarkrun") == []
+
+
+def test_a_spot_gpu_loop_is_bounded_by_two_lost_spot_claims_then_on_demand(h):
+    """SCarpenter deletes each GPU claim whose NVIDIA check fails and Karpenter launches the next VM; a SpotFirst
+    run gives up on spot after two such claims, and the on-demand attempt ends at the first one."""
+    labels = {"scarpenter.sparecores.com/accelerator-count": "1", "karpenter.sh/capacity-type": "spot"}
+    h.cluster.provision_enabled = False
+    h.start(["nvidia_smi"], capacity=CapacityMode.SPOT_FIRST)
+    h.runner.reconcile(h.name)
+    anchor = h.kube.get("pod", f"{h.name}-a1")
+    spot_vms = 0
+    while h.run.status.attempt == 1 and h.run.status.phase == RunPhase.PROVISIONING:
+        assert spot_vms < 5, "the spot loop is not bounded"
+        spot_vms += 1
+        _launched_claim(h, anchor, f"claim-{spot_vms}")
+        _set_conditions(h, f"claim-{spot_vms}", labels=labels, Launched=True, Registered=True)
+        h.runner.reconcile(h.name)  # seen registered
+        h.clock.advance(minutes=30)
+        h.kube.delete("nodeclaim", f"claim-{spot_vms}")  # the check failed, the claim is gone
+        h.runner.reconcile(h.name)
+    assert spot_vms == 2
+    assert h.run.status.phase == RunPhase.PENDING and h.run.status.attempts[0].outcome == AttemptOutcome.LAUNCH_FAILED
+    h.runner.reconcile(h.name)  # attempt 2: on-demand only
+    assert h.run.status.attempt == 2 and h.run.status.spot_reclaims == 0
+    anchor = h.kube.get("pod", f"{h.name}-a2")
+    od_labels = {**labels, "karpenter.sh/capacity-type": "on-demand"}
+    _launched_claim(h, anchor, "claim-od")
+    _set_conditions(h, "claim-od", labels=od_labels, Launched=True, Registered=True)
+    h.runner.reconcile(h.name)
+    h.clock.advance(minutes=30)
+    h.kube.delete("nodeclaim", "claim-od")
+    h.runner.reconcile(h.name)
+    assert h.kube.list("benchmarkrun") == [] and h.entry()["reason"] == "BOOT_FAILURE"

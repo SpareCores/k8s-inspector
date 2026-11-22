@@ -139,6 +139,7 @@ spec:
                     nodeClaim: {type: string}
                     message: {type: string}
                     time: {type: string, format: date-time}
+              spotReclaims: {type: integer}
               uninitializedClaims:
                 type: array
                 items:
