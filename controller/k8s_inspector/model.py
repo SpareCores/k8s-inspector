@@ -249,6 +249,9 @@ class UninitializedClaim:
 
     node_claim: str
     launched: datetime
+    capacity_type: str | None = (
+        None  # `karpenter.sh/capacity-type` of the claim; None (older entry) counts as on-demand
+    )
 
 
 @dataclass
@@ -456,6 +459,7 @@ class Deadlines:
     ready_minutes: int = 15  # a registered node that is not Ready this long after registering ends it BOOT_FAILURE
     ready_minutes_bare_metal: int = 30
     ready_minutes_gpu: int = 45  # driver sysext download and install
+    anchor_ready_minutes: int = 15  # the node is Initialized and the anchor is not Ready this long: ANCHOR_FAILED
     no_offering_minutes: int = 10  # an unschedulable anchor without a NodeClaim this long ends -1 NO_OFFERING
     no_offering_fast_minutes: int = 2  # ... or this long when Karpenter's event says the bench pool cannot fit it
     image_pull_minutes: int = 15

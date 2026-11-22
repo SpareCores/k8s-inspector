@@ -2150,15 +2150,57 @@ def test_a_second_claim_does_not_fail_a_run_whose_first_claim_is_initialized(h):
     assert h.run.status.phase == RunPhase.PROVISIONING
 
 
-def test_an_anchor_that_never_gets_ready_on_an_initialized_node_ends_within_the_budget(h):
+def test_an_anchor_that_never_gets_ready_on_an_initialized_node_ends_at_the_anchor_ready_limit(h):
     _boot_run(h)
     _set_conditions(h, "claim-1", Launched=True, Registered=True, Initialized=True)
-    h.clock.advance(minutes=59)
+    h.clock.advance(minutes=14)
     h.runner.reconcile(h.name)
     assert h.run.status.phase == RunPhase.PROVISIONING
     h.clock.advance(minutes=2)
     h.runner.reconcile(h.name)
     assert h.kube.list("benchmarkrun") == [] and h.entry()["reason"] == "ANCHOR_FAILED"
+
+
+def test_a_node_initialized_just_before_the_budget_gets_its_own_anchor_ready_time(h):
+    h.cluster.provision_enabled = False
+    h.start(["geekbench"])
+    h.runner.reconcile(h.name)
+    h.clock.advance(minutes=58)
+    _launched_claim(h, h.kube.get("pod", f"{h.name}-a1"), "claim-1")
+    _set_conditions(h, "claim-1", Launched=True, Registered=True)
+    h.runner.reconcile(h.name)
+    h.clock.advance(minutes=3)  # past the 60 min budget of the attempt
+    _set_conditions(h, "claim-1", Launched=True, Registered=True, Initialized=True)
+    h.runner.reconcile(h.name)
+    assert h.run.status.phase == RunPhase.PROVISIONING  # the image is still being pulled
+    h.clock.advance(minutes=16)
+    h.runner.reconcile(h.name)
+    assert h.entry()["reason"] == "ANCHOR_FAILED"
+
+
+def test_a_spot_claim_that_vanishes_unseen_is_not_a_boot_failure(h):
+    spot_labels = {"karpenter.sh/capacity-type": "spot"}
+    _registered_run(h, 5, labels=spot_labels)  # remembered with its capacity type
+    assert h.run.status.uninitialized_claims[0].capacity_type == "spot"
+    h.kube.objects.pop("nodeclaim")  # annotated, deleted and finalised between two passes
+    h.clock.advance(minutes=1)
+    h.runner.reconcile(h.name)
+    assert h.run.status.phase == RunPhase.PROVISIONING and h.run.status.uninitialized_claims == []
+
+
+def test_a_spot_claim_being_deleted_unseen_is_not_a_boot_failure(h):
+    _registered_run(h, 5, labels={"karpenter.sh/capacity-type": "spot"})
+    h.kube.merge_patch("nodeclaim", "claim-1", {"metadata": {"deletionTimestamp": iso(h.clock.now)}})
+    h.runner.reconcile(h.name)
+    assert h.run.status.phase == RunPhase.PROVISIONING
+
+
+def test_an_on_demand_claim_that_vanishes_unseen_is_a_boot_failure(h):
+    _registered_run(h, 5, labels={"karpenter.sh/capacity-type": "on-demand"})
+    h.kube.objects.pop("nodeclaim")
+    h.clock.advance(minutes=1)
+    h.runner.reconcile(h.name)
+    assert h.kube.list("benchmarkrun") == [] and h.entry()["reason"] == "BOOT_FAILURE"
 
 
 def test_an_anchor_that_ended_before_running_is_anchor_failed_not_boot_failure(h):

@@ -188,7 +188,7 @@ def _status_from_dict(d: dict) -> RunStatus:
             for f in d.get("launchFailures") or []
         ],
         uninitialized_claims=[
-            UninitializedClaim(c["nodeClaim"], _parse_time(c.get("launched")))
+            UninitializedClaim(c["nodeClaim"], _parse_time(c.get("launched")), c.get("capacityType"))
             for c in d.get("uninitializedClaims") or []
         ],
         conditions=list(d.get("conditions") or []),
@@ -278,7 +278,8 @@ def status_to_dict(status: RunStatus) -> dict:
             for f in status.launch_failures
         ],
         "uninitializedClaims": [
-            {"nodeClaim": c.node_claim, "launched": _format_time(c.launched)} for c in status.uninitialized_claims
+            {"nodeClaim": c.node_claim, "launched": _format_time(c.launched), "capacityType": c.capacity_type}
+            for c in status.uninitialized_claims
         ],
         "conditions": status.conditions,
     }

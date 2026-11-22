@@ -147,6 +147,7 @@ spec:
                   properties:
                     nodeClaim: {type: string}
                     launched: {type: string, format: date-time}
+                    capacityType: {type: string, nullable: true}
               conditions:
                 type: array
                 items:

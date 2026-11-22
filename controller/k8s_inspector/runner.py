@@ -242,6 +242,13 @@ def _interrupted(claim: dict | None) -> bool:
     )
 
 
+def _reclaimed(claim: dict) -> bool:
+    """A spot interruption notice, or a spot claim being deleted: Karpenter reclaims those, no boot failure."""
+    deleting = bool(_meta(claim).get("deletionTimestamp"))
+    spot_claim = (_meta(claim).get("labels") or {}).get(CAPACITY_LABEL) == "spot"
+    return _interrupted(claim) or (deleting and spot_claim)
+
+
 def _claim_error(claims: list[dict]) -> str | None:
     """The error of a NodeClaim that failed to launch or register, else None. The reason is the class in the
     condition message; without one a launch failure is ICE and a registration failure BOOT_FAILURE."""
@@ -925,12 +932,12 @@ class Runner:
         ):
             message = self._bench_pool_event(anchor, cfg.settings.bench_pool, started)
             error = f"SCARPENTER_NO_OFFERING: {message}" if message else None
-        if error is None and waited > budget and (bound or not any(_is_true(c, "Launched") for c in claims)):
+        if error is None and bound:
+            error = self._anchor_ready_error(run, cfg, anchor, claims)
+        if error is None and not bound and waited > budget and not any(_is_true(c, "Launched") for c in claims):
             minutes = int(budget.total_seconds() // 60)
             if failures:  # the launch kept failing: that is the error, not a missing node
                 error = self._launch_error(failures[-1].message)
-            elif bound:  # the node is up and the anchor never became Ready (image pull, probe, taint)
-                error = launch.error_message("ANCHOR_FAILED", f"anchor not Ready after {minutes} minutes")
             else:  # Karpenter keeps replacing claims that never launched: capacity or quota
                 error = launch.error_message("ICE", f"no node launched after {minutes} minutes")
         if error is None:
@@ -967,27 +974,47 @@ class Runner:
             ready = timedelta(minutes=deadlines.ready_minutes)
         now = self._now()
         coming_up = [
-            c for c in claims if _is_true(c, "Launched") and not _is_true(c, "Initialized") and not _interrupted(c)
+            c for c in claims if _is_true(c, "Launched") and not _is_true(c, "Initialized") and not _reclaimed(c)
         ]
         remembered = self._remember_uninitialized(run, coming_up, claims)
         alive = {_meta(c)["name"] for c in coming_up if not _meta(c).get("deletionTimestamp")}
-        gone = sorted(remembered.keys() - alive)
+        gone = sorted(remembered.keys() - alive)  # spot claims were dropped from `remembered` already
         if gone:
             return launch.error_message("BOOT_FAILURE", f"node of {gone[0]} was deleted before it was Ready")
         expiries = []
         for claim in coming_up:
             name = _meta(claim)["name"]
             if _is_true(claim, "Registered"):
-                limit_at = (_condition_time(claim, "Registered") or remembered[name]) + ready
+                limit_at = (_condition_time(claim, "Registered") or remembered[name].launched) + ready
                 late = f"node of {name} was not Ready within {_minutes(ready)} min"
             else:
-                limit_at = (_time(_meta(claim).get("creationTimestamp")) or remembered[name]) + registration
+                limit_at = (_time(_meta(claim).get("creationTimestamp")) or remembered[name].launched) + registration
                 late = f"node of {name} did not register within {_minutes(registration)} min"
             if now >= limit_at:
                 return self._boot_failure(claim, late)
             expiries.append(limit_at)
         if expiries:
             self._enqueue_later(run.name, max((min(expiries) - now).total_seconds(), 1))
+        return None
+
+    def _anchor_ready_error(self, run: BenchmarkRun, cfg: Config, anchor: dict, claims: list[dict]) -> str | None:
+        """ANCHOR_FAILED when the anchor has its node and is not Ready `anchorReadyMinutes` after the node was
+        Initialized (else after the anchor was scheduled): an image pull error, a probe, a leftover taint. Not a
+        boot failure: the node came up. Otherwise the run is queued again for the moment the limit expires."""
+        scheduled = [c for c in anchor.get("status", {}).get("conditions") or [] if c.get("type") == "PodScheduled"]
+        times = [_condition_time(c, "Initialized") for c in claims] + [
+            _time(c.get("lastTransitionTime")) for c in scheduled
+        ]
+        times = [t for t in times if t]
+        if not times:
+            return None
+        limit = timedelta(minutes=cfg.settings.deadlines.anchor_ready_minutes)
+        limit_at = min(times) + limit
+        if self._now() >= limit_at:
+            return launch.error_message(
+                "ANCHOR_FAILED", f"anchor not Ready {_minutes(limit)} minutes after its node came up"
+            )
+        self._enqueue_later(run.name, max((limit_at - self._now()).total_seconds(), 1))
         return None
 
     def _boot_failure(self, claim: dict, message: str) -> str:
@@ -997,18 +1024,28 @@ class Runner:
 
     def _remember_uninitialized(
         self, run: BenchmarkRun, coming_up: list[dict], claims: list[dict]
-    ) -> dict[str, datetime]:
-        """`status.uninitializedClaims` as `{claim: launched}`, updated: the claims seen launched and not
-        Initialized are added; those that initialized or got an interruption notice are dropped."""
-        known = {c.node_claim: c.launched for c in run.status.uninitialized_claims}
-        done = {_meta(c)["name"] for c in claims if _is_true(c, "Initialized") or _interrupted(c)}
-        wanted = {name: launched for name, launched in known.items() if name not in done}
+    ) -> dict[str, UninitializedClaim]:
+        """`status.uninitializedClaims` by name, updated: the claims seen launched and not Initialized are added;
+        those that initialized or are reclaimed (`_reclaimed`) are dropped, and so is a spot claim that is gone or
+        being deleted (a reclaim finalised between two passes; on-demand claims are not deleted by Karpenter before
+        they are up, except for a boot failure)."""
+        known = {c.node_claim: c for c in run.status.uninitialized_claims}
+        present = {_meta(c)["name"] for c in claims if not _meta(c).get("deletionTimestamp")}
+        done = {_meta(c)["name"] for c in claims if _is_true(c, "Initialized") or _reclaimed(c)}
+        done |= {name for name, c in known.items() if c.capacity_type == "spot" and name not in present}
+        wanted = {name: c for name, c in known.items() if name not in done}
         for claim in coming_up:
-            wanted.setdefault(_meta(claim)["name"], _condition_time(claim, "Launched") or self._now())
+            name = _meta(claim)["name"]
+            capacity = (_meta(claim).get("labels") or {}).get(CAPACITY_LABEL)
+            launched = _condition_time(claim, "Launched") or self._now()
+            old = wanted.get(name)
+            wanted[name] = UninitializedClaim(
+                name, old.launched if old else launched, capacity or (old and old.capacity_type)
+            )
         if wanted != known:
 
             def mutate(status: RunStatus) -> None:
-                status.uninitialized_claims = [UninitializedClaim(n, t) for n, t in wanted.items()]
+                status.uninitialized_claims = list(wanted.values())
 
             self._update(run, mutate)
         return wanted

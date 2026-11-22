@@ -56,6 +56,7 @@ deadlines:
   readyMinutes: 15               # registered, not Initialized (Ready) this long after registering: BOOT_FAILURE
   readyMinutesBareMetal: 30
   readyMinutesGpu: 45
+  anchorReadyMinutes: 15         # node Initialized, anchor not Ready this long: ANCHOR_FAILED (temporary)
   noOfferingMinutes: 10          # unschedulable anchor with no NodeClaim this long: -1 SCARPENTER_NO_OFFERING
   noOfferingFastMinutes: 2       # ... the same when Karpenter's FailedScheduling event says the bench pool is incompatible
   imagePullMinutes: 15
@@ -75,7 +76,9 @@ uploads:
 `deadlines.provisionCpuMinutes` / `provisionGpuHours` bound the wait until a NodeClaim of the run launches. After
 launch, `registrationMinutes*` bound the time to registration (counted from the claim's creation, like Karpenter's own limit) and
 `readyMinutes*` the time from registration to the NodeClaim's `Initialized` condition; a node that misses either ends
-the run as `BOOT_FAILURE` ([launch retries](../explanation/launch-retries.md#a-node-that-does-not-come-up)).
+the run as `BOOT_FAILURE`. `anchorReadyMinutes` bounds the time from the node being Initialized (else from the anchor being
+scheduled) to the anchor Pod being Ready (an image pull, a probe, a leftover taint); a miss ends the run as the temporary
+`ANCHOR_FAILED` ([launch retries](../explanation/launch-retries.md#a-node-that-does-not-come-up)).
 
 <a id="deadlines"></a>The class of a SKU picks the limits. Bare metal is told by the SKU name: OCI `BM.`, OVH `bm-`,
 AWS `.metal`, GCP `-metal`, Alibaba `ecs.ebm`, Vultr `vbm` and `vdm` (`BARE_METAL_SKU` in `runner.py`; some Vultr

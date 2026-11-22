@@ -38,12 +38,15 @@ pre-launch budget:
   `nvidia.com/gpu` registered) the ready limit after it registered (`readyMinutes` 15, `readyMinutesBareMetal` 30,
   `readyMinutesGpu` 45; the Registered transition time, else the time the run first saw the claim launched);
 - a NodeClaim that is Launched and not yet Initialized is being deleted or is gone, registered or not, unless it
-  carries a spot interruption notice (a reclaim is not a boot failure; such a claim is forgotten). Karpenter deletes
+  carries a spot interruption notice or is a spot claim (`karpenter.sh/capacity-type`; a reclaim is not a boot failure,
+  and reclaimed claims are often finalised between two passes, so the run keeps each claim's capacity type; a claim
+  without one counts as on-demand). A reclaimed claim is forgotten; a spot node that never comes up is still caught by
+  the registration and ready limits while its claim exists, and by the pre-launch budget otherwise. Karpenter deletes
   a claim that does not register within its own 15 minutes, silently (no `Registered=False`, no Event) and creates a
   new claim for the pending anchor; SCarpenter deletes a GPU claim whose NVIDIA check fails or whose `gpu-pending`
   taint stays 30 minutes, which the 45 min GPU limit backs up. `gpu-pending` is a startup taint of the bench NodePool
   (with SCarpenter's release that adds it), which is why Karpenter's `Initialized` waits for it; the anchor does not
-  tolerate it. The run keeps the names and Launched times of such claims in `status.uninitializedClaims` to notice a
+  tolerate it. The run keeps the names and Launched times of such claims in `status.uninitializedClaims` ({nodeClaim, launched, capacityType}) to notice a
   claim that vanished between reconciles; a claim that initializes is dropped from the list.
 
 Once a claim of the attempt is Initialized, or the anchor has its node, other claims of the attempt are ignored
@@ -53,7 +56,7 @@ for a boot failure: a node that never joined is not a capacity problem. How a SK
 [configuration](../reference/configuration.md#deadlines). A forced run (`k8s-inspector run`) records its failure as a
 `-1` instead of being deleted.
 
-A node that came up but whose anchor Pod ended, vanished, or is still not Ready when the pre-launch budget has passed
+A node that came up but whose anchor Pod ended, vanished, or is still not Ready `anchorReadyMinutes` (15) after its node was Initialized
 (an image pull error, a probe, a leftover taint), or a node older than the anchor, ends as `ANCHOR_FAILED`: temporary
 like `ICE` (1 h, doubling, up to 6 h), never permanent, and not counted by the vendor breaker.
 
