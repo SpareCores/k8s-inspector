@@ -160,8 +160,8 @@ it is due and the vendor has room. Per vendor:
    cannot choose the hardware, so a fill may land on an older variant, fail or be lost and leave `N` as it was.
    After an attempt since `first_seen`, only the retry rules above decide, applied to that attempt wherever it
    landed: `-4` and a command that does not start are retried after their backoff and end as `-5` after three in a
-   row, a permanent launch failure (`LAUNCH_REJECTED`, `BOOT_FAILURE`), a task's own exit code and the other final
-   codes are not repeated, a temporary launch failure leaves nothing in git and is paced by the launch backoff. A
+   row, a permanent launch failure (`LAUNCH_REJECTED`, `BOOT_FAILURE`) is re-checked after 30 days, a task's own exit
+   code and the other final codes are not repeated, a temporary launch failure leaves nothing in git and is paced by the launch backoff. A
    variant without a readable `first_seen` is not filled (a missing `variant.json` is logged at debug level, an
    unreadable `first_seen` at warning level), nor is a task whose latest attempt has no `start`. The state is all
    in git; nothing is kept in the cluster.
@@ -172,7 +172,7 @@ it is due and the vendor has room. Per vendor:
 
 The git state is read from the publisher's checkout (blobless, sparse: only the `schedule/*/meta.json` files of the
 vendor), under the publisher's lock; the schedule metas, the newest variants with their tasks, and `first_seen` of a variant (only when a candidate task is
-missing from it) are three reads in separate lock sections, the last two from the git trees with no checkout (origin only moves forward, so the two reads cannot contradict each other). If Keeper or git cannot be read, the cycle (or that vendor) plans nothing and
+missing from it) are three reads in separate lock sections, the last two from the git trees with no checkout (origin only moves forward; a publish landing between the reads is covered by the SKU lease, which keeps two runs off the same SKU). If Keeper or git cannot be read, the cycle (or that vendor) plans nothing and
 logs why: the planner never creates runs blindly. `k8s-inspector plan [--dry-run]` runs one cycle in its own
 checkout; with `--dry-run` it creates nothing and prints the first SKU that would start for each vendor.
 

@@ -133,7 +133,7 @@ the lease about twice `keepRunHours` after its end.
      and `-5` included, never replaces an exit code 0 result, because sc-crawler reads the DBaaS `stdout` without
      the exit code.
    - **`-4` and `-5` are not results**: the task never finished, so its output is partial. They go to
-     `schedule/<task>/meta.json` only (the planner reads nothing else from git; `start_retries` is counted along the
+     `schedule/<task>/meta.json` only (besides the variant tree listing and `variant.json` `first_seen`, the planner reads nothing else from git; `start_retries` is counted along the
      chain of [`last_attempt`](../reference/output-contract.md#last_attempt)), without `stdout`/`stderr`, and never
      touch a variant dir.
    - **`stdout_bytes`/`stderr_bytes`** are the sizes of the files written (`null` when the file is not written), so
