@@ -11,6 +11,10 @@ same inputs (see tests/test_render.py, golden files under tests/fixtures/publish
 Deviations from the legacy, on purpose:
 - Transforms and parsers run only for tasks with `exit_code == 0` (and streams are written for any exit code except
   256, the harness error); the legacy ran the parsers in a separate daily workflow and crashed on bad output.
+- `-4`/`-5` go to `schedule/<task>/meta.json` only, without outputs; a failure never replaces a good schedule meta;
+  `stdout_bytes`/`stderr_bytes` are the sizes of the files written; files of the previous result that the new one
+  does not write are removed; a command that did not start (`256 cannot start command`) is `-1`; `error_msg` is
+  redacted (`redact_error_msg`).
 - `start_retries` and the `-5` rule are applied here (the runner does not know git): see `_apply_start_retries`.
 - Nothing is written when a transform or parser raises: all content is computed before the first write.
 - Optional parser dependencies (`dmiparser`, `dateparser`, `fastnumbers`, `lxml`) are imported lazily, only for the
@@ -26,6 +30,7 @@ import re
 import subprocess
 import tempfile
 import urllib.request
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -44,7 +49,10 @@ from k8s_inspector.model import (
     Verification,
 )
 
+NOT_FINAL_CODES = (ExitCode.NEVER_FINISHED, ExitCode.RETRIES_EXHAUSTED)  # never finished: no variant dir, no outputs
 MAX_START_RETRIES = 3  # three `-4` in a row become `-5` (exit-codes.md)
+START_FAILURE_PREFIX = "cannot start command:"  # sc-run's error_msg when the task's command does not start
+ERROR_MSG_MAX = 200  # published error_msg length; a longer one keeps its start and end
 
 LEGACY_META_FIELDS = (
     "start",
@@ -215,6 +223,45 @@ def meta_from_status(status: dict) -> dict:
     nodeclass_hash, nice`. Everything else in `status` (the Kubernetes facts, see `build_status`) is dropped; a
     missing key is null (`outputs` []; `start_retries` 0)."""
     return _canonical_meta(status, with_added=True)
+
+
+_URL = re.compile(r"https?://[^\s\"'<>]+")
+_ID = re.compile(
+    r"\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b"  # UUID: subscription, tenant, request ID
+    r"|\bocid1\.[a-z0-9_.-]+"  # OCI OCID
+    r"|\barn:aws[a-z-]*:\S+"  # AWS ARN (carries the account number)
+    r"|/subscriptions/[^\s\"']+",  # Azure resource ID quoted without a URL
+    re.IGNORECASE,
+)
+_GCP_PROJECT = re.compile(r"\bprojects/[a-z][-a-z0-9]+")
+_ACCOUNT = re.compile(
+    r"(\baccount\W{0,3})\d{12}\b", re.IGNORECASE
+)  # AWS account number; other 12-digit numbers are sizes
+
+
+def redact_error_msg(message: str | None, limit: int = ERROR_MSG_MAX) -> str | None:
+    """`error_msg` as published to the public repo: URLs become `<url>`; UUIDs, OCIDs, ARNs, Azure resource IDs,
+    GCP project paths and AWS account numbers (after "account") become `<id>`. A message longer than `limit`
+    (separator included) keeps its start (the reason code) and its end."""
+    if not message:
+        return message
+    message = _ID.sub("<id>", _URL.sub("<url>", message))
+    message = _ACCOUNT.sub(r"\1<id>", _GCP_PROJECT.sub("projects/<id>", message))
+    if len(message) > limit:
+        sep = " ... "
+        head = (limit - len(sep)) // 2
+        message = f"{message[:head]}{sep}{message[-(limit - len(sep) - head) :]}"
+    return message
+
+
+def published_meta(status: dict) -> dict:
+    """`meta_from_status` for git: a command that did not start (sc-run's `256 cannot start command: ...`) is a
+    `-1` (legacy semantics: the task could not run, the planner retries it), and `error_msg` is redacted."""
+    meta = meta_from_status(status)
+    if meta["exit_code"] == ExitCode.HARNESS_ERROR and str(meta["error_msg"]).startswith(START_FAILURE_PREFIX):
+        meta["exit_code"] = int(ExitCode.NO_NODE)
+    meta["error_msg"] = redact_error_msg(meta["error_msg"])
+    return meta
 
 
 def dump_meta(meta: dict) -> str:
@@ -626,6 +673,21 @@ def _read_meta(path: Path) -> dict | None:
         return None
 
 
+def _is_good(meta: dict | None, task_hash: str) -> bool:
+    return bool(
+        meta and meta.get("exit_code") == ExitCode.OK and meta.get("end") and meta.get("task_hash") == task_hash
+    )
+
+
+def _remove_stale_files(task_dir: Path, keep: Iterable[str]) -> None:
+    """A new result replaces the old one: files of the old result that the new one does not write go (next to the
+    new meta.json they would read as current). The caller writes meta.json after this."""
+    if task_dir.is_dir():
+        for path in task_dir.iterdir():
+            if path.is_file() and path.name != "meta.json" and path.name not in keep:
+                path.unlink()
+
+
 def _is_stale(path: Path, start: datetime | None) -> bool:
     """The meta already in the tree started later than this result: a stale duplicate."""
     existing = _read_meta(path)
@@ -680,29 +742,42 @@ def refresh_schedule_meta(instance_root: Path, task: str, current_hash: str, ext
     if selected is None:
         return None
     path = instance_root / "schedule" / task / "meta.json"
-    _write(path, dump_meta(selected))
+    if selected.get("exit_code") != ExitCode.OK and _is_good(_read_meta(path), current_hash):
+        log.info("%s: exit code %s kept out of the schedule, which has a good result", path, selected.get("exit_code"))
+        return None  # a failure never replaces a good result of the same task hash
+    text = dump_meta(selected)
+    if path.exists() and path.read_text(encoding="utf-8") == text:
+        return None  # unchanged
+    _write(path, text)
     return path
 
 
+def _is_start_failure(meta: dict) -> bool:
+    """A `-1` published for a command that did not start (see `published_meta`)."""
+    return meta.get("exit_code") == ExitCode.NO_NODE and str(meta.get("error_msg")).startswith(START_FAILURE_PREFIX)
+
+
 def _apply_start_retries(meta: dict, prior: dict | None) -> None:
-    """`start_retries` counts consecutive `-4` of the same task hash: +1 on `-4` after a `-4` of that hash,
-    otherwise 1 on `-4` and 0 on any other code (success, a changed task hash, another failure; `-5` counts as
-    a `-4` here); the third `-4`
-    in a row becomes `-5`. The same run and start seen again (re-render after a crash) keeps its count."""
+    """`start_retries` counts consecutive start attempts of the same task hash that never produced a result: a
+    `-4` or a start-failure `-1` (a command that does not start). It is +1 on such a code after one of that hash,
+    otherwise 1 on such a code and 0 on any other code (success, a changed task hash, another failure; `-5` counts
+    as a `-4` here). The third in a row becomes `-5`. The same run and start seen again (re-render after a crash)
+    keeps its count."""
+    counted = meta["exit_code"] == ExitCode.NEVER_FINISHED or _is_start_failure(meta)
     if prior and prior.get("run_id") == meta["run_id"] and prior.get("start") == meta["start"]:
         retries = prior.get("start_retries", 0)
-    elif meta["exit_code"] != ExitCode.NEVER_FINISHED:
+    elif not counted:
         retries = 0
     elif (
         prior
-        and prior.get("exit_code") in (ExitCode.NEVER_FINISHED, ExitCode.RETRIES_EXHAUSTED)
+        and (prior.get("exit_code") in NOT_FINAL_CODES or _is_start_failure(prior))
         and prior.get("task_hash") == meta["task_hash"]
     ):
         retries = prior.get("start_retries", 0) + 1
     else:
         retries = 1
     meta["start_retries"] = retries
-    if meta["exit_code"] == ExitCode.NEVER_FINISHED and retries >= MAX_START_RETRIES:
+    if counted and retries >= MAX_START_RETRIES:
         meta["exit_code"] = int(ExitCode.RETRIES_EXHAUSTED)
         meta["error_msg"] = f"exceeded {MAX_START_RETRIES} start retries"
 
@@ -713,21 +788,25 @@ def _apply_start_retries(meta: dict, prior: dict | None) -> None:
 def render_task(tree: Path, vendor: str, sku: str, variant: int | None, inp: RenderInput) -> list[Path]:
     """Write `data/<vendor>/<sku>/<variant>/<task>/` (meta.json, stdout/stderr via the `raw` transform -- empty
     streams not written --, geekbench `results.json`, parsers' `parsed.*`/`lstopo.svg`) and refresh
-    `schedule/<task>/meta.json`. `variant=None` (no node or no lscpu result: nothing to identify the hardware)
-    writes only `schedule/<task>/meta.json`. Skip (return []) when the meta already in the tree has a newer
-    `start` (stale duplicate). Returns the written paths (removed stale streams are not listed)."""
+    `schedule/<task>/meta.json`. `variant=None` (no node or no lscpu result: nothing to identify the hardware) and
+    `-4`/`-5` (never finished: no outputs) write only `schedule/<task>/meta.json`. Skip (return []) when the meta
+    already in the tree has a newer `start` (stale duplicate). Returns the written paths (removed stale files are
+    not listed)."""
     task = inp.task.name
     instance = tree / "data" / vendor / sku
     schedule_path = instance / "schedule" / task / "meta.json"
-    meta = meta_from_status(inp.status)
+    meta = published_meta(inp.status)
     start = _parse_dt(meta["start"])
-    if _is_stale(schedule_path if variant is None else instance / str(variant) / task / "meta.json", start):
+    schedule_only = variant is None or meta["exit_code"] in NOT_FINAL_CODES
+    if _is_stale(schedule_path if schedule_only else instance / str(variant) / task / "meta.json", start):
         return []
     _apply_start_retries(meta, _read_meta(schedule_path))
+    schedule_only = variant is None or meta["exit_code"] in NOT_FINAL_CODES  # a third `-4` or start failure became `-5`
 
-    if variant is None:
-        _write(schedule_path, dump_meta(meta))
-        return [schedule_path]
+    if schedule_only:
+        meta["stdout_bytes"] = meta["stderr_bytes"] = None
+        schedule = refresh_schedule_meta(instance, task, meta["task_hash"], extra=meta)
+        return [schedule] if schedule else []
 
     task_dir = instance / str(variant) / task
     previous = _read_meta(task_dir / "meta.json")
@@ -740,7 +819,7 @@ def render_task(tree: Path, vendor: str, sku: str, variant: int | None, inp: Ren
         # A failure (a cancelled task's partial output included) never replaces a good result of the task in this
         # variant. A changed task hash still needs the failure in the schedule (picked among the variants like any
         # other meta), or the planner would start the task again at every cycle.
-        if previous.get("task_hash") == meta["task_hash"]:
+        if _is_good(previous, meta["task_hash"]):
             log.info(
                 "%s/%s/%s: exit code %s kept out of variant %s, which has a good result",
                 vendor,
@@ -770,12 +849,11 @@ def render_task(tree: Path, vendor: str, sku: str, variant: int | None, inp: Ren
             if stream in outputs:
                 files[out_name] = parse(inp.stdout if stream == "stdout" else inp.stderr)
     meta["outputs"] = outputs
+    meta["stdout_bytes"] = len(files["stdout"]) if "stdout" in files else None
+    meta["stderr_bytes"] = len(files["stderr"]) if "stderr" in files else None
 
     written = []
-    for name in ("stdout", "stderr"):
-        if name not in files:
-            # Drop a stale stream from a prior run so meta.outputs matches the tree.
-            (task_dir / name).unlink(missing_ok=True)
+    _remove_stale_files(task_dir, keep=files)
     for name, data in files.items():
         _write(task_dir / name, data)
         written.append(task_dir / name)
@@ -792,17 +870,22 @@ def render_dbaas_task(tree: Path, database: dict, inp: RenderInput) -> list[Path
         tree / "dbaas" / database["vendor"] / database["id"] / "postgres" / str(database["engineVersion"])
         / "standalone" / inp.task.name
     )  # fmt: skip
-    meta = meta_from_status(inp.status)
+    meta = published_meta(inp.status)
     if _is_stale(task_dir / "meta.json", _parse_dt(meta["start"])):
         return []
-    _apply_start_retries(meta, _read_meta(task_dir / "meta.json"))
-    meta["outputs"] = ["stdout"] if inp.stdout else []
+    previous = _read_meta(task_dir / "meta.json")
+    if meta["exit_code"] != ExitCode.OK and previous and previous.get("exit_code") == ExitCode.OK:
+        return []  # a failure never replaces a good result (sc-crawler reads the stdout without the exit code)
+    _apply_start_retries(meta, previous)
+    stdout = inp.stdout if inp.stdout and meta["exit_code"] not in NOT_FINAL_CODES else b""
+    meta["outputs"] = ["stdout"] if stdout else []
+    meta["stdout_bytes"] = len(stdout) if stdout else None
+    meta["stderr_bytes"] = None
     written = []
-    if inp.stdout:
-        _write(task_dir / "stdout", inp.stdout)
+    _remove_stale_files(task_dir, keep=["stdout"] if stdout else [])
+    if stdout:
+        _write(task_dir / "stdout", stdout)
         written.append(task_dir / "stdout")
-    else:
-        (task_dir / "stdout").unlink(missing_ok=True)
     _write(task_dir / "meta.json", dump_meta(meta))
     return [*written, task_dir / "meta.json"]
 
