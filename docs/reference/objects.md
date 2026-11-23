@@ -56,7 +56,7 @@ status:
   - {n: 1, capacityType: spot, nodeClaim: …, node: …, start: …, end: null, outcome: null}   # Completed | SpotInterrupted | NodeLost | ProvisioningFailed | LaunchFailed | Cancelled | HarnessError
   spotReclaims: 0                # spot claims of the current attempt lost before they were Initialized
   uninitializedClaims: []       # NodeClaims of the current attempt seen launched and not Initialized: [{nodeClaim, launched, capacityType}]
-  launchFailures: []             # NodeClaims of the current attempt that failed to launch: [{nodeClaim, message, time}], last 5
+  launchFailures: []             # NodeClaims of the current attempt that failed to launch: [{nodeClaim, message, time, vendor?, region?, zone?, capacityType?}], last 5; the optional ones come from the NodeClaim's labels and are absent for a claim only an Event reports
   conditions: []
 ```
 

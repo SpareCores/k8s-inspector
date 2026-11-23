@@ -25,8 +25,12 @@ failure. A run whose NodeClaims never launch within the pre-launch budget (`prov
 is `ICE` (Karpenter keeps replacing claims that never launched, which is capacity or quota); after launch failures it
 ends with the reason of the last one.
 
-Every failed launch of the attempt's NodeClaims counts toward `MAX_LAUNCH_FAILURES` (2 distinct claims), whatever
-the class. A claim that hit InsufficientCapacity is deleted by Karpenter before any condition is visible, so the
+Every failed launch of the attempt's NodeClaims counts toward `MAX_LAUNCH_FAILURES` (2 distinct claims). When all of
+them are `ICE`, the run goes on instead, as long as SCarpenter's offered-types ConfigMap lists the SKU as available
+(SCarpenter tries the other regions and zones itself, and the controller never pins one); the pre-launch budget
+(`provisionCpuMinutes`, `provisionGpuHours`) still ends the run. If the ConfigMap cannot be read, the cap of 2 applies
+to `ICE` too. Each failure in `status.launchFailures` also records the claim's vendor, region, zone and capacity type
+when its labels have them. A claim that hit InsufficientCapacity is deleted by Karpenter before any condition is visible, so the
 controller reads it from the `InsufficientCapacityError` Event on the anchor Pod (`NodeClaim <name> nominated for this
 pod failed to launch: <message>`; Karpenter v1.15 or newer). SCarpenter's message there is `insufficient capacity,
 every launch attempt failed (N attempts), the last: <Class> (<Code>): ...` and carries only the last candidate's
@@ -89,7 +93,7 @@ until `next`. The count is of failures in a row with the same reason (another re
 | `QUOTA`, `VENDOR` | 6 h |
 | `BOOT_FAILURE` | 24 h at once (no doubling): every try bills a VM that never joins |
 | `NO_LSCPU` | 24 h at once (no doubling: a node clears the count every run, and a big SKU relaunched hourly costs money); recorded by the publisher, not by a launch: a run ended without an `lscpu` result and its successful tasks were given up ([outputs](outputs.md#publishing-to-git)) |
-| `NO_OFFERING` | 24 h at once (no doubling): where the offered-types filter fails open nothing else stops the retries |
+| `NO_OFFERING` | 24 h at once (no doubling): where the offered-types filter fails open nothing else stops the retries; when every offering of the SKU in SCarpenter's offered-types ConfigMap is unavailable with an `until`, `next` is the earliest `until` |
 | `DAILY_LIMIT` | `next` is the SKU's `until` in SCarpenter's offered-types ConfigMap when it has one (the vendor's reset), else 6 h |
 
 SCarpenter's own short marks handle the fast path; this wait only bounds how often a failing SKU is tried. An entry

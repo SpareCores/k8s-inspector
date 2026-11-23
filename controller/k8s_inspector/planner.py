@@ -281,15 +281,31 @@ def _until(offerings: list) -> datetime | None:
     return max(untils, default=None)
 
 
+def _retry_at(offerings: list) -> datetime | None:
+    """The earliest `until` when every offering is unavailable and has a valid one (RFC3339, with timezone), else
+    None: while one is open, or one has no end, nothing says when the SKU is next worth trying."""
+    untils = []
+    for offering in offerings:
+        try:
+            until = datetime.fromisoformat(offering["until"])
+        except KeyError, TypeError, ValueError:
+            return None
+        if offering.get("available") or not until.tzinfo:
+            return None
+        untils.append(until)
+    return min(untils, default=None)
+
+
 def read_offered(
     kube: Kube, cfg: Config, vendor: str, now: datetime | None = None
 ) -> tuple[dict[str, dict], bool] | None:
     """The usable content of SCarpenter's offered-types ConfigMap `scarpenter-offered-<benchClass>-<vendor>` in
     `SCARPENTER_NAMESPACE` (gzipped JSON in `binaryData["types.json.gz"]`, else plain `data["types.json"]`; the
     optional `zonesOmitted` field is ignored, nothing reads zones): `({apiReference: entry}, truncated)`, where
-    an entry is `{available, capacityTypes, reason, until}` and `until` is the latest of its unavailable offerings
-    (`offerings[].until`, else None). Entries without an `apiReference` are ignored; of two with the same one the
-    available wins and `until` is the latest of both. `now` (default the current time) judges staleness.
+    an entry is `{available, capacityTypes, reason, until, retry_at}`, `until` is the latest of its unavailable
+    offerings (`offerings[].until`, else None) and `retry_at` the earliest of them when all are unavailable
+    (`_retry_at`). Entries without an `apiReference` are ignored; of two with the same one the available
+    wins and `until` is the latest of both. `now` (default the current time) judges staleness.
 
     None (fail open, the reason is logged) when the ConfigMap is absent, unreadable (a corrupt gzip too), malformed or
     stale (`generatedAt` missing, without timezone or older than `OFFERED_MAX_AGE`), or has a malformed entry."""
@@ -323,7 +339,11 @@ def read_offered(
                     "available": available,
                     "capacityTypes": capacity_types,
                     "reason": entry.get("reason", "unavailable"),
+                    "retry_at": _retry_at(offerings),
                 }
+            else:  # a duplicate: the earlier retry, if both have one
+                retry_at = _retry_at(offerings)
+                old["retry_at"] = min(old["retry_at"], retry_at) if old["retry_at"] and retry_at else None
             old["until"] = max(untils, default=None)
     except NotFound:
         log.debug("offered types of vendor %s unusable: ConfigMap %s not found", vendor, name)
@@ -343,6 +363,18 @@ def offered_until(kube: Kube, cfg: Config, vendor: str, sku: str, now: datetime 
     """When SCarpenter's marks on the SKU's unavailable offerings expire (`read_offered`), else None."""
     offered = read_offered(kube, cfg, vendor, now)
     return offered[0].get(sku, {}).get("until") if offered else None
+
+
+def offered_retry_at(kube: Kube, cfg: Config, vendor: str, sku: str, now: datetime | None = None) -> datetime | None:
+    """When the first of the SKU's offerings, all unavailable, is open again (`read_offered`), else None."""
+    offered = read_offered(kube, cfg, vendor, now)
+    return offered[0].get(sku, {}).get("retry_at") if offered else None
+
+
+def is_offered(kube: Kube, cfg: Config, vendor: str, sku: str, now: datetime | None = None) -> bool:
+    """SCarpenter lists the SKU as available. False when the listing cannot be read or the SKU is not in it."""
+    offered = read_offered(kube, cfg, vendor, now)
+    return bool(offered and offered[0].get(sku, {}).get("available"))
 
 
 def not_offered(kube: Kube, cfg: Config, vendor: str, skus: list[str]) -> dict[str, str]:

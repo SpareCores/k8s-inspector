@@ -108,7 +108,8 @@ SKU_NOT_SELECTABLE = "SKU name is not a valid label value; SCarpenter cannot sel
 ACTIVE = (RunPhase.PENDING, RunPhase.PROVISIONING, RunPhase.RUNNING, RunPhase.RELEASING)
 MAX_PROVISION_RETRIES = 3  # attempts lost before a node was usable (stale node, anchor deleted)
 EXTRA_ATTEMPTS = 2  # attempts beyond `max_spot_attempts` (the on-demand one plus one spare)
-MAX_LAUNCH_FAILURES = 2  # distinct NodeClaims that failed to launch in one attempt before the run gives up
+MAX_LAUNCH_FAILURES = 2  # distinct NodeClaims that failed to launch in one attempt before the run gives up; ICE
+# ones go on while SCarpenter still offers the SKU (`_launch_failures_exhausted`)
 SPOT_FALLBACK_ERRORS = (
     "SCARPENTER_LAUNCH_REJECTED",
 )  # a spot attempt ending so goes on-demand (not a capacity error: those wait, or end as ICE or quota; a node that
@@ -786,9 +787,11 @@ class Runner:
             return False
         if reason not in launch.REASONS or run.spec.force:  # a forced run is the operator's: it records its result
             return False
-        until = (
-            planner.offered_until(self.kube, self._cfg(), vendor, sku, self._now()) if reason == "DAILY_LIMIT" else None
-        )
+        until = None
+        if reason == "DAILY_LIMIT":
+            until = planner.offered_until(self.kube, self._cfg(), vendor, sku, self._now())
+        elif reason == "NO_OFFERING":  # every offering is marked: wait for the first to open, not a flat 24 h
+            until = planner.offered_retry_at(self.kube, self._cfg(), vendor, sku, self._now())
         count = launch.record_failure(self.kube, vendor, sku, reason, self._now(), until)
         if reason == "BOOT_FAILURE" and count >= launch.BOOT_FAILURE_LIMIT:
             return False  # the entry stays: it counts for the vendor's breaker until a node comes up
@@ -918,7 +921,7 @@ class Runner:
         error = _claim_error(claims)
         events = [] if bound else self._anchor_events(anchor)
         failures = self._record_launch_failures(run, claims, events)
-        if error is None and len(failures) >= MAX_LAUNCH_FAILURES:
+        if error is None and self._launch_failures_exhausted(run, cfg, failures):
             error = self._launch_error(failures[-1].message)
         on_demand_retry = bool(error) and error.startswith(SPOT_FALLBACK_ERRORS)
         reclaims = run.status.spot_reclaims
@@ -959,6 +962,16 @@ class Runner:
             # The next attempt (`spot.capacity_for_next_attempt`) is on-demand only.
             return self._retry_on_demand(run, live, error)
         self._fail_run(run, error)
+
+    def _launch_failures_exhausted(self, run: BenchmarkRun, cfg: Config, failures: list[LaunchFailure]) -> bool:
+        """`MAX_LAUNCH_FAILURES` claims failed to launch. When all of them were ICE the run goes on while SCarpenter's
+        offered listing has an available offering for the SKU (it tries other regions and zones itself); the
+        provisioning budget still ends it. An unreadable listing counts as none."""
+        if len(failures) < MAX_LAUNCH_FAILURES:
+            return False
+        if any(launch.reason_of_class(f.message, "ICE") != "ICE" for f in failures):
+            return True
+        return not planner.is_offered(self.kube, cfg, run.spec.vendor, run.spec.sku, self._now())
 
     @staticmethod
     def _is_gpu(run: BenchmarkRun, claims: list[dict]) -> bool:
@@ -1089,7 +1102,16 @@ class Runner:
         for claim in claims:
             message = _launch_failed_message(claim)
             if message:
-                found[_meta(claim)["name"]] = LaunchFailure(_meta(claim)["name"], message, self._now())
+                labels = _meta(claim).get("labels") or {}
+                found[_meta(claim)["name"]] = LaunchFailure(
+                    _meta(claim)["name"],
+                    message,
+                    self._now(),
+                    pods.claim_vendor(claim),
+                    labels.get("topology.kubernetes.io/region"),
+                    labels.get("topology.kubernetes.io/zone"),
+                    labels.get(CAPACITY_LABEL),
+                )
         for failure in self._ice_events(events):
             found.setdefault(failure.node_claim, failure)
         new = [f for name, f in found.items() if name not in seen]

@@ -2567,3 +2567,80 @@ def test_a_temporary_launch_failure_drops_the_variant_record(h):
     h.runner.reconcile(h.name)
     assert h.kube.list("benchmarkrun") == []
     assert launch.read_variants(h.kube, "oci") == {"other": 2}
+
+
+def _offer(h, available: bool, until: timedelta | None = None) -> None:
+    """SCarpenter's offered-types ConfigMap for the SKU, with one offering (marked until `until` when unavailable)."""
+    offering = {"capacityType": "on-demand", "zones": ["z1"], "available": available}
+    if until is not None:
+        offering["until"] = (h.clock.now + until).isoformat()
+    entry = {
+        "apiReference": "VM.Standard.E5.Flex.2-16",
+        "available": available,
+        "capacityTypes": ["on-demand"] if available else [],
+        "offerings": [offering],
+    }
+    document = {"generatedAt": h.clock.now.isoformat(), "types": {"oci.x": entry}}
+    h.kube.objects["configmap/scarpenter-system"] = {
+        "scarpenter-offered-bench-oci": {
+            "metadata": {"name": "scarpenter-offered-bench-oci"},
+            "data": {"types.json": json.dumps(document)},
+        }
+    }
+
+
+def _two_ice_failures(h) -> None:
+    h.cluster.provision_enabled = False
+    h.start(["geekbench"], capacity=CapacityMode.ON_DEMAND)
+    h.runner.reconcile(h.name)
+    for name in ("bench-aaaaa", "bench-bbbbb"):
+        _launch_failed(h, name, "InsufficientCapacity (X): none")
+
+
+def test_ice_launch_failures_go_on_while_scarpenter_offers_the_sku(h):
+    _offer(h, available=True)
+    _two_ice_failures(h)
+    h.runner.reconcile(h.name)
+    assert h.run.status.phase == RunPhase.PROVISIONING and len(h.run.status.launch_failures) == 2
+    _offer(h, available=False)
+    h.runner.reconcile(h.name)
+    assert h.kube.list("benchmarkrun") == [] and h.entry()["reason"] == "ICE"  # deferred: the run is gone
+
+
+def test_ice_launch_failures_stop_at_the_cap_without_a_readable_listing(h):
+    _two_ice_failures(h)  # no ConfigMap
+    h.runner.reconcile(h.name)
+    assert h.kube.list("benchmarkrun") == [] and h.entry()["reason"] == "ICE"
+
+
+def test_ice_launch_failures_end_with_the_provision_budget_while_the_sku_is_offered(h):
+    _offer(h, available=True)
+    _two_ice_failures(h)
+    h.runner.reconcile(h.name)
+    h.clock.advance(hours=2)
+    _offer(h, available=True)  # a fresh listing
+    h.runner.reconcile(h.name)
+    assert h.kube.list("benchmarkrun") == [] and h.entry()["reason"] == "ICE"
+
+
+def test_a_launch_failure_records_where_its_claim_was_headed(h):
+    h.cluster.provision_enabled = False
+    h.start(["geekbench"], capacity=CapacityMode.ON_DEMAND)
+    h.runner.reconcile(h.name)
+    _launch_failed(h, "bench-aaaaa", "InsufficientCapacity (X): none")
+    labels = h.kube.objects["nodeclaim"]["bench-aaaaa"]["metadata"]["labels"]
+    labels |= {"topology.kubernetes.io/region": "eu-1", "topology.kubernetes.io/zone": "eu-1a"}
+    labels["karpenter.sh/capacity-type"] = "spot"
+    h.runner.reconcile(h.name)
+    failure = h.run.status.launch_failures[0]
+    assert (failure.vendor, failure.region, failure.zone, failure.capacity_type) == ("oci", "eu-1", "eu-1a", "spot")
+    assert crd._status_from_dict(crd.status_to_dict(h.run.status)).launch_failures == [failure]
+
+
+def test_no_offering_waits_until_the_first_offering_opens(h):
+    _offer(h, available=False, until=timedelta(hours=3))
+    h.cluster.provision_enabled = False
+    h.start(["geekbench"])
+    h.runner.reconcile(h.name)
+    h.runner._fail_run(h.run, "SCARPENTER_NO_OFFERING: nothing")
+    assert datetime.fromisoformat(h.entry()["next"]) == h.clock.now + timedelta(hours=3)

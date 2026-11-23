@@ -40,7 +40,8 @@ CLASS_REASONS = {
     "Fatal": "LAUNCH_REJECTED",
 }
 # NO_OFFERING (no instance type for the SKU, or an anchor nobody schedules): SCarpenter's mark is usually short, but
-# where the offered-types filter fails open nothing else stops the retries, so the wait is a flat 24 h.
+# where the offered-types filter fails open nothing else stops the retries, so the wait is a flat 24 h, unless
+# the offered-types ConfigMap says when the first offering opens (`planner.offered_retry_at`).
 # ANCHOR_FAILED: the node came up but the anchor Pod ended, vanished or never became Ready; not the node's fault.
 TEMPORARY = ("ICE", "QUOTA", "DAILY_LIMIT", "VENDOR", "NO_OFFERING", "NO_LSCPU", "ANCHOR_FAILED")
 # Reasons of `-1` schedule metas written before the classes existed; they were temporary too.
