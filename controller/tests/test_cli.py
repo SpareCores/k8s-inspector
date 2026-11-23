@@ -360,7 +360,7 @@ def test_status_command(env, monkeypatch, capsys):
 def test_plan_command(env, monkeypatch, capsys):
     seen = {}
 
-    def plan_cycle(kube, cfg, schedule_reader, dry_run=False, variant_reader=None):
+    def plan_cycle(kube, cfg, schedule_reader, dry_run=False, variant_reader=None, first_seen_reader=None):
         seen["dry_run"] = dry_run
         return []
 
@@ -521,6 +521,9 @@ def controller(monkeypatch):
         def read_newest_variants(self, vendor):
             return {}
 
+        def read_first_seen(self, vendor, sku, variant):
+            return None
+
         def run_forever(self, settings_provider, stop):
             assert settings_provider() is SETTINGS
             started["publisher"].set()
@@ -528,8 +531,9 @@ def controller(monkeypatch):
             stop.wait()
             stopped.append("publisher")
 
-    def plan_loop(kube, cfg_provider, schedule_reader, stop, variant_reader):
+    def plan_loop(kube, cfg_provider, schedule_reader, stop, variant_reader, first_seen_reader):
         assert variant_reader("oci") == {}
+        assert first_seen_reader("oci", "s", 0) is None
         assert schedule_reader("oci") == {}
         assert cfg_provider().settings is SETTINGS
         started["planner"].set()

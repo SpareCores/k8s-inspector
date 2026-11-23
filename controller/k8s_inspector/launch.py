@@ -11,10 +11,6 @@ launch condition; `reason_of_class` maps the class to a reason (no keyword guess
 The ConfigMap holds `{sku: {reason, since, last, count, next}}` as JSON under the key `skus`. Losing it only means an
 earlier retry. Entries go when the SKU gets a node or is no longer in Keeper's ACTIVE list.
 
-It also holds `{sku: N}` under the key `variants`: the newest hardware variant for which the planner already started
-a run to fill in its missing tasks (`planner.plan_cycle`), so that happens once per variant. Losing it means one
-more such run.
-
 A vendor with `BREAKER_LIMIT` BOOT_FAILURE entries whose `last` is within `BREAKER_WINDOW` is paused for autoPlan
 (`paused`): its nodes do not come up, whatever the SKU. A node of the vendor becoming ready drops every `last`
 (`node_ready`), which ends the pause; the counts and waits stay.
@@ -206,24 +202,6 @@ def record_failure(kube: Kube, vendor: str, sku: str, reason: str, now: datetime
 
     _change(kube, vendor, mutate)
     return count
-
-
-def read_variants(kube: Kube, vendor: str) -> dict[str, int]:
-    """`{sku: N}`: the newest variant of each SKU that already got its follow-up run. Unlike `read`, a ConfigMap that
-    cannot be read raises: reading it as empty would start those runs again."""
-    try:
-        return _entries(kube.get("configmap", configmap_name(vendor)), "variants", int)
-    except NotFound, KeyError:
-        return {}
-
-
-def record_variant(kube: Kube, vendor: str, sku: str, variant: int) -> None:
-    """Remember that the follow-up run for the SKU's newest variant `variant` was started."""
-
-    def mutate(entries: dict) -> None:
-        entries[sku] = variant
-
-    _change(kube, vendor, mutate, "variants", int)
 
 
 def clear(kube: Kube, vendor: str, skus: list[str]) -> None:

@@ -1087,3 +1087,28 @@ def test_read_newest_variants_lists_the_highest_variant_and_its_tasks_from_git(t
 
     assert pub.read_newest_variants("hcloud") == {"a": (10, frozenset()), "b": (0, frozenset({"lscpu"}))}
     assert pub.read_newest_variants("nothing") == {}
+
+
+def test_read_first_seen_reads_variant_json_from_git(tmp_path, origin, storage):
+    seed = clone(origin, tmp_path, "seed3")
+    files = {
+        "a/1/variant.json": '{"first_seen": "2026-03-01T10:00:00", "id": "x"}',
+        "a/2/variant.json": '{"first_seen": null}',
+        "a/3/variant.json": '{"first_seen": "yesterday"}',
+        "a/4/variant.json": "{damaged",
+        "a/5/lscpu/meta.json": "{}",  # no variant.json
+    }
+    for name, text in files.items():
+        path = seed / "data" / "hcloud" / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text)
+    git(seed, "add", "-A")
+    git(seed, "commit", "-m", "variants")
+    git(seed, "push", "origin", "HEAD:main")
+    env = EnvConfig(bucket="b", bucket_region="r", git_url=origin.as_uri())
+    pub = publisher.Publisher(None, storage, env, tmp_path / "work")
+    pub.read_schedule_metas("hcloud")  # fetches origin/main
+
+    assert pub.read_first_seen("hcloud", "a", 1) == datetime(2026, 3, 1, 10)
+    assert [pub.read_first_seen("hcloud", "a", n) for n in (2, 3, 4, 5, 6)] == [None] * 5
+    assert pub.read_first_seen("hcloud", "nothing", 0) is None
