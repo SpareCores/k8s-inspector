@@ -1058,3 +1058,32 @@ def test_success_without_lscpu_in_a_cancelled_run_is_discarded_at_once(tmp_path,
     assert all(t.published for t in run.status.tasks)
     assert not publisher.publishing_stalled(ENABLED, "hcloud", list(cluster.runs.values()))
     assert cluster.deferred == [] and not (clone(origin, tmp_path) / "data").exists()
+
+
+def test_read_newest_variants_lists_the_highest_variant_and_its_tasks_from_git(tmp_path, origin, storage):
+    seed = clone(origin, tmp_path, "seed2")
+    files = [
+        "a/0/lscpu/meta.json",
+        "a/0/membench/meta.json",
+        "a/2/lscpu/meta.json",
+        "a/2/lscpu/stdout",
+        "a/2/membench/stdout",  # no meta.json: not done
+        "a/10/variant.json",  # a variant with no tasks yet; 10 is newer than 2
+        "b/0/lscpu/meta.json",
+        "b/0/variant.json",
+        "b/schedule/lscpu/meta.json",
+        "c/schedule/lscpu/meta.json",  # no variant at all
+    ]
+    for name in files:
+        path = seed / "data" / "hcloud" / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("{}")
+    git(seed, "add", "-A")
+    git(seed, "commit", "-m", "more")
+    git(seed, "push", "origin", "HEAD:main")
+    env = EnvConfig(bucket="b", bucket_region="r", git_url=origin.as_uri())
+    pub = publisher.Publisher(None, storage, env, tmp_path / "work")
+    pub.read_schedule_metas("hcloud")  # fetches origin/main
+
+    assert pub.read_newest_variants("hcloud") == {"a": (10, frozenset()), "b": (0, frozenset({"lscpu"}))}
+    assert pub.read_newest_variants("nothing") == {}

@@ -96,6 +96,12 @@ SCarpenter's own short marks handle the fast path; this wait only bounds how oft
 is removed when a node of the SKU is ready, or when the SKU is no longer in Keeper's ACTIVE list (the planner
 prunes). Losing the ConfigMap only means an earlier retry.
 
+The ConfigMap's key `variants`, JSON `{sku: N}`, is not a launch failure: it records the newest hardware variant of
+the SKU for which the planner already started a run to fill in its missing tasks
+([configuration](../reference/configuration.md#autoplan)). A variant gets that run once, whichever variant the
+node lands on; nodes are not chosen by the planner. The record is not touched by a ready node, and losing it means one
+more such run per SKU. A `variants` that cannot be read as JSON stops these runs until it is fixed or deleted.
+
 ### Vendor breaker
 
 An entry also records `last`, the time of its latest failure. A vendor with three SKUs whose entry is `BOOT_FAILURE` with
