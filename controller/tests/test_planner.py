@@ -1116,3 +1116,22 @@ def test_a_failed_record_write_neither_loops_nor_breaks_the_run(kube, quiet, mon
     assert (
         planner.plan_cycle(kube, auto_config(), lambda v: {"s1": all_done()}, variant_reader=lambda v: variants) == []
     )
+
+
+def test_is_offered_needs_an_available_listing_of_the_sku(kube):
+    cfg = make_config()
+    assert not planner.is_offered(kube, cfg, "oci", "s1", False)  # no ConfigMap
+    publish_offered(kube, offered_configmap({"s1": MARKED}))
+    assert not planner.is_offered(kube, cfg, "oci", "s1", False)
+    publish_offered(kube, offered_configmap({"s1": {**MARKED, "available": True}}))
+    assert planner.is_offered(kube, cfg, "oci", "s1", False) and not planner.is_offered(
+        kube, cfg, "oci", "other", False
+    )
+
+
+def test_is_offered_of_an_on_demand_attempt_needs_on_demand_capacity(kube):
+    cfg = make_config()
+    spot_only = {**MARKED, "available": True, "capacityTypes": ["spot"]}
+    publish_offered(kube, offered_configmap({"s1": spot_only}))
+    assert planner.is_offered(kube, cfg, "oci", "s1", False)
+    assert not planner.is_offered(kube, cfg, "oci", "s1", True)

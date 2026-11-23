@@ -108,7 +108,8 @@ SKU_NOT_SELECTABLE = "SKU name is not a valid label value; SCarpenter cannot sel
 ACTIVE = (RunPhase.PENDING, RunPhase.PROVISIONING, RunPhase.RUNNING, RunPhase.RELEASING)
 MAX_PROVISION_RETRIES = 3  # attempts lost before a node was usable (stale node, anchor deleted)
 EXTRA_ATTEMPTS = 2  # attempts beyond `max_spot_attempts` (the on-demand one plus one spare)
-MAX_LAUNCH_FAILURES = 2  # distinct NodeClaims that failed to launch in one attempt before the run gives up
+MAX_LAUNCH_FAILURES = 2  # distinct NodeClaims that failed to launch in one attempt before the run gives up; ICE
+# ones go on while SCarpenter still offers the SKU (`_launch_failures_exhausted`)
 SPOT_FALLBACK_ERRORS = (
     "SCARPENTER_LAUNCH_REJECTED",
 )  # a spot attempt ending so goes on-demand (not a capacity error: those wait, or end as ICE or quota; a node that
@@ -118,7 +119,10 @@ SPOT_FALLBACK_ERRORS = (
 BARE_METAL_SKU = re.compile(r"^(BM\.|bm-|vbm|vdm|ecs\.ebm)|[.-]metal(-|$)")
 
 MAX_SPOT_RECLAIMS = 2  # spot claims of one attempt lost before they were Initialized; then the attempt goes on-demand
-MAX_LAUNCH_FAILURES_KEPT = 5  # entries of `status.launchFailures`
+MAX_ICE_LAUNCH_FAILURES = 20  # ICE claims of one attempt, whatever SCarpenter still offers, before the run gives up
+# Entries of `status.launchFailures`. The run ends at `MAX_ICE_LAUNCH_FAILURES`, so no claim is ever dropped and
+# an old InsufficientCapacityError Event never looks new again.
+MAX_LAUNCH_FAILURES_KEPT = MAX_ICE_LAUNCH_FAILURES
 ICE_EVENT = re.compile(r"NodeClaim (?P<claim>\S+) nominated for this pod failed to launch: (?P<message>.*)", re.S)
 LAUNCH_FAILED_REASON = "LaunchFailed"  # reason of a NodeClaim's `Launched` condition
 BACKOFF_SECONDS = (2, 5, 15, 30, 60)
@@ -918,7 +922,7 @@ class Runner:
         error = _claim_error(claims)
         events = [] if bound else self._anchor_events(anchor)
         failures = self._record_launch_failures(run, claims, events)
-        if error is None and len(failures) >= MAX_LAUNCH_FAILURES:
+        if error is None and self._launch_failures_exhausted(run, cfg, anchor, failures):
             error = self._launch_error(failures[-1].message)
         on_demand_retry = bool(error) and error.startswith(SPOT_FALLBACK_ERRORS)
         reclaims = run.status.spot_reclaims
@@ -935,7 +939,12 @@ class Runner:
             else timedelta(minutes=cfg.settings.deadlines.provision_cpu_minutes)
         )
         waited = self._now() - started
-        if error is None and not claims and waited > timedelta(minutes=cfg.settings.deadlines.no_offering_minutes):
+        if (
+            error is None
+            and not claims
+            and not failures  # ICE claims are deleted at once, so most reconciles see none
+            and waited > timedelta(minutes=cfg.settings.deadlines.no_offering_minutes)
+        ):
             error = _unschedulable(anchor)
         if (
             error is None
@@ -959,6 +968,22 @@ class Runner:
             # The next attempt (`spot.capacity_for_next_attempt`) is on-demand only.
             return self._retry_on_demand(run, live, error)
         self._fail_run(run, error)
+
+    def _launch_failures_exhausted(
+        self, run: BenchmarkRun, cfg: Config, anchor: dict, failures: list[LaunchFailure]
+    ) -> bool:
+        """`MAX_LAUNCH_FAILURES` claims failed to launch. When all of them name the class InsufficientCapacity or
+        ZoneUnusable the run goes on while SCarpenter's offered listing has an available offering for the SKU in a
+        capacity type the anchor allows (it tries other regions and zones itself), up to `MAX_ICE_LAUNCH_FAILURES`;
+        the provisioning budget still ends it. An unreadable listing counts as none."""
+        if len(failures) < MAX_LAUNCH_FAILURES:
+            return False
+        if not all(launch.is_capacity_class(f.message) for f in failures):
+            return True
+        if len(failures) >= MAX_ICE_LAUNCH_FAILURES:
+            return True
+        on_demand_only = not pods.allows_spot(anchor)
+        return not planner.is_offered(self.kube, cfg, run.spec.vendor, run.spec.sku, on_demand_only, self._now())
 
     @staticmethod
     def _is_gpu(run: BenchmarkRun, claims: list[dict]) -> bool:

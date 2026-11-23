@@ -90,6 +90,13 @@ def reason_of_class(message: str, default: str) -> str:
     return reason
 
 
+def is_capacity_class(message: str) -> bool:
+    """The message's own class (the first `<Class> (<Code>):`) is InsufficientCapacity or ZoneUnusable. A message
+    without a class (`no candidate offering had quota headroom`, `no offering satisfies ...`) is not."""
+    found = _CLASSIFIED.search(message)
+    return bool(found) and found.group(1) in ("InsufficientCapacity", "ZoneUnusable")
+
+
 def error_message(reason: str, message: str) -> str:
     """The `error_msg` of a `-1` task: `SCARPENTER_<reason>: <message>`."""
     return f"SCARPENTER_{reason}: {message}"

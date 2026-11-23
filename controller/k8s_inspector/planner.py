@@ -345,6 +345,18 @@ def offered_until(kube: Kube, cfg: Config, vendor: str, sku: str, now: datetime 
     return offered[0].get(sku, {}).get("until") if offered else None
 
 
+def is_offered(
+    kube: Kube, cfg: Config, vendor: str, sku: str, on_demand_only: bool, now: datetime | None = None
+) -> bool:
+    """SCarpenter lists the SKU as available (with `on-demand` among its capacity types when `on_demand_only`).
+    False when the listing cannot be read or the SKU is not in it."""
+    offered = read_offered(kube, cfg, vendor, now)
+    entry = offered[0].get(sku) if offered else None
+    return bool(
+        entry and entry["available"] and (not on_demand_only or CapacityType.ON_DEMAND in entry["capacityTypes"])
+    )
+
+
 def not_offered(kube: Kube, cfg: Config, vendor: str, skus: list[str]) -> dict[str, str]:
     """The SKUs (of `skus`) that SCarpenter's offered-types ConfigMap (`read_offered`) does not offer for the
     vendor's capacity mode, with the reason. A SKU is not offered when its entry is missing, `available` is false
