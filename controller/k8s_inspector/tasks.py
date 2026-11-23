@@ -89,6 +89,7 @@ _PLAIN_KEYS = {
     "memory_cap",
     "shm_gib",
     "gpu",
+    "host_network",
     "precheck_command",
     "precheck_regex",
     "workload_proxy",

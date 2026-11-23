@@ -11,6 +11,10 @@
 #   default CMD is part of `entrypoint` (passmark). Probe images (dmidecode, hwinfo, virtualization, nvidia/cuda) have no
 #   ENTRYPOINT, so their command is a complete command line. The resource-tracker wrapper is part of every benchmark
 #   image's entrypoint, never of the probes (as in sc-inspector).
+# - `host_network: false`: the step Pod gets its own network namespace instead of the node's. For tasks whose server and
+#   client talk over loopback only (redis, static_web): the node's namespace runs every loopback packet through
+#   kube-proxy's and tailscale's netfilter rules, which costs 20-30 % of the request rate at low concurrency
+#   (docs/explanation/node-profile.md). Not hashed. Default true (Docker's `--network=host`).
 # - `timeout`: `<n>s`, `<n>m` or `<n>h` (sums allowed: `1h30m`).
 # - Ordering: `priority` ascending, then `parallel: true` before serial, then name. No priority = last.
 #   `parallel: true` tasks form the probe step (one Pod, one container per task).
@@ -254,6 +258,7 @@ tasks:
     command: nice -n -20 python /usr/local/bin/benchmark.py
     version_command: |-
       bash -c "(binserve --version; wrk -v) | egrep -o '(binserve|wrk) [0-9.]+'"
+    host_network: false
     timeout: 30m
     priority: 9
     secrets: [sentinel]
@@ -265,6 +270,7 @@ tasks:
     entrypoint: [/usr/local/bin/resource-tracker, --]
     command: nice -n -20 python /usr/local/bin/benchmark.py
     version_command: redis-server -v
+    host_network: false
     timeout: 10m
     priority: 10
     secrets: [sentinel]

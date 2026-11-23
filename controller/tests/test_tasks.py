@@ -80,6 +80,10 @@ def test_catalogue_facts_ported():
     assert {t.name for t in tasks.all_tasks() if t.gpu} == {"nvidia_smi", "gpu_facts", "nvbandwidth"}
 
 
+def test_only_loopback_tasks_use_the_pod_network():
+    assert {t.name for t in tasks.all_tasks() if not t.host_network} == {"redis", "static_web"}
+
+
 def test_select_tasks():
     everything = [task.name for task in tasks.select_tasks([])]
     assert "pgbench_postgres_dbaas_ro_durable" not in everything

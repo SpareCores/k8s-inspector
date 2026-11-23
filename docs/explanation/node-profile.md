@@ -76,7 +76,7 @@ Measured on the `Lean` E5.Flex.2-8 node.
 
 | Docker era | k8s-inspector |
 |---|---|
-| `--privileged --network=host` | `privileged: true`, `hostNetwork: true`, `dnsPolicy: Default` |
+| `--privileged --network=host` | `privileged: true`, `hostNetwork: true`, `dnsPolicy: Default`; `redis` and `static_web` use the Pod's own network namespace instead ([loopback tasks](#loopback-tasks)) |
 | `seccomp=unconfined`, `nofile=1048576`, `memlock=-1` for DB tasks | `seccompProfile: Unconfined` for all; rlimits set by `sc-run` |
 | `--pid=host` for storage | `hostPID: true` on the storage step only |
 | no CPU limits | no CPU limits (no CFS quota, so `nproc` and cgroup-aware tools see the whole node); the step Pod's CPU **request** is what the other Pods leave ([CPU weight](#cpu-weight)) |
@@ -87,6 +87,41 @@ Measured on the `Lean` E5.Flex.2-8 node.
 `storage` runs last on a node, because it may unmount and overwrite free disks. The spool is on the boot disk, which
 the storage benchmark treats as protected (it holds `/`). Until the Flatcar-specific protected mounts land in the
 storage image (last phase, [roadmap](../roadmap.md)), a storage failure is accepted and recorded like any other.
+
+## Loopback tasks
+
+`redis` (memtier against local servers) and `static_web` (wrk against binserve) talk only over loopback. In the node's
+network namespace every loopback packet passes the netfilter hooks that kube-proxy (`INPUT`/`OUTPUT` jumps to
+`KUBE-FIREWALL`, `KUBE-SERVICES`, `KUBE-NODEPORTS`, conntrack matches), tailscale (`ts-input`) and flannel leave there.
+A Pod's own namespace has none of them, so these two tasks set `host_network: false` in the catalogue
+(`hostNetwork: false`, `dnsPolicy: Default`, outbound traffic still works through flannel, the benchmark traffic itself
+stays on the Pod's `lo`). The step Pod is otherwise unchanged: `privileged`, `seccompProfile: Unconfined`, requests only.
+
+Measured on one Azure `Standard_D2ds_v5` (Xeon 8370C, 2 vCPU) node, median of 3 runs each, same image digests and
+commands as the catalogue. The legacy row is the Ubuntu VM result of the same SKU (2024-09):
+
+| | redis SET p1 | p4 | p16 | p512 | static_web 1k 2t/2c | 1k 2t/32c |
+|---|---|---|---|---|---|---|
+| legacy (Docker, Ubuntu) | 117537 | 333787 | 613729 | 840007 | 84206 | 116874 |
+| host network (before) | 93266 | 285357 | 559876 | 775870 | 77186 | 106296 |
+| Pod network (now) | 122206 | 332942 | 600650 | 779868 | 103235 | 135849 |
+
+Other settings, all with `hostNetwork: true`, redis p1: `RuntimeDefault` seccomp is 11 % slower (83142, so the
+`privileged` + `Unconfined` Pods stay); a CPU request of 10m, no `benchmark`
+priority class, running in `system.slice`, no resource-tracker wrapper and CPU pinning change nothing outside the
+noise (±1-4 %); a Guaranteed Pod (`limits.cpu` 1.8) loses 5 % at p512 to CFS throttling (the reason for "no CPU
+limits"). Accepting loopback early in the node's `iptables` `INPUT`/`OUTPUT` plus `notrack` for `lo` recovers 10 %
+(102858) of the 31 % the Pod namespace recovers, so the cost is not conntrack alone and a node-level rule is no
+substitute. The kernel mitigations of the node and of the legacy VM are the same (see `lscpu` Vulnerability lines),
+so they are not the cause of the gap to legacy. Booting the node with `mitigations=off` (retpolines and the other
+Spectre defences) is a separate gain on top: redis p1 111289 on the host network and 135528 in the Pod namespace
+(+19 % and +11 %), p512 796722, static_web 1k 2t/2c 113852 and 2t/32c 149332 in the Pod namespace (+10 % and +10 %).
+That is a node setting (kernel argument, one extra reboot), owned by the bench node Butane in sc-infra, not by this
+repository. `sched_autogroup`, transparent huge pages (`never`), a Guaranteed or 10m-request Pod, the `benchmark`
+priority class and running in `system.slice` change nothing measurable. Not tested:
+`cpuManagerPolicy: static` (SCarpenter's SCNodeClass has no field for it), idle polling and CPU governor (the Azure
+guest exposes no cpufreq or cpuidle driver).
+p512 stays about 7 % under legacy on the Azure host, which is outside the Pod's reach.
 
 ## CPU weight
 
@@ -151,7 +186,7 @@ SCarpenter's reservations for the Lean small nodes and change with them.
 | Runtime | dockerd → containerd → runc | kubelet → containerd 2 → runc | same runc path |
 | cgroup | `system.slice/docker-<id>.scope` | `kubepods.slice/…/cri-containerd-<id>.scope`, `kubepods.slice` cpu weight ~76 | `kubepods.slice` against `system.slice` is fixed by the kubelet and matters only under contention from daemons that use ~2 % CPU; inside `kubepods.slice` the step Pod has nearly all the weight ([CPU weight](#cpu-weight)) |
 | Memory | no cap except vLLM/geekbench | `kubepods.slice` capped at allocatable | slightly less headroom on small types |
-| Network | host | host | identical (the pod network over the tailnet is never used by benchmarks) |
+| Network | host | host, except the loopback-only tasks `redis` and `static_web`: the Pod's own network namespace | identical for host tasks; the two loopback tasks avoid the node's netfilter rules ([loopback tasks](#loopback-tasks)) |
 | OS, kernel | Ubuntu 24.04, kernel 6.8, services stopped | Flatcar, kernel 6.12, kubelet, tailscaled, flannel, kube-proxy | the main source of differences |
 
 The differences are measured, not assumed: before a vendor moves from the legacy pipeline, a few of its SKUs run the
