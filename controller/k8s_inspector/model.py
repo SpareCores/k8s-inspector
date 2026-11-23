@@ -126,6 +126,7 @@ class TaskDef:
     transforms: tuple[str, ...] = ("raw",)  # "raw", "fetch_geekbench_results"
     parse: str | None = None  # publisher parser: dmidecode | openssl | stressnglongrun | lstopo
     privileges: frozenset[str] = frozenset()  # "host_pid" (storage), "db_rlimits" (pgbench)
+    host_network: bool = True  # False: the Pod's own network namespace (loopback-only tasks)
     memory_cap: float | None = None  # fraction of Node allocatable memory as limit (0.85 geekbench, vllm)
     shm_gib: int | None = None  # /dev/shm size (4 for vllm)
     gpu: bool = False  # needs the GPU, no CPU fallback

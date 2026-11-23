@@ -419,8 +419,9 @@ def render_step(
     gpu_count: int = 0,
     cpu_millicores: int = CPU_FLOOR_M,
 ) -> dict:
-    """A step Pod (objects.md "Step Pod"): `nodeName`, bare Pod, `hostNetwork`, `dnsPolicy: Default`,
-    `hostPID` iff any task has `host_pid`, `runtimeClassName: nvidia` iff `step.gpu_runtime`, tolerations
+    """A step Pod (objects.md "Step Pod"): `nodeName`, bare Pod, `hostNetwork` (false iff every task has
+    `host_network: false`), `dnsPolicy: Default`, `hostPID` iff any task has `host_pid`, `runtimeClassName: nvidia`
+    iff `step.gpu_runtime`, tolerations
     `Exists`, no service account token, `terminationGracePeriodSeconds: 20`, `activeDeadlineSeconds`
     from `step_deadline_seconds`, owner = the anchor Pod. One container per `step.containers`, each:
     image `container.image`, `command: [/k8si/bin/sc-run, exec, --task <key>, --timeout <t>, --spool
@@ -456,7 +457,7 @@ def render_step(
             "restartPolicy": "Never",
             "activeDeadlineSeconds": step_deadline_seconds(step, cfg),
             "terminationGracePeriodSeconds": TERMINATION_GRACE_SECONDS,
-            "hostNetwork": True,
+            "hostNetwork": any(c.task.host_network for c in step.containers),
             "dnsPolicy": "Default",
             "hostPID": any("host_pid" in c.task.privileges for c in step.containers),
             "automountServiceAccountToken": False,

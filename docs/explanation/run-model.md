@@ -112,7 +112,7 @@ Every step adds a little idle time on the node between two benchmarks. Its parts
 | Controller notices the previous step ended | ~1 s | a **watch** on the run's Pods wakes the controller; a 15 s poll would add ~7.5 s on average |
 | Controller confirms uploads, writes `status.json`, signs URLs for the next step | ~1 s | a handful of object storage calls |
 | Pod creation → kubelet sees it | <1 s | `nodeName` skips scheduling |
-| Pod sandbox | ~1 s | `hostNetwork: true` needs no CNI setup |
+| Pod sandbox | ~1 s | `hostNetwork: true` needs no CNI setup (the loopback-only tasks get a CNI namespace, a fraction of a second more) |
 | Wrapper delivery | 0 s | `sc-run` is installed once per node by the anchor into a hostPath and mounted read-only; no per-step initContainer |
 | Container start | <1 s | image pulled by digest with `IfNotPresent` |
 | Kubelet reports the end | ~1 s | |

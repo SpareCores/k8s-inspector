@@ -9,7 +9,7 @@ The cluster also runs web services and applications. Benchmarks must neither dis
 | The controller runs with the apps | toleration `frankenscube/apps` only; never on control planes (`CriticalAddonsOnly`) |
 | Benchmarks cannot starve the cluster | per-vendor `maxInFlight` and `maxUsdPerHour` in the controller; `ResourceQuota` (`pods: 60`) in `inspector`; PriorityClass `benchmark` (low, `preemptionPolicy: Never`) |
 | Privileged Pods only where intended | namespace `inspector` with Pod Security `privileged`; the `ValidatingAdmissionPolicy` and RBAC in [security](security.md#admission-and-rbac) |
-| Benchmark traffic does not cross the cluster network | `hostNetwork: true`; outputs go straight to object storage |
+| Benchmark traffic does not cross the cluster network | `hostNetwork: true` (the loopback-only tasks use their Pod's own namespace); outputs go straight to object storage |
 
 ## The controller's node
 

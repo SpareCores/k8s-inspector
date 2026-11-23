@@ -89,6 +89,7 @@ _PLAIN_KEYS = {
     "memory_cap",
     "shm_gib",
     "gpu",
+    "host_network",
     "precheck_command",
     "precheck_regex",
     "workload_proxy",
@@ -139,6 +140,13 @@ def _task_from_yaml(entry: dict) -> TaskDef:
     else:
         raise ValueError(f"task {name}: image or images is required")
 
+    if "host_network" in fields and not isinstance(fields["host_network"], bool):
+        raise ValueError(f"task {name}: host_network must be true or false, not {fields['host_network']!r}")
+    if fields.get("host_network") is False and fields.get("parallel"):
+        raise ValueError(
+            f"task {name}: host_network: false cannot be combined with parallel: true "
+            "(the probe step is on the host network)"
+        )
     for transform in fields.get("transforms", ()):
         if transform not in TRANSFORM_SOURCES:
             raise ValueError(f"task {name}: unknown transform {transform!r}")

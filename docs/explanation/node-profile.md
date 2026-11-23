@@ -15,7 +15,7 @@ disk is decided in P6. k8s-inspector only selects the pool by name.
 | Image garbage collection | kubelet defaults | replaces Docker's prune between task groups |
 | Root disk | 128 GiB (256 GiB for GPU, see above) (decision K21) | images, the llm model, the spool |
 | Local instance storage | `ignore` (left raw) | the storage benchmark measures raw disks |
-| Instance metadata | `Open` ([security](security.md#instance-metadata-imds)) | resource tracker cloud detection |
+| Instance metadata | `Open`; on AWS also hop limit 2, `httpTokens: required` ([security](security.md#instance-metadata-imds)) | resource tracker cloud detection, also from a Pod's own network namespace (hop limit 2 on AWS) |
 | Butane | mask `docker.socket`, `systemd-sysupdate*`, `systemd-oomd`, the SSH key fetch units; stop vendor agents after Ready | less background noise |
 | Billing retention | off | a node is never reused |
 | NodePool `bench` | taint `frankenscube/bench=true:NoSchedule`, label `frankenscube/pool=bench`, `WhenEmpty`, `consolidateAfter: 0s`, `expireAfter: 48h`, `terminationGracePeriod: 1h`, no `limits` (every instance type of every vendor must be benchmarkable; the controller bounds running instances with `maxInFlight`), node repair off | dedicated, short-lived |
@@ -76,7 +76,7 @@ Measured on the `Lean` E5.Flex.2-8 node.
 
 | Docker era | k8s-inspector |
 |---|---|
-| `--privileged --network=host` | `privileged: true`, `hostNetwork: true`, `dnsPolicy: Default` |
+| `--privileged --network=host` | `privileged: true`, `hostNetwork: true`, `dnsPolicy: Default`; `redis` and `static_web` use the Pod's own network namespace instead ([loopback tasks](#loopback-tasks)) |
 | `seccomp=unconfined`, `nofile=1048576`, `memlock=-1` for DB tasks | `seccompProfile: Unconfined` for all; rlimits set by `sc-run` |
 | `--pid=host` for storage | `hostPID: true` on the storage step only |
 | no CPU limits | no CPU limits (no CFS quota, so `nproc` and cgroup-aware tools see the whole node); the step Pod's CPU **request** is what the other Pods leave ([CPU weight](#cpu-weight)) |
@@ -87,6 +87,60 @@ Measured on the `Lean` E5.Flex.2-8 node.
 `storage` runs last on a node, because it may unmount and overwrite free disks. The spool is on the boot disk, which
 the storage benchmark treats as protected (it holds `/`). Until the Flatcar-specific protected mounts land in the
 storage image (last phase, [roadmap](../roadmap.md)), a storage failure is accepted and recorded like any other.
+
+## Loopback tasks
+
+`redis` (memtier against local servers) and `static_web` (wrk against binserve) talk only over loopback. In the node's
+network namespace every loopback packet passes the netfilter hooks that kube-proxy (`INPUT`/`OUTPUT` jumps to
+`KUBE-FIREWALL`, `KUBE-SERVICES`, `KUBE-NODEPORTS`, conntrack matches), tailscale (`ts-input`) and flannel leave there.
+A Pod's own namespace has none of them, so these two tasks set `host_network: false` in the catalogue
+(`hostNetwork: false`, `dnsPolicy: Default`, outbound traffic still works through flannel, the benchmark traffic itself
+stays on the Pod's `lo`). The step Pod is otherwise unchanged: `privileged`, `seccompProfile: Unconfined`, requests only.
+
+Consequences of the Pod's own namespace for these tasks:
+
+- The resource tracker reports the Pod's name and IP as the host identity (not the node's hostname and address) and sees
+  only the Pod's `eth0` in its network metrics, not the node's interfaces.
+- On AWS the metadata service is two hops away, so the bench NodeClass sets the IMDS hop limit to 2
+  ([security](security.md#instance-metadata-imds)).
+
+## Measurement conditions
+
+Two settings shape how loopback- and syscall-heavy results compare with the VM era: the Pod network namespace of the
+loopback tasks (above) and the kernel's CPU vulnerability mitigations.
+
+- **Pod network namespace: used** for `redis` and `static_web`.
+- **Kernel mitigations: on**, as on the legacy sc-inspector VMs. The node's mitigations match the VM's (same
+  `lscpu` Vulnerability lines). Booting with `mitigations=off` would gain about 10-19 % on syscall- and loopback-heavy
+  tasks, but then every task's results would diverge from legacy, so bench nodes do not use it.
+
+Measured on one Azure `Standard_D2ds_v5` (Xeon 8370C, 2 vCPU), median of 3 runs each, same image digests and
+commands as the catalogue. The legacy row is the Ubuntu VM result of the same SKU (sc-inspector-data commit
+`ba01cd99cdd`). redis is SET requests per second at pipeline 1/4/16/512; static_web is 1 KiB requests per second with
+2 threads at 2/8/32 connections.
+
+| Variant | redis p1 | p4 | p16 | p512 | web 2c | 8c | 32c |
+|---|---|---|---|---|---|---|---|
+| legacy VM | 117537 | 333787 | 613729 | 840007 | 84206 | 105162 | 116874 |
+| host network (before) | 93266 | 285357 | 559876 | 775870 | 77186 | 96257 | 106296 |
+| **Pod network (chosen)** | 122206 | 332942 | 600650 | 779868 | 103235 | 120188 | 135849 |
+| host network, `mitigations=off` | 111289 | 318063 | 592843 | 783261 | 89807 | 109814 | 120209 |
+| Pod network, `mitigations=off` (not used) | 135528 | 357966 | 622644 | 796722 | 113852 | 132205 | 149332 |
+
+Other findings, all on the host network unless noted:
+
+- `RuntimeDefault` seccomp (unprivileged) is about 11 % worse on redis p1 (83142), which is why step Pods stay
+  `privileged` with `Unconfined`.
+- CPU requests, the `benchmark` priority class, cgroup placement (`system.slice`), the resource-tracker wrapper and
+  `taskset` pinning change nothing outside the noise (+-1-4 %). A Guaranteed Pod (`limits.cpu` 1.8) loses 5 % at p512
+  to CFS throttling (the reason for "no CPU limits"). `sched_autogroup` and transparent huge pages (`never`) change
+  nothing measurable.
+- Accepting loopback early in the node's `iptables` plus `notrack` for `lo` (netfilter in the host namespace) recovers
+  only about a third of the gap (redis p1 102858), so the cost is not conntrack alone and a node-level rule is no
+  substitute for the Pod namespace.
+- redis p512 stays about 7 % under legacy in every variant (unattributed).
+- Azure guests expose no cpufreq or cpuidle driver, so governor and idle polling cannot be set.
+- Not tested: `cpuManagerPolicy: static` (SCarpenter's SCNodeClass has no field for it) and other vendors.
 
 ## CPU weight
 
@@ -151,7 +205,8 @@ SCarpenter's reservations for the Lean small nodes and change with them.
 | Runtime | dockerd → containerd → runc | kubelet → containerd 2 → runc | same runc path |
 | cgroup | `system.slice/docker-<id>.scope` | `kubepods.slice/…/cri-containerd-<id>.scope`, `kubepods.slice` cpu weight ~76 | `kubepods.slice` against `system.slice` is fixed by the kubelet and matters only under contention from daemons that use ~2 % CPU; inside `kubepods.slice` the step Pod has nearly all the weight ([CPU weight](#cpu-weight)) |
 | Memory | no cap except vLLM/geekbench | `kubepods.slice` capped at allocatable | slightly less headroom on small types |
-| Network | host | host | identical (the pod network over the tailnet is never used by benchmarks) |
+| Network | host | host, except the loopback-only tasks `redis` and `static_web`: the Pod's own network namespace | identical for host tasks; the two loopback tasks avoid the node's netfilter rules ([loopback tasks](#loopback-tasks)) |
+| Kernel mitigations | on | on, identical to the VM's | same; `mitigations=off` is not used ([measurement conditions](#measurement-conditions)) |
 | OS, kernel | Ubuntu 24.04, kernel 6.8, services stopped | Flatcar, kernel 6.12, kubelet, tailscaled, flannel, kube-proxy | the main source of differences |
 
 The differences are measured, not assumed: before a vendor moves from the legacy pipeline, a few of its SKUs run the

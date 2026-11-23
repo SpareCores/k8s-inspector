@@ -69,7 +69,7 @@ remaining tasks ([spot strategy](spot.md)).
 - **Results stay compatible.** The sc-inspector-data layout, `meta.json` fields and task hashes are unchanged, so
   sc-crawler needs no change and the switch reruns nothing by itself ([output contract](../reference/output-contract.md),
   [tasks](../reference/tasks.md)).
-- **Benchmark conditions match the VM era where it matters**: privileged, host network, no CPU limits, `nice -20`,
+- **Benchmark conditions match the VM era where it matters**: privileged, host network (own network namespace for the loopback-only `redis` and `static_web`), no CPU limits, `nice -20`,
   the same images ([node profile](node-profile.md)).
 - **One pipeline per vendor.** A vendor is benchmarked either by the legacy sc-inspector or by k8s-inspector, never
   both ([roadmap](../roadmap.md)).

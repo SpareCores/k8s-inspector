@@ -19,6 +19,7 @@ and `dbaas_tasks.py`; the task list, images, commands, timeouts and priorities a
 | `transforms` | list | `raw`, `fetch_geekbench_results`; the legacy source text of each transform is part of the hash |
 | `parse` | string | `dmidecode`, `openssl`, `stressnglongrun`, `lstopo` (run by the publisher) |
 | `privileges` | set | `host_pid` (storage), `db_rlimits` (pgbench) |
+| `host_network` | bool, default true | `false`: the step Pod uses its own network namespace (`redis`, `static_web`: [loopback tasks](../explanation/node-profile.md#loopback-tasks)); not hashed |
 | `memory_cap` | float | fraction of Node allocatable as the memory limit (0.85 for geekbench, vllm) |
 | `shm_gib` | int | `/dev/shm` size in GiB (4 for vllm) |
 | `gpu` | bool | needs the GPU (no CPU fallback); a node without an NVIDIA GPU (accelerator labels) → `-3` |

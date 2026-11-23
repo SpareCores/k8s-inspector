@@ -123,6 +123,19 @@ def test_deadlines(cfg):
     assert pods.step_deadline_seconds(s, cfg2) == (1 + 1 + 40 + 10 + 5) * 60
 
 
+def test_step_pod_network_namespace_for_loopback_tasks(run, cfg):
+    def spec_of(*tasks):
+        step_ = step(*(container(t) for t in tasks))
+        pod = pods.render_step(run, 1, step_, cfg, node_name="n1", node_allocatable_memory_bytes=1000, owner=OWNER)
+        return pod["spec"]
+
+    spec = spec_of(task("redis", host_network=False))
+    assert spec["hostNetwork"] is False and spec["dnsPolicy"] == "Default"
+    assert spec["containers"][0]["securityContext"] == {"privileged": True, "seccompProfile": {"type": "Unconfined"}}
+    assert spec_of(task("membench"))["hostNetwork"] is True
+    assert spec_of(task("redis", host_network=False), task("membench"))["hostNetwork"] is True
+
+
 def test_step_pod_like_spike(run, cfg):
     pod = pods.render_step(
         run, 1, step(container(task())), cfg, node_name="n1", node_allocatable_memory_bytes=1000, owner=OWNER
