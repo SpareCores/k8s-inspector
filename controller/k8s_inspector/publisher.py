@@ -39,7 +39,7 @@ Decisions:
   defers its SKU (`NO_LSCPU`). A task of such a run that finished (exit code 0 or above) without an lscpu result of
   its attempt is discarded the same way: no lscpu will come, so it is neither filed under a guessed variant nor
   waited for. Other `-4` reasons, and a `CANCELLED` of a SIGTERM in a run that was not cancelled,
-  are published as usual.
+  go to `schedule/<task>/meta.json` only (render.py), never over a good result.
 - A task whose rendering keeps failing is published without parser output after `MAX_RENDER_FAILURES` cycles.
 - vLLM probe keys (`vllm-probe-<image>`) are not tasks of the data tree: they are marked published unrendered.
 - Timing files come from `run.json`: the latest attempt that has an lscpu result (`attempts[]`: `api_start`,

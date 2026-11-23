@@ -430,3 +430,129 @@ def test_dbaas_layout(tmp_path):
     written = render.render_dbaas_task(tmp_path, db, inp)
     base = tmp_path / "dbaas/ovh/postgresql-discovery-b3-4/postgres/18/standalone/pgbench_postgres_dbaas_ro_durable"
     assert sorted(p.name for p in written) == ["meta.json", "stdout"] and (base / "stdout").read_bytes() == b"out"
+
+
+# ------------------------------------------------- -4 not published, redaction, start failure, stale files
+
+
+def sched_meta(tree: Path, task: str = "lscpu") -> dict:
+    return json.loads((tree / "data/hcloud/cax31/schedule" / task / "meta.json").read_text())
+
+
+@pytest.mark.parametrize("error_msg", ["NODE_LOST", "CANCELLED", "EVICTED"])
+def test_minus_four_goes_to_the_schedule_without_output(tmp_path, error_msg):
+    inp = plain_input(exit_code=-4, error_msg=error_msg, stdout=b"partial")
+    assert render.render_task(tmp_path, "hcloud", "cax31", 0, inp) == [
+        tmp_path / "data/hcloud/cax31/schedule/lscpu/meta.json"
+    ]
+    assert not (tmp_path / "data/hcloud/cax31/0").exists()
+    meta = sched_meta(tmp_path)
+    assert (meta["exit_code"], meta["start_retries"], meta["outputs"], meta["stdout_bytes"]) == (-4, 1, [], None)
+
+
+def test_minus_four_keeps_the_previous_failure_result_with_its_output(tmp_path):
+    render.render_task(tmp_path, "hcloud", "cax31", 0, plain_input(exit_code=1, stdout=b"why"))
+    render.render_task(
+        tmp_path, "hcloud", "cax31", 0, plain_input(exit_code=-4, start="2026-10-02T10:00:00", run_id="r2")
+    )
+    assert (
+        tree_file(tmp_path, "lscpu", "stdout").read_bytes() == b"why" and read_meta(tmp_path, "lscpu")["exit_code"] == 1
+    )
+    assert sched_meta(tmp_path)["exit_code"] == -4
+
+
+@pytest.mark.parametrize("variant", [0, None])
+@pytest.mark.parametrize("exit_code", [-4, -1, 256])
+def test_failure_does_not_replace_a_good_schedule_meta(tmp_path, variant, exit_code):
+    render.render_task(tmp_path, "hcloud", "cax31", 0, plain_input(start="2026-10-01T10:00:00"))
+    failed = plain_input(start="2026-10-02T10:00:00", run_id="r2", exit_code=exit_code)
+    assert render.render_task(tmp_path, "hcloud", "cax31", variant, failed) == []
+    assert sched_meta(tmp_path)["run_id"] == "r1" and sched_meta(tmp_path)["exit_code"] == 0
+
+
+def test_failure_does_not_replace_a_good_schedule_meta_without_variant_dirs(tmp_path):
+    good = tmp_path / "data/hcloud/cax31/schedule/lscpu/meta.json"
+    good.parent.mkdir(parents=True)
+    good.write_text(render.dump_meta(render.meta_from_status(plain_input().status)))
+    render.render_task(tmp_path, "hcloud", "cax31", 0, plain_input(exit_code=137, start="2026-10-02T10:00:00"))
+    assert sched_meta(tmp_path)["exit_code"] == 0
+
+
+def test_stream_sizes_match_the_files_written(tmp_path):
+    inp = plain_input(stdout=b"12345", stdout_bytes=None, stderr_bytes=99)  # the manifest has no or another size
+    render.render_task(tmp_path, "hcloud", "cax31", 0, inp)
+    meta = read_meta(tmp_path, "lscpu")
+    assert (meta["outputs"], meta["stdout_bytes"], meta["stderr_bytes"]) == (["stdout"], 5, None)
+
+
+def test_failure_replacing_a_failure_removes_the_old_outputs(tmp_path):
+    ok = plain_input("stressnglongrun", exit_code=1, stdout=b"out")
+    render.render_task(tmp_path, "hcloud", "cax31", 0, ok)
+    old = tree_file(tmp_path, "stressnglongrun", "parsed.csv")
+    old.write_text("a,b\n")
+    new = plain_input("stressnglongrun", exit_code=256, start="2026-10-02T10:00:00", run_id="r2", stdout=b"x")
+    render.render_task(tmp_path, "hcloud", "cax31", 0, new)
+    assert sorted(p.name for p in old.parent.iterdir()) == ["meta.json"]
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "cannot start command: fork/exec /usr/local/bin/resource-tracker: no such file or directory",
+        "cannot start command: exec format error",
+    ],
+)
+def test_command_that_did_not_start_is_published_as_minus_one(tmp_path, message):
+    render.render_task(tmp_path, "hcloud", "cax31", 0, plain_input(exit_code=256, error_msg=message, stdout=b""))
+    meta = read_meta(tmp_path, "lscpu")
+    assert (meta["exit_code"], meta["error_msg"]) == (-1, message)
+
+
+def test_other_harness_errors_stay_256(tmp_path):
+    render.render_task(tmp_path, "hcloud", "cax31", 0, plain_input(exit_code=256, error_msg="nice 30: want -20 to 19"))
+    assert read_meta(tmp_path, "lscpu")["exit_code"] == 256
+
+
+def test_redact_error_msg_drops_urls_and_ids():
+    uuid = "12345678-90ab-cdef-1234-567890abcdef"
+    ocid = "ocid1.instance.oc1.eu-frankfurt-1.abcdefghijklmnop"
+    arn = "arn:aws:iam::123456789012:role/x"
+    url = f"https://management.azure.com/subscriptions/{uuid}/x"
+    message = (
+        f"SCARPENTER_LAUNCH_REJECTED: Fatal (BadRequest): PUT {url} tenant {uuid} {ocid} {arn} account 123456789012"
+    )
+    assert render.redact_error_msg(message) == (
+        "SCARPENTER_LAUNCH_REJECTED: Fatal (BadRequest): PUT <url> tenant <id> <id> <id> account <id>"
+    )
+
+
+def test_redact_error_msg_leaves_plain_messages_and_none_alone():
+    assert render.redact_error_msg("NODE_LOST") == "NODE_LOST" and render.redact_error_msg(None) is None
+    assert render.redact_error_msg("exit code 1234567") == "exit code 1234567"
+
+
+def test_redact_error_msg_truncation_keeps_the_start_code_and_the_end():
+    message = "SCARPENTER_BOOT_FAILURE: " + "a" * 500 + " the real reason"
+    out = render.redact_error_msg(message, limit=100)
+    assert out.startswith("SCARPENTER_BOOT_FAILURE: ") and out.endswith("the real reason") and len(out) <= 105
+
+
+def test_published_meta_is_redacted(tmp_path):
+    url = "https://management.azure.com/subscriptions/12345678-90ab-cdef-1234-567890abcdef/resourceGroups/rg/x"
+    render.render_task(
+        tmp_path, "hcloud", "cax31", None, plain_input(exit_code=-1, error_msg=f"SCARPENTER_X: PUT {url}")
+    )
+    assert sched_meta(tmp_path)["error_msg"] == "SCARPENTER_X: PUT <url>"
+
+
+def test_dbaas_failure_does_not_replace_a_good_result_and_minus_four_has_no_output(tmp_path):
+    db = {"vendor": "ovh", "id": "pg", "engineVersion": 18}
+    task = "pgbench_postgres_dbaas_ro_durable"
+    render.render_dbaas_task(tmp_path, db, plain_input(task, stdout=b"good"))
+    base = tmp_path / "dbaas/ovh/pg/postgres/18/standalone" / task
+    failed = plain_input(task, exit_code=-4, start="2026-10-02T10:00:00", run_id="r2", stdout=b"partial")
+    assert render.render_dbaas_task(tmp_path, db, failed) == []
+    assert (base / "stdout").read_bytes() == b"good"
+    other = tmp_path / "other"
+    render.render_dbaas_task(other, db, failed)
+    assert not (other / "dbaas/ovh/pg/postgres/18/standalone" / task / "stdout").exists()
