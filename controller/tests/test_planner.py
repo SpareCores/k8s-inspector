@@ -1,4 +1,6 @@
+import base64
 import copy
+import gzip
 import json
 import threading
 import zlib
@@ -614,8 +616,9 @@ def test_run_forever_survives_errors_and_stops():
 # --------------------------------------------------------------------------- SCarpenter offered types
 
 
-def offered_configmap(types: dict, *, age=timedelta(minutes=1), truncated=False, naive_time=False) -> dict:
-    """ConfigMap `scarpenter-offered-bench-oci` as SCarpenter writes it; `types` is {sku: entry fields}."""
+def offered_configmap(types: dict, *, age=timedelta(minutes=1), truncated=False, naive_time=False, gz=False) -> dict:
+    """ConfigMap `scarpenter-offered-bench-oci` as SCarpenter writes it; `types` is {sku: entry fields}. `gz`: the
+    gzipped `binaryData` form (base64, as the API client returns it) instead of `data`."""
     generated = datetime.now(UTC) - age
     document = {
         "generatedAt": generated.replace(tzinfo=None).isoformat() if naive_time else generated.isoformat(),
@@ -627,6 +630,10 @@ def offered_configmap(types: dict, *, age=timedelta(minutes=1), truncated=False,
             for sku, fields in types.items()
         },
     }
+    if gz:
+        return {
+            "binaryData": {"types.json.gz": base64.b64encode(gzip.compress(json.dumps(document).encode())).decode()}
+        }
     return {"data": {"types.json": json.dumps(document)}}
 
 
@@ -670,12 +677,23 @@ def test_offered_types_on_demand_mode_needs_an_on_demand_offering(kube, keeper_s
         offered_configmap({"s1": QUOTA}, age=timedelta(minutes=31)),  # stale
         {"data": {"types.json": "{not json"}},
         {"data": {}},
+        {"binaryData": {"types.json.gz": base64.b64encode(b"not gzip").decode()}},
         {"data": {"types.json": json.dumps({"generatedAt": "now", "truncated": False, "types": {}})}},
         offered_configmap({"s1": QUOTA}, naive_time=True),
         offered_configmap({"s1": {"available": True, "capacityTypes": None}}),
         offered_configmap({"s1": {"available": True, "capacityTypes": ["spot"], "offerings": None}}),
     ],
-    ids=["absent", "stale", "bad-json", "no-key", "bad-time", "naive-time", "null-capacity-types", "null-offerings"],
+    ids=[
+        "absent",
+        "stale",
+        "bad-json",
+        "no-key",
+        "corrupt-gzip",
+        "bad-time",
+        "naive-time",
+        "null-capacity-types",
+        "null-offerings",
+    ],
 )
 def test_offered_types_unusable_configmap_filters_nothing(kube, keeper_skus, caplog, configmap):
     if configmap:
@@ -683,6 +701,35 @@ def test_offered_types_unusable_configmap_filters_nothing(kube, keeper_skus, cap
     with caplog.at_level("DEBUG"):
         assert planned_skus(kube) == ["s1"]
     assert "offered types of vendor oci unusable" in caplog.text
+
+
+def test_offered_types_read_the_gzipped_listing(kube, keeper_skus):
+    keeper_skus["oci"] = {"quota": {}, "ok": {}}
+    configmap = offered_configmap({"quota": QUOTA, "ok": OFFERED}, gz=True)
+    document = json.loads(gzip.decompress(base64.b64decode(configmap["binaryData"]["types.json.gz"])))
+    document["zonesOmitted"] = True  # tolerated
+    configmap["binaryData"]["types.json.gz"] = base64.b64encode(gzip.compress(json.dumps(document).encode())).decode()
+    publish_offered(kube, configmap)
+    assert planned_skus(kube) == ["ok"]
+
+
+def test_offered_types_prefer_the_gzipped_listing_over_data(kube, keeper_skus):
+    keeper_skus["oci"] = {"s1": {}}
+    gz = offered_configmap({"s1": OFFERED}, gz=True)
+    stale = offered_configmap({"s1": QUOTA})
+    publish_offered(kube, {**stale, **gz})
+    assert planned_skus(kube) == ["s1"]
+    publish_offered(kube, {**offered_configmap({"s1": QUOTA}, gz=True), **offered_configmap({"s1": OFFERED})})
+    assert planned_skus(kube) == []
+
+
+def test_offered_types_without_truncated_field_are_complete(kube, keeper_skus):
+    keeper_skus["oci"] = {"unknown": {}}
+    configmap = offered_configmap({"ok": OFFERED})
+    document = json.loads(configmap["data"]["types.json"])
+    del document["truncated"]
+    publish_offered(kube, {"data": {"types.json": json.dumps(document)}})
+    assert planned_skus(kube) == []  # a missing entry counts: the list is complete
 
 
 def test_offered_types_truncated_list_skips_only_listed_unavailable(kube, keeper_skus):

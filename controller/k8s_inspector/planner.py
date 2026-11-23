@@ -5,6 +5,8 @@ vendors), state.md "What git still records", exit-codes.md "Planner retry" and t
 feature-mapping.md. The lease is the BenchmarkRun name: creating a second run for a SKU raises `RunExists`.
 """
 
+import base64
+import gzip
 import json
 import logging
 import threading
@@ -277,20 +279,25 @@ def read_offered(
     kube: Kube, cfg: Config, vendor: str, now: datetime | None = None
 ) -> tuple[dict[str, dict], bool] | None:
     """The usable content of SCarpenter's offered-types ConfigMap `scarpenter-offered-<benchClass>-<vendor>` in
-    `SCARPENTER_NAMESPACE`: `({apiReference: entry}, truncated)`, where an entry is `{available, capacityTypes, reason,
-    until}` and `until` is the latest of its unavailable offerings (`offerings[].until`, else None). Entries without
-    an `apiReference` are ignored; of two with the same one the available wins and `until` is the latest of both.
-    `now` (default the current time) judges staleness.
+    `SCARPENTER_NAMESPACE` (gzipped JSON in `binaryData["types.json.gz"]`, else plain `data["types.json"]`; the
+    optional `zonesOmitted` field is ignored, nothing reads zones): `({apiReference: entry}, truncated)`, where
+    an entry is `{available, capacityTypes, reason, until}` and `until` is the latest of its unavailable offerings
+    (`offerings[].until`, else None). Entries without an `apiReference` are ignored; of two with the same one the
+    available wins and `until` is the latest of both. `now` (default the current time) judges staleness.
 
-    None (fail open, the reason is logged) when the ConfigMap is absent, unreadable, malformed or stale
-    (`generatedAt` missing, without timezone or older than `OFFERED_MAX_AGE`), or has a malformed entry."""
+    None (fail open, the reason is logged) when the ConfigMap is absent, unreadable (a corrupt gzip too), malformed or
+    stale (`generatedAt` missing, without timezone or older than `OFFERED_MAX_AGE`), or has a malformed entry."""
     name = f"scarpenter-offered-{cfg.settings.bench_class}-{vendor}"
     try:
-        data = json.loads(kube.get_configmap_in(SCARPENTER_NAMESPACE, name)["data"]["types.json"])
+        configmap = kube.get_configmap_in(SCARPENTER_NAMESPACE, name)
+        if gz := (configmap.get("binaryData") or {}).get("types.json.gz"):  # base64 in the API object
+            data = json.loads(gzip.decompress(base64.b64decode(gz)))
+        else:  # an older SCarpenter writes plain JSON
+            data = json.loads(configmap["data"]["types.json"])
         generated = datetime.fromisoformat(data["generatedAt"])
         if generated.tzinfo is None:
             raise ValueError(f"generatedAt {data['generatedAt']!r} has no timezone")
-        truncated = data["truncated"] is True
+        truncated = data.get("truncated") is True  # absent: false
         entries = {}  # a malformed entry fails the whole read
         for entry in data["types"].values():
             api_reference = entry.get("apiReference")
