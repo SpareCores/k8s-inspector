@@ -212,7 +212,11 @@ def read_variants(kube: Kube, vendor: str) -> dict[str, int]:
 
 def record_variant(kube: Kube, vendor: str, sku: str, variant: int) -> None:
     """Remember that the follow-up run for the SKU's newest variant `variant` was started."""
-    _change(kube, vendor, lambda entries: entries.__setitem__(sku, variant), "variants", int)
+
+    def mutate(entries: dict) -> None:
+        entries[sku] = variant
+
+    _change(kube, vendor, mutate, "variants", int)
 
 
 def clear(kube: Kube, vendor: str, skus: list[str]) -> None:

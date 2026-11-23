@@ -1077,3 +1077,42 @@ def test_the_record_survives_a_restart_and_lives_beside_the_launch_failures(kube
     assert json.loads(stored["variants"]) == {"s1": 1} and set(json.loads(stored["skus"])) == {"s2"}
     # a restarted controller has only the ConfigMap
     assert plan_variant(kube, newest(1, missing=["lscpu"]), keeper_cache=planner.KeeperCache()) == []
+
+
+def test_a_temporary_launch_failure_clears_the_record_and_the_backoff_paces_the_retrigger(kube, quiet):
+    variants = newest(1, missing=["lscpu"])
+    assert plan_variant(kube, variants)
+    assert launch.read_variants(kube, "oci") == {"s1": 1}
+    # what the runner does when the run's launch fails with ICE: count the failure, drop the record
+    launch.record_failure(kube, "oci", "s1", "ICE", datetime.now(UTC))
+    launch._change(kube, "oci", lambda entries: entries.pop("s1", None), "variants", int)
+    assert launch.read_variants(kube, "oci") == {}
+    assert plan_variant(kube, variants) == []  # the backoff holds
+    launch.record_failure(kube, "oci", "s1", "ICE", datetime.now(UTC) - timedelta(days=1))  # it has elapsed
+    assert [p.tasks for p in plan_variant(kube, variants)] == [("lscpu",)]
+    assert launch.read_variants(kube, "oci") == {"s1": 1}
+
+
+def test_a_failed_record_write_neither_loops_nor_breaks_the_run(kube, quiet, monkeypatch):
+    launch.record_failure(kube, "oci", "s2", "ICE", NOW.replace(tzinfo=UTC))  # the ConfigMap exists: writes patch it
+
+    patch = kube.merge_patch
+
+    def refuse(kind, name, body, subresource_status=False):
+        if kind == "configmap":
+            raise RuntimeError("API down")
+        return patch(kind, name, body, subresource_status)
+
+    monkeypatch.setattr(kube, "merge_patch", refuse)
+    variants = newest(1, missing=["lscpu"])
+    planned = [
+        p.tasks
+        for p in planner.plan_cycle(
+            kube, auto_config(), lambda v: {"s1": all_done()}, variant_reader=lambda v: variants
+        )
+    ]
+    assert planned == [("lscpu",)] and len(kube.list("benchmarkrun")) == 1  # the run exists
+    assert launch.read_variants(kube, "oci") == {}  # unrecorded: the lease holds it while the run lives
+    assert (
+        planner.plan_cycle(kube, auto_config(), lambda v: {"s1": all_done()}, variant_reader=lambda v: variants) == []
+    )

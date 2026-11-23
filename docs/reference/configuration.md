@@ -157,16 +157,18 @@ it is due and the vendor has room. Per vendor:
    `variants` of the launch ConfigMap, and never starts another for the same `N`, so a rerun that fails, or whose
    node lands on another variant, cannot repeat; the backoff, `-5` and hash rules above take over. The planner
    cannot choose the hardware of the node, so the follow-up may fill an older variant and leave `N` as it was.
-   A run that ends in a launch failure leaves nothing in `N`, and the record stays: the missing tasks are not
-   started again for `N`.
+   A run that ends in a temporary launch failure is deleted and leaves nothing in `N`, so the runner drops the
+   record together with counting the failure: the launch backoff paces the retry, which writes the record again.
+   If the record cannot be written, the run goes on; the SKU's lease holds it, and a later cycle starts another
+   fill only if `N` still lacks the tasks.
    A SKU waiting in the launch ConfigMap (`next` ahead) or unavailable in SCarpenter's offered-types ConfigMap is
    skipped ([launch retries](../explanation/launch-retries.md), [Offered types](#offered-types)).
 5. The first SKU in that order with at least one due task gets a run with exactly those tasks (not forced:
    Keeper's rules were applied). Then the caps are checked again; below them the next SKU follows.
 
 The git state is read from the publisher's checkout (blobless, sparse: only the `schedule/*/meta.json` files of the
-vendor), under the publisher's lock; the newest variants and their tasks come from the git trees of the same fetch,
-with no checkout. If Keeper or git cannot be read, the cycle (or that vendor) plans nothing and
+vendor), under the publisher's lock; the newest variants and their tasks are read in a second, separate lock
+section from the git trees, with no checkout (origin only moves forward, so the two reads cannot contradict each other). If Keeper or git cannot be read, the cycle (or that vendor) plans nothing and
 logs why: the planner never creates runs blindly. `k8s-inspector plan [--dry-run]` runs one cycle in its own
 checkout; with `--dry-run` it creates nothing and prints the first SKU that would start for each vendor.
 

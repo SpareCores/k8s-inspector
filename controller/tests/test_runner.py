@@ -2555,3 +2555,15 @@ def test_a_spot_gpu_loop_is_bounded_by_two_lost_spot_claims_then_on_demand(h):
     h.kube.delete("nodeclaim", "claim-od")
     h.runner.reconcile(h.name)
     assert h.kube.list("benchmarkrun") == [] and h.entry()["reason"] == "BOOT_FAILURE"
+
+
+def test_a_temporary_launch_failure_drops_the_variant_record(h):
+    launch.record_variant(h.kube, "oci", "VM.Standard.E5.Flex.2-16", 1)
+    launch.record_variant(h.kube, "oci", "other", 2)
+    h.cluster.provision_enabled = False
+    h.start(["geekbench"])
+    h.runner.reconcile(h.name)
+    h.cluster.fail_launch(h.kube.get("pod", f"{h.name}-a1"), "InsufficientInstanceCapacity in zone")
+    h.runner.reconcile(h.name)
+    assert h.kube.list("benchmarkrun") == []
+    assert launch.read_variants(h.kube, "oci") == {"other": 2}
