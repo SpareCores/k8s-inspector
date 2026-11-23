@@ -760,6 +760,154 @@ def test_launch_failures_of_the_on_demand_attempt_end_the_run(h):
     assert h.codes()["geekbench"] == (-1, "SCARPENTER_LAUNCH_REJECTED: Fatal (X): second")
 
 
+ICE_TAIL = "insufficient capacity, every launch attempt failed (2 attempts), the last: {}"
+NO_QUOTA = "insufficient capacity, no candidate offering had quota headroom (3 skipped)"
+NO_CANDIDATE = "insufficient capacity, no offering satisfies the NodeClaim's requirements and has capacity"
+
+
+def _ice_event(h, claim, tail=None, **times):
+    """What Karpenter does when a launch hits InsufficientCapacity: it deletes the NodeClaim (no condition is ever
+    seen) and publishes this Event on the pending anchor Pod (the message is SCarpenter's, see its create.go)."""
+    anchor = f"{h.name}-a1"
+    tail = tail or ICE_TAIL.format("InsufficientCapacity (NoValidHost): nova: HTTP 500: No valid host was found.")
+    h.kube.create(
+        "event",
+        {
+            "metadata": {"name": f"ev-{claim}"},
+            "involvedObject": {"kind": "Pod", "name": anchor, "uid": h.kube.get("pod", anchor)["metadata"]["uid"]},
+            "reason": "InsufficientCapacityError",
+            "reportingController": "karpenter",
+            "message": f"NodeClaim {claim} nominated for this pod failed to launch: {tail}",
+            **times,
+        },
+    )
+
+
+def _provisioning_without_nodes(h, **start):
+    h.cluster.provision_enabled = False
+    h.start(["geekbench"], **start)
+    h.runner.reconcile(h.name)
+
+
+def test_ice_of_deleted_nodeclaims_is_counted_from_the_anchor_events(h):
+    _provisioning_without_nodes(h, capacity=CapacityMode.ON_DEMAND, force=True)
+    _ice_event(h, "bench-5krfr", lastTimestamp=iso(h.clock.now))
+    h.runner.reconcile(h.name)
+    assert h.run.status.phase == RunPhase.PROVISIONING
+    assert [f.node_claim for f in h.run.status.launch_failures] == ["bench-5krfr"]
+    h.runner.reconcile(h.name)  # the same event again is not a second failure
+    assert [f.node_claim for f in h.run.status.launch_failures] == ["bench-5krfr"]
+    h.clock.advance(minutes=3)
+    _ice_event(h, "bench-c54f9", lastTimestamp=iso(h.clock.now))
+    h.runner.reconcile(h.name)
+    assert h.run.status.phase == RunPhase.FAILED
+    code, message = h.codes()["geekbench"]
+    assert code == -1
+    assert message.startswith("SCARPENTER_ICE: insufficient capacity, every launch attempt failed")
+
+
+@pytest.mark.parametrize(
+    "last_error",
+    [
+        "Unsupported (InvalidFlavor): flavor not found",
+        "InvalidOffering (NoSuchOffering): offering is gone",
+        "Fatal (X): something else",
+    ],
+)
+def test_ice_event_is_ice_whatever_the_class_of_the_last_candidate(h, last_error):
+    _provisioning_without_nodes(h, capacity=CapacityMode.ON_DEMAND, force=True)
+    for claim in ("bench-aaaaa", "bench-bbbbb"):
+        _ice_event(h, claim, ICE_TAIL.format(last_error))
+    h.runner.reconcile(h.name)
+    code, message = h.codes()["geekbench"]
+    assert code == -1 and message.startswith("SCARPENTER_ICE: ")
+
+
+def test_ice_events_of_an_unforced_run_end_as_a_temporary_ice(h):
+    _provisioning_without_nodes(h, capacity=CapacityMode.ON_DEMAND)
+    for claim in ("bench-aaaaa", "bench-bbbbb"):
+        _ice_event(h, claim, ICE_TAIL.format("Unsupported (InvalidFlavor): flavor not found"))
+    h.runner.reconcile(h.name)
+    assert h.kube.list("benchmarkrun") == []
+    assert h.entry()["reason"] == "ICE"
+
+
+def test_ice_events_of_a_spot_attempt_are_not_a_launch_rejection(h):
+    _provisioning_without_nodes(h, force=True)
+    assert pods.allows_spot(h.kube.get("pod", f"{h.name}-a1"))
+    for claim in ("bench-aaaaa", "bench-bbbbb"):
+        _ice_event(h, claim, ICE_TAIL.format("InvalidOffering (NoSuchOffering): offering is gone"))
+    h.runner.reconcile(h.name)
+    assert h.run.status.phase == RunPhase.FAILED  # no on-demand fallback: that is for LAUNCH_REJECTED only
+    assert h.codes()["geekbench"][1].startswith("SCARPENTER_ICE: ")
+
+
+@pytest.mark.parametrize("tail", [NO_QUOTA, NO_CANDIDATE])
+def test_ice_events_without_a_last_candidate_class_are_ice(h, tail):
+    _provisioning_without_nodes(h, capacity=CapacityMode.ON_DEMAND, force=True)
+    for claim in ("bench-aaaaa", "bench-bbbbb"):
+        _ice_event(h, claim, tail)
+    h.runner.reconcile(h.name)
+    assert h.codes()["geekbench"] == (-1, f"SCARPENTER_ICE: {tail}")
+
+
+def test_ice_event_with_a_quota_last_candidate_stays_quota(h):
+    _provisioning_without_nodes(h, capacity=CapacityMode.ON_DEMAND)
+    for claim in ("bench-aaaaa", "bench-bbbbb"):
+        _ice_event(h, claim, ICE_TAIL.format("QuotaExceeded (Limit): quota is zero"))
+    h.runner.reconcile(h.name)
+    assert h.entry()["reason"] == "QUOTA"
+
+
+def test_the_same_claim_as_a_condition_and_as_an_event_is_one_failure(h):
+    _provisioning_without_nodes(h, capacity=CapacityMode.ON_DEMAND)
+    anchor = h.kube.get("pod", f"{h.name}-a1")
+    h.cluster.fail_launch(
+        anchor, ICE_TAIL.format("Fatal (X): y"), name="bench-aaaaa", status="Unknown", reason="LaunchFailed"
+    )
+    _ice_event(h, "bench-aaaaa")
+    h.runner.reconcile(h.name)
+    assert h.run.status.phase == RunPhase.PROVISIONING
+    assert [f.node_claim for f in h.run.status.launch_failures] == ["bench-aaaaa"]
+
+
+def test_a_condition_failure_and_an_event_failure_reach_the_cap(h):
+    _provisioning_without_nodes(h, capacity=CapacityMode.ON_DEMAND, force=True)
+    anchor = h.kube.get("pod", f"{h.name}-a1")
+    h.cluster.fail_launch(anchor, "Fatal (X): first", name="bench-aaaaa", status="Unknown", reason="LaunchFailed")
+    _ice_event(h, "bench-bbbbb")
+    h.runner.reconcile(h.name)
+    assert h.run.status.phase == RunPhase.FAILED
+    assert len(h.run.status.launch_failures) == 2
+
+
+def test_ice_events_of_a_bound_anchor_are_ignored(h):
+    h.start(["geekbench"], capacity=CapacityMode.ON_DEMAND)
+    h.runner.reconcile(h.name)
+    h.kube.merge_patch("pod", f"{h.name}-a1", {"spec": {"nodeName": "node-1"}})
+    for claim in ("bench-aaaaa", "bench-bbbbb"):
+        _ice_event(h, claim)
+    h.runner.reconcile(h.name)
+    assert h.run.status.launch_failures == []
+
+
+def test_forbidden_events_fail_open(h):
+    _provisioning_without_nodes(h, capacity=CapacityMode.ON_DEMAND)
+    h.kube.events_forbidden = True
+    for claim in ("bench-aaaaa", "bench-bbbbb"):
+        _ice_event(h, claim)
+    h.runner.reconcile(h.name)
+    assert h.run.status.phase == RunPhase.PROVISIONING and h.run.status.launch_failures == []
+
+
+def test_an_event_without_a_nodeclaim_of_this_anchor_is_not_a_launch_failure(h):
+    _provisioning_without_nodes(h, capacity=CapacityMode.ON_DEMAND)
+    _ice_event(h, "bench-aaaaa")
+    h.kube.merge_patch("event", "ev-bench-aaaaa", {"involvedObject": {"uid": "uid-of-the-previous-anchor"}})
+    h.runner.reconcile(h.name)
+    assert h.run.status.launch_failures == []
+
+
 def _ice(h):
     anchor = h.kube.get("pod", f"{h.name}-a1")
     h.cluster.fail_launch(anchor, "InsufficientCapacity (X): no capacity")

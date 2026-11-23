@@ -119,6 +119,7 @@ BARE_METAL_SKU = re.compile(r"^(BM\.|bm-|vbm|vdm|ecs\.ebm)|[.-]metal(-|$)")
 
 MAX_SPOT_RECLAIMS = 2  # spot claims of one attempt lost before they were Initialized; then the attempt goes on-demand
 MAX_LAUNCH_FAILURES_KEPT = 5  # entries of `status.launchFailures`
+ICE_EVENT = re.compile(r"NodeClaim (?P<claim>\S+) nominated for this pod failed to launch: (?P<message>.*)", re.S)
 LAUNCH_FAILED_REASON = "LaunchFailed"  # reason of a NodeClaim's `Launched` condition
 BACKOFF_SECONDS = (2, 5, 15, 30, 60)
 RECLAIM_WAIT = timedelta(minutes=5)  # how long a task cancelled or evicted on a spot node waits for the reclaim to show
@@ -913,7 +914,8 @@ class Runner:
         if bound:  # the anchor has its node: Karpenter cleans up any other claim
             claims = [c for c in claims if _is_true(c, "Initialized")]
         error = _claim_error(claims)
-        failures = self._record_launch_failures(run, claims)
+        events = [] if bound else self._anchor_events(anchor)
+        failures = self._record_launch_failures(run, claims, events)
         if error is None and len(failures) >= MAX_LAUNCH_FAILURES:
             error = self._launch_error(failures[-1].message)
         on_demand_retry = bool(error) and error.startswith(SPOT_FALLBACK_ERRORS)
@@ -939,7 +941,7 @@ class Runner:
             and not failures  # a launch failure is a transient ICE, not a missing offering
             and waited >= timedelta(minutes=cfg.settings.deadlines.no_offering_fast_minutes)
         ):
-            message = self._bench_pool_event(anchor, cfg.settings.bench_pool, started)
+            message = _bench_pool_message(events, cfg.settings.bench_pool, started)
             error = f"SCARPENTER_NO_OFFERING: {message}" if message else None
         if error is None and bound:
             error = self._anchor_ready_error(run, cfg, anchor, claims)
@@ -1067,26 +1069,31 @@ class Runner:
     def _launch_error(message: str) -> str:
         return launch.error_message(launch.reason_of_class(message, "ICE"), message)
 
-    def _bench_pool_event(self, anchor: dict, bench_pool: str, since: datetime) -> str | None:
-        """`_bench_pool_message` of the anchor's Events; an API error counts as no event."""
+    def _anchor_events(self, anchor: dict) -> list[dict]:
+        """The anchor Pod's Events; an API error counts as no events."""
         try:
-            events = self.kube.list_pod_events(_meta(anchor)["name"], _meta(anchor)["uid"])
-            return _bench_pool_message(events, bench_pool, since)
+            return self.kube.list_pod_events(_meta(anchor)["name"], _meta(anchor)["uid"])
         except Exception:
             log.warning("listing events of %s failed", _meta(anchor)["name"], exc_info=True)
-            return None
+            return []
 
-    def _record_launch_failures(self, run: BenchmarkRun, claims: list[dict]) -> list[LaunchFailure]:
-        """Remember in `status.launchFailures` each NodeClaim that failed to launch: Karpenter deletes it and
-        creates a new one, so a failure is gone from the cluster a few minutes later."""
+    def _record_launch_failures(self, run: BenchmarkRun, claims: list[dict], events: list[dict]) -> list[LaunchFailure]:
+        """Remember in `status.launchFailures` each NodeClaim of the attempt that failed to launch. Karpenter keeps
+        a claim with a `LaunchFailed` condition for a while, but deletes one that hit InsufficientCapacity at once,
+        without any condition: that one is only in the `InsufficientCapacityError` Event on the anchor Pod. Either
+        way it is a new claim a few minutes later, so the failure must be recorded here."""
         seen = {f.node_claim for f in run.status.launch_failures}
-        new = []
+        found = {}
         for claim in claims:
             message = _launch_failed_message(claim)
-            if message and _meta(claim)["name"] not in seen:
-                new.append(LaunchFailure(_meta(claim)["name"], message, self._now()))
+            if message:
+                found[_meta(claim)["name"]] = LaunchFailure(_meta(claim)["name"], message, self._now())
+        for failure in self._ice_events(events):
+            found.setdefault(failure.node_claim, failure)
+        new = [f for name, f in found.items() if name not in seen]
         if not new:
             return run.status.launch_failures
+        new.sort(key=lambda f: f.time)
 
         def mutate(status: RunStatus) -> None:
             known = {f.node_claim for f in status.launch_failures}
@@ -1094,6 +1101,16 @@ class Runner:
             status.launch_failures = status.launch_failures[-MAX_LAUNCH_FAILURES_KEPT:]
 
         return self._update(run, mutate).status.launch_failures
+
+    def _ice_events(self, events: list[dict]) -> list[LaunchFailure]:
+        """The NodeClaims Karpenter reports in the anchor's `InsufficientCapacityError` Events (`NodeClaim <name>
+        nominated for this pod failed to launch: <message>`)."""
+        failures = []
+        for event in events:
+            found = ICE_EVENT.match(event.get("message") or "")
+            if event.get("reason") == "InsufficientCapacityError" and found:
+                failures.append(LaunchFailure(found["claim"], found["message"], _event_time(event) or self._now()))
+        return failures
 
     def _pending_claims(self, anchor: dict) -> list[dict]:
         """NodeClaims created for this anchor's pool, vendor and SKU since the anchor exists."""

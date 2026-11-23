@@ -99,10 +99,16 @@ attempt started (Karpenter creates one within seconds for any SKU it can launch)
 a `no instance type met all requirements` clause for `karpenter.sh/nodepool In [<benchPool>]` (and the attempt has no launch failure), the run ends the same way (`no instance type met all requirements for <SKU> in nodepool <benchPool>`)
 after `noOfferingFastMinutes`; this needs `list` on `events`.
 
-Karpenter replaces a NodeClaim that fails to launch (`Launched` condition reason `LaunchFailed`, status Unknown or
-False) with a new one every few minutes, so the deadlines above would not fire. The controller remembers each failed
-NodeClaim of the attempt in `status.launchFailures` and, at the second distinct one (or when the provisioning
-pre-launch budget passes after a failure), ends the run with the reason of the class SCarpenter put in the last message
+Karpenter replaces a NodeClaim that fails to launch with a new one every few minutes, so the deadlines above would
+not fire. A failure shows as a `Launched` condition with reason `LaunchFailed` (status Unknown or False), except
+InsufficientCapacity (also what SCarpenter returns when every candidate failed or had no quota): Karpenter deletes
+that claim at once, with no condition, and only publishes an `InsufficientCapacityError` Event on the anchor Pod
+(`NodeClaim <name> nominated for this pod failed to launch: <message>`; needs `list` on `events` and Karpenter v1.15
+or newer). That message carries the last candidate's class, or none (quota headroom, no candidate), and the controller
+treats it as `ICE` (`QUOTA` for a quota class). Detection can lag up to the 300 s resync, so a 3rd or 4th ICE claim may
+be tried before the cap applies; ICE bills nothing. The controller remembers each failed NodeClaim of the attempt,
+from the condition or from that Event, in `status.launchFailures` and, at the second distinct one (or when the
+provisioning pre-launch budget passes after a failure), ends the run with the reason of the class SCarpenter put in the last message
 ([launch retries](../explanation/launch-retries.md)) and deletes the anchor; when the attempt allowed spot and the
 reason is `LAUNCH_REJECTED`, it instead ends `LaunchFailed` and the next attempt is on-demand only
 ([spot](../explanation/spot.md)). A single transient failure is tolerated.
