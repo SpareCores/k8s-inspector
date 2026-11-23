@@ -25,6 +25,11 @@ failure. A run whose NodeClaims never launch within the pre-launch budget (`prov
 is `ICE` (Karpenter keeps replacing claims that never launched, which is capacity or quota); after launch failures it
 ends with the reason of the last one.
 
+Every failed launch of the attempt's NodeClaims counts toward `MAX_LAUNCH_FAILURES` (2 distinct claims), whatever
+the class. A claim that hit InsufficientCapacity is deleted by Karpenter before any condition is visible, so the
+controller reads it from the `InsufficientCapacityError` Event on the anchor Pod, whose message carries the same
+`<Class> (<Code>): <message>`; the run ends with that class's reason (`ICE` for it).
+
 ## A node that does not come up
 
 The run ends `BOOT_FAILURE` at the first node of an attempt that does not come up, without waiting for Karpenter or the
