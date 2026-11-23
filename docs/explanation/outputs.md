@@ -126,15 +126,16 @@ the lease about twice `keepRunHours` after its end.
      `schedule/<task>/meta.json` (picked among the variants like any meta, so a current-hash success of another variant
      still wins) and the planner waits before it retries; if the new hash keeps failing, the old-hash result stays in the
      tree. A failure still replaces an earlier failure,
-     and a success replaces anything.
+     and a success replaces anything. A failure kept out of the schedule is still recorded as its `last_attempt`.
    - **Transforms and parsers run only for tasks with exit code 0**; `stdout` and `stderr` are written for every
      exit code except the harness error `256` and `-4`/`-5`.
    - **DBaaS results** (`dbaas/...`, no variant, no schedule) follow the same rule: a failure of any hash, `-4`
      and `-5` included, never replaces an exit code 0 result, because sc-crawler reads the DBaaS `stdout` without
      the exit code.
    - **`-4` and `-5` are not results**: the task never finished, so its output is partial. They go to
-     `schedule/<task>/meta.json` only (the planner reads nothing else from git, and `start_retries` is counted there),
-     without `stdout`/`stderr`, and never touch a variant dir.
+     `schedule/<task>/meta.json` only (the planner reads nothing else from git; `start_retries` is counted along the
+     chain of [`last_attempt`](../reference/output-contract.md#last_attempt)), without `stdout`/`stderr`, and never
+     touch a variant dir.
    - **`stdout_bytes`/`stderr_bytes`** are the sizes of the files written (`null` when the file is not written), so
      they agree with `outputs`.
    - **A new result replaces the old one completely**: files of the task dir that the new result does not write (a

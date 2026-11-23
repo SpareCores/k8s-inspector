@@ -15,6 +15,8 @@ Deviations from the legacy, on purpose:
   `stdout_bytes`/`stderr_bytes` are the sizes of the files written; files of the previous result that the new one
   does not write are removed; a command that did not start (`256 cannot start command`) is `-1`; `error_msg` is
   redacted (`redact_error_msg`).
+- `last_attempt` in `schedule/<task>/meta.json` records the latest attempt of any outcome when the meta is not that
+  attempt (the planner decides retries and variant fills from it).
 - `start_retries` and the `-5` rule are applied here (the runner does not know git): see `_apply_start_retries`.
 - Nothing is written when a transform or parser raises: all content is computed before the first write.
 - Optional parser dependencies (`dmiparser`, `dateparser`, `fastnumbers`, `lxml`) are imported lazily, only for the
@@ -266,7 +268,10 @@ def published_meta(status: dict) -> dict:
 
 def dump_meta(meta: dict) -> str:
     """meta.json text: compact JSON as pydantic's `model_dump_json` writes it, no trailing newline."""
-    return json.dumps(_canonical_meta(meta, with_added=False), separators=(",", ":"), ensure_ascii=False)
+    out = _canonical_meta(meta, with_added=False)
+    if "last_attempt" in meta:  # schedule metas only
+        out["last_attempt"] = meta["last_attempt"]
+    return json.dumps(out, separators=(",", ":"), ensure_ascii=False)
 
 
 # --------------------------------------------------------------------------- transforms
@@ -736,16 +741,37 @@ def select_schedule_meta(instance_root: Path, task: str, current_hash: str, extr
     return max(candidates, key=_meta_sort_key)
 
 
-def refresh_schedule_meta(instance_root: Path, task: str, current_hash: str, extra: dict | None = None) -> Path | None:
-    """Recompute `schedule/<task>/meta.json` from all variant metas (and `extra`); untouched when none is usable."""
-    selected = select_schedule_meta(instance_root, task, current_hash, extra)
+ATTEMPT_FIELDS = ("run_id", "start", "end", "exit_code", "error_msg", "task_hash", "start_retries")
+
+
+def latest_attempt(schedule_meta: dict) -> dict:
+    """The latest attempt of a task on the SKU: `last_attempt` of its schedule meta, else the meta itself (it is
+    the latest attempt whenever `last_attempt` is absent, and in a meta written before `last_attempt` existed)."""
+    return schedule_meta.get("last_attempt") or schedule_meta
+
+
+def refresh_schedule_meta(instance_root: Path, task: str, attempt: dict, extra: dict | None = None) -> Path | None:
+    """Recompute `schedule/<task>/meta.json` from all variant metas (and `extra`) and record `attempt`, the
+    result just published (any outcome), as `last_attempt` unless the meta is that attempt itself. An attempt older
+    than the recorded one is not recorded. Untouched when nothing changes."""
+    path = instance_root / "schedule" / task / "meta.json"
+    existing = _read_meta(path)
+    selected = select_schedule_meta(instance_root, task, attempt["task_hash"], extra)
     if selected is None:
         return None
-    path = instance_root / "schedule" / task / "meta.json"
-    if selected.get("exit_code") != ExitCode.OK and _is_good(_read_meta(path), current_hash):
+    if selected.get("exit_code") != ExitCode.OK and _is_good(existing, attempt["task_hash"]):
         log.info("%s: exit code %s kept out of the schedule, which has a good result", path, selected.get("exit_code"))
-        return None  # a failure never replaces a good result of the same task hash
-    text = dump_meta(selected)
+        selected = existing  # a failure never replaces a good result of the same task hash
+    recorded = latest_attempt(existing) if existing else None
+    if recorded and (_parse_dt(recorded.get("start")) or datetime.min) > (
+        _parse_dt(attempt.get("start")) or datetime.min
+    ):
+        attempt = recorded
+    attempt = {field: attempt.get(field) for field in ATTEMPT_FIELDS}
+    result = {k: v for k, v in selected.items() if k != "last_attempt"}
+    if attempt != {field: result.get(field) for field in ATTEMPT_FIELDS}:
+        result["last_attempt"] = attempt
+    text = dump_meta(result)
     if path.exists() and path.read_text(encoding="utf-8") == text:
         return None  # unchanged
     _write(path, text)
@@ -758,11 +784,11 @@ def _is_start_failure(meta: dict) -> bool:
 
 
 def _apply_start_retries(meta: dict, prior: dict | None) -> None:
-    """`start_retries` counts consecutive start attempts of the same task hash that never produced a result: a
-    `-4` or a start-failure `-1` (a command that does not start). It is +1 on such a code after one of that hash,
-    otherwise 1 on such a code and 0 on any other code (success, a changed task hash, another failure; `-5` counts
-    as a `-4` here). The third in a row becomes `-5`. The same run and start seen again (re-render after a crash)
-    keeps its count."""
+    """`prior` is the latest attempt before this one (`latest_attempt`). `start_retries` counts consecutive start
+    attempts of the same task hash that never produced a result: a `-4` or a start-failure `-1` (a command that does
+    not start). It is +1 on such a code after one of that hash, otherwise 1 on such a code and 0 on any other code
+    (success, a changed task hash, another failure; `-5` counts as a `-4` here). The third in a row becomes `-5`.
+    The same run and start seen again (re-render after a crash) keeps its count."""
     counted = meta["exit_code"] == ExitCode.NEVER_FINISHED or _is_start_failure(meta)
     if prior and prior.get("run_id") == meta["run_id"] and prior.get("start") == meta["start"]:
         retries = prior.get("start_retries", 0)
@@ -800,12 +826,13 @@ def render_task(tree: Path, vendor: str, sku: str, variant: int | None, inp: Ren
     schedule_only = variant is None or meta["exit_code"] in NOT_FINAL_CODES
     if _is_stale(schedule_path if schedule_only else instance / str(variant) / task / "meta.json", start):
         return []
-    _apply_start_retries(meta, _read_meta(schedule_path))
+    scheduled = _read_meta(schedule_path)
+    _apply_start_retries(meta, latest_attempt(scheduled) if scheduled else None)
     schedule_only = variant is None or meta["exit_code"] in NOT_FINAL_CODES  # a third `-4` or start failure became `-5`
 
     if schedule_only:
         meta["stdout_bytes"] = meta["stderr_bytes"] = None
-        schedule = refresh_schedule_meta(instance, task, meta["task_hash"], extra=meta)
+        schedule = refresh_schedule_meta(instance, task, meta, extra=meta)
         return [schedule] if schedule else []
 
     task_dir = instance / str(variant) / task
@@ -828,8 +855,9 @@ def render_task(tree: Path, vendor: str, sku: str, variant: int | None, inp: Ren
                 meta["exit_code"],
                 variant,
             )
-            return []
-        schedule = refresh_schedule_meta(instance, task, meta["task_hash"], extra=meta)
+            schedule = refresh_schedule_meta(instance, task, meta)
+            return [schedule] if schedule else []
+        schedule = refresh_schedule_meta(instance, task, meta, extra=meta)
         return [schedule] if schedule else []
     files: dict[str, bytes] = {}
     outputs: list[str] = []
@@ -859,7 +887,7 @@ def render_task(tree: Path, vendor: str, sku: str, variant: int | None, inp: Ren
         written.append(task_dir / name)
     _write(task_dir / "meta.json", dump_meta(meta))
     written.append(task_dir / "meta.json")
-    schedule = refresh_schedule_meta(instance, task, meta["task_hash"])
+    schedule = refresh_schedule_meta(instance, task, meta)
     return written + ([schedule] if schedule else [])
 
 

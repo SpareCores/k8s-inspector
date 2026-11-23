@@ -123,10 +123,10 @@ def configmap_name(vendor: str) -> str:
     return f"k8s-inspector-launch-{vendor}"
 
 
-def _entries(configmap: dict, key: str = "skus", kind: type = dict) -> dict:
-    """The entries of a ConfigMap's JSON `key`: only the `kind` ones, none when it is not a JSON object."""
-    found = json.loads(configmap["data"][key])
-    return {sku: entry for sku, entry in found.items() if isinstance(entry, kind)} if isinstance(found, dict) else {}
+def _entries(configmap: dict) -> dict:
+    """The entries of a ConfigMap's JSON `skus`: only the object ones, none when it is not a JSON object."""
+    found = json.loads(configmap["data"]["skus"])
+    return {sku: entry for sku, entry in found.items() if isinstance(entry, dict)} if isinstance(found, dict) else {}
 
 
 def read(kube: Kube, vendor: str) -> dict[str, dict]:
@@ -141,8 +141,8 @@ def read(kube: Kube, vendor: str) -> dict[str, dict]:
         return {}
 
 
-def _change(kube: Kube, vendor: str, mutate, key: str = "skus", kind: type = dict) -> None:
-    """Apply `mutate(entries)` to the vendor's entries under `key` (create the ConfigMap when missing). Best
+def _change(kube: Kube, vendor: str, mutate) -> None:
+    """Apply `mutate(entries)` to the vendor's entries (create the ConfigMap when missing). Best
     effort: never raises."""
     name = configmap_name(vendor)
     try:
@@ -155,10 +155,10 @@ def _change(kube: Kube, vendor: str, mutate, key: str = "skus", kind: type = dic
                 if not entries:
                     return
                 body = {"apiVersion": "v1", "kind": "ConfigMap", "metadata": {"name": name}}
-                kube.create("configmap", {**body, "data": {key: json.dumps(entries)}})
+                kube.create("configmap", {**body, "data": {"skus": json.dumps(entries)}})
                 return
             try:
-                entries = _entries(configmap, key, kind)
+                entries = _entries(configmap)
             except KeyError, TypeError, ValueError:
                 entries = {}
             before = json.dumps(entries)
@@ -167,7 +167,7 @@ def _change(kube: Kube, vendor: str, mutate, key: str = "skus", kind: type = dic
                 return
             patch = {
                 "metadata": {"resourceVersion": configmap["metadata"]["resourceVersion"]},
-                "data": {key: json.dumps(entries)},
+                "data": {"skus": json.dumps(entries)},
             }
             try:
                 kube.merge_patch("configmap", name, patch)

@@ -16,7 +16,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
-from k8s_inspector import crd, keeper, launch, pods, publisher, tasks
+from k8s_inspector import crd, keeper, launch, pods, publisher, render, tasks
 from k8s_inspector.kube import Kube, NotFound
 from k8s_inspector.model import (
     BenchmarkRun,
@@ -270,6 +270,20 @@ def _naive(timestamp: str) -> datetime:
     return datetime.fromisoformat(timestamp).replace(tzinfo=None)
 
 
+def fill_reason(task: TaskDef, meta: dict, first_seen: datetime, now: datetime) -> str | None:
+    """Why `task` is due for the newest variant, which first appeared at `first_seen` and has no result of it, on a
+    SKU whose `schedule/<task>/meta.json` is `meta`. The latest attempt (`render.latest_attempt`) decides: one from
+    before `first_seen` says nothing about the new hardware, so the task is filled; a later one is final except
+    for the retries of `due_reason` (`-4`, a start failure, with their `-5` cap). An attempt without `start` is
+    not filled."""
+    attempt = render.latest_attempt(meta)
+    if not attempt.get("start"):
+        return None
+    if _naive(attempt["start"]) < first_seen:
+        return NEW_VARIANT
+    return due_reason(task, attempt, now)
+
+
 def _read_first_seen(reader: FirstSeenReader | None, vendor: str, sku: str, variant: int) -> datetime | None:
     try:
         return reader(vendor, sku, variant) if reader else None
@@ -435,11 +449,10 @@ def plan_cycle(
     which also drops the entries of SKUs Keeper no longer lists, except in a dry run) are skipped.
     When a run's node lands on new hardware, `pick_variant` creates a new variant directory that only gets the
     tasks that ran. So a task Keeper allows that the SKU's newest variant `N` has no `meta.json` for
-    (`variant_reader`) is due too (`NEW_VARIANT`), unless it was attempted since that hardware first appeared:
-    its `schedule/<task>/meta.json` is missing or started before `N`'s `first_seen` (`first_seen_reader`, from
-    `variant.json`; none: no fill for the SKU). An attempt that landed on an older variant still moves the schedule
-    meta past `first_seen`, so it is not repeated; the retry bounds of `due_reason` then apply. The planner cannot
-    choose the hardware.
+    (`variant_reader`) is due too (`NEW_VARIANT`) when its latest attempt on the SKU (`fill_reason`: `last_attempt`
+    of `schedule/<task>/meta.json`, else the meta) started before `N`'s `first_seen` (`first_seen_reader`, from
+    `variant.json`; none: no fill for the SKU). After an attempt since then only the retry bounds of `due_reason`
+    on that attempt apply, wherever it landed. The planner cannot choose the hardware.
     With `dry_run` nothing is created and the first such SKU of each vendor is returned.
 
     Fails closed: when Keeper or git cannot be read the cycle plans nothing (for git: nothing for that vendor)
@@ -533,8 +546,8 @@ def plan_cycle(
                                 _read_first_seen(first_seen_reader, vendor, sku, variant),
                                 True,
                             )
-                        if first_seen and (meta is None or _naive(meta.get("start")) < first_seen):
-                            reason = NEW_VARIANT
+                        if first_seen:
+                            reason = fill_reason(task, meta, first_seen, now)
                 except AttributeError, TypeError, ValueError:  # a damaged meta.json field: unreadable, skip the SKU
                     log.warning("autoPlan skips %s/%s: damaged schedule/%s/meta.json", vendor, sku, task.name)
                     due = None

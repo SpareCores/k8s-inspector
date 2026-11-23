@@ -152,21 +152,27 @@ it is due and the vendor has room. Per vendor:
    GPU), and a SKU whose due tasks are only GPU tasks is not planned.
    A task is also due (`missing from the newest hardware variant`) when the SKU's newest hardware variant, the
    highest-numbered directory `data/<vendor>/<sku>/<N>/` (0 included), has no `<task>/meta.json`, Keeper allows
-   the task, no rule above applies, and the task was not attempted since that hardware appeared: its
-   `schedule/<task>/meta.json` is missing or its `start` is earlier than `first_seen` in `<N>/variant.json`. A node
-   on new hardware makes the publisher create a new variant, which would otherwise hold only the tasks that
-   happened to be due. The planner cannot choose the hardware, so a fill may land on an older variant and leave
-   `N` as it was; its schedule meta is then newer than `first_seen`, which stops the repetition, and only the
-   retry rules above (`-4` backoff, `-5`, the launch backoff) decide from then on. A variant without a readable
-   `first_seen` is not filled (logged at debug level). The state is all in git; nothing is kept in the cluster.
+   the task, no rule above applies, and the task's latest attempt on the SKU started before the hardware
+   appeared: `first_seen` in `<N>/variant.json`. The latest attempt is `last_attempt` of
+   `schedule/<task>/meta.json` ([output contract](output-contract.md#last_attempt)), else the meta itself; a task
+   without a schedule meta is due as never run. A node on new hardware makes the
+   publisher create a new variant, which would otherwise hold only the tasks that happened to be due. The planner
+   cannot choose the hardware, so a fill may land on an older variant, fail or be lost and leave `N` as it was.
+   After an attempt since `first_seen`, only the retry rules above decide, applied to that attempt wherever it
+   landed: `-4` and a command that does not start are retried after their backoff and end as `-5` after three in a
+   row, a permanent launch failure (`LAUNCH_REJECTED`, `BOOT_FAILURE`), a task's own exit code and the other final
+   codes are not repeated, a temporary launch failure leaves nothing in git and is paced by the launch backoff. A
+   variant without a readable `first_seen` is not filled (a missing `variant.json` is logged at debug level, an
+   unreadable `first_seen` at warning level), nor is a task whose latest attempt has no `start`. The state is all
+   in git; nothing is kept in the cluster.
    A SKU waiting in the launch ConfigMap (`next` ahead) or unavailable in SCarpenter's offered-types ConfigMap is
    skipped ([launch retries](../explanation/launch-retries.md), [Offered types](#offered-types)).
 5. The first SKU in that order with at least one due task gets a run with exactly those tasks (not forced:
    Keeper's rules were applied). Then the caps are checked again; below them the next SKU follows.
 
 The git state is read from the publisher's checkout (blobless, sparse: only the `schedule/*/meta.json` files of the
-vendor), under the publisher's lock; the newest variants and their tasks, and `first_seen` of a variant (only when a candidate task is missing from it), are read in separate lock
-sections from the git trees, with no checkout (origin only moves forward, so the two reads cannot contradict each other). If Keeper or git cannot be read, the cycle (or that vendor) plans nothing and
+vendor), under the publisher's lock; the schedule metas, the newest variants with their tasks, and `first_seen` of a variant (only when a candidate task is
+missing from it) are three reads in separate lock sections, the last two from the git trees with no checkout (origin only moves forward, so the two reads cannot contradict each other). If Keeper or git cannot be read, the cycle (or that vendor) plans nothing and
 logs why: the planner never creates runs blindly. `k8s-inspector plan [--dry-run]` runs one cycle in its own
 checkout; with `--dry-run` it creates nothing and prints the first SKU that would start for each vendor.
 

@@ -8,7 +8,7 @@ from datetime import UTC, datetime, timedelta, timezone
 
 import pytest
 
-from k8s_inspector import crd, keeper, launch, planner
+from k8s_inspector import crd, keeper, launch, planner, render
 from k8s_inspector.crd import RunExists, from_dict
 from k8s_inspector.kube import AlreadyExists, NotFound
 from k8s_inspector.model import (
@@ -16,6 +16,7 @@ from k8s_inspector.model import (
     Config,
     Defaults,
     EnvConfig,
+    RunKey,
     RunPhase,
     RunSpec,
     Settings,
@@ -1019,13 +1020,6 @@ def test_a_task_attempted_since_the_variant_appeared_is_not_due_again(kube, quie
     assert plan_variant(kube, variants, first_seen=-HOURS_12)  # the variant appeared after the last attempt
 
 
-@pytest.mark.parametrize("failure", [1, -6, 137, -3, 256])
-def test_a_failed_variant_rerun_does_not_trigger_again(kube, quiet, failure):
-    variants = newest(1, missing=["lscpu"])
-    lscpu = done_meta("lscpu", ago=timedelta(minutes=5), code=failure)
-    assert plan_variant(kube, variants, {"s1": all_done(lscpu=lscpu)}) == []
-
-
 def test_a_variant_without_first_seen_is_not_filled(kube, quiet):
     assert plan_variant(kube, newest(1, missing=["lscpu"]), first_seen=None) == []
 
@@ -1064,17 +1058,131 @@ def test_first_seen_is_read_only_for_a_sku_with_a_candidate_task(kube, quiet):
     assert reads == []
 
 
-@pytest.mark.parametrize("retries,ago,due", [(1, 1, False), (1, 3, True), (2, 7, True), (2, 1, False)])
-def test_due_reason_retries_apply_after_an_attempt(kube, quiet, retries, ago, due):
-    """A -4 attempted after the variant appeared is retried by `due_reason` alone, and -5 is final."""
-    variants = newest(1, missing=["lscpu"])
-    lscpu = done_meta("lscpu", code=-4, error_msg="NODE_LOST", start_retries=retries, ago=timedelta(hours=ago))
-    planned = plan_variant(kube, variants, {"s1": all_done(lscpu=lscpu)}, first_seen=-timedelta(hours=ago + 5))
-    assert bool(planned) is due
-    if planned:
-        assert "retry after exit code -4" in planned[0].reason
-    final = done_meta("lscpu", code=-5, start_retries=3, ago=timedelta(days=3))
-    assert plan_variant(kube, variants, {"s1": all_done(lscpu=final)}, first_seen=-timedelta(days=5)) == []
+# --- end to end: failed fill attempts are published by `render.render_task`, the planner reads the resulting metas
+
+
+class FillScenario:
+    """A SKU whose `lscpu` succeeded on variant 0 long ago, while variant 1 appeared later and lacks it. `attempt`
+    publishes a result of a fill attempt like the publisher does; `plan` plans from the schedule metas it left."""
+
+    FIRST_SEEN = -timedelta(hours=200)
+
+    def __init__(self, tree):
+        self.tree = tree
+        self.task = get_task("lscpu")
+        self.runs = 0
+        self.publish(0, -timedelta(hours=300), 0)
+
+    def publish(self, variant, start, code, error_msg=None):
+        self.runs += 1
+        begin = datetime.now(UTC).replace(tzinfo=None) + start
+        status = {
+            "start": begin.isoformat(),
+            "end": (begin + timedelta(minutes=1)).isoformat(),
+            "exit_code": code,
+            "error_msg": error_msg,
+            "task_hash": task_hash(self.task),
+            "run_id": f"r{self.runs}",
+        }
+        inp = render.RenderInput(RunKey("oci", "s1", datetime(2026, 1, 1).date(), "r"), self.task, "lscpu", status)
+        render.render_task(self.tree, "oci", "s1", variant, inp)
+
+    def attempt(self, ago_hours, code, error_msg=None, variant=None):
+        self.publish(variant, -timedelta(hours=ago_hours), code, error_msg)
+
+    def schedule(self):
+        return json.loads((self.tree / "data" / "oci" / "s1" / "schedule" / "lscpu" / "meta.json").read_text())
+
+    def plan(self, kube):
+        metas = {"s1": all_done(lscpu=self.schedule())}
+        return plan_variant(kube, newest(1, missing=["lscpu"]), metas, first_seen=self.FIRST_SEEN)
+
+
+@pytest.fixture
+def fill(tmp_path):
+    return FillScenario(tmp_path)
+
+
+def test_the_fill_is_due_while_only_the_old_success_exists(kube, quiet, fill):
+    assert [p.tasks for p in fill.plan(kube)] == [("lscpu",)]
+
+
+@pytest.mark.parametrize("variant", [None, 0, 1])
+@pytest.mark.parametrize("ago,due", [(1, False), (3, True)])
+def test_the_first_lost_node_is_retried_after_two_hours(kube, quiet, fill, variant, ago, due):
+    """-4 on no variant, on the old variant 0 or on the new variant 1: the schedule keeps the old success and
+    `last_attempt` carries the failure, so the fill is not due at every cycle."""
+    fill.attempt(ago, -4, "NODE_LOST", variant)
+    assert fill.schedule()["exit_code"] == 0
+    assert fill.schedule()["last_attempt"]["start_retries"] == 1
+    assert bool(fill.plan(kube)) is due
+
+
+@pytest.mark.parametrize("variant", [None, 0, 1])
+def test_three_lost_nodes_in_a_row_end_with_minus_5(kube, quiet, fill, variant):
+    fill.attempt(120, -4, "NODE_LOST", variant)
+    fill.attempt(110, -4, "NODE_LOST", variant)
+    assert fill.schedule()["last_attempt"]["start_retries"] == 2
+    fill.attempt(100, -4, "NODE_LOST", variant)
+    last = fill.schedule()["last_attempt"]
+    assert (last["exit_code"], last["error_msg"], last["start_retries"]) == (-5, "exceeded 3 start retries", 3)
+    assert fill.schedule()["exit_code"] == 0  # the old success stays
+    assert fill.plan(kube) == []
+
+
+@pytest.mark.parametrize("ago,due", [(1, False), (7, True)])
+def test_the_second_lost_node_waits_longer(kube, quiet, fill, ago, due):
+    fill.attempt(ago + 50, -4, "NODE_LOST")
+    fill.attempt(ago, -4, "NODE_LOST")
+    assert bool(fill.plan(kube)) is due
+
+
+@pytest.mark.parametrize(
+    "code,error_msg,variant",
+    [
+        (-1, "SCARPENTER_LAUNCH_REJECTED: not allowed", None),
+        (-1, "SCARPENTER_BOOT_FAILURE: node never registered", None),
+        (137, None, 0),
+        (137, None, 1),
+        (1, None, 0),
+        (-6, None, 1),
+    ],
+)
+def test_final_failures_of_a_fill_attempt_are_not_repeated(kube, quiet, fill, code, error_msg, variant):
+    fill.attempt(5, code, error_msg, variant)
+    assert fill.schedule()["exit_code"] == 0  # a failure never replaces the success
+    assert fill.schedule()["last_attempt"]["exit_code"] == code
+    assert fill.plan(kube) == []
+
+
+def test_a_command_that_does_not_start_is_retried_three_times_then_given_up(kube, quiet, fill):
+    for ago in (120, 110, 100):
+        fill.attempt(ago, 256, "cannot start command: not found")
+    assert fill.schedule()["last_attempt"]["exit_code"] == -5
+    assert fill.plan(kube) == []
+
+
+def test_a_temporary_launch_failure_leaves_nothing_but_the_launch_backoff(kube, quiet, fill):
+    assert fill.plan(kube)  # nothing was published: still due, `launch.deferred` paces it
+    assert fill.schedule()["exit_code"] == 0 and "last_attempt" not in fill.schedule()
+
+
+def test_a_success_after_first_seen_ends_the_fill(kube, quiet, fill):
+    fill.attempt(100, -4, "NODE_LOST")
+    fill.attempt(50, 0, variant=0)  # landed on the old hardware: variant 1 still lacks the task
+    assert "last_attempt" not in fill.schedule()
+    assert fill.plan(kube) == []
+
+
+def test_a_schedule_meta_without_start_blocks_only_its_own_task(kube, quiet):
+    broken = {
+        "end": datetime.now(UTC).replace(tzinfo=None).isoformat(),
+        "exit_code": 0,
+        "task_hash": task_hash(get_task("lscpu")),
+    }
+    metas = {"s1": all_done(lscpu=broken, membench=None)}
+    planned = plan_variant(kube, newest(1, missing=["lscpu", "membench"]), metas)
+    assert [p.tasks for p in planned] == [("membench",)]
 
 
 def test_blocked_and_gpu_tasks_do_not_trigger(kube, keeper_skus):
