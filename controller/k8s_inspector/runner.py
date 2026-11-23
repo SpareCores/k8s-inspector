@@ -794,6 +794,8 @@ class Runner:
             return False  # the entry stays: it counts for the vendor's breaker until a node comes up
         if any(t.state == TaskState.DONE for t in run.status.tasks):
             return False
+        # the run is gone and nothing reached git: a variant fill is due again once the backoff allows
+        launch._change(self.kube, vendor, lambda entries: entries.pop(sku, None), "variants", int)
         log.warning("run %s: %s, launch of %s/%s deferred (failure %d)", run.name, message, vendor, sku, count)
         self._delete_secret(run)
         crd.delete_run(self.kube, run.name)

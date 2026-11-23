@@ -726,6 +726,26 @@ class Publisher:
                 found.setdefault(path.parts[-4], {})[path.parts[-2]] = meta
             return found
 
+    def read_newest_variants(self, vendor: str) -> dict[str, tuple[int, frozenset[str]]]:
+        """`{sku: (N, tasks)}` for the planner: the highest-numbered variant directory `data/<vendor>/<sku>/<N>` of
+        origin/<branch> and the names of the tasks that have a `meta.json` in it. Read from the git trees, no
+        checkout; call it after `read_schedule_metas`, which fetched origin/<branch>."""
+        _safe_part(vendor)
+        with self._lock:
+            listing = self._git("ls-tree", "-r", "--name-only", f"origin/{self._env.git_branch}", f"data/{vendor}/")
+        found: dict[tuple[str, int], set[str]] = {}
+        for line in listing.splitlines():
+            parts = line.split("/")  # data/<vendor>/<sku>/<N>/<task>/meta.json
+            if len(parts) > 3 and parts[3].isdigit():
+                done = found.setdefault((parts[2], int(parts[3])), set())
+                if len(parts) == 6 and parts[5] == "meta.json":
+                    done.add(parts[4])
+        newest: dict[str, tuple[int, frozenset[str]]] = {}
+        for (sku, n), done in found.items():
+            if sku not in newest or n > newest[sku][0]:
+                newest[sku] = (n, frozenset(done))
+        return newest
+
     def _git_names(self, path: str) -> list[str]:
         """Entry names under `path` in origin/<branch> (no checkout needed)."""
         out = self._git("ls-tree", "--name-only", f"origin/{self._env.git_branch}", f"{path}/")

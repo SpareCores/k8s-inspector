@@ -954,3 +954,165 @@ def test_a_forced_run_ignores_the_breaker(kube):
     assert launch.paused(kube, "oci", datetime.now(UTC))
     run = planner.force_run(kube, make_config(), "oci", "s1")
     assert run.spec.force is True
+
+
+# --------------------------------------------------------------------------- a new hardware variant
+
+VARIANT_CONFIGMAP = "k8s-inspector-launch-oci"
+
+
+def newest(n, missing=()):
+    """What `Publisher.read_newest_variants` returns for s1: variant `n` has a meta.json for every default task
+    except `missing`."""
+    return {"s1": (n, frozenset(DEFAULT_TASKS) - set(missing))}
+
+
+def plan_variant(kube, variants, metas=None, **kw):
+    """One cycle with the stressnglongrun task blocked (so only the default tasks are in play); the lease is freed
+    afterwards, as if the run had ended."""
+    metas = {"s1": all_done()} if metas is None else metas
+    try:
+        return planner.plan_cycle(
+            kube, auto_config(), lambda vendor: metas, variant_reader=lambda vendor: variants, **kw
+        )
+    finally:
+        kube.objects.clear()
+
+
+@pytest.fixture
+def quiet(keeper_skus):
+    keeper_skus["oci"]["s1"] = {"stressnglongrun": ["KEEPER_NOT_ALLOWED"]}
+    return keeper_skus
+
+
+def test_a_task_missing_from_the_newest_variant_is_due_once(kube, quiet):
+    planned = plan_variant(kube, newest(1, missing=["lscpu", "membench"]))
+    assert [(p.sku, set(p.tasks)) for p in planned] == [("s1", {"lscpu", "membench"})]
+    assert "missing from the newest hardware variant" in planned[0].reason
+    assert launch.read_variants(kube, "oci") == {"s1": 1}
+    assert plan_variant(kube, newest(1, missing=["lscpu", "membench"])) == []
+
+
+def test_the_tasks_of_a_new_variant_ending_before_lscpu_do_not_trigger(kube, quiet):
+    # the probe tasks end seconds before lscpu, the last of the step: every task has its meta.json in variant 1
+    metas = {"s1": {name: done_meta(name, ago=timedelta(days=1, seconds=i)) for i, name in enumerate(DEFAULT_TASKS)}}
+    assert plan_variant(kube, newest(1), metas) == []
+    assert launch.read_variants(kube, "oci") == {}
+
+
+@pytest.mark.parametrize("failure", [None, 1, -6, 137, -3, 256])
+def test_a_failed_variant_rerun_does_not_trigger_again(kube, quiet, failure):
+    """Whatever the exit code of the rerun, and whether the schedule meta still points at the old success (None)
+    or at the failure: variant 1 still lacks lscpu, and nothing is due again."""
+    variants = newest(1, missing=["lscpu"])
+    assert [p.tasks for p in plan_variant(kube, variants)] == [("lscpu",)]
+    lscpu = done_meta("lscpu", ago=timedelta(0) if failure is None else timedelta(minutes=5), code=failure or 0)
+    assert plan_variant(kube, variants, {"s1": all_done(lscpu=lscpu)}) == []
+
+
+def test_a_rerun_that_landed_on_the_older_variant_does_not_trigger_again(kube, quiet):
+    assert plan_variant(kube, newest(1, missing=["lscpu"]))
+    assert plan_variant(kube, newest(1, missing=["lscpu"])) == []  # variant 0 got the results, 1 stays as it was
+    assert [p.tasks for p in plan_variant(kube, newest(2, missing=["lscpu"]))] == [("lscpu",)]  # a newer one does
+    assert launch.read_variants(kube, "oci") == {"s1": 2}
+
+
+def test_a_record_only_covers_its_own_variant_number(kube, quiet):
+    launch.record_variant(kube, "oci", "s1", 1)
+    assert plan_variant(kube, newest(1, missing=["lscpu"])) == []
+    assert plan_variant(kube, newest(10, missing=["lscpu"]))  # 10 is newer than 1, not older as a string
+    assert plan_variant(kube, newest(3, missing=["lscpu"])) == []  # nor is an older one started again
+
+
+def test_a_minus_4_after_the_variant_rerun_still_escalates_to_minus_5(kube, quiet):
+    launch.record_variant(kube, "oci", "s1", 1)
+    variants = newest(1, missing=["lscpu"])
+
+    def lscpu_due(**fields):
+        metas = {"s1": all_done(lscpu=done_meta("lscpu", code=-4, error_msg="NODE_LOST", **fields))}
+        return [p.tasks for p in plan_variant(kube, variants, metas)]
+
+    assert lscpu_due(start_retries=1, ago=timedelta(hours=1)) == []
+    assert lscpu_due(start_retries=1, ago=timedelta(hours=3)) == [("lscpu",)]
+    assert lscpu_due(start_retries=2, ago=timedelta(hours=7)) == [("lscpu",)]
+    final = {"s1": all_done(lscpu=done_meta("lscpu", code=-5, start_retries=3, ago=timedelta(days=3)))}
+    assert plan_variant(kube, variants, final) == []
+
+
+def test_blocked_and_gpu_tasks_do_not_trigger(kube, keeper_skus):
+    keeper_skus["oci"]["s1"] = {"stressnglongrun": ["x"], "membench": ["KEEPER_X"], "nvidia_smi": ["NO_GPU"]}
+    assert plan_variant(kube, newest(1, missing=["membench", "gpu_facts", "nvbandwidth"])) == []
+    assert launch.read_variants(kube, "oci") == {}
+
+
+def test_a_sku_without_a_variant_or_without_a_reader_has_nothing_to_trigger(kube, quiet):
+    assert plan_variant(kube, {}) == []
+    assert plan(kube, auto_config(), {"s1": all_done()}) == []
+
+
+def test_a_dry_run_records_nothing(kube, quiet):
+    assert plan_variant(kube, newest(1, missing=["lscpu"]), dry_run=True)
+    assert launch.read_variants(kube, "oci") == {}
+
+
+def test_unreadable_variants_or_record_trigger_nothing_but_the_normal_rules_apply(kube, quiet):
+    def broken(vendor):
+        raise RuntimeError("git")
+
+    metas = {"s1": all_done(lscpu=None)}
+    assert planner.plan_cycle(kube, auto_config(), lambda v: {"s1": all_done()}, variant_reader=broken) == []
+    assert [p.tasks for p in planner.plan_cycle(kube, auto_config(), lambda v: metas, variant_reader=broken)] == [
+        ("lscpu",)
+    ]
+    kube.objects.clear()
+    kube.configmaps[VARIANT_CONFIGMAP] = {"data": {"variants": "{damaged", "skus": "{}"}, "metadata": {}}
+    assert plan_variant(kube, newest(1, missing=["lscpu"])) == []
+
+
+def test_the_record_survives_a_restart_and_lives_beside_the_launch_failures(kube, quiet):
+    assert plan_variant(kube, newest(1, missing=["lscpu"]))
+    launch.record_failure(kube, "oci", "s2", "ICE", NOW)
+    launch.node_ready(kube, "oci", "s1")
+    stored = kube.configmaps[VARIANT_CONFIGMAP]["data"]
+    assert json.loads(stored["variants"]) == {"s1": 1} and set(json.loads(stored["skus"])) == {"s2"}
+    # a restarted controller has only the ConfigMap
+    assert plan_variant(kube, newest(1, missing=["lscpu"]), keeper_cache=planner.KeeperCache()) == []
+
+
+def test_a_temporary_launch_failure_clears_the_record_and_the_backoff_paces_the_retrigger(kube, quiet):
+    variants = newest(1, missing=["lscpu"])
+    assert plan_variant(kube, variants)
+    assert launch.read_variants(kube, "oci") == {"s1": 1}
+    # what the runner does when the run's launch fails with ICE: count the failure, drop the record
+    launch.record_failure(kube, "oci", "s1", "ICE", datetime.now(UTC))
+    launch._change(kube, "oci", lambda entries: entries.pop("s1", None), "variants", int)
+    assert launch.read_variants(kube, "oci") == {}
+    assert plan_variant(kube, variants) == []  # the backoff holds
+    launch.record_failure(kube, "oci", "s1", "ICE", datetime.now(UTC) - timedelta(days=1))  # it has elapsed
+    assert [p.tasks for p in plan_variant(kube, variants)] == [("lscpu",)]
+    assert launch.read_variants(kube, "oci") == {"s1": 1}
+
+
+def test_a_failed_record_write_neither_loops_nor_breaks_the_run(kube, quiet, monkeypatch):
+    launch.record_failure(kube, "oci", "s2", "ICE", NOW.replace(tzinfo=UTC))  # the ConfigMap exists: writes patch it
+
+    patch = kube.merge_patch
+
+    def refuse(kind, name, body, subresource_status=False):
+        if kind == "configmap":
+            raise RuntimeError("API down")
+        return patch(kind, name, body, subresource_status)
+
+    monkeypatch.setattr(kube, "merge_patch", refuse)
+    variants = newest(1, missing=["lscpu"])
+    planned = [
+        p.tasks
+        for p in planner.plan_cycle(
+            kube, auto_config(), lambda v: {"s1": all_done()}, variant_reader=lambda v: variants
+        )
+    ]
+    assert planned == [("lscpu",)] and len(kube.list("benchmarkrun")) == 1  # the run exists
+    assert launch.read_variants(kube, "oci") == {}  # unrecorded: the lease holds it while the run lives
+    assert (
+        planner.plan_cycle(kube, auto_config(), lambda v: {"s1": all_done()}, variant_reader=lambda v: variants) == []
+    )

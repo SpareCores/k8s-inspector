@@ -196,7 +196,7 @@ what is left.
 | CRD `benchmarkruns.inspector.sparecores.com` | shipped in this repository's deployment manifests |
 | ConfigMap `k8s-inspector` | settings ([configuration](configuration.md)) |
 | ConfigMap `k8s-inspector-spot` | per-SKU interruption counts ([spot](../explanation/spot.md)) |
-| ConfigMap `k8s-inspector-launch-<vendor>` | launch failures per SKU, `skus` = JSON `{sku: {reason, since, count, next}}` ([launch retries](../explanation/launch-retries.md)) |
+| ConfigMap `k8s-inspector-launch-<vendor>` | launch failures per SKU, `skus` = JSON `{sku: {reason, since, count, next}}`, `variants` = JSON `{sku: N}` ([launch retries](../explanation/launch-retries.md)) |
 | Secret `inspector-secrets` | benchmark secrets (External Secrets) |
 | Jobs `dbaas-up-<run>`, `dbaas-down-<run>` | DBaaS provisioning ([DBaaS](../explanation/dbaas.md)) |
 | PriorityClass `benchmark` | value `-10`, `preemptionPolicy: Never`, not the global default; shipped in `deploy/` |
