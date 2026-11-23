@@ -48,6 +48,10 @@ DBaaS tasks follow the same rules (no endless retry).
 record the kubelet's waiting message as `error_msg` (not `IMAGE_PULL_TIMEOUT`), and unlike a stuck pull they get no
 CPU fallback.
 
+A step Pod with its own network namespace (`host_network: false`: `redis`, `static_web`) needs the CNI to create its
+sandbox. When the CNI is down on the node, the Pod stays in `ContainerCreating`, so it is reported as
+`IMAGE_PULL_TIMEOUT` after `imagePullMinutes`, although no image pull is involved.
+
 Where the controller gets the facts: `sc-run`'s `result.json` and termination message (exit code, timeout, OOM),
 container state and reason, Pod `DeadlineExceeded`, NodeClaim conditions and Events (capacity errors), the anchor's
 presence (node loss).

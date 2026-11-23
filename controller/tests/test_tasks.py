@@ -167,6 +167,9 @@ def test_image_ref(tmp_path):
         ("{name: a, image: i, command: c, timeout: 1m, transforms: [nope]}", "unknown transform"),
         ("{name: a, command: c, timeout: 1m}", "image or images"),
         ("{name: a, image: i, command: c}", "timeout is required"),
+        ("{name: a, image: i, command: c, timeout: 1m, host_network: 'false'}", "host_network must be true or false"),
+        ("{name: a, image: i, command: c, timeout: 1m, host_network: 0}", "host_network must be true or false"),
+        ("{name: a, image: i, command: c, timeout: 1m, host_network: false, parallel: true}", "combined with parallel"),
     ],
 )
 def test_load_catalogue_validation(tmp_path, yaml_text, message):

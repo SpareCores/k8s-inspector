@@ -35,7 +35,12 @@ hostNetwork Pods get nothing. `spec.instanceMetadata.access: Open` on an SCNodeC
 
 On the bench NodeClass the setting is `Open` (decision K17): the resource tracker inside every benchmark image detects
 the cloud through the metadata service, and a privileged container could read the node's disk anyway, so a restriction
-would protect nothing there. All other NodeClasses keep the default. Later the controller can pass the cloud facts to
+would protect nothing there. All other NodeClasses keep the default.
+
+On AWS the bench NodeClass also sets the IMDS hop limit to 2 (`httpTokens` stays `required`, IMDSv2 only). SCarpenter's
+default hop limit is 1, which drops the token reply at the veth hop of a Pod with its own network namespace, so the
+tasks with `host_network: false` ([loopback tasks](node-profile.md#loopback-tasks)) could not detect the cloud. A node
+started before the setting keeps hop limit 1 (the bench pool does not replace drifted nodes). Later the controller can pass the cloud facts to
 the tracker as environment variables, and bench nodes can return to the default.
 
 The node's tailnet credential is the remaining sensitive item on a bench node. Mitigations: a tailnet ACL tag that

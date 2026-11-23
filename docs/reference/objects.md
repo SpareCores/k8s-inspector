@@ -78,7 +78,7 @@ spec:
   priorityClassName: benchmark
   automountServiceAccountToken: false
   enableServiceLinks: false
-  hostNetwork: true
+  hostNetwork: true                      # false for tasks with `host_network: false` (redis, static_web), see node-profile.md#loopback-tasks
   dnsPolicy: Default
   nodeSelector: {karpenter.sh/nodepool: bench, scarpenter.sparecores.com/vendor: oci, scarpenter.sparecores.com/api-reference: VM.Standard.E5.Flex.2-16}
   affinity: {nodeAffinity: {requiredDuringSchedulingIgnoredDuringExecution: {nodeSelectorTerms: [{matchExpressions:

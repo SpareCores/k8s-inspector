@@ -15,7 +15,7 @@ disk is decided in P6. k8s-inspector only selects the pool by name.
 | Image garbage collection | kubelet defaults | replaces Docker's prune between task groups |
 | Root disk | 128 GiB (256 GiB for GPU, see above) (decision K21) | images, the llm model, the spool |
 | Local instance storage | `ignore` (left raw) | the storage benchmark measures raw disks |
-| Instance metadata | `Open` ([security](security.md#instance-metadata-imds)) | resource tracker cloud detection |
+| Instance metadata | `Open`; on AWS also hop limit 2, `httpTokens: required` ([security](security.md#instance-metadata-imds)) | resource tracker cloud detection, also from a Pod's own network namespace (hop limit 2 on AWS) |
 | Butane | mask `docker.socket`, `systemd-sysupdate*`, `systemd-oomd`, the SSH key fetch units; stop vendor agents after Ready | less background noise |
 | Billing retention | off | a node is never reused |
 | NodePool `bench` | taint `frankenscube/bench=true:NoSchedule`, label `frankenscube/pool=bench`, `WhenEmpty`, `consolidateAfter: 0s`, `expireAfter: 48h`, `terminationGracePeriod: 1h`, no `limits` (every instance type of every vendor must be benchmarkable; the controller bounds running instances with `maxInFlight`), node repair off | dedicated, short-lived |
@@ -96,6 +96,13 @@ network namespace every loopback packet passes the netfilter hooks that kube-pro
 A Pod's own namespace has none of them, so these two tasks set `host_network: false` in the catalogue
 (`hostNetwork: false`, `dnsPolicy: Default`, outbound traffic still works through flannel, the benchmark traffic itself
 stays on the Pod's `lo`). The step Pod is otherwise unchanged: `privileged`, `seccompProfile: Unconfined`, requests only.
+
+Consequences of the Pod's own namespace for these tasks:
+
+- The resource tracker reports the Pod's name and IP as the host identity (not the node's hostname and address) and sees
+  only the Pod's `eth0` in its network metrics, not the node's interfaces.
+- On AWS the metadata service is two hops away, so the bench NodeClass sets the IMDS hop limit to 2
+  ([security](security.md#instance-metadata-imds)).
 
 Measured on one Azure `Standard_D2ds_v5` (Xeon 8370C, 2 vCPU) node, median of 3 runs each, same image digests and
 commands as the catalogue. The legacy row is the Ubuntu VM result of the same SKU (2024-09):
