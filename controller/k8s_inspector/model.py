@@ -241,12 +241,6 @@ class LaunchFailure:
     node_claim: str
     message: str
     time: datetime
-    # Where the claim was meant to land, from its labels; None when unknown (a claim Karpenter deleted at once is
-    # only in an Event, which names none of them).
-    vendor: str | None = None
-    region: str | None = None
-    zone: str | None = None
-    capacity_type: str | None = None
 
 
 @dataclass

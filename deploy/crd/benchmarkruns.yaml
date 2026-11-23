@@ -139,10 +139,6 @@ spec:
                     nodeClaim: {type: string}
                     message: {type: string}
                     time: {type: string, format: date-time}
-                    vendor: {type: string}
-                    region: {type: string}
-                    zone: {type: string}
-                    capacityType: {type: string}
               spotReclaims: {type: integer}
               uninitializedClaims:
                 type: array

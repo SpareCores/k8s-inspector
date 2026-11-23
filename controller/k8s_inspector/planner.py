@@ -371,10 +371,16 @@ def offered_retry_at(kube: Kube, cfg: Config, vendor: str, sku: str, now: dateti
     return offered[0].get(sku, {}).get("retry_at") if offered else None
 
 
-def is_offered(kube: Kube, cfg: Config, vendor: str, sku: str, now: datetime | None = None) -> bool:
-    """SCarpenter lists the SKU as available. False when the listing cannot be read or the SKU is not in it."""
+def is_offered(
+    kube: Kube, cfg: Config, vendor: str, sku: str, on_demand_only: bool, now: datetime | None = None
+) -> bool:
+    """SCarpenter lists the SKU as available (with `on-demand` among its capacity types when `on_demand_only`).
+    False when the listing cannot be read or the SKU is not in it."""
     offered = read_offered(kube, cfg, vendor, now)
-    return bool(offered and offered[0].get(sku, {}).get("available"))
+    entry = offered[0].get(sku) if offered else None
+    return bool(
+        entry and entry["available"] and (not on_demand_only or CapacityType.ON_DEMAND in entry["capacityTypes"])
+    )
 
 
 def not_offered(kube: Kube, cfg: Config, vendor: str, skus: list[str]) -> dict[str, str]:

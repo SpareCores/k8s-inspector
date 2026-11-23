@@ -153,12 +153,6 @@ def _task_from_dict(d: dict) -> TaskStatus:
     )
 
 
-def _launch_failure_to_dict(f: LaunchFailure) -> dict:
-    d = {"nodeClaim": f.node_claim, "message": f.message, "time": _format_time(f.time)}
-    optional = {"vendor": f.vendor, "region": f.region, "zone": f.zone, "capacityType": f.capacity_type}
-    return d | {key: value for key, value in optional.items() if value}  # the schema has no nulls
-
-
 def _attempt_from_dict(d: dict) -> AttemptStatus:
     outcome = d.get("outcome")
     return AttemptStatus(
@@ -190,15 +184,7 @@ def _status_from_dict(d: dict) -> RunStatus:
         tasks=[_task_from_dict(t) for t in d.get("tasks") or []],
         attempts=[_attempt_from_dict(a) for a in d.get("attempts") or []],
         launch_failures=[
-            LaunchFailure(
-                f["nodeClaim"],
-                f.get("message", ""),
-                _parse_time(f.get("time")),
-                f.get("vendor"),
-                f.get("region"),
-                f.get("zone"),
-                f.get("capacityType"),
-            )
+            LaunchFailure(f["nodeClaim"], f.get("message", ""), _parse_time(f.get("time")))
             for f in d.get("launchFailures") or []
         ],
         uninitialized_claims=[
@@ -288,7 +274,10 @@ def status_to_dict(status: RunStatus) -> dict:
         "variant": status.variant,
         "tasks": [_task_to_dict(t) for t in status.tasks],
         "attempts": [_attempt_to_dict(a) for a in status.attempts],
-        "launchFailures": [_launch_failure_to_dict(f) for f in status.launch_failures],
+        "launchFailures": [
+            {"nodeClaim": f.node_claim, "message": f.message, "time": _format_time(f.time)}
+            for f in status.launch_failures
+        ],
         "uninitializedClaims": [
             {"nodeClaim": c.node_claim, "launched": _format_time(c.launched), "capacityType": c.capacity_type}
             for c in status.uninitialized_claims

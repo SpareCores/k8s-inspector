@@ -2569,7 +2569,7 @@ def test_a_temporary_launch_failure_drops_the_variant_record(h):
     assert launch.read_variants(h.kube, "oci") == {"other": 2}
 
 
-def _offer(h, available: bool, until: timedelta | None = None) -> None:
+def _offer(h, available: bool, until: timedelta | None = None, capacity_types=("on-demand",)) -> None:
     """SCarpenter's offered-types ConfigMap for the SKU, with one offering (marked until `until` when unavailable)."""
     offering = {"capacityType": "on-demand", "zones": ["z1"], "available": available}
     if until is not None:
@@ -2577,7 +2577,7 @@ def _offer(h, available: bool, until: timedelta | None = None) -> None:
     entry = {
         "apiReference": "VM.Standard.E5.Flex.2-16",
         "available": available,
-        "capacityTypes": ["on-demand"] if available else [],
+        "capacityTypes": list(capacity_types) if available else [],
         "offerings": [offering],
     }
     document = {"generatedAt": h.clock.now.isoformat(), "types": {"oci.x": entry}}
@@ -2623,20 +2623,6 @@ def test_ice_launch_failures_end_with_the_provision_budget_while_the_sku_is_offe
     assert h.kube.list("benchmarkrun") == [] and h.entry()["reason"] == "ICE"
 
 
-def test_a_launch_failure_records_where_its_claim_was_headed(h):
-    h.cluster.provision_enabled = False
-    h.start(["geekbench"], capacity=CapacityMode.ON_DEMAND)
-    h.runner.reconcile(h.name)
-    _launch_failed(h, "bench-aaaaa", "InsufficientCapacity (X): none")
-    labels = h.kube.objects["nodeclaim"]["bench-aaaaa"]["metadata"]["labels"]
-    labels |= {"topology.kubernetes.io/region": "eu-1", "topology.kubernetes.io/zone": "eu-1a"}
-    labels["karpenter.sh/capacity-type"] = "spot"
-    h.runner.reconcile(h.name)
-    failure = h.run.status.launch_failures[0]
-    assert (failure.vendor, failure.region, failure.zone, failure.capacity_type) == ("oci", "eu-1", "eu-1a", "spot")
-    assert crd._status_from_dict(crd.status_to_dict(h.run.status)).launch_failures == [failure]
-
-
 def test_no_offering_waits_until_the_first_offering_opens(h):
     _offer(h, available=False, until=timedelta(hours=3))
     h.cluster.provision_enabled = False
@@ -2644,3 +2630,41 @@ def test_no_offering_waits_until_the_first_offering_opens(h):
     h.runner.reconcile(h.name)
     h.runner._fail_run(h.run, "SCARPENTER_NO_OFFERING: nothing")
     assert datetime.fromisoformat(h.entry()["next"]) == h.clock.now + timedelta(hours=3)
+
+
+def test_no_offering_waits_at_least_an_hour_and_ignores_a_past_retry(h):
+    h.cluster.provision_enabled = False
+    h.start(["geekbench"])
+    h.runner.reconcile(h.name)
+    _offer(h, available=False, until=timedelta(minutes=5))
+    h.runner._fail_run(h.run, "SCARPENTER_NO_OFFERING: nothing")
+    assert datetime.fromisoformat(h.entry()["next"]) == h.clock.now + timedelta(hours=1)
+    _offer(h, available=False, until=-timedelta(minutes=5))
+    h.start(["geekbench"], sku="other")
+    h.runner.reconcile(h.name)
+    h.runner._fail_run(h.run, "SCARPENTER_NO_OFFERING: nothing")
+    assert datetime.fromisoformat(h.entry("other")["next"]) == h.clock.now + timedelta(hours=24)
+
+
+def test_ice_events_beyond_the_old_window_stay_stable_and_the_cap_ends_the_run(h):
+    _offer(h, available=True)
+    _provisioning_without_nodes(h, capacity=CapacityMode.ON_DEMAND)
+    for n in range(7):
+        _ice_event(h, f"bench-{n}", lastTimestamp=iso(h.clock.now + timedelta(seconds=n)))
+    h.runner.reconcile(h.name)
+    before = [f.node_claim for f in h.run.status.launch_failures]
+    assert len(before) == 7
+    for _ in range(3):
+        h.runner.reconcile(h.name)
+    assert [f.node_claim for f in h.run.status.launch_failures] == before
+    for n in range(7, 20):
+        _ice_event(h, f"bench-{n}", lastTimestamp=iso(h.clock.now + timedelta(seconds=n)))
+    h.runner.reconcile(h.name)
+    assert h.kube.list("benchmarkrun") == [] and h.entry()["reason"] == "ICE"
+
+
+def test_ice_failures_of_an_on_demand_attempt_need_an_on_demand_offering(h):
+    _offer(h, available=True, capacity_types=("spot",))
+    _two_ice_failures(h)
+    h.runner.reconcile(h.name)
+    assert h.kube.list("benchmarkrun") == []
