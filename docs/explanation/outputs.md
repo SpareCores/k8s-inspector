@@ -129,22 +129,28 @@ the lease about twice `keepRunHours` after its end.
      and a success replaces anything.
    - **Transforms and parsers run only for tasks with exit code 0**; `stdout` and `stderr` are written for every
      exit code except the harness error `256` and `-4`/`-5`.
+   - **DBaaS results** (`dbaas/...`, no variant, no schedule) follow the same rule: a failure of any hash, `-4`
+     and `-5` included, never replaces an exit code 0 result, because sc-crawler reads the DBaaS `stdout` without
+     the exit code.
    - **`-4` and `-5` are not results**: the task never finished, so its output is partial. They go to
      `schedule/<task>/meta.json` only (the planner reads nothing else from git, and `start_retries` is counted there),
      without `stdout`/`stderr`, and never touch a variant dir.
    - **`stdout_bytes`/`stderr_bytes`** are the sizes of the files written (`null` when the file is not written), so
      they agree with `outputs`.
    - **A new result replaces the old one completely**: files of the task dir that the new result does not write (a
-     `parsed.csv` of an earlier success, a stale `stdout`) are removed. A result that is not rendered (the previous
+     `parsed.csv` of an earlier success, a stale `stdout`) are removed. A new success without parsed output (the
+     parser's input stream is empty) therefore removes the old `parsed.*`. A result that is not rendered (the previous
      rule) leaves the old files with the old `meta.json`.
-   - **`error_msg` is public**: URLs become `<url>`, UUIDs (subscription, tenant IDs), OCIDs, AWS ARNs and 12-digit
-     account numbers become `<id>`, and a message over 200 characters keeps its start (the reason code) and its end.
+   - **`error_msg` is public**: URLs become `<url>`; UUIDs (subscription, tenant IDs), OCIDs, AWS ARNs, Azure
+     resource IDs (`/subscriptions/...`) and the number after "account" become `<id>`; GCP `projects/<name>` becomes
+     `projects/<id>`. A message over 200 characters (separator included) keeps its start (the reason code) and its end.
      `status.json` in object storage keeps the original.
    - **A command that did not start** (sc-run's `256` with `cannot start command: ...`) is published as `-1` with the
-     message in `error_msg`; the planner retries a `-1` after its wait. Other `256` stay `256`.
+     message in `error_msg`; the planner retries a `-1` after its wait. Such start failures count in `start_retries` like
+     a `-4`, so the third in a row becomes `-5` and the retries stop. Other `256` stay `256`.
    - **`-5`** is created here, not by the runner: the runner records `-4`, and the publisher, which sees the
-     previous `meta.json` in git, counts consecutive `-4` of the same task hash in `start_retries` and writes the
-     third as `-5` ([exit codes](../reference/exit-codes.md)). Any other exit code, or a changed hash, resets the
+     previous `meta.json` in git, counts consecutive `-4` and start-failure `-1` of the same task hash in `start_retries` and
+     writes the third as `-5` ([exit codes](../reference/exit-codes.md)). Any other exit code, or a changed hash, resets the
      count.
    - A SKU is published only when its vendor is enabled with `publish: true` or a list that names it
      ([configuration](../reference/configuration.md)); the runs of other SKUs are deleted after `keepRunHours`, their

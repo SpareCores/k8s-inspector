@@ -397,6 +397,64 @@ def test_start_retries_reset_on_a_changed_hash_and_on_other_failures(tmp_path):
     assert attempt(5, task_hash="new") == 1  # not carried over the failure
 
 
+def test_four_start_failures_in_a_row_end_in_minus_five(tmp_path):
+    message = "cannot start command: fork/exec /usr/local/bin/x: no such file or directory"
+
+    def attempt(n: int) -> dict:
+        inp = plain_input(exit_code=256, start=f"2026-10-0{n}T10:00:00", run_id=f"r{n}", error_msg=message)
+        render.render_task(tmp_path, "hcloud", "cax31", 0, inp)
+        return sched_meta(tmp_path)
+
+    first = attempt(1)
+    assert (first["exit_code"], first["start_retries"], first["error_msg"]) == (-1, 1, message)
+    assert (attempt(2)["exit_code"], attempt(2)["start_retries"]) == (-1, 2)
+    third = attempt(3)
+    assert (third["exit_code"], third["start_retries"], third["error_msg"]) == (-5, 3, "exceeded 3 start retries")
+    fourth = attempt(4)
+    assert (fourth["exit_code"], fourth["start_retries"]) == (-5, 4)
+
+
+def test_other_minus_one_is_not_a_start_retry(tmp_path):
+    for n in (1, 2, 3):
+        inp = plain_input(exit_code=-1, start=f"2026-10-0{n}T10:00:00", run_id=f"r{n}", error_msg="SCARPENTER_ICE: x")
+        render.render_task(tmp_path, "hcloud", "cax31", None, inp)
+    assert (sched_meta(tmp_path)["exit_code"], sched_meta(tmp_path)["start_retries"]) == (-1, 0)
+
+
+def test_changed_hash_then_minus_four_three_times_leaves_the_old_good_result(tmp_path):
+    render.render_task(tmp_path, "hcloud", "cax31", 0, plain_input(start="2026-10-01T10:00:00", stdout=b"good"))
+    seen = []
+    for n in (2, 3, 4):
+        inp = plain_input(exit_code=-4, start=f"2026-10-0{n}T10:00:00", run_id=f"r{n}", task_hash="new")
+        render.render_task(tmp_path, "hcloud", "cax31", 0, inp)
+        seen.append((sched_meta(tmp_path)["exit_code"], sched_meta(tmp_path)["start_retries"]))
+    assert seen == [(-4, 1), (-4, 2), (-5, 3)]
+    assert tree_file(tmp_path, "lscpu", "stdout").read_bytes() == b"good"
+    assert read_meta(tmp_path, "lscpu")["task_hash"] == "h" and read_meta(tmp_path, "lscpu")["exit_code"] == 0
+
+
+def test_schedule_picks_the_newest_meta_by_end(tmp_path):
+    older_end = plain_input(start="2026-10-03T10:00:00", end="2026-10-03T10:05:00", run_id="r1")
+    newer_end = plain_input(start="2026-10-01T10:00:00", end="2026-10-05T10:05:00", run_id="r2")
+    render.render_task(tmp_path, "hcloud", "cax31", 0, older_end)
+    render.render_task(tmp_path, "hcloud", "cax31", 1, newer_end)
+    assert sched_meta(tmp_path)["run_id"] == "r2"
+    render.render_task(tmp_path, "hcloud", "cax31", 0, older_end)  # a re-render does not flip the pick
+    assert sched_meta(tmp_path)["run_id"] == "r2"
+
+
+def test_success_without_parsed_output_removes_the_old_parsed_file(tmp_path):
+    stress_root = FIXTURES / "stressnglongrun_t4g" / "0"
+    task = task_def("stressnglongrun", parse="stressnglongrun")
+    render.render_task(tmp_path, "hcloud", "cax31", 0, golden_input("stressnglongrun", task, stress_root))
+    assert tree_file(tmp_path, "stressnglongrun", "parsed.csv").exists()
+    degraded = golden_input("stressnglongrun", task, stress_root, start="2099-01-01T00:00:00")
+    degraded.stderr = b""  # the parser has nothing to read
+    render.render_task(tmp_path, "hcloud", "cax31", 0, degraded)
+    assert not tree_file(tmp_path, "stressnglongrun", "parsed.csv").exists()
+    assert read_meta(tmp_path, "stressnglongrun")["exit_code"] == 0
+
+
 def test_failing_parser_leaves_the_tree_untouched(tmp_path):
     inp = plain_input("stressnglongrun", stdout=b"x", stderr=b"not yaml")
     inp.stderr = b"not yaml"
@@ -534,7 +592,32 @@ def test_redact_error_msg_leaves_plain_messages_and_none_alone():
 def test_redact_error_msg_truncation_keeps_the_start_code_and_the_end():
     message = "SCARPENTER_BOOT_FAILURE: " + "a" * 500 + " the real reason"
     out = render.redact_error_msg(message, limit=100)
-    assert out.startswith("SCARPENTER_BOOT_FAILURE: ") and out.endswith("the real reason") and len(out) <= 105
+    assert out.startswith("SCARPENTER_BOOT_FAILURE: ") and out.endswith("the real reason") and len(out) == 100
+    assert len(render.redact_error_msg("x" * 1000)) == render.ERROR_MSG_MAX
+    assert render.redact_error_msg("x" * 200) == "x" * 200
+
+
+def test_redact_error_msg_azure_resource_ids_without_a_url():
+    uuid = "12345678-90ab-cdef-1234-567890abcdef"
+    message = f"ResourceNotFound: '/subscriptions/{uuid}/resourceGroups/rg/providers/Microsoft.Compute/vm/x' failed"
+    assert render.redact_error_msg(message) == "ResourceNotFound: '<id>' failed"
+    assert render.redact_error_msg("bad /subscriptions/abc/resourceGroups/rg done") == "bad <id> done"
+
+
+def test_redact_error_msg_gcp_project_paths():
+    message = "PERMISSION_DENIED on projects/my-project-123/zones/europe-west1-b/instances/x"
+    assert render.redact_error_msg(message) == "PERMISSION_DENIED on projects/<id>/zones/europe-west1-b/instances/x"
+
+
+def test_redact_error_msg_keeps_byte_counts_and_redacts_account_numbers():
+    assert render.redact_error_msg("cannot allocate 137438953472 bytes") == "cannot allocate 137438953472 bytes"
+    assert render.redact_error_msg("denied for account 123456789012.") == "denied for account <id>."
+    assert render.redact_error_msg("denied for arn:aws:iam::123456789012:role/x") == "denied for <id>"
+
+
+def test_redact_error_msg_url_keeps_quotes_and_colons():
+    message = "GET 'https://a.example.com/x?y=1' failed: \"https://b.example.com\": timeout"
+    assert render.redact_error_msg(message) == "GET '<url>' failed: \"<url>\": timeout"
 
 
 def test_published_meta_is_redacted(tmp_path):
@@ -556,3 +639,15 @@ def test_dbaas_failure_does_not_replace_a_good_result_and_minus_four_has_no_outp
     other = tmp_path / "other"
     render.render_dbaas_task(other, db, failed)
     assert not (other / "dbaas/ovh/pg/postgres/18/standalone" / task / "stdout").exists()
+
+
+@pytest.mark.parametrize("exit_code", [-4, -5, 1, 137, 256])
+def test_dbaas_failure_with_a_changed_hash_does_not_replace_a_good_result(tmp_path, exit_code):
+    db = {"vendor": "ovh", "id": "pg", "engineVersion": 18}
+    task = "pgbench_postgres_dbaas_ro_durable"
+    render.render_dbaas_task(tmp_path, db, plain_input(task, stdout=b"good"))
+    base = tmp_path / "dbaas/ovh/pg/postgres/18/standalone" / task
+    before = (base / "meta.json").read_text()
+    failed = plain_input(task, exit_code=exit_code, start="2026-10-02T10:00:00", run_id="r2", task_hash="new")
+    assert render.render_dbaas_task(tmp_path, db, failed) == []
+    assert (base / "stdout").read_bytes() == b"good" and (base / "meta.json").read_text() == before
