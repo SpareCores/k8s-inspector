@@ -2623,29 +2623,6 @@ def test_ice_launch_failures_end_with_the_provision_budget_while_the_sku_is_offe
     assert h.kube.list("benchmarkrun") == [] and h.entry()["reason"] == "ICE"
 
 
-def test_no_offering_waits_until_the_first_offering_opens(h):
-    _offer(h, available=False, until=timedelta(hours=3))
-    h.cluster.provision_enabled = False
-    h.start(["geekbench"])
-    h.runner.reconcile(h.name)
-    h.runner._fail_run(h.run, "SCARPENTER_NO_OFFERING: nothing")
-    assert datetime.fromisoformat(h.entry()["next"]) == h.clock.now + timedelta(hours=3)
-
-
-def test_no_offering_waits_at_least_an_hour_and_ignores_a_past_retry(h):
-    h.cluster.provision_enabled = False
-    h.start(["geekbench"])
-    h.runner.reconcile(h.name)
-    _offer(h, available=False, until=timedelta(minutes=5))
-    h.runner._fail_run(h.run, "SCARPENTER_NO_OFFERING: nothing")
-    assert datetime.fromisoformat(h.entry()["next"]) == h.clock.now + timedelta(hours=1)
-    _offer(h, available=False, until=-timedelta(minutes=5))
-    h.start(["geekbench"], sku="other")
-    h.runner.reconcile(h.name)
-    h.runner._fail_run(h.run, "SCARPENTER_NO_OFFERING: nothing")
-    assert datetime.fromisoformat(h.entry("other")["next"]) == h.clock.now + timedelta(hours=24)
-
-
 def test_ice_events_beyond_the_old_window_stay_stable_and_the_cap_ends_the_run(h):
     _offer(h, available=True)
     _provisioning_without_nodes(h, capacity=CapacityMode.ON_DEMAND)
@@ -2668,3 +2645,28 @@ def test_ice_failures_of_an_on_demand_attempt_need_an_on_demand_offering(h):
     _two_ice_failures(h)
     h.runner.reconcile(h.name)
     assert h.kube.list("benchmarkrun") == []
+
+
+@pytest.mark.parametrize(
+    "tail", [NO_QUOTA, NO_CANDIDATE, ICE_TAIL.format("Unsupported (InvalidFlavor): flavor not found")]
+)
+def test_ice_failures_without_a_capacity_class_stop_at_the_cap_of_two(h, tail):
+    _offer(h, available=True)
+    _provisioning_without_nodes(h, capacity=CapacityMode.ON_DEMAND)
+    for claim in ("bench-aaaaa", "bench-bbbbb"):
+        _ice_event(h, claim, tail)
+    h.runner.reconcile(h.name)
+    assert h.kube.list("benchmarkrun") == []
+
+
+def test_ice_failures_with_an_unschedulable_anchor_are_not_a_missing_offering(h):
+    _offer(h, available=True)
+    _provisioning_without_nodes(h, capacity=CapacityMode.ON_DEMAND)
+    anchor = h.kube.get("pod", f"{h.name}-a1")
+    anchor["status"]["conditions"] = [{"type": "PodScheduled", "status": "False", "message": "0/3 nodes"}]
+    h.kube.objects["pod"][f"{h.name}-a1"] = anchor
+    _ice_event(h, "bench-aaaaa", lastTimestamp=iso(h.clock.now))
+    h.runner.reconcile(h.name)
+    h.clock.advance(minutes=20)
+    h.runner.reconcile(h.name)
+    assert h.run.status.phase == RunPhase.PROVISIONING

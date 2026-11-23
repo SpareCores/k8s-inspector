@@ -1118,17 +1118,6 @@ def test_a_failed_record_write_neither_loops_nor_breaks_the_run(kube, quiet, mon
     )
 
 
-def test_offered_retry_at_is_the_earliest_until_when_every_offering_is_marked(kube):
-    cfg = make_config()
-    publish_offered(kube, offered_configmap({"s1": MARKED}))
-    assert planner.offered_retry_at(kube, cfg, "oci", "s1") == datetime(2026, 11, 21, 10, 5, tzinfo=UTC)
-    open_offering = {"capacityType": "spot", "zones": ["z"], "available": True}
-    no_end = {"capacityType": "spot", "zones": ["z"], "available": False}
-    for extra in (open_offering, no_end, {**no_end, "until": "tomorrow"}):
-        publish_offered(kube, offered_configmap({"s1": {**MARKED, "offerings": [*MARKED["offerings"], extra]}}))
-        assert planner.offered_retry_at(kube, cfg, "oci", "s1") is None
-
-
 def test_is_offered_needs_an_available_listing_of_the_sku(kube):
     cfg = make_config()
     assert not planner.is_offered(kube, cfg, "oci", "s1", False)  # no ConfigMap

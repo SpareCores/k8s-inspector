@@ -790,13 +790,9 @@ class Runner:
             return False
         if reason not in launch.REASONS or run.spec.force:  # a forced run is the operator's: it records its result
             return False
-        until = None
-        if reason == "DAILY_LIMIT":
-            until = planner.offered_until(self.kube, self._cfg(), vendor, sku, self._now())
-        elif reason == "NO_OFFERING":  # every offering is marked: wait for the first to open, not a flat 24 h
-            retry_at = planner.offered_retry_at(self.kube, self._cfg(), vendor, sku, self._now())
-            if retry_at and retry_at > self._now():  # a past one keeps the flat wait
-                until = max(retry_at, self._now() + timedelta(hours=1))
+        until = (
+            planner.offered_until(self.kube, self._cfg(), vendor, sku, self._now()) if reason == "DAILY_LIMIT" else None
+        )
         count = launch.record_failure(self.kube, vendor, sku, reason, self._now(), until)
         if reason == "BOOT_FAILURE" and count >= launch.BOOT_FAILURE_LIMIT:
             return False  # the entry stays: it counts for the vendor's breaker until a node comes up
@@ -943,7 +939,12 @@ class Runner:
             else timedelta(minutes=cfg.settings.deadlines.provision_cpu_minutes)
         )
         waited = self._now() - started
-        if error is None and not claims and waited > timedelta(minutes=cfg.settings.deadlines.no_offering_minutes):
+        if (
+            error is None
+            and not claims
+            and not failures  # ICE claims are deleted at once, so most reconciles see none
+            and waited > timedelta(minutes=cfg.settings.deadlines.no_offering_minutes)
+        ):
             error = _unschedulable(anchor)
         if (
             error is None
@@ -971,13 +972,13 @@ class Runner:
     def _launch_failures_exhausted(
         self, run: BenchmarkRun, cfg: Config, anchor: dict, failures: list[LaunchFailure]
     ) -> bool:
-        """`MAX_LAUNCH_FAILURES` claims failed to launch. When all of them were ICE the run goes on while SCarpenter's
-        offered listing has an available offering for the SKU in a capacity type the anchor allows (it tries other
-        regions and zones itself), up to `MAX_ICE_LAUNCH_FAILURES`; the provisioning budget still ends it. An
-        unreadable listing counts as none."""
+        """`MAX_LAUNCH_FAILURES` claims failed to launch. When all of them name the class InsufficientCapacity or
+        ZoneUnusable the run goes on while SCarpenter's offered listing has an available offering for the SKU in a
+        capacity type the anchor allows (it tries other regions and zones itself), up to `MAX_ICE_LAUNCH_FAILURES`;
+        the provisioning budget still ends it. An unreadable listing counts as none."""
         if len(failures) < MAX_LAUNCH_FAILURES:
             return False
-        if any(launch.reason_of_class(f.message, "ICE") != "ICE" for f in failures):
+        if not all(launch.is_capacity_class(f.message) for f in failures):
             return True
         if len(failures) >= MAX_ICE_LAUNCH_FAILURES:
             return True

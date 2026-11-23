@@ -40,8 +40,7 @@ CLASS_REASONS = {
     "Fatal": "LAUNCH_REJECTED",
 }
 # NO_OFFERING (no instance type for the SKU, or an anchor nobody schedules): SCarpenter's mark is usually short, but
-# where the offered-types filter fails open nothing else stops the retries, so the wait is a flat 24 h, unless
-# the offered-types ConfigMap says when the first offering opens (`planner.offered_retry_at`).
+# where the offered-types filter fails open nothing else stops the retries, so the wait is a flat 24 h.
 # ANCHOR_FAILED: the node came up but the anchor Pod ended, vanished or never became Ready; not the node's fault.
 TEMPORARY = ("ICE", "QUOTA", "DAILY_LIMIT", "VENDOR", "NO_OFFERING", "NO_LSCPU", "ANCHOR_FAILED")
 # Reasons of `-1` schedule metas written before the classes existed; they were temporary too.
@@ -89,6 +88,13 @@ def reason_of_class(message: str, default: str) -> str:
     if message.startswith(ICE_PREFIX) and reason != "QUOTA":  # a last candidate over quota stays QUOTA
         return "ICE"
     return reason
+
+
+def is_capacity_class(message: str) -> bool:
+    """The message's own class (the first `<Class> (<Code>):`) is InsufficientCapacity or ZoneUnusable. A message
+    without a class (`no candidate offering had quota headroom`, `no offering satisfies ...`) is not."""
+    found = _CLASSIFIED.search(message)
+    return bool(found) and found.group(1) in ("InsufficientCapacity", "ZoneUnusable")
 
 
 def error_message(reason: str, message: str) -> str:
