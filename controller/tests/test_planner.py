@@ -675,6 +675,7 @@ def test_offered_types_on_demand_mode_needs_an_on_demand_offering(kube, keeper_s
     [
         None,  # vendor not opted in
         offered_configmap({"s1": QUOTA}, age=timedelta(minutes=31)),  # stale
+        offered_configmap({"s1": QUOTA}, age=timedelta(minutes=31), gz=True),
         {"data": {"types.json": "{not json"}},
         {"data": {}},
         {"binaryData": {"types.json.gz": base64.b64encode(b"not gzip").decode()}},
@@ -686,6 +687,7 @@ def test_offered_types_on_demand_mode_needs_an_on_demand_offering(kube, keeper_s
     ids=[
         "absent",
         "stale",
+        "stale-gzip",
         "bad-json",
         "no-key",
         "corrupt-gzip",
@@ -716,8 +718,8 @@ def test_offered_types_read_the_gzipped_listing(kube, keeper_skus):
 def test_offered_types_prefer_the_gzipped_listing_over_data(kube, keeper_skus):
     keeper_skus["oci"] = {"s1": {}}
     gz = offered_configmap({"s1": OFFERED}, gz=True)
-    stale = offered_configmap({"s1": QUOTA})
-    publish_offered(kube, {**stale, **gz})
+    plain = offered_configmap({"s1": QUOTA})
+    publish_offered(kube, {**plain, **gz})
     assert planned_skus(kube) == ["s1"]
     publish_offered(kube, {**offered_configmap({"s1": QUOTA}, gz=True), **offered_configmap({"s1": OFFERED})})
     assert planned_skus(kube) == []
