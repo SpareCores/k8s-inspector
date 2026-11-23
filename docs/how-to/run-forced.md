@@ -2,8 +2,10 @@
 
 *Planned: describes the CLI once it exists.*
 
-A forced run benchmarks one SKU now, skipping Keeper eligibility and the "is it due" check. It is for operators: to
-rerun a SKU or a task now, or to run a SKU Keeper blocks. The controller picks SKUs itself when `autoPlan` is on for the
+`k8s-inspector run` benchmarks one SKU now, whether or not its tasks are due. With `--force` it also skips Keeper's
+eligibility check, and its launch failures are recorded as `-1` results instead of launch backoff entries ([launch
+retries](../explanation/launch-retries.md)); the enabled vendor, `maxInFlight` and `maxUsdPerHour` checks apply either way.
+It is for operators: to rerun a SKU or a task now, or to run a SKU Keeper blocks. The controller picks SKUs itself when `autoPlan` is on for the
 vendor ([autoPlan](../reference/configuration.md#autoplan));
 a forced run of such a SKU takes the SKU's lease like any other run, so autoPlan does not start it twice.
 

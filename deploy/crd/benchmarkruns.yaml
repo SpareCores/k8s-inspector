@@ -43,7 +43,7 @@ spec:
                 type: array
                 items: {type: string}
               force:
-                description: Skip Keeper and should_start.
+                description: Skip Keeper's eligibility check; launch failures end as -1 results, not launch backoff.
                 type: boolean
                 default: false
               capacity:
