@@ -104,31 +104,43 @@ Consequences of the Pod's own namespace for these tasks:
 - On AWS the metadata service is two hops away, so the bench NodeClass sets the IMDS hop limit to 2
   ([security](security.md#instance-metadata-imds)).
 
-Measured on one Azure `Standard_D2ds_v5` (Xeon 8370C, 2 vCPU) node, median of 3 runs each, same image digests and
-commands as the catalogue. The legacy row is the Ubuntu VM result of the same SKU (2024-09):
+## Measurement conditions
 
-| | redis SET p1 | p4 | p16 | p512 | static_web 1k 2t/2c | 1k 2t/32c |
-|---|---|---|---|---|---|---|
-| legacy (Docker, Ubuntu) | 117537 | 333787 | 613729 | 840007 | 84206 | 116874 |
-| host network (before) | 93266 | 285357 | 559876 | 775870 | 77186 | 106296 |
-| Pod network (now) | 122206 | 332942 | 600650 | 779868 | 103235 | 135849 |
+Two settings shape how loopback- and syscall-heavy results compare with the VM era: the Pod network namespace of the
+loopback tasks (above) and the kernel's CPU vulnerability mitigations.
 
-Other settings, all with `hostNetwork: true`, redis p1: `RuntimeDefault` seccomp is 11 % slower (83142, so the
-`privileged` + `Unconfined` Pods stay); a CPU request of 10m, no `benchmark`
-priority class, running in `system.slice`, no resource-tracker wrapper and CPU pinning change nothing outside the
-noise (±1-4 %); a Guaranteed Pod (`limits.cpu` 1.8) loses 5 % at p512 to CFS throttling (the reason for "no CPU
-limits"). Accepting loopback early in the node's `iptables` `INPUT`/`OUTPUT` plus `notrack` for `lo` recovers 10 %
-(102858) of the 31 % the Pod namespace recovers, so the cost is not conntrack alone and a node-level rule is no
-substitute. The kernel mitigations of the node and of the legacy VM are the same (see `lscpu` Vulnerability lines),
-so they are not the cause of the gap to legacy. Booting the node with `mitigations=off` (retpolines and the other
-Spectre defences) is a separate gain on top: redis p1 111289 on the host network and 135528 in the Pod namespace
-(+19 % and +11 %), p512 796722, static_web 1k 2t/2c 113852 and 2t/32c 149332 in the Pod namespace (+10 % and +10 %).
-That is a node setting (kernel argument, one extra reboot), owned by the bench node Butane in sc-infra, not by this
-repository. `sched_autogroup`, transparent huge pages (`never`), a Guaranteed or 10m-request Pod, the `benchmark`
-priority class and running in `system.slice` change nothing measurable. Not tested:
-`cpuManagerPolicy: static` (SCarpenter's SCNodeClass has no field for it), idle polling and CPU governor (the Azure
-guest exposes no cpufreq or cpuidle driver).
-p512 stays about 7 % under legacy on the Azure host, which is outside the Pod's reach.
+- **Pod network namespace: used** for `redis` and `static_web`.
+- **Kernel mitigations: on**, as on the legacy sc-inspector VMs. The node's mitigations match the VM's (same
+  `lscpu` Vulnerability lines). Booting with `mitigations=off` would gain about 10-19 % on syscall- and loopback-heavy
+  tasks, but then every task's results would diverge from legacy, so bench nodes do not use it.
+
+Measured on one Azure `Standard_D2ds_v5` (Xeon 8370C, 2 vCPU), median of 3 runs each, same image digests and
+commands as the catalogue. The legacy row is the Ubuntu VM result of the same SKU (sc-inspector-data commit
+`ba01cd99cdd`). redis is SET requests per second at pipeline 1/4/16/512; static_web is 1 KiB requests per second with
+2 threads at 2/8/32 connections.
+
+| Variant | redis p1 | p4 | p16 | p512 | web 2c | 8c | 32c |
+|---|---|---|---|---|---|---|---|
+| legacy VM | 117537 | 333787 | 613729 | 840007 | 84206 | 105162 | 116874 |
+| host network (before) | 93266 | 285357 | 559876 | 775870 | 77186 | 96257 | 106296 |
+| **Pod network (chosen)** | 122206 | 332942 | 600650 | 779868 | 103235 | 120188 | 135849 |
+| host network, `mitigations=off` | 111289 | 318063 | 592843 | 783261 | 89807 | 109814 | 120209 |
+| Pod network, `mitigations=off` (not used) | 135528 | 357966 | 622644 | 796722 | 113852 | 132205 | 149332 |
+
+Other findings, all on the host network unless noted:
+
+- `RuntimeDefault` seccomp (unprivileged) is about 11 % worse on redis p1 (83142), which is why step Pods stay
+  `privileged` with `Unconfined`.
+- CPU requests, the `benchmark` priority class, cgroup placement (`system.slice`), the resource-tracker wrapper and
+  `taskset` pinning change nothing outside the noise (+-1-4 %). A Guaranteed Pod (`limits.cpu` 1.8) loses 5 % at p512
+  to CFS throttling (the reason for "no CPU limits"). `sched_autogroup` and transparent huge pages (`never`) change
+  nothing measurable.
+- Accepting loopback early in the node's `iptables` plus `notrack` for `lo` (netfilter in the host namespace) recovers
+  only about a third of the gap (redis p1 102858), so the cost is not conntrack alone and a node-level rule is no
+  substitute for the Pod namespace.
+- redis p512 stays about 7 % under legacy in every variant (unattributed).
+- Azure guests expose no cpufreq or cpuidle driver, so governor and idle polling cannot be set.
+- Not tested: `cpuManagerPolicy: static` (SCarpenter's SCNodeClass has no field for it) and other vendors.
 
 ## CPU weight
 
@@ -194,6 +206,7 @@ SCarpenter's reservations for the Lean small nodes and change with them.
 | cgroup | `system.slice/docker-<id>.scope` | `kubepods.slice/…/cri-containerd-<id>.scope`, `kubepods.slice` cpu weight ~76 | `kubepods.slice` against `system.slice` is fixed by the kubelet and matters only under contention from daemons that use ~2 % CPU; inside `kubepods.slice` the step Pod has nearly all the weight ([CPU weight](#cpu-weight)) |
 | Memory | no cap except vLLM/geekbench | `kubepods.slice` capped at allocatable | slightly less headroom on small types |
 | Network | host | host, except the loopback-only tasks `redis` and `static_web`: the Pod's own network namespace | identical for host tasks; the two loopback tasks avoid the node's netfilter rules ([loopback tasks](#loopback-tasks)) |
+| Kernel mitigations | on | on, identical to the VM's | same; `mitigations=off` is not used ([measurement conditions](#measurement-conditions)) |
 | OS, kernel | Ubuntu 24.04, kernel 6.8, services stopped | Flatcar, kernel 6.12, kubelet, tailscaled, flannel, kube-proxy | the main source of differences |
 
 The differences are measured, not assumed: before a vendor moves from the legacy pipeline, a few of its SKUs run the
