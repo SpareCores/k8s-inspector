@@ -10,7 +10,7 @@ rules:
   verbs: [create, list, watch, delete]
 - apiGroups: [""]
   resources: [events]
-  verbs: [list]                 # Karpenter's FailedScheduling event of the anchor (fast NO_OFFERING)
+  verbs: [list]                 # anchor events: FailedScheduling (fast NO_OFFERING) and InsufficientCapacityError (ICE launch failures)
 - apiGroups: [""]
   resources: [pods/exec]
   verbs: [get, create]          # exec is a websocket upgrade: a GET, then the create

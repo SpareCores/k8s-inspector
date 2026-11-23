@@ -27,8 +27,16 @@ ends with the reason of the last one.
 
 Every failed launch of the attempt's NodeClaims counts toward `MAX_LAUNCH_FAILURES` (2 distinct claims), whatever
 the class. A claim that hit InsufficientCapacity is deleted by Karpenter before any condition is visible, so the
-controller reads it from the `InsufficientCapacityError` Event on the anchor Pod, whose message carries the same
-`<Class> (<Code>): <message>`; the run ends with that class's reason (`ICE` for it).
+controller reads it from the `InsufficientCapacityError` Event on the anchor Pod (`NodeClaim <name> nominated for this
+pod failed to launch: <message>`; Karpenter v1.15 or newer). SCarpenter's message there is `insufficient capacity,
+every launch attempt failed (N attempts), the last: <Class> (<Code>): ...` and carries only the last candidate's
+class, or no class at all (`no candidate offering had quota headroom`, `no offering satisfies the NodeClaim's
+requirements and has capacity`). The controller therefore treats every message starting `insufficient capacity,` as
+`ICE` (never `LAUNCH_REJECTED`, so no on-demand fallback), except when the last candidate's class is `QuotaExceeded`
+(`QUOTA`).
+
+The controller sees the Event on its next reconcile, which can be up to the 300 s resync after the claim failed, so a
+3rd or 4th ICE claim may be launched before the cap applies. That costs nothing: an ICE claim never bills.
 
 ## A node that does not come up
 

@@ -914,7 +914,8 @@ class Runner:
         if bound:  # the anchor has its node: Karpenter cleans up any other claim
             claims = [c for c in claims if _is_true(c, "Initialized")]
         error = _claim_error(claims)
-        failures = self._record_launch_failures(run, claims, anchor, bound)
+        events = [] if bound else self._anchor_events(anchor)
+        failures = self._record_launch_failures(run, claims, events)
         if error is None and len(failures) >= MAX_LAUNCH_FAILURES:
             error = self._launch_error(failures[-1].message)
         on_demand_retry = bool(error) and error.startswith(SPOT_FALLBACK_ERRORS)
@@ -940,7 +941,7 @@ class Runner:
             and not failures  # a launch failure is a transient ICE, not a missing offering
             and waited >= timedelta(minutes=cfg.settings.deadlines.no_offering_fast_minutes)
         ):
-            message = self._bench_pool_event(anchor, cfg.settings.bench_pool, started)
+            message = _bench_pool_message(events, cfg.settings.bench_pool, started)
             error = f"SCARPENTER_NO_OFFERING: {message}" if message else None
         if error is None and bound:
             error = self._anchor_ready_error(run, cfg, anchor, claims)
@@ -1068,18 +1069,15 @@ class Runner:
     def _launch_error(message: str) -> str:
         return launch.error_message(launch.reason_of_class(message, "ICE"), message)
 
-    def _bench_pool_event(self, anchor: dict, bench_pool: str, since: datetime) -> str | None:
-        """`_bench_pool_message` of the anchor's Events; an API error counts as no event."""
+    def _anchor_events(self, anchor: dict) -> list[dict]:
+        """The anchor Pod's Events; an API error counts as no events."""
         try:
-            events = self.kube.list_pod_events(_meta(anchor)["name"], _meta(anchor)["uid"])
-            return _bench_pool_message(events, bench_pool, since)
+            return self.kube.list_pod_events(_meta(anchor)["name"], _meta(anchor)["uid"])
         except Exception:
             log.warning("listing events of %s failed", _meta(anchor)["name"], exc_info=True)
-            return None
+            return []
 
-    def _record_launch_failures(
-        self, run: BenchmarkRun, claims: list[dict], anchor: dict, bound: bool
-    ) -> list[LaunchFailure]:
+    def _record_launch_failures(self, run: BenchmarkRun, claims: list[dict], events: list[dict]) -> list[LaunchFailure]:
         """Remember in `status.launchFailures` each NodeClaim of the attempt that failed to launch. Karpenter keeps
         a claim with a `LaunchFailed` condition for a while, but deletes one that hit InsufficientCapacity at once,
         without any condition: that one is only in the `InsufficientCapacityError` Event on the anchor Pod. Either
@@ -1090,9 +1088,8 @@ class Runner:
             message = _launch_failed_message(claim)
             if message:
                 found[_meta(claim)["name"]] = LaunchFailure(_meta(claim)["name"], message, self._now())
-        if not bound:
-            for failure in self._ice_events(anchor):
-                found.setdefault(failure.node_claim, failure)
+        for failure in self._ice_events(events):
+            found.setdefault(failure.node_claim, failure)
         new = [f for name, f in found.items() if name not in seen]
         if not new:
             return run.status.launch_failures
@@ -1105,14 +1102,9 @@ class Runner:
 
         return self._update(run, mutate).status.launch_failures
 
-    def _ice_events(self, anchor: dict) -> list[LaunchFailure]:
+    def _ice_events(self, events: list[dict]) -> list[LaunchFailure]:
         """The NodeClaims Karpenter reports in the anchor's `InsufficientCapacityError` Events (`NodeClaim <name>
-        nominated for this pod failed to launch: <message>`); an API error counts as no event."""
-        try:
-            events = self.kube.list_pod_events(_meta(anchor)["name"], _meta(anchor)["uid"])
-        except Exception:
-            log.warning("listing events of %s failed", _meta(anchor)["name"], exc_info=True)
-            return []
+        nominated for this pod failed to launch: <message>`)."""
         failures = []
         for event in events:
             found = ICE_EVENT.match(event.get("message") or "")

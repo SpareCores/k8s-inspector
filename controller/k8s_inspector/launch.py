@@ -69,14 +69,21 @@ PATCH_RETRIES = 3
 
 # The class may be wrapped (`launching X: Retryable (RequestLimitExceeded): ...`): search for the token.
 _CLASSIFIED = re.compile(rf"\b({'|'.join(CLASS_REASONS)}) \([^)]*\): ")
+# SCarpenter's message when every candidate of a NodeClaim failed or had no quota/offering; it carries only the last
+# candidate's class, which says nothing about the others, so the claim counts as capacity (ICE).
+ICE_PREFIX = "insufficient capacity,"
 _ERROR = re.compile(r"^SCARPENTER_([A-Z_]+):")
 
 
 def reason_of_class(message: str, default: str) -> str:
     """The reason of a NodeClaim message containing `<Class> (<Code>): <text>`; `default` when it has no known class
-    (an older SCarpenter, or a failure that is not a launch call)."""
+    (an older SCarpenter, or a failure that is not a launch call). A message starting `insufficient capacity,` is
+    ICE whatever the class of the last candidate, except QUOTA."""
     found = _CLASSIFIED.search(message)
-    return CLASS_REASONS.get(found.group(1), default) if found else default
+    reason = CLASS_REASONS.get(found.group(1), default) if found else default
+    if message.startswith(ICE_PREFIX) and reason != "QUOTA":  # a last candidate over quota stays QUOTA
+        return "ICE"
+    return reason
 
 
 def error_message(reason: str, message: str) -> str:
