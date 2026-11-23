@@ -157,8 +157,9 @@ checkout; with `--dry-run` it creates nothing and prints the first SKU that woul
 ### Offered types
 
 SCarpenter publishes which instance types it can launch in ConfigMap `scarpenter-offered-<benchClass>-<vendor>`
-(for example `scarpenter-offered-bench-oci`) in namespace `scarpenter-system`, key `types.json`. Once per vendor and
-cycle autoPlan reads it (the controller may `get` only the ConfigMaps named in `deploy/controller/rbac.yaml`: the default `bench` class of every SCarpenter vendor, so a non-default `benchClass` or a new vendor needs that list updated) and skips a
+(for example `scarpenter-offered-bench-oci`) in namespace `scarpenter-system`, as gzipped JSON in `binaryData` key
+`types.json.gz` (an older SCarpenter writes plain JSON in `data` key `types.json`, which is the fallback when the
+gzip key is absent; the gzip wins when both exist). Once per vendor and cycle autoPlan reads it (the controller may `get` only the ConfigMaps named in `deploy/controller/rbac.yaml`: the default `bench` class of every SCarpenter vendor, so a non-default `benchClass` or a new vendor needs that list updated) and skips a
 SKU, matched by the entry's `apiReference` (entries without one are ignored; of two with the same one the available
 wins), when:
 
@@ -177,8 +178,9 @@ Every `available: false` entry is skipped; SCarpenter rewrites the entry when a 
 the [launch backoff](../explanation/launch-retries.md#temporary-failure) of a `DAILY_LIMIT` failure waits.
 
 The filter fails open: a ConfigMap that is absent (the vendor is not opted in), unreadable, malformed or stale
-(`generatedAt` older than 30 minutes) filters nothing, and the cycle logs why. In a ConfigMap with `truncated: true`
-only entries with `available: false` are skipped; a missing entry proves nothing.
+(`generatedAt` older than 30 minutes) or holds a corrupt gzip filters nothing, and the cycle logs why. A ConfigMap
+without `truncated` counts as complete; the optional `zonesOmitted` field is ignored (nothing reads zones). In a ConfigMap with
+`truncated: true` only entries with `available: false` are skipped; a missing entry proves nothing.
 
 ## CLI
 
