@@ -49,8 +49,9 @@ RUNNING_PHASES = (RunPhase.PENDING, RunPhase.PROVISIONING, RunPhase.RUNNING)
 
 
 def _new_password() -> str:
-    """Random, with a letter of each case, a digit and a symbol, which the password policies of the vendors ask for."""
-    return f"Sc1-{secrets.token_urlsafe(24)}"
+    """28 characters (vendors cap at 30 or 32), with a letter of each case, a digit and a symbol, which the password
+    policies of the vendors ask for; only letters, digits, `-` and `_`, which none of them rejects."""
+    return f"Sc1-{secrets.token_urlsafe(18)}"
 
 
 def database_over(run: BenchmarkRun) -> bool:

@@ -3,13 +3,14 @@ parallel with the node release, retries, restarts, the finalizer. Jobs and Pods 
 
 import base64
 import json
+import re
 from dataclasses import replace
 from datetime import timedelta
 
 import pytest
 from test_runner import START, Harness, in_step
 
-from k8s_inspector import crd, dbaas_jobs, dbaas_keeper, pods
+from k8s_inspector import crd, dbaas_jobs, dbaas_keeper, pods, runner_dbaas
 from k8s_inspector import keeper as sc_keeper
 from k8s_inspector.model import (
     CapacityMode,
@@ -458,6 +459,13 @@ def test_the_password_survives_a_restart_and_is_never_in_the_job_spec(h):
     h.new_runner().reconcile(h.name)
     assert h.secret(f"{h.name}-db")["K8SI_RUN_PASSWORD"] == password
     assert password not in json.dumps(h.kube.get("job", f"dbaas-up-{h.name}"))
+
+
+def test_the_generated_password_fits_the_vendor_policies():
+    for _ in range(100):
+        password = runner_dbaas._new_password()
+        assert len(password) <= 30 and re.fullmatch(r"[A-Za-z0-9_-]+", password)
+        assert password.startswith("Sc1-")  # upper, lower, digit and special, whatever the random part is
 
 
 def test_the_anchor_is_kept_alive_while_the_database_is_created(h):
