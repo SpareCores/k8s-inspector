@@ -42,7 +42,7 @@ database second; on the way out, database destroy and node release in parallel.*
    `k8s-dbaas-<run>`; the password is passed as an environment variable from the Secret and used as a Pulumi secret. The
    Job has no Kubernetes API access: it reports host, port, admin user, admin database and sslmode in its termination
    message, and the controller writes them, with the password, to the Secret `<run>-db` as the `SC_DB_*` variables. A
-   vendor that generates the admin password reports it too, sealed ([the admin password](#the-admin-password)).
+   vendor that generates the admin password reports it too, in plain text ([the admin password](#the-admin-password)); the controller then deletes the Job.
    Creation has a deadline of 60 minutes (`dbaas.createMinutes`), which is the Job's `activeDeadlineSeconds`. The vendor
    module sets Pulumi `customTimeouts` 10 minutes shorter (`spec.create_timeout`), so Pulumi fails by itself and records
    the resource. The Job's Pod is annotated `karpenter.sh/do-not-disrupt` and has a 15 minute termination grace period:
@@ -103,12 +103,13 @@ rules; every input is Keeper's data, nothing is a static table:
   row, never again for the other results. There is no schedule directory and no variant.
 - **Region**: the database's regions with a standalone on-demand price (Keeper's `none` level, else `single-zone`) that
   have a client region, cheapest first; after a failed attempt the database region whose client region that attempt used
-  goes last, so the retry tries another. The client regions of a database region, in the order they are tried, are the
-  region itself and the regions with the same Keeper `city`, each only when the ConfigMap has a network for it
-  (`dbaas.vendors.<vendor>.networks.<client region>`); the first with a client wins. For most vendors the database and
-  server regions are the same names, so the region is its own client region. OVH's are not (databases in `GRA`, servers in
-  `GRA7`, `GRA9`, `GRA11`), and the city ties them. The run records `database.region` and, when it differs,
-  `database.clientRegion`. An operator may name both (`run --region`, `--client-region`).
+  goes last, so the retry tries another. The client regions of a database region, in the order they are tried: the
+  region itself when the ConfigMap has a network for it (`dbaas.vendors.<vendor>.networks.<client region>`), and only
+  then, if it has none, the regions with the same Keeper country and `city` that have one; the first with a client wins.
+  For most vendors the database and server regions are the same names, so the region is its own client region. OVH's are
+  not (databases in `GRA`, servers in `GRA7`, `GRA9`, `GRA11`), and the city ties them. The run records `database.region`
+  and, when it differs, `database.clientRegion`. An operator may name both (`run --region`, `--client-region`); an
+  explicit client region is an override with no city check, with or without `--region`.
 - **Client**: Keeper's servers in the client region that are x86_64 (the benchmark image is amd64 only), without
   accelerator, with 2-4 vCPUs and 4-8 GiB, dedicated CPUs when there are any (else shared), cheapest after a Tukey price
   fence (Q3 + 1.5 IQR over the region's own candidates), without SKUs SCarpenter does not offer, that wait for a launch
@@ -134,21 +135,24 @@ Node's `ExternalIP` addresses when it creates the up Job and passes them as `DbS
 
 ### The admin password
 
-The controller generates the run's password into the Secret `<run>-db` and the Job gets it by `secretKeyRef`. A vendor
-that generates the admin password itself and cannot be given one (OVH) returns it as `DbOutputs.password`, a Pulumi
-secret, and the controller uses it as `SC_DB_PASSWORD` instead of its own.
+The controller generates the run's password into the Secret `<run>-db` as `K8SI_RUN_PASSWORD`, which is never
+overwritten, and the up and down Jobs get it as `DBAAS_PASSWORD` by `secretKeyRef`. `SC_DB_PASSWORD`, the one the
+benchmark and the bootstrap use, is the same until a vendor that generates the admin password itself and cannot be given
+one (OVH) returns it as `DbOutputs.password`, a Pulumi secret: the controller then writes that one to `SC_DB_PASSWORD`.
 
-The up Job reports through its termination message, which anyone who can read Pods in the namespace can read, so the
-password must not be in it in plain text. The Job seals it with the run's own password before it reports it: HMAC-SHA256
-in counter mode as the keystream and an HMAC-SHA256 tag over nonce and ciphertext (`sealing.py` in the image,
-`dbaas_seal.py` in the controller, stdlib only), keyed by the 192 random bits of the run's password. The controller opens
-it with the password it already holds. This was chosen over the alternatives because the Jobs have no API access by
-design (so the Job cannot write a Secret), reading the stack output through another Job would again report through a
-termination message, and a crypto library would add a heavy dependency to both packages. What Pod readers see is the
-sealed value, useless without the run's password, which only the controller (and the Job's `secretKeyRef`, never shown in
-the Pod spec) holds. Pod logs and events do not carry it: Pulumi prints secrets as `[secret]`. The password is also in the
-Pulumi state, encrypted by the stack passphrase like every secret there. The sealing is a small construction of standard
-primitives written for this one use, not a reviewed library; a reader of Secrets has the password anyway.
+The Jobs have no API access by design, so the up Job reports through its termination message, and the vendor-generated
+password is in it in plain text. The exposure is accepted:
+
+- The controller deletes the up Job and its Pod as soon as it has read the outputs and written the run's Secret, so the
+  password does not linger in Pod status.
+- While it is there, Pod status is readable by the controller and by humans with `view` on the `inspector` namespace,
+  not by workload Pods (they have no service-account tokens).
+- The database only accepts the client node's address or the private network, requires TLS, holds no data and lives
+  about an hour.
+- The password also sits in the Secret `<run>-db`, which the same readers could otherwise reach.
+
+Pod logs and events do not carry it: Pulumi prints secrets as `[secret]`. It is also in the Pulumi state, encrypted by
+the stack passphrase like every secret there.
 
 ### Limits
 

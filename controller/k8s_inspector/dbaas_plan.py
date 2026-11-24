@@ -12,7 +12,7 @@ docs/explanation/dbaas.md.
 
 import logging
 import threading
-from collections.abc import Callable
+from collections.abc import Callable, Collection
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
@@ -102,22 +102,20 @@ def check_spend(cfg: Config, vendor: str, runs: list[BenchmarkRun], price: float
         )
 
 
-def region_order(prices: dict[str, float], networks: dict, last_failed: str | None = None) -> list[str]:
-    """The database's regions that have a network, cheapest first; the region where the last attempt failed goes last,
+def region_order(prices: dict[str, float], networks: dict, failed: Collection[str] = ()) -> list[str]:
+    """The database's regions that have a network, cheapest first; the regions where the last attempt failed go last,
     so a retry tries another one."""
-    ordered = sorted((region for region in prices if region in networks), key=lambda r: (prices[r], r))
-    if last_failed in ordered and len(ordered) > 1:
-        ordered.remove(last_failed)
-        ordered.append(last_failed)
-    return ordered
+    return sorted((r for r in prices if r in networks), key=lambda r: (r in failed, prices[r], r))
 
 
-def client_regions(region: str, networks: dict, cities: dict[str, str]) -> list[str]:
-    """The regions the client of a database in `region` may run in, in the order they are tried: the region itself, then
-    the regions of the same Keeper city; only those the platform has a network for."""
+def client_regions(region: str, networks: dict, cities: dict[str, tuple[str, str]]) -> list[str]:
+    """The regions the client of a database in `region` may run in, in the order they are tried: the region itself when
+    the platform has a network there; otherwise (OVH: databases and servers are in differently named regions) the
+    regions of the same Keeper city (country and city) that have one."""
+    if region in networks:
+        return [region]
     city = cities.get(region)
-    same_city = [r for r in sorted(networks) if r != region and city and cities.get(r) == city]
-    return ([region] if region in networks else []) + same_city
+    return [r for r in sorted(networks) if city and cities.get(r) == city]
 
 
 def _failed_region(meta: dict | None) -> str | None:
@@ -203,11 +201,7 @@ def _resolve(
     cities = dbaas_keeper.region_cities(cfg.env, vendor)
 
     def clients_of(database_region: str) -> list[str]:
-        automatic = client_regions(database_region, networks, cities)
-        if client_region is None:
-            return automatic
-        usable = client_region in networks and (region is not None or client_region in automatic)
-        return [client_region] if usable else []
+        return [client_region] if client_region else client_regions(database_region, networks, cities)
 
     if client_region and client_region not in networks:
         raise ValueError(f"no DBaaS network of {vendor} in {client_region} in the ConfigMap")
@@ -218,7 +212,7 @@ def _resolve(
     else:
         reachable = {r: price for r, price in prices.items() if clients_of(r)}
         # a run records the region of its node, which is the client's
-        failed = next((r for r in reachable if last_failed in (r, *clients_of(r))), None)
+        failed = {r for r in reachable if last_failed in (r, *clients_of(r))}
         regions = region_order(reachable, reachable, failed)
     if not regions:
         raise ValueError(f"{vendor}/{database_id} has no standalone price in a region that has a DBaaS network")

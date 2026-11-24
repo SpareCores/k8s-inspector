@@ -38,6 +38,7 @@ JOB_NAME_MAX = 63
 PULUMI_TIMEOUT_MARGIN_MINUTES = 10  # the vendor module's create/delete timeouts end this long before the Job's deadline
 BOOTSTRAP_BUDGET = timedelta(seconds=pods.BOOTSTRAP_SECONDS)
 BOOTSTRAP_SCRIPT = "bootstrap.py"
+RUN_PASSWORD_KEY = "K8SI_RUN_PASSWORD"  # the run's own password in Secret `<run>-db`; never overwritten
 DB_KEYS = ("SC_DB_HOST", "SC_DB_PORT", "SC_DB_USER", "SC_DB_PASSWORD", "SC_DB_NAME", "SC_DB_SSLMODE", "PGSSLMODE")
 WORKLOAD_DATABASE = "bench"  # created by the bootstrap; pgbench makes its own `pgbench` inside the server
 
@@ -214,10 +215,11 @@ def build_spec(
 
 def connection_secret(run: BenchmarkRun, owner: OwnerRef, password: str, outputs: dict | None) -> dict:
     """Secret `<run>-db`. With `outputs` (the provisioner's connection facts) it carries the `SC_DB_*` variables of the
-    benchmark and the bootstrap; without, only the password the up Job reads."""
-    data = {"SC_DB_PASSWORD": password}
+    benchmark and the bootstrap, and `SC_DB_PASSWORD`, the password the benchmark uses: the vendor's when it generated
+    the admin password, else the run's. `K8SI_RUN_PASSWORD`, the run's own password the Jobs get, is always there."""
+    data = {RUN_PASSWORD_KEY: password}
     if outputs:
-        data["SC_DB_PASSWORD"] = outputs.get("password") or password  # a vendor that generates the admin password
+        data["SC_DB_PASSWORD"] = outputs.get("password") or password
         user = outputs.get("user") or outputs["admin_user"]
         sslmode = outputs.get("sslmode", "require")
         data |= {
@@ -376,16 +378,17 @@ def _job(
     }
 
 
+def _run_password_env(run_name: str) -> dict:
+    return {
+        "name": "DBAAS_PASSWORD",
+        "valueFrom": {"secretKeyRef": {"name": db_secret_name(run_name), "key": RUN_PASSWORD_KEY}},
+    }
+
+
 def up_job(run: BenchmarkRun, cfg: Config, spec: dict, owner: OwnerRef) -> dict:
     """`dbaas-up-<run>`: create the database. The spec is not secret, the password comes from the run's Secret. The
     Job's deadline is `dbaas.createMinutes`; the vendor module's Pulumi timeouts are shorter (`build_spec`)."""
-    env = [
-        {"name": "DBAAS_SPEC", "value": json.dumps(spec, separators=(",", ":"))},
-        {
-            "name": "DBAAS_PASSWORD",
-            "valueFrom": {"secretKeyRef": {"name": db_secret_name(run.name), "key": "SC_DB_PASSWORD"}},
-        },
-    ]
+    env = [{"name": "DBAAS_SPEC", "value": json.dumps(spec, separators=(",", ":"))}, _run_password_env(run.name)]
     return _job(
         up_job_name(run.name),
         "up",
@@ -409,7 +412,7 @@ def down_job(run_name: str, vendor: str, cfg: Config, *, sweep: bool = False) ->
         kind="down",
         vendor=vendor,
         cfg=cfg,
-        env=[{"name": "DBAAS_RUN", "value": run_name}],
+        env=[{"name": "DBAAS_RUN", "value": run_name}] + ([] if sweep else [_run_password_env(run_name)]),
         deadline_seconds=DOWN_DEADLINE_SECONDS,
         run=None if sweep else run_name,
         owner=None,

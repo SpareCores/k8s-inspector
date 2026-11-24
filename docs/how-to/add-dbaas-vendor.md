@@ -39,7 +39,7 @@ are RFC 3339 and `run` is the tag's value. `fake.py` is the smallest example of 
 **`DbOutputs`**: `host`, `admin_user`, `admin_db`, `port` (5432), `sslmode` (`require`; use the vendor's real policy:
 `prefer` or `disable` only when it cannot do better), and optionally `user`, `grant_role` and `password`. `password` is for
 a vendor that generates the admin password and cannot be given one (OVH): a Pulumi secret, which the controller uses as
-`SC_DB_PASSWORD` instead of its own and which travels to it sealed
+`SC_DB_PASSWORD` instead of its own and which travels to it in plain text in the termination message
 ([DBaaS](../explanation/dbaas.md#the-admin-password)); a vendor that takes the password never sets it. `admin_user` is the user the
 vendor created and the bootstrap connects as, to `admin_db`, a database that exists from the start (`postgres`,
 `defaultdb`). When the workload user must differ (Cloud SQL: `postgres` cannot create a database it can then use), set

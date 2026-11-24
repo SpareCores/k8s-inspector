@@ -82,12 +82,14 @@ def region_ids(env: EnvConfig, vendor: str) -> dict[str, str]:
     return {row["api_reference"]: str(row["region_id"]) for row in rows if row.get("vendor_id", vendor) == vendor}
 
 
-def region_cities(env: EnvConfig, vendor: str) -> dict[str, str]:
-    """`{region api_reference: Keeper city}` of the vendor's regions that have a city. A vendor whose database regions
-    differ from its server regions (OVH) is matched by it."""
+def region_cities(env: EnvConfig, vendor: str) -> dict[str, tuple[str, str]]:
+    """`{region api_reference: (Keeper country_id, city)}` of the vendor's regions that have a city. A vendor whose
+    database regions differ from its server regions (OVH) is matched by it."""
     rows = _list(env, "/regions", [("vendor", vendor)])
     return {
-        row["api_reference"]: row["city"] for row in rows if row.get("vendor_id", vendor) == vendor and row.get("city")
+        row["api_reference"]: (row.get("country_id"), row["city"])
+        for row in rows
+        if row.get("vendor_id", vendor) == vendor and row.get("city")
     }
 
 

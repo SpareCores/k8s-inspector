@@ -2,11 +2,9 @@
 parallel with the node release, retries, restarts, the finalizer. Jobs and Pods are played by `fakes.Cluster`."""
 
 import base64
-import importlib.util
 import json
 from dataclasses import replace
 from datetime import timedelta
-from pathlib import Path
 
 import pytest
 from test_runner import START, Harness, in_step
@@ -49,14 +47,6 @@ def make_dbaas_config(**dbaas) -> Config:
         env=env,
         settings=Settings(vendors={"oci": VendorSettings(enabled=True)}, dbaas=DbaasSettings(vendors=vendors, **dbaas)),
     )
-
-
-def load_sealing():
-    """The image's `sealing.py` (a separate package, stdlib only): what the Job seals the controller must open."""
-    path = Path(__file__).parents[2] / "dbaas/k8s_inspector_dbaas/sealing.py"
-    module = importlib.util.module_from_spec(importlib.util.spec_from_file_location("sealing", path))
-    module.__spec__.loader.exec_module(module)
-    return module
 
 
 class DbHarness(Harness):
@@ -133,8 +123,8 @@ def test_the_client_node_comes_first_and_the_database_is_created_when_the_anchor
     assert spec["network"] == {"vpc": "vcn-1", "subnet": "sn-1"} and spec["record"] == RECORD
     assert spec["labels"]["sc_inspector_run"] == "r20261120t1000-aaaa"
     assert spec["labels"]["sc_inspector_expires"].endswith("z") and spec["expiresAt"].endswith("Z")
-    assert env["DBAAS_PASSWORD"]["valueFrom"]["secretKeyRef"] == {"name": f"{h.name}-db", "key": "SC_DB_PASSWORD"}
-    assert "Sc1-" in h.secret(f"{h.name}-db")["SC_DB_PASSWORD"] and "DBAAS_PASSWORD" not in job["spec"]["template"][
+    assert env["DBAAS_PASSWORD"]["valueFrom"]["secretKeyRef"] == {"name": f"{h.name}-db", "key": "K8SI_RUN_PASSWORD"}
+    assert "Sc1-" in h.secret(f"{h.name}-db")["K8SI_RUN_PASSWORD"] and "DBAAS_PASSWORD" not in job["spec"]["template"][
         "spec"
     ]["containers"][0]["env"][0].get("value", "")
     assert job["spec"]["template"]["spec"]["automountServiceAccountToken"] is False
@@ -197,8 +187,10 @@ def test_a_dbaas_run_creates_bootstraps_benchmarks_and_destroys(h):
 
 
 def test_the_job_pods_are_not_the_runs_pods(h):
+    h.cluster.jobs["up"] = ["hang"]
     h.start_db()
-    h.until_phase(DbPhase.BOOTSTRAPPING)
+    h.until_phase(DbPhase.CREATING)
+    h.cluster.react()
     (pod,) = [p for p in h.kube.list("pod") if p["metadata"]["name"].endswith("-pod")]
     assert crd.LABEL_RUN not in pod["metadata"]["labels"]  # the sweep of the run's Pods never touches a Job's
     assert pods.LABEL_ROLE in pod["metadata"]["labels"]
@@ -461,10 +453,10 @@ def test_a_restart_between_the_phase_and_the_job_creates_the_missing_job(h):
 def test_the_password_survives_a_restart_and_is_never_in_the_job_spec(h):
     h.start_db()
     h.until_phase(DbPhase.CREATING)
-    password = h.secret(f"{h.name}-db")["SC_DB_PASSWORD"]
+    password = h.secret(f"{h.name}-db")["K8SI_RUN_PASSWORD"]
     h.kube.delete("job", f"dbaas-up-{h.name}")
     h.new_runner().reconcile(h.name)
-    assert h.secret(f"{h.name}-db")["SC_DB_PASSWORD"] == password
+    assert h.secret(f"{h.name}-db")["K8SI_RUN_PASSWORD"] == password
     assert password not in json.dumps(h.kube.get("job", f"dbaas-up-{h.name}"))
 
 
@@ -608,20 +600,27 @@ def test_a_node_without_public_addresses_gives_an_empty_list(h):
     assert json.loads(env["DBAAS_SPEC"])["clientAddresses"] == []
 
 
-def test_a_vendor_generated_password_replaces_the_runs_and_is_never_in_the_message_in_plain_text(h):
+def test_a_vendor_generated_password_replaces_the_one_the_benchmark_uses_and_the_up_job_is_deleted(h):
     h.start_db()
     h.until_phase(DbPhase.CREATING)
-    run_password = h.secret(f"{h.name}-db")["SC_DB_PASSWORD"]
-    sealed = load_sealing().seal(run_password, "Vendor-Generated-pw")
-    h.cluster.db_outputs = {**h.cluster.db_outputs, "password": sealed}
+    run_password = h.secret(f"{h.name}-db")["K8SI_RUN_PASSWORD"]
+    h.cluster.db_outputs = {**h.cluster.db_outputs, "password": "Vendor-Generated-pw"}
     h.until_phase(DbPhase.BOOTSTRAPPING)
-    assert h.secret(f"{h.name}-db")["SC_DB_PASSWORD"] == "Vendor-Generated-pw"
-    pod = h.kube.get("pod", f"dbaas-up-{h.name}-pod")
-    assert "Vendor-Generated-pw" not in json.dumps(pod)
+    secret = h.secret(f"{h.name}-db")
+    assert secret["SC_DB_PASSWORD"] == "Vendor-Generated-pw" and secret["K8SI_RUN_PASSWORD"] == run_password
+    assert h.kube.list("job") == [] and h.kube.list("pod", labels={dbaas_jobs.LABEL_JOB: f"dbaas-up-{h.name}"}) == []
 
 
-def test_a_sealed_password_that_does_not_open_fails_the_creation(h):
-    h.cluster.db_outputs = {**h.cluster.db_outputs, "password": "AAAA"}
+def test_a_restart_after_the_secret_was_written_keeps_the_runs_own_password_for_later_jobs(h):
+    h.cluster.db_outputs = {**h.cluster.db_outputs, "password": "Vendor-Generated-pw"}
     h.start_db()
-    h.drive(stop=lambda run: run.status.phase == RunPhase.FAILED)
-    assert h.codes()[TASK][1].startswith("DBAAS_CREATE_FAILED: the Job's sealed password cannot be opened")
+    h.until_phase(DbPhase.BOOTSTRAPPING)
+    run_password = h.secret(f"{h.name}-db")["K8SI_RUN_PASSWORD"]
+    second = h.new_runner()  # restarted after the Secret was written
+    h.drive(runner=second, stop=in_step(STEP))
+    assert h.secret(f"{h.name}-db")["SC_DB_PASSWORD"] == "Vendor-Generated-pw"
+    assert second._password(h.run) == run_password
+    h.drive(runner=second, stop=lambda run: run.status.phase == RunPhase.PUBLISHING)
+    down = h.kube.get("job", dbaas_jobs.down_job_name(h.name))
+    (env,) = [e for e in down["spec"]["template"]["spec"]["containers"][0]["env"] if e["name"] == "DBAAS_PASSWORD"]
+    assert env["valueFrom"]["secretKeyRef"] == {"name": f"{h.name}-db", "key": "K8SI_RUN_PASSWORD"}

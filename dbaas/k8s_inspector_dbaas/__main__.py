@@ -2,7 +2,7 @@
 and `dbaas-inventory-<vendor>`.
 
 The Job has no Kubernetes API access and reports through the termination message (`/dev/termination-log`): `up` the
-connection facts as JSON (a vendor-generated password sealed with the run's, see `sealing`), `inventory` the tagged
+connection facts as JSON (a vendor-generated password in plain text: docs/explanation/dbaas.md), `inventory` the tagged
 databases, any command `{"error": "..."}` on failure (the password is removed from the text). The exit code is 0 on
 success. `down` needs only `DBAAS_RUN`, the BenchmarkRun name, and exits 0 once nothing is left; `inventory` needs
 `DBAAS_VENDOR`.
@@ -59,7 +59,7 @@ def run(command: str) -> int:
     password = os.environ.get("DBAAS_PASSWORD", "")
     try:
         if command == "up":
-            _report(stack.up(load_spec()).to_json(password))
+            _report(stack.up(load_spec()).to_json())
         elif command == "down":
             stack.down(os.environ["DBAAS_RUN"])
         else:

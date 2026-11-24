@@ -24,7 +24,7 @@ import logging
 import secrets
 from datetime import timedelta
 
-from k8s_inspector import crd, dbaas_jobs, dbaas_keeper, dbaas_seal, pods
+from k8s_inspector import crd, dbaas_jobs, dbaas_keeper, pods
 from k8s_inspector.kube import NotFound
 from k8s_inspector.model import (
     AttemptOutcome,
@@ -157,11 +157,11 @@ class DbaasMixin:
         return None
 
     def _password(self, run: BenchmarkRun) -> str:
-        """The run's database password: generated once, kept in the run's Secret (so it survives a restart)."""
+        """The run's own database password: generated once, kept in the run's Secret (so it survives a restart)."""
         name = pods.db_secret_name(run.name)
         try:
             data = self.kube.get("secret", name).get("data") or {}
-            return base64.b64decode(data["SC_DB_PASSWORD"]).decode()
+            return base64.b64decode(data[dbaas_jobs.RUN_PASSWORD_KEY]).decode()
         except NotFound, KeyError:
             password = _new_password()
             self.kube.apply_secret(dbaas_jobs.connection_secret(run, self._run_owner(run), password, None))
@@ -200,11 +200,6 @@ class DbaasMixin:
         outputs = dbaas_jobs.job_message(self.kube, name)
         if "host" not in outputs:
             return self._database_fail(run, "DBAAS_CREATE_FAILED", "the Job reported no connection facts")
-        if "password" in outputs:  # sealed with the run's password (docs/explanation/dbaas.md)
-            try:
-                outputs["password"] = dbaas_seal.unseal(self._password(run), outputs["password"])
-            except ValueError:
-                return self._database_fail(run, "DBAAS_CREATE_FAILED", "the Job's sealed password cannot be opened")
         self.kube.apply_secret(dbaas_jobs.connection_secret(run, self._run_owner(run), self._password(run), outputs))
         now = self._now()
 
@@ -212,6 +207,7 @@ class DbaasMixin:
             status.database.phase, status.database.since = DbPhase.BOOTSTRAPPING, now
 
         run = self._set_database(run, mutate)
+        self.kube.delete("job", name)  # a vendor-generated password is in its Pod's termination message
         self._start_bootstrap(run, cfg, live)
 
     # ----------------------------------------------------------------------- bootstrapping

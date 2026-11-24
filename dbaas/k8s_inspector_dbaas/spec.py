@@ -24,8 +24,6 @@ from dataclasses import dataclass, field, fields
 
 import pulumi
 
-from k8s_inspector_dbaas import sealing
-
 PASSWORD_ENV = "DBAAS_PASSWORD"
 SPEC_ENV = "DBAAS_SPEC"
 
@@ -89,16 +87,19 @@ class DbOutputs:
     output while the program runs; `export` registers them as stack outputs."""
 
     host: pulumi.Input[str]
-    admin_user: pulumi.Input[str]  # the user the vendor created; the bootstrap connects as this one
-    admin_db: pulumi.Input[
-        str
-    ]  # a database that exists from the start ("postgres", "defaultdb"); the bootstrap uses it
+    # The user the vendor created; the bootstrap connects as this one.
+    admin_user: pulumi.Input[str]
+    # A database that exists from the start ("postgres", "defaultdb"); the bootstrap uses it.
+    admin_db: pulumi.Input[str]
     port: pulumi.Input[int] = 5432
-    sslmode: pulumi.Input[str] = "require"  # libpq sslmode of the client
-    user: pulumi.Input[str] | None = None  # workload user; None: `admin_user`. Otherwise the bootstrap creates it
-    grant_role: pulumi.Input[str] | None = None  # role the bootstrap grants to `user` (Cloud SQL: "cloudsqlsuperuser")
+    # libpq sslmode of the client.
+    sslmode: pulumi.Input[str] = "require"
+    # Workload user; None: `admin_user`. Otherwise the bootstrap creates it.
+    user: pulumi.Input[str] | None = None
+    # Role the bootstrap grants to `user` (Cloud SQL: "cloudsqlsuperuser").
+    grant_role: pulumi.Input[str] | None = None
     # The admin password when the vendor generates it and cannot be given one (OVH): a Pulumi secret that replaces the
-    # run's. It never leaves the Job in plain text (`to_json` seals it).
+    # run's. It is reported in plain text (`to_json`).
     password: pulumi.Input[str] | None = field(default=None, repr=False)
 
     def export(self) -> None:
@@ -113,15 +114,10 @@ class DbOutputs:
         """The outputs of a finished `up` (plain values)."""
         return cls(**{f.name: exports[f.name] for f in fields(cls) if f.name in exports})
 
-    def to_json(self, run_password: str = "") -> str:
-        """The termination message. A vendor-generated `password` is sealed with `run_password` (`sealing`): the message
-        is readable by anyone who can read Pods."""
-        facts = {f.name: getattr(self, f.name) for f in fields(self) if getattr(self, f.name) is not None}
-        if "password" in facts:
-            if not run_password:
-                raise ValueError("a vendor-generated password needs the run's password to be sealed with")
-            facts["password"] = sealing.seal(run_password, facts["password"])
-        return json.dumps(facts)
+    def to_json(self) -> str:
+        """The termination message: every set field. A vendor-generated `password` is in it in plain text; the
+        controller deletes the Job right after it has read it (docs/explanation/dbaas.md)."""
+        return json.dumps({f.name: getattr(self, f.name) for f in fields(self) if getattr(self, f.name) is not None})
 
 
 def load_spec(environ: dict[str, str] | None = None) -> DbSpec:

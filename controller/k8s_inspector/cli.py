@@ -79,7 +79,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     run.add_argument(
         "--client-region",
-        help="with --database: the client node's region (default: the database's, else one of its Keeper city)",
+        help="with --database: the client node's region, an operator override with no city check (default: the "
+        "database's, else one of its Keeper city)",
     )
     run.add_argument(
         "--tasks", type=lambda s: [t for t in s.split(",") if t], default=[], help="comma-separated task names"

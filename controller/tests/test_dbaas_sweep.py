@@ -158,7 +158,7 @@ def test_the_connection_secret_carries_the_password_first_and_the_facts_later():
 
     run = BenchmarkRun("aws-x-1", "inspector", "u", "1", NOW, RunSpec("aws", "x", "r"), RunStatus())
     owner = OwnerRef("v1", "BenchmarkRun", "aws-x-1", "u")
-    assert dbaas_jobs.connection_secret(run, owner, "pw", None)["stringData"] == {"SC_DB_PASSWORD": "pw"}
+    assert dbaas_jobs.connection_secret(run, owner, "pw", None)["stringData"] == {"K8SI_RUN_PASSWORD": "pw"}
     gcp = {
         "host": "h",
         "admin_user": "postgres",
