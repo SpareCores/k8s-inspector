@@ -309,7 +309,9 @@ def test_a_destroy_of_the_leftover_stack_that_fails_is_retried(h):
     assert h.codes()[TASK] == (0, None)
 
 
-def test_a_leftover_stack_that_cannot_be_destroyed_drops_the_run_without_a_result_and_keeps_the_stack(h):
+def test_a_leftover_stack_that_cannot_be_destroyed_ends_the_run_with_a_result_and_keeps_the_stack(h):
+    failures = []
+    h.runner._on_leftover_stack_failure = failures.append
     h.cluster.jobs["down"] = ["fail"] * 5
     h.storage.objects[STATE_KEY] = b"{}"
     h.start_db()
@@ -319,8 +321,27 @@ def test_a_leftover_stack_that_cannot_be_destroyed_drops_the_run_without_a_resul
         h.runner.reconcile(h.name)
         h.clock.advance(minutes=5)
         h.runner.reconcile(h.name)
-    assert not h.run_exists()  # dropped: nothing published, nothing holds a database for it
+    run = h.run
+    assert run.status.phase == RunPhase.FAILED and run.status.database is None  # nothing holds the vendor's slot
+    code, message = h.codes()[TASK]
+    assert code == ExitCode.NO_NODE and message.startswith("DBAAS_LEFTOVER_STACK: k8s-dbaas-")
+    assert "operator action needed" in message and failures == ["oci"]
     assert STATE_KEY in h.storage.objects and h.pod_names() == []  # the sweeper and the operator take it from here
+
+
+@pytest.mark.parametrize("how", ["cancel", "delete"])
+def test_a_run_cancelled_while_clearing_records_nothing(h, how):
+    h.cluster.jobs["down"] = ["hang"]
+    h.storage.objects[STATE_KEY] = b"{}"
+    h.start_db()
+    h.until_phase(DbPhase.CLEARING)
+    if how == "cancel":
+        crd.request_cancel(h.kube, h.name)
+    else:
+        h.kube.delete("benchmarkrun", h.name)
+    h.runner.reconcile(h.name)
+    assert h.codes().get(TASK, (None, None)) == (None, None)  # no result for a database that was never created
+    assert h.db.phase == DbPhase.DESTROYING  # the leftover stack is still destroyed
 
 
 # ------------------------------------------------------------------ the node is lost, the run is cancelled or deleted

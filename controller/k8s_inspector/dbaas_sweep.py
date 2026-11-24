@@ -2,11 +2,12 @@
 (decision K11, docs/explanation/dbaas.md).
 
 A run that was deleted by hand, or whose finalizer was removed, can leave its database behind. The state of every
-stack `k8s-dbaas-<run>` is in the bucket, so the sweeper lists it, whatever the configuration says: a stack older than
-`dbaas.sweepAfterHours` whose BenchmarkRun does not exist is destroyed by a `dbaas-down-<run>` Job that belongs to no
-run. The sweeper deletes that Job when it is over (a failed one is created again next cycle, so the destroy is retried
-until it succeeds). A stack of a vendor the configuration does not know at all is reported and logged, not destroyed:
-the Job would have no credentials. It reports every stack it sees, for the metric `k8s_inspector_dbaas_instances`.
+stack `k8s-dbaas-<run>` is in the bucket, so the sweeper lists it, whatever the configuration says: a stack whose
+first update is older than `dbaas.sweepAfterHours` and whose BenchmarkRun does not exist is destroyed by a
+`dbaas-down-<run>` Job that belongs to no run. The sweeper deletes that Job when it is over (a failed one is created
+again next cycle, so the destroy is retried until it succeeds). A stack of a vendor the configuration does not know at
+all is reported and logged, not destroyed: the Job would have no credentials.
+It reports every stack it sees, for the metric `k8s_inspector_dbaas_instances`.
 
 Every `INVENTORY_INTERVAL` it also runs `dbaas-inventory-<vendor>` for each configured vendor. That Job lists the
 vendor's databases that carry the `sc_inspector_run` tag, which finds a database the state never recorded; the
@@ -36,7 +37,7 @@ INVENTORY_INTERVAL = timedelta(minutes=30)
 class Stack:
     run: str
     vendor: str | None  # None: no configured vendor owns the run name
-    modified: datetime  # the last change of its state file
+    created: datetime  # when the stack was first updated: the oldest of its Pulumi history files, which no retry resets
     orphan: bool  # no BenchmarkRun of that name exists
 
 
@@ -54,7 +55,9 @@ def known_vendors(cfg: Config) -> set[str]:
 
 
 def stacks(kube: Kube, cfg: Config, storage) -> list[Stack]:
-    """Every stack in the bucket, with whether its BenchmarkRun still exists."""
+    """Every stack in the bucket, with whether its BenchmarkRun still exists. A stack's age is that of its first
+    update (the oldest history file; the state file's own time when it has none), so neither a destroy that keeps
+    failing nor a run of the same name created again makes a stack look young."""
     runs = {run.name: run for run in crd.list_runs(kube)}
     vendors = known_vendors(cfg)
     found = []
@@ -63,7 +66,8 @@ def stacks(kube: Kube, cfg: Config, storage) -> list[Stack]:
         if name:
             run = runs.get(name)
             vendor = run.spec.vendor if run else dbaas_jobs.vendor_of_run(name, vendors)
-            found.append(Stack(name, vendor, modified, run is None))
+            history = [at for _, at in storage.list_objects(dbaas_jobs.state_history_prefix(name))]
+            found.append(Stack(name, vendor, min(history, default=modified), run is None))
     return found
 
 
@@ -98,17 +102,17 @@ def sweep(kube: Kube, cfg: Config, storage, now: datetime) -> list[Stack]:
     seen = stacks(kube, cfg, storage)
     limit = timedelta(hours=cfg.settings.dbaas.sweep_after_hours)
     for stack in seen:
-        if not (stack.orphan and now - stack.modified >= limit):
+        if not (stack.orphan and now - stack.created >= limit):
             continue
         if stack.vendor is None:
             log.warning(
                 "run %s is gone and its database stack is %s old, but no configured vendor owns it: not destroying it",
                 stack.run,
-                now - stack.modified,
+                now - stack.created,
             )
         elif dbaas_jobs.down_job_name(stack.run) not in existing:
             log.warning(
-                "run %s is gone but its database stack is %s old, destroying it", stack.run, now - stack.modified
+                "run %s is gone but its database stack is %s old, destroying it", stack.run, now - stack.created
             )
             with contextlib.suppress(AlreadyExists):
                 kube.create("job", dbaas_jobs.down_job(stack.run, stack.vendor, cfg, sweep=True))

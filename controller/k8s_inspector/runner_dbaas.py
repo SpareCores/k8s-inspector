@@ -10,8 +10,8 @@ database to destroy and creates the missing Job again. Creating and Bootstrappin
 phase (`_database_up`); Destroying is driven on every pass of every run phase (`_database_teardown`) as soon as the
 benchmark is over, however it ended. The destroy Job is retried until it succeeds; only then is the finalizer removed.
 A stack left by an earlier run of the same name is destroyed before the run asks for its client node (`Clearing` in
-`Pending`, then back to `(none)`); if that destroy fails `CLEAR_ATTEMPTS` times the run is dropped without a result and
-the stack is left to the sweeper.
+`Pending`, then back to `(none)`); if that destroy fails `CLEAR_ATTEMPTS` times the run ends with `-1`
+(`DBAAS_LEFTOVER_STACK`), holding no database, so the usual retry cap stops it, and the stack is left to the sweeper.
 
 A running `dbaas-up` Job is never deleted: it ends within its own deadline (Pulumi records what it created) and only
 then the destroy starts. Deleting it would risk a database the state never recorded.
@@ -44,7 +44,7 @@ TIMEOUT_MARGIN = timedelta(minutes=5)  # the controller judges the create deadli
 POLL_SECONDS = 60  # while waiting for a Job: the Job and Pod watches wake the run, this bounds the wait for a deadline
 WAIT_FOR_POD_SECONDS = 10  # the up Job's Pod is still going away; the down Job must not start before it is gone
 RETRY_MIN_SECONDS, RETRY_MAX_SECONDS = 60, 1800  # between destroy attempts: doubles from a minute to half an hour
-CLEAR_ATTEMPTS = 3  # failed destroys of a leftover stack after which the run gives up and leaves it to the sweeper
+CLEAR_ATTEMPTS = 3  # failed destroys of a leftover stack after which the run ends -1 and leaves it to the sweeper
 RUNNING_PHASES = (RunPhase.PENDING, RunPhase.PROVISIONING, RunPhase.RUNNING)
 
 
@@ -115,11 +115,16 @@ class DbaasMixin:
         )
         self._database_creating(run, cfg, live)
 
+    def _clearing(self, run: BenchmarkRun) -> bool:
+        """The run waits for the destroy of a stack an earlier run left: it has created no database."""
+        return run.status.database is not None and run.status.database.phase == DbPhase.CLEARING
+
     def _clear_leftover_stack(self, run: BenchmarkRun, cfg: Config) -> BenchmarkRun | None:
         """Called from `Pending`, before the run asks for a client node: destroy a stack left by an earlier run of the
-        same name (`Clearing`). Returns the run to go on with, or None while the destroy is going on (or the run was
-        dropped). A destroy that fails `CLEAR_ATTEMPTS` times (pending operations, say) drops the run without a result:
-        the stack stays for the sweeper and the operator, and a paid client node never waits for it."""
+        same name (`Clearing`). Returns the run to go on with, or None while the destroy is going on (or the run
+        ended). A destroy that fails `CLEAR_ATTEMPTS` times (pending operations, say) ends the run with `-1`
+        `DBAAS_LEFTOVER_STACK`: it holds no database, the retry cap stops the planner, the stack stays for the sweeper
+        and the operator, and a paid client node never waits for it."""
         db = run.status.database
         if db is not None and db.phase != DbPhase.CLEARING:
             return run  # an earlier attempt of this run made its database
@@ -136,19 +141,18 @@ class DbaasMixin:
                 run, lambda status: setattr(status, "database", DbStatus(DbPhase.CLEARING, now, now))
             )
             db = run.status.database
-        if self._drive_destroy(run, cfg, db):
+        done, run = self._drive_destroy(run, cfg, db)
+        if done:
             return self._set_database(run, lambda status: setattr(status, "database", None))
-        failures = crd.get_run(self.kube, run.name).status.database.destroy_failures
-        if failures >= CLEAR_ATTEMPTS:
-            log.error(
-                "run %s: the leftover stack cannot be destroyed (%d attempts), leaving it to the sweeper",
-                run.name,
-                failures,
-            )
-            self._delete_secret(run)
-            crd.remove_finalizer(self.kube, run.name)
-            crd.delete_run(self.kube, run.name)
-            self._forget(run.name)
+        db = run.status.database
+        if db.destroy_failures >= CLEAR_ATTEMPTS:
+            reason = db.error.removeprefix("DBAAS_DESTROY_FAILED: ") if db.error else "unknown"
+            stack = dbaas_jobs.stack_name(run.name)
+            text = f"DBAAS_LEFTOVER_STACK: {stack} could not be destroyed ({reason}); operator action needed"
+            if self._on_leftover_stack_failure:
+                self._on_leftover_stack_failure(run.spec.vendor)
+            run = self._set_database(run, lambda status: setattr(status, "database", None))
+            self._end_run(run, ExitCode.NO_NODE, text[:500], AttemptOutcome.PROVISIONING_FAILED)
         return None
 
     def _password(self, run: BenchmarkRun) -> str:
@@ -264,16 +268,17 @@ class DbaasMixin:
         self._destroy(run, cfg, db)
 
     def _destroy(self, run: BenchmarkRun, cfg: Config, db: DbStatus) -> None:
-        if not self._drive_destroy(run, cfg, db):
+        if not self._drive_destroy(run, cfg, db)[0]:
             return
         self.kube.delete("secret", pods.db_secret_name(run.name))
         self._set_database(run, lambda status: setattr(status.database, "phase", DbPhase.DESTROYED))
         crd.remove_finalizer(self.kube, run.name)
         log.info("run %s: the database is destroyed", run.name)
 
-    def _drive_destroy(self, run: BenchmarkRun, cfg: Config, db: DbStatus) -> bool:
-        """One pass of the destroy of the run's stack: True when it succeeded and its state is gone. A running up Job is
-        waited for, never deleted: it ends within its deadline and Pulumi records what it created."""
+    def _drive_destroy(self, run: BenchmarkRun, cfg: Config, db: DbStatus) -> tuple[bool, BenchmarkRun]:
+        """One pass of the destroy of the run's stack: True when it succeeded and its state is gone, with the run as
+        it is now (a failed destroy updated it). A running up Job is waited for, never deleted: it ends within its
+        deadline and Pulumi records what it created."""
         up = dbaas_jobs.up_job_name(run.name)
         try:
             up_job = self.kube.get("job", up)
@@ -282,33 +287,32 @@ class DbaasMixin:
         if up_job is not None:
             if dbaas_jobs.job_state(up_job) == "running":
                 self._enqueue_later(run.name, POLL_SECONDS)
-                return False
+                return False, run
             self.kube.delete("job", up)
         if self.kube.list("pod", labels={dbaas_jobs.LABEL_JOB: up}):  # it must be gone before the destroy starts
             self._enqueue_later(run.name, WAIT_FOR_POD_SECONDS)
-            return False
+            return False, run
         name = dbaas_jobs.down_job_name(run.name)
         try:
             job = self.kube.get("job", name)
         except NotFound:
             if db.retry_after and self._now() < db.retry_after:
                 self._enqueue_later(run.name, max(1.0, (db.retry_after - self._now()).total_seconds()))
-                return False
+                return False, run
             self._create("job", dbaas_jobs.down_job(run.name, run.spec.vendor, cfg))
             self._enqueue_later(run.name, POLL_SECONDS)
-            return False
+            return False, run
         state = dbaas_jobs.job_state(job)
         if state == "running":
             self._enqueue_later(run.name, POLL_SECONDS)
-            return False
+            return False, run
         if state == "failed":
-            self._destroy_failed(run, name, db)
-            return False
+            return False, self._destroy_failed(run, name, db)
         dbaas_jobs.clean_state(self.storage, run.name)
         self.kube.delete("job", name)
-        return True
+        return True, run
 
-    def _destroy_failed(self, run: BenchmarkRun, name: str, db: DbStatus) -> None:
+    def _destroy_failed(self, run: BenchmarkRun, name: str, db: DbStatus) -> BenchmarkRun:
         """The destroy failed: try again later, as long as it takes (a database that bills must not stay)."""
         message = dbaas_jobs.job_message(self.kube, name).get("error") or "the destroy Job failed"
         failures = db.destroy_failures + 1
@@ -320,6 +324,7 @@ class DbaasMixin:
             status.database.destroy_failures, status.database.retry_after = failures, retry_after
             status.database.error = f"DBAAS_DESTROY_FAILED: {message}"[:500]
 
-        self._set_database(run, mutate)
+        run = self._set_database(run, mutate)
         self.kube.delete("job", name)
         self._enqueue_later(run.name, wait)
+        return run

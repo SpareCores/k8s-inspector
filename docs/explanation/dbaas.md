@@ -77,8 +77,13 @@ database second; on the way out, database destroy and node release in parallel.*
 `status.database.phase` is the state: `Clearing`, `Creating`, `Bootstrapping`, `Ready`, `Destroying`, `Destroyed`; absent
 means nothing was created. `Clearing` is a stack of an earlier run of the same name that is destroyed first, while the run is still `Pending`: the
 client node is requested only after that. The down Job is retried like any other, up to 3 failures (for instance pending
-operations); then the run is deleted without a result of any kind, its stack is left to the sweeper and the operator
-(it counts in `k8s_inspector_dbaas_instances` and is logged), and the planner creates the run again in a later cycle. The phase is written before what it stands for is created, and the Job names follow from the run
+operations); then the run ends with a `-1` result `DBAAS_LEFTOVER_STACK: <stack> could not be destroyed (<reason>);
+operator action needed` and holds no database (`status.database` is cleared, so nothing occupies the vendor's DBaaS
+slot). The usual retry cap applies (three `-1`, then `-5`), so the planner stops by itself. The stack is left to the
+sweeper and the operator: it counts in `k8s_inspector_dbaas_instances`, aged from its first update (the oldest Pulumi
+history file), so the 8 h alert fires however often the run is created again, and
+`k8s_inspector_dbaas_leftover_stack_failures_total{vendor}` counts these give-ups. A run cancelled or deleted while it
+is `Clearing` records nothing: it created no database. The phase is written before what it stands for is created, and the Job names follow from the run
 name, so a controller that restarts anywhere continues: it creates a missing Job again and runs the destroy of every
 run that is over.
 
@@ -156,8 +161,8 @@ Guarantees:
   created. The task ends `-1` with `DBAAS_CREATE_FAILED`, `DBAAS_CREATE_TIMEOUT` or `DBAAS_BOOTSTRAP_FAILED`
   ([exit codes](../reference/exit-codes.md)), which the usual retry rules bound.
 - **`BenchmarkRun` deleted:** a finalizer keeps the object until `down` succeeded; deleting an active run cancels it.
-- **Run gone, stack left:** the sweeper (every 10 minutes) lists the stacks `k8s-dbaas-*` in the bucket; one older than
-  `dbaas.sweepAfterHours` (6 h) whose run does not exist is destroyed by a `dbaas-down-<run>` Job that belongs to no run,
+- **Run gone, stack left:** the sweeper (every 10 minutes) lists the stacks `k8s-dbaas-*` in the bucket; one whose first update is older than
+  `dbaas.sweepAfterHours` (6 h) and whose run does not exist is destroyed by a `dbaas-down-<run>` Job that belongs to no run,
   and retried every cycle until it succeeds. The sweeper lists the bucket whatever the configuration says, also when
   `dbaas.vendors` is empty or a vendor was removed from it: such a stack is destroyed with the vendor's ServiceAccount
   and Secret by their names (the default ServiceAccount when `dbaas.vendors.<vendor>` is gone). A stack of a vendor the
@@ -171,8 +176,8 @@ Guarantees:
   exports `k8s_inspector_dbaas_tagged_databases{vendor}` and `k8s_inspector_dbaas_tagged_oldest_age_seconds{vendor}`.
   The monitoring alerts when the oldest is older than 8 h ([monitoring](monitoring.md)). The metrics
   `k8s_inspector_dbaas_instances` and `k8s_inspector_dbaas_oldest_age_seconds` count the databases the controller knows
-  about. An inventory Job that fails or reports something unreadable drops the vendor's tagged metrics, and
-  `k8s_inspector_dbaas_inventory_last_success_timestamp_seconds{vendor}` (0: no success since the controller started)
+  about. An inventory Job that fails or reports something unreadable drops the vendor's tagged series (a transient failure makes them disappear until the next good inventory), and
+  `k8s_inspector_dbaas_inventory_last_success_timestamp_seconds{vendor}` (the controller's start time until the first success, so a vendor that never succeeds alerts 2 h after the start)
   alerts when it is older than 2 h. This is alert-only; no tag-driven automatic delete.
 
 Retries follow the normal `-1`/`-4` backoff with the cap of three, instead of today's retry every 2 h forever.

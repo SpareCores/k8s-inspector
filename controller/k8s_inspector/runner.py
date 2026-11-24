@@ -406,17 +406,20 @@ class Runner(DbaasMixin):
         *,
         clock: Callable[[], datetime] | None = None,
         on_launch_failure: Callable[[str, str], None] | None = None,
+        on_leftover_stack_failure: Callable[[str], None] | None = None,
     ) -> None:
         """`cfg_provider`: zero-argument callable returning the current `Config` (settings are re-read from the
         ConfigMap every cycle, so a callable is passed instead of a snapshot). `clock` (tests) returns the
         current UTC time. `on_launch_failure(vendor, reason)` is called
-        for each run that ends because no node could be launched (metrics)."""
+        for each run that ends because no node could be launched, `on_leftover_stack_failure(vendor)` for each that gave
+        up destroying a stack an earlier run left (metrics)."""
         self.kube = kube
         self.storage = storage
         self.namespace = namespace
         self._cfg = cfg_provider
         self._clock = clock or (lambda: datetime.now(UTC))
         self._on_launch_failure = on_launch_failure
+        self._on_leftover_stack_failure = on_leftover_stack_failure
         self._queue: queue.Queue[str] = queue.Queue()
         self._lock = threading.Lock()
         self._queued: set[str] = set()
@@ -466,11 +469,11 @@ class Runner(DbaasMixin):
             if (
                 run.deleting
                 and run.spec.database is not None
-                and run.status.database is None
+                and (run.status.database is None or self._clearing(run))
                 and run.status.phase in NO_NODE_YET
             ):
-                # A DBaaS run deleted before it created anything (its finalizer is only there for the database): drop it
-                # like a deleted server run, leaving no record.
+                # A DBaaS run deleted before it created anything (its finalizer is only there for the database, or
+                # for the leftover stack it clears): drop it like a deleted server run, leaving no record.
                 self._delete_anchors(live)
                 self._delete_secret(run)
             elif (run.cancel_requested or run.deleting) and run.status.phase in ACTIVE:
@@ -1893,6 +1896,7 @@ class Runner(DbaasMixin):
         results = [
             _Result(steps.task_of(t.name), t.name, ExitCode.NEVER_FINISHED, Reason.CANCELLED.value)
             for t in self._unfinished(run)
+            if not self._clearing(run)  # no database was created: nothing to record
         ]
         run = self._record(run, nd, results)
 

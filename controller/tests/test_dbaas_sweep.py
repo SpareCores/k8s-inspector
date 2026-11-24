@@ -99,6 +99,34 @@ def EnvConfigWith(**fields):
     return replace(make_config().env, **fields)
 
 
+def test_the_web_identity_token_is_mounted_in_every_job_kind_but_the_state_env_only_where_there_is_state():
+    cfg = make_sweep_config()
+    cfg = type(cfg)(EnvConfigWith(dbaas_role_arn="arn:aws:iam::1:role/state"), cfg.settings)
+    inventory = dbaas_jobs.inventory_job("aws", cfg)
+    down = dbaas_jobs.down_job("aws-x-1", "aws", cfg)
+    for job in (inventory, down):
+        pod = job["spec"]["template"]["spec"]
+        assert [v["name"] for v in pod["volumes"] if v["name"] == "aws-token"] == ["aws-token"]
+        assert {"name": "aws-token", "mountPath": dbaas_jobs.AWS_TOKEN_DIR, "readOnly": True} in (
+            pod["containers"][0]["volumeMounts"]
+        )
+    env = lambda job: {e["name"] for e in job["spec"]["template"]["spec"]["containers"][0]["env"]}  # noqa: E731
+    assert "PULUMI_BACKEND_URL" in env(down) and "PULUMI_BACKEND_URL" not in env(inventory)
+
+
+def test_a_stack_is_as_old_as_its_first_update_whatever_its_state_file_was_last_changed(kube):
+    storage = FakeStorage()
+    stack(storage, "aws-leak-1", 1)  # a destroy that keeps failing rewrites the state file
+    history = dbaas_jobs.state_history_prefix("aws-leak-1")
+    for name, hours in (("a", 9), ("b", 2)):
+        storage.objects[f"{history}{name}.json"] = b"{}"
+        storage.modified[f"{history}{name}.json"] = NOW - timedelta(hours=hours)
+    (seen,) = dbaas_sweep.stacks(kube, make_sweep_config(), storage)
+    assert seen.created == NOW - timedelta(hours=9)
+    dbaas_sweep.sweep(kube, make_sweep_config(), storage, NOW)
+    assert jobs(kube) == ["dbaas-down-aws-leak-1"]  # past the 6 h from its creation
+
+
 def test_every_database_is_labelled_with_the_run_and_an_expiry():
     expires = datetime(2026, 11, 21, 9, 5, tzinfo=UTC)
     labels = dbaas_jobs.labels("r20261120T1000-AAAA", expires)
@@ -324,7 +352,9 @@ def test_a_failed_inventory_drops_the_last_result_and_the_metric_tells_the_last_
     assert (
         f'k8s_inspector_dbaas_inventory_last_success_timestamp_seconds{{vendor="aws"}} {good.at.timestamp():g}' in text
     )
-    assert 'k8s_inspector_dbaas_inventory_last_success_timestamp_seconds{vendor="oci"} 0' in text  # never worked
+    assert (
+        f'k8s_inspector_dbaas_inventory_last_success_timestamp_seconds{{vendor="oci"}} {NOW.timestamp():g}' in text
+    )  # never worked: the process start
     metrics.record_dbaas_inventory({}, {"aws": good.at})  # the latest one failed: no stale count
     text = metrics.render()
     assert "dbaas_tagged_databases{" not in text

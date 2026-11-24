@@ -180,7 +180,14 @@ def serve(kube: Kube, provider: ConfigProvider, stop: threading.Event, metrics_p
     env = cfg.env
     storage = Storage(env, cfg.settings.uploads)
     metrics = Metrics(kube, lambda: provider().settings)
-    runner = Runner(kube, storage, provider, env.namespace, on_launch_failure=metrics.record_launch_failure)
+    runner = Runner(
+        kube,
+        storage,
+        provider,
+        env.namespace,
+        on_launch_failure=metrics.record_launch_failure,
+        on_leftover_stack_failure=metrics.record_dbaas_leftover_failure,
+    )
     publisher = _MeteredPublisher(
         kube,
         storage,

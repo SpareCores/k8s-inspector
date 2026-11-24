@@ -97,6 +97,11 @@ def stack_state_key(run: str) -> str:
     return f"{STATE_PREFIX}.pulumi/stacks/{STATE_PROJECT}/{stack_name(run)}.json"
 
 
+def state_history_prefix(run: str) -> str:
+    """Where Pulumi keeps one file per update of the stack; the oldest is its creation."""
+    return f"{STATE_PREFIX}.pulumi/history/{STATE_PROJECT}/{stack_name(run)}/"
+
+
 def state_leftover_prefixes(run: str) -> list[str]:
     """Where Pulumi leaves files of the stack after a successful `destroy --remove`: its backups and history, and the
     `.bak` of the state. They hold no live resource, only old encrypted state, so the controller deletes them."""
@@ -104,7 +109,7 @@ def state_leftover_prefixes(run: str) -> list[str]:
     base = f"{STATE_PREFIX}.pulumi"
     return [
         f"{base}/backups/{STATE_PROJECT}/{stack}/",
-        f"{base}/history/{STATE_PROJECT}/{stack}/",
+        state_history_prefix(run),
         f"{base}/stacks/{STATE_PROJECT}/{stack}.json",
     ]
 
@@ -288,7 +293,8 @@ def _job(
 ) -> dict:
     """A Job with one Pod of the provisioner image: no retries inside the Job (the controller decides), no Kubernetes
     API token, the vendor's credentials from an optional Secret. With `state` it also gets the Pulumi state bucket
-    (through the projected web identity token). The Pod is never disrupted by Karpenter and has time to let Pulumi
+    backend; the projected web identity token (`AWS_TOKEN_DIR/token`, audience `sts.amazonaws.com`) is mounted in every
+    Job when `K8SI_DBAAS_ROLE_ARN` is set. The Pod is never disrupted by Karpenter and has time to let Pulumi
     record what is in flight when it is stopped."""
     env_cfg = cfg.env
     vendor_config = cfg.settings.dbaas.vendors.get(vendor)
@@ -298,7 +304,7 @@ def _job(
     container_env = [*(_state_env(env_cfg) if state else []), *env]
     mounts = [{"name": "work", "mountPath": "/work"}, {"name": "tmp", "mountPath": "/tmp"}]
     volumes = [{"name": "work", "emptyDir": {"sizeLimit": "1Gi"}}, {"name": "tmp", "emptyDir": {"sizeLimit": "512Mi"}}]
-    if state and env_cfg.dbaas_role_arn:
+    if env_cfg.dbaas_role_arn:  # every Job kind: vendor modules may use the token too (the state env is state-only)
         mounts.append({"name": "aws-token", "mountPath": AWS_TOKEN_DIR, "readOnly": True})
         token = {"serviceAccountToken": {"audience": "sts.amazonaws.com", "expirationSeconds": 3600, "path": "token"}}
         volumes.append({"name": "aws-token", "projected": {"sources": [token]}})

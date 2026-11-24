@@ -12,14 +12,16 @@ on: no lscpu result), `_last_publish_timestamp_seconds`
 `_spend_usd_per_hour`, `_task_duration_seconds` (summary sum/count), `_launch_failures_total{vendor,reason}`
 (runs that ended because no node could be launched, counted by the runner), `_launch_deferred_skus{vendor,reason}`
 and `_launch_blocked{vendor,reason}` (SKUs in the launch ConfigMap, and those of them still waiting for their
-retry). `_dbaas_instances{vendor}` and `_dbaas_oldest_age_seconds{vendor}`: the managed databases (stacks) that exist,
-from the DBaaS
-runs not yet destroyed and the leaked stacks the sweeper sees (stacks of a vendor the configuration does not know are
+retry), `_dbaas_leftover_stack_failures_total{vendor}` (runs that gave up destroying a stack of an earlier run of the
+same name, counted by the runner). `_dbaas_instances{vendor}` and `_dbaas_oldest_age_seconds{vendor}`: the managed
+databases (stacks) that exist, from the stacks the sweeper sees (aged from their first update) and the DBaaS runs not
+yet destroyed that no stack shows yet (stacks of a vendor the configuration does not know are
 `vendor="unknown"`); alert when the oldest is over 8 h. `_dbaas_tagged_databases{vendor}` and
 `_dbaas_tagged_oldest_age_seconds{vendor}`: the databases the vendor's inventory Job found by their `sc_inspector_run`
 tag (also the ones no state records), refreshed every 30 minutes; alert when the oldest is over 8 h. A vendor whose
 inventory failed has no tagged metrics. `_dbaas_inventory_last_success_timestamp_seconds{vendor}`: when the last
-inventory of every configured vendor worked (0: not since the controller started); alert when it is over 2 h old.
+inventory of every configured vendor worked (the controller's start time until the first success); alert when it is over
+2 h old.
 `/healthz` answers 200 as long as the process serves.
 """
 
@@ -91,22 +93,21 @@ class Metrics:
         self._kube = kube
         self._settings = settings_provider
         self._clock = clock
+        self._started = clock()
         self._lock = threading.Lock()
         self._counters: dict[str, dict[Labels, float]] = defaultdict(lambda: defaultdict(float))
         self._seen: set[tuple] = set()
         self._gauges: list[str] = []  # last good snapshot, served when the API server is unreachable
         self._last_publish = time.time()  # process start until the first cycle: a stuck publisher still ages
         self._counters["unpublishable_tasks_total"][()] = 0
-        self._orphans: list[tuple[str, float]] = []  # (vendor, age in seconds) of the stacks without a run
+        self._stacks: list = []  # `dbaas_sweep.Stack`s the sweeper saw last
         self._tagged: dict = {}  # vendor -> `dbaas_sweep.Tagged`: the databases the last inventory found by their tag
         self._inventory_success: dict[str, datetime] = {}  # vendor -> when its inventory last worked
 
     def record_dbaas_stacks(self, stacks) -> None:
-        """The stacks the sweeper saw (`dbaas_sweep.Stack`); those without a BenchmarkRun are counted here, the others
-        come from their runs."""
-        now = self._clock()
+        """The stacks the sweeper saw (`dbaas_sweep.Stack`), counted with their age since their first update."""
         with self._lock:
-            self._orphans = [(s.vendor or "unknown", (now - s.modified).total_seconds()) for s in stacks if s.orphan]
+            self._stacks = list(stacks)
 
     def record_dbaas_inventory(self, tagged: dict, last_success: dict) -> None:
         """The latest good inventory of every vendor (`dbaas_sweep.Tagged` by vendor) and when each vendor's last one
@@ -124,6 +125,11 @@ class Metrics:
         reason = reason if reason in LAUNCH_REASONS else "OTHER"
         with self._lock:
             self._counters["launch_failures_total"][_labels(vendor=vendor, reason=reason)] += 1
+
+    def record_dbaas_leftover_failure(self, vendor: str) -> None:
+        """A run gave up destroying the stack an earlier run of its name left."""
+        with self._lock:
+            self._counters["dbaas_leftover_stack_failures_total"][_labels(vendor=vendor)] += 1
 
     def record_unpublishable(self, count: int) -> None:
         """Tasks the publisher gave up on (finished, but no lscpu result to pick a variant from)."""
@@ -157,13 +163,14 @@ class Metrics:
         spend: dict[str, float] = defaultdict(float)
         node_age: dict[Labels, float] = {}
         databases: dict[str, list[float]] = defaultdict(list)  # vendor -> ages of its existing databases
+        has_database: dict[str, bool] = {}  # run -> its database exists (not destroyed yet)
         backlog = 0
         oldest_unpublished: datetime | None = None
 
         for run in runs:
             vendor = run.spec.vendor
-            if run.status.database and run.status.database.phase != DbPhase.DESTROYED:
-                databases[vendor].append((now - run.created).total_seconds())
+            if run.status.database:
+                has_database[run.name] = run.status.database.phase != DbPhase.DESTROYED
             for phase in RunPhase:
                 phases.setdefault((vendor, phase.value), 0)
             phases[(vendor, run.status.phase.value)] += 1
@@ -227,8 +234,13 @@ class Metrics:
         ]
         lines.append(f"# TYPE {PREFIX}node_age_seconds gauge")
         lines += [_line("node_age_seconds", labels, age) for labels, age in sorted(node_age.items())]
-        for vendor, age in self._orphans:
-            databases[vendor].append(age)
+        seen = {stack.run for stack in self._stacks}
+        for stack in self._stacks:  # a destroyed run's state may linger until the next sweep
+            if has_database.get(stack.run, True):
+                databases[stack.vendor or "unknown"].append((now - stack.created).total_seconds())
+        for run in runs:  # a database whose stack the sweeper has not seen yet
+            if has_database.get(run.name) and run.name not in seen:
+                databases[run.spec.vendor].append((now - run.created).total_seconds())
         for vendor in settings.vendors:
             databases.setdefault(vendor, [])  # a vendor without databases reports 0, not nothing
         lines.append(f"# TYPE {PREFIX}dbaas_instances gauge")
@@ -254,7 +266,7 @@ class Metrics:
             _line(
                 "dbaas_inventory_last_success_timestamp_seconds",
                 _labels(vendor=v),
-                self._inventory_success[v].timestamp() if v in self._inventory_success else 0,
+                self._inventory_success.get(v, self._started).timestamp(),
             )
             for v in sorted(settings.dbaas.vendors)
         ]

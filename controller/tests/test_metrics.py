@@ -257,3 +257,26 @@ def test_launch_gauges_survive_a_damaged_launch_configmap():
         kube.merge_patch("configmap", "k8s-inspector-launch-oci", {"data": {"skus": skus}})
         text = Metrics(kube, lambda: SETTINGS, clock=lambda: NOW).render()
         assert 'k8s_inspector_launch_blocked{reason="ICE",vendor="oci"} 0' in text
+
+
+def test_dbaas_stack_ages_come_from_the_stack_and_the_inventory_clock_starts_with_the_process(runs):
+    from dataclasses import replace
+
+    from fakes import Clock, FakeKube
+
+    from k8s_inspector.dbaas_sweep import Stack
+    from k8s_inspector.model import DbaasVendor
+
+    settings = replace(SETTINGS, dbaas=replace(SETTINGS.dbaas, vendors={"oci": DbaasVendor()}))
+    clock = Clock(NOW)
+    metrics = Metrics(FakeKube(clock), lambda: settings, clock=clock)
+    clock.advance(minutes=10)
+    # a run that ended with -1 and holds no database; its stack is 9 h old whatever the run's age
+    runs.append(make_run("vm", RunPhase.FAILED))
+    metrics.record_dbaas_stacks([Stack(runs[0].name, "oci", NOW + timedelta(minutes=10) - timedelta(hours=9), False)])
+    metrics.record_dbaas_leftover_failure("oci")
+    text = metrics.render()
+    assert 'k8s_inspector_dbaas_instances{vendor="oci"} 1' in text
+    assert 'k8s_inspector_dbaas_oldest_age_seconds{vendor="oci"} 32400' in text
+    assert 'k8s_inspector_dbaas_leftover_stack_failures_total{vendor="oci"} 1' in text
+    assert f'k8s_inspector_dbaas_inventory_last_success_timestamp_seconds{{vendor="oci"}} {NOW.timestamp():g}' in text

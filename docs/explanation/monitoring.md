@@ -46,9 +46,10 @@ Transient API errors (429, 5xx, connection errors, timeouts, a 404 on the `Bench
 | `k8s_inspector_last_publish_timestamp_seconds` | (last publish cycle without error; the process start until the first one) |
 | `k8s_inspector_spend_usd_per_hour` | vendor (sum of running node prices) |
 | `k8s_inspector_dbaas_instances` | vendor: managed databases that exist: DBaaS runs whose database is not yet destroyed, plus leaked stacks the sweeper sees (0 for a vendor without any) |
-| `k8s_inspector_dbaas_oldest_age_seconds` | vendor: age of the oldest of them (the run's age; a leaked stack's age since its last state change). Stacks of a vendor the ConfigMap does not know are `vendor="unknown"` |
+| `k8s_inspector_dbaas_oldest_age_seconds` | vendor: age of the oldest of them (a stack's age since its first update, whatever retries or runs of the same name came after). Stacks of a vendor the ConfigMap does not know are `vendor="unknown"` |
+| `k8s_inspector_dbaas_leftover_stack_failures_total` | vendor: runs that ended `-1 DBAAS_LEFTOVER_STACK` because the stack of an earlier run of the same name could not be destroyed in 3 attempts (operator action needed) |
 | `k8s_inspector_dbaas_tagged_databases` | vendor: databases the vendor's inventory Job (every 30 minutes) found by their `sc_inspector_run` tag, also those no state records |
-| `k8s_inspector_dbaas_inventory_last_success_timestamp_seconds` | vendor: when its inventory Job last succeeded (0: not since the controller started); the tagged metrics are missing while the latest one failed |
+| `k8s_inspector_dbaas_inventory_last_success_timestamp_seconds` | vendor: when its inventory Job last succeeded (the controller's start time until the first success: a vendor that never succeeds alerts 2 h after the start); the tagged metrics are missing while the latest one failed |
 | `k8s_inspector_dbaas_tagged_oldest_age_seconds` | vendor: age of the oldest of them since its creation in the cloud |
 | `k8s_inspector_task_duration_seconds_sum`, `_count` | vendor, task |
 
