@@ -276,9 +276,9 @@ directly comparable with it.
   created in the dedicated DBaaS resource group (the Job's identity may write servers only there), named from the run
   id (a globally unique DNS name that a rerun of the same client SKU does not repeat), and has no public access, so no
   allowlist is needed.
-- **Identity**: Azure workload identity. The federated credential of an Entra application trusts the Job's
+- **Identity**: Azure workload identity. The federated credential of a user-assigned managed identity trusts the Job's
   ServiceAccount `k8s-inspector-dbaas-azure`; the Job's projected token (audience `sts.amazonaws.com`, the one the state
-  profile uses) is the client assertion. The Secret `k8s-inspector-dbaas-azure` holds the application, tenant and
+  profile uses) is the client assertion. The Secret `k8s-inspector-dbaas-azure` holds the identity's client id, tenant and
   subscription ids and `ARM_USE_OIDC` / `ARM_OIDC_TOKEN_FILE_PATH` for the provider.
 - **Sizing**: the tier comes from the `GP_`, `MO_` or `B_` prefix of Keeper's `api_reference_object.sku_name`, the compute
   size is Keeper's `api_reference`. Premium SSD v2 when Keeper's `compatible_storage_ids` has `ManagedDiskV2`, with the

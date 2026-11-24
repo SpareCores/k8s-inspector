@@ -44,7 +44,8 @@ def subscription_id() -> str:
 
 def token() -> str:
     """An ARM token for the workload identity: the projected Kubernetes token (`ARM_OIDC_TOKEN_FILE_PATH`) is the client
-    assertion of the Entra app named by `ARM_CLIENT_ID` and `ARM_TENANT_ID`, the variables the Pulumi provider reads."""
+    assertion of the managed identity named by `ARM_CLIENT_ID` and `ARM_TENANT_ID`, the variables the Pulumi provider
+    reads."""
     body = urllib.parse.urlencode(
         {
             "grant_type": "client_credentials",
@@ -107,7 +108,8 @@ def headroom(usages: dict[str, dict], family: str | None, vcpus: int) -> str | N
 
     cores = usages.get("cores")
     if cores is None:
-        return "the regional cores quota is not listed"
+        log.warning("the regional cores quota is not listed, the vCPU headroom is not checked")
+        return None
     if cores["limit"] - cores["currentValue"] < vcpus:
         return f"{vcpus} vCPUs needed, the regional cores quota has {left(cores)}"
     if family is None:

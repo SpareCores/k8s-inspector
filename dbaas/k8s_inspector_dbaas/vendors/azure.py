@@ -32,12 +32,11 @@ ADMIN_DB = "postgres"
 TIERS = {"B": "Burstable", "GP": "GeneralPurpose", "MO": "MemoryOptimized"}  # prefixes of Keeper's `sku_name`
 # Premium SSD v2 (the legacy choice, https://learn.microsoft.com/azure/virtual-machines/disks-types#premium-ssd-v2):
 # 3000 IOPS and 125 MB/s are free (the module provisions at least the P30 equivalent), throughput is at most
-# 0.25 MB/s per IOPS; the SKUs that do not offer it
-# (Keeper's `compatible_storage_ids` lacks ManagedDiskV2: Burstable) get Premium SSD, as the legacy did.
+# 0.25 MB/s per IOPS. The SKUs that do not offer it (Keeper's `compatible_storage_ids` lacks ManagedDiskV2: Burstable)
+# get Premium SSD, as the legacy did.
 PREMIUM_V2 = "ManagedDiskV2"
-PREMIUM_V2_MIN_IOPS = (
-    5000  # the floor of the legacy sc-runner: the performance of Premium SSD P30 (5000 IOPS, 200 MB/s),
-)
+# The floor of the legacy sc-runner: the performance of Premium SSD P30 (5000 IOPS, 200 MB/s).
+PREMIUM_V2_MIN_IOPS = 5000
 PREMIUM_V2_MIN_MBPS = 200  # more only when the storage plan asks for more
 PREMIUM_V2_MBPS_PER_IOPS = 0.25
 PREMIUM_V2_PROFILE = {"max_write_iops": 80_000, "max_write_mbps": 1200, "independently_provisioned": True}
@@ -111,9 +110,8 @@ def provision(spec: DbSpec) -> DbOutputs:
     edition = PREMIUM_V2 if uses_premium_v2(spec) else "ManagedDisk"
     zones = azure_preflight.check(spec.region, sku, spec.vcpus, edition)  # raises before anything is created
     network = spec.network
-    provider = Provider(
-        "azure"
-    )  # credentials from the ARM_* environment, never as arguments (they would go to the state)
+    # Credentials come from the ARM_* environment, never as arguments (they would go to the state).
+    provider = Provider("azure")
     server = dbforpostgresql.Server(
         "server",
         server_name=server_name(spec.run_id),

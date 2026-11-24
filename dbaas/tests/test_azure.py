@@ -25,6 +25,7 @@ RECORD = {
 def make_spec(**changes) -> DbSpec:
     fields = dict(
         vendor="azure", database_id="Standard_D4ds_v5", engine_version="18", region="westeurope", zone="westeurope-2",
+        client_region="westeurope",
         run="azure-standard-d2ds-v5-1234abcd", run_id="r1", expires_at="2026-11-20T16:00:00Z",
         labels={"sc_inspector_run": "r1", "sc_inspector_expires": "20261120t1600z"},
         create_timeout_minutes=50, delete_timeout_minutes=100, network=NETWORK, record=RECORD, password="s3cret-pass",
@@ -244,13 +245,18 @@ def test_the_pre_flight_passes_and_returns_the_zones_of_the_sku(arm):
         ({"capabilities": capabilities(storages=("ManagedDisk",))}, "not ManagedDiskV2"),
         ({"usages": usages(cores=(98, 100))}, "regional cores quota has 2 of 100"),
         ({"usages": usages(family=("standardDdsv5Family", 98, 100))}, "quota standardDdsv5Family has 2 of 100"),
-        ({"usages": usages(family=None)[:0]}, "regional cores quota is not listed"),
     ],
 )  # fmt: skip
 def test_the_pre_flight_refuses_with_the_reason(arm, change, message):
     arm.update(change)
     with pytest.raises(PreflightError, match=message):
         azure_preflight.check("westeurope", "Standard_D4ds_v5", 4, "ManagedDiskV2")
+
+
+def test_a_missing_cores_quota_is_logged_and_passes(arm, caplog):
+    arm["usages"] = usages(family=None)[:0]
+    assert azure_preflight.check("westeurope", "Standard_D4ds_v5", 4, "ManagedDiskV2") == ["1", "2"]
+    assert "cores quota is not listed" in caplog.text
 
 
 def test_a_quota_family_the_usages_do_not_list_only_checks_the_regional_cores(arm, caplog):
