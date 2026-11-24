@@ -746,6 +746,22 @@ class Publisher:
                 newest[sku] = (n, frozenset(done))
         return newest
 
+    def read_first_seen(self, vendor: str, sku: str, variant: int) -> datetime | None:
+        """When variant `variant` of the SKU first appeared (naive UTC): `first_seen` of its `variant.json` in
+        origin/<branch>, read from the git tree, no checkout. None when the file is missing (logged at debug) or
+        has no readable `first_seen` (logged at warning)."""
+        path = f"data/{_safe_part(vendor)}/{_safe_part(sku)}/{variant}/variant.json"
+        with self._lock:
+            shown = self._run_git(("show", f"origin/{self._env.git_branch}:{path}"), False)
+        if shown.returncode != 0:
+            log.debug("no %s in origin/%s", path, self._env.git_branch)
+            return None
+        try:
+            return datetime.fromisoformat(json.loads(shown.stdout)["first_seen"]).replace(tzinfo=None)
+        except (ValueError, KeyError, TypeError) as e:
+            log.warning("no readable first_seen in %s: %r", path, e)
+            return None
+
     def _git_names(self, path: str) -> list[str]:
         """Entry names under `path` in origin/<branch> (no checkout needed)."""
         out = self._git("ls-tree", "--name-only", f"origin/{self._env.git_branch}", f"{path}/")

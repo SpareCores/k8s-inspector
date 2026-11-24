@@ -206,7 +206,12 @@ def serve(kube: Kube, provider: ConfigProvider, stop: threading.Event, metrics_p
     targets = {
         "runner": lambda: runner.run_forever(stop),
         "planner": lambda: planner.run_forever(
-            kube, provider, publisher.read_schedule_metas, stop, publisher.read_newest_variants
+            kube,
+            provider,
+            publisher.read_schedule_metas,
+            stop,
+            publisher.read_newest_variants,
+            publisher.read_first_seen,
         ),
         "publisher": lambda: publisher.run_forever(lambda: provider().settings, stop),
         "metrics": server.serve_forever,
@@ -256,6 +261,7 @@ def cmd_plan(args: argparse.Namespace) -> int:
             publisher.read_schedule_metas,
             dry_run=args.dry_run,
             variant_reader=publisher.read_newest_variants,
+            first_seen_reader=publisher.read_first_seen,
         )
     for run in planned:
         print(f"{run.vendor} {run.sku} {','.join(run.tasks)} ({run.reason})")

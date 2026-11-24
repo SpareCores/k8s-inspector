@@ -16,7 +16,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
-from k8s_inspector import crd, keeper, launch, pods, publisher, tasks
+from k8s_inspector import crd, keeper, launch, pods, publisher, render, tasks
 from k8s_inspector.kube import Kube, NotFound
 from k8s_inspector.model import (
     BenchmarkRun,
@@ -252,7 +252,7 @@ def due_reason(task: TaskDef, meta: dict | None, now: datetime) -> str | None:
         wait = RETRY_AFTER_NEVER_FINISHED[retries - 1]
     else:
         return None
-    if now - datetime.fromisoformat(end).replace(tzinfo=None) >= wait:
+    if now - _naive(end) >= wait:
         return f"retry after exit code {code}"
     return None
 
@@ -260,7 +260,36 @@ def due_reason(task: TaskDef, meta: dict | None, now: datetime) -> str | None:
 # The newest hardware variant of each SKU (`Publisher.read_newest_variants`): {sku: (N, names of the tasks with a
 # `data/<vendor>/<sku>/<N>/<task>/meta.json`)}
 VariantReader = Callable[[str], dict[str, tuple[int, frozenset[str]]]]
+# When hardware variant N of a SKU first appeared (`Publisher.read_first_seen(vendor, sku, N)`), None when unknown.
+FirstSeenReader = Callable[[str, str, int], datetime | None]
 NEW_VARIANT = "missing from the newest hardware variant"
+
+
+def _naive(timestamp: str) -> datetime:
+    """A meta time as naive UTC, parsed like in `due_reason`."""
+    return datetime.fromisoformat(timestamp).replace(tzinfo=None)
+
+
+def fill_reason(task: TaskDef, meta: dict, first_seen: datetime, now: datetime) -> str | None:
+    """Why `task` is due for the newest variant, which first appeared at `first_seen` and has no result of it, on a
+    SKU whose `schedule/<task>/meta.json` is `meta`. The latest attempt (`render.latest_attempt`) decides: one from
+    before `first_seen` says nothing about the new hardware, so the task is filled; a later one is final except
+    for the retries of `due_reason` (`-4`, a start failure, with their `-5` cap). An attempt without `start` is
+    not filled."""
+    attempt = render.latest_attempt(meta)
+    if not attempt.get("start"):
+        return None
+    if _naive(attempt["start"]) < first_seen:
+        return NEW_VARIANT
+    return due_reason(task, attempt, now)
+
+
+def _read_first_seen(reader: FirstSeenReader | None, vendor: str, sku: str, variant: int) -> datetime | None:
+    try:
+        return reader(vendor, sku, variant) if reader else None
+    except Exception:
+        log.exception("autoPlan: cannot read variant.json of %s/%s/%d, no variant fill", vendor, sku, variant)
+        return None
 
 
 SCARPENTER_NAMESPACE = "scarpenter-system"  # keep in sync with deploy/controller/rbac.yaml
@@ -405,6 +434,7 @@ def plan_cycle(
     dry_run: bool = False,
     keeper_cache: KeeperCache | None = None,
     variant_reader: VariantReader | None = None,
+    first_seen_reader: FirstSeenReader | None = None,
 ) -> list[PlannedRun]:
     """One autoPlan cycle. For each enabled vendor with autoPlan whose results are published (`publish`; without it
     git would never record them and the SKU would be run again and again) and that is below its caps
@@ -418,10 +448,11 @@ def plan_cycle(
     too. SKUs SCarpenter does not offer (`not_offered`) and SKUs waiting for a launch retry (`launch.deferred`,
     which also drops the entries of SKUs Keeper no longer lists, except in a dry run) are skipped.
     When a run's node lands on new hardware, `pick_variant` creates a new variant directory that only gets the
-    tasks that ran. So a task Keeper allows that the SKU's newest variant has no `meta.json` for (`variant_reader`)
-    is due too, once per variant: the launch ConfigMap records `{sku: N}` when such a run is created
-    (`launch.record_variant`), so a failed rerun, or a node landing on another variant, starts no second one; the
-    normal due rules take over. The planner cannot choose the hardware.
+    tasks that ran. So a task Keeper allows that the SKU's newest variant `N` has no `meta.json` for
+    (`variant_reader`) is due too (`NEW_VARIANT`) when its latest attempt on the SKU (`fill_reason`: `last_attempt`
+    of `schedule/<task>/meta.json`, else the meta) started before `N`'s `first_seen` (`first_seen_reader`, from
+    `variant.json`; none: no fill for the SKU). After an attempt since then only the retry bounds of `due_reason`
+    on that attempt apply, wherever it landed. The planner cannot choose the hardware.
     With `dry_run` nothing is created and the first such SKU of each vendor is returned.
 
     Fails closed: when Keeper or git cannot be read the cycle plans nothing (for git: nothing for that vendor)
@@ -470,11 +501,10 @@ def plan_cycle(
             log.exception("autoPlan skips vendor %s: cannot read the sc-inspector-data state", vendor)
             continue
         try:
-            newest = variant_reader(vendor) if variant_reader else {}
-            started = launch.read_variants(kube, vendor) if variant_reader else {}
+            newest = variant_reader(vendor) if variant_reader and first_seen_reader else {}
         except Exception:
             log.exception("autoPlan: no check for new hardware variants of vendor %s this cycle", vendor)
-            newest, started = {}, {}
+            newest = {}
         runs = crd.list_runs(kube)
         leased = {run.name for run in runs}
         skus = sorted(blocked.get(vendor, {}), key=lambda sku: start_order(vendor, sku))
@@ -502,20 +532,26 @@ def plan_cycle(
                 continue
             no_gpu = GPU_PROBE_TASK in blocked[vendor][sku]
             variant, present = newest.get(sku, (None, frozenset()))
-            check_variant = variant is not None and started.get(sku, -1) < variant
-            new_variant = False
+            first_seen, first_seen_read = None, False  # read at most once, and only when a task needs it
             due = {}
             for task in server_tasks:
                 if task.name in blocked[vendor][sku] or (task.gpu and no_gpu):
                     continue
+                meta = metas.get(sku, {}).get(task.name)
                 try:
-                    reason = due_reason(task, metas.get(sku, {}).get(task.name), now)
+                    reason = due_reason(task, meta, now)
+                    if not reason and variant is not None and task.name not in present:
+                        if not first_seen_read:
+                            first_seen, first_seen_read = (
+                                _read_first_seen(first_seen_reader, vendor, sku, variant),
+                                True,
+                            )
+                        if first_seen:
+                            reason = fill_reason(task, meta, first_seen, now)
                 except AttributeError, TypeError, ValueError:  # a damaged meta.json field: unreadable, skip the SKU
                     log.warning("autoPlan skips %s/%s: damaged schedule/%s/meta.json", vendor, sku, task.name)
                     due = None
                     break
-                if not reason and check_variant and task.name not in present:
-                    reason, new_variant = NEW_VARIANT, True
                 if reason:
                     due[task.name] = reason
             if due is None:
@@ -532,8 +568,6 @@ def plan_cycle(
                     runs.append(_create_run(kube, cfg, vendor, sku, list(due)))
                 except crd.RunExists:
                     continue
-                if new_variant:
-                    launch.record_variant(kube, vendor, sku, variant)
             reason = ", ".join(f"{name}: {why}" for name, why in due.items())
             planned.append(PlannedRun(vendor, sku, tuple(due), reason))
             if dry_run:
@@ -547,6 +581,7 @@ def run_forever(
     schedule_reader: ScheduleReader,
     stop: threading.Event,
     variant_reader: VariantReader | None = None,
+    first_seen_reader: FirstSeenReader | None = None,
 ) -> None:
     """Every `planner.interval_minutes`: `plan_cycle`; exceptions are logged, never fatal. `cfg_provider` is a
     zero-argument callable returning the current `Config`."""
@@ -557,7 +592,12 @@ def run_forever(
             cfg = cfg_provider()
             interval_minutes = cfg.settings.planner_interval_minutes
             for planned in plan_cycle(
-                kube, cfg, schedule_reader, keeper_cache=keeper_cache, variant_reader=variant_reader
+                kube,
+                cfg,
+                schedule_reader,
+                keeper_cache=keeper_cache,
+                variant_reader=variant_reader,
+                first_seen_reader=first_seen_reader,
             ):
                 log.info("planned run", extra={"vendor": planned.vendor, "sku": planned.sku, "reason": planned.reason})
         except Exception:

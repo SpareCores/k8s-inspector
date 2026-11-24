@@ -290,7 +290,8 @@ def test_stale_duplicate_is_skipped_and_same_start_rewrites(tmp_path):
 def test_failure_does_not_replace_a_good_result(tmp_path, exit_code):
     render.render_task(tmp_path, "hcloud", "cax31", 0, plain_input(start="2026-10-01T10:00:00", stdout=b"good"))
     failed = plain_input(start="2026-10-02T10:00:00", run_id="r2", exit_code=exit_code, stdout=b"partial")
-    assert render.render_task(tmp_path, "hcloud", "cax31", 0, failed) == []
+    written = render.render_task(tmp_path, "hcloud", "cax31", 0, failed)
+    assert [p.parent.name for p in written] == ["lscpu"] and written[0].parent.parent.name == "schedule"  # last_attempt
     assert tree_file(tmp_path, "lscpu", "stdout").read_bytes() == b"good"
     assert read_meta(tmp_path, "lscpu")["run_id"] == "r1"
     assert read_meta(tmp_path, "lscpu", "schedule")["run_id"] == "r1"
@@ -350,15 +351,57 @@ def test_schedule_is_the_union_across_variants(tmp_path):
     assert read_meta(tmp_path, "lscpu", "schedule")["run_id"] == "r3"
 
 
+def schedule_meta(tree):
+    return read_meta(tree, "lscpu", "schedule")
+
+
+def test_last_attempt_is_recorded_when_a_failure_stays_out_of_the_schedule(tmp_path):
+    render.render_task(tmp_path, "hcloud", "cax31", 0, plain_input())
+    assert "last_attempt" not in schedule_meta(tmp_path)  # the meta is the latest attempt itself
+    failed = plain_input(start="2026-10-02T10:00:00", run_id="r2", exit_code=137, error_msg="oom at https://x.example")
+    render.render_task(tmp_path, "hcloud", "cax31", 0, failed)
+    meta = schedule_meta(tmp_path)
+    assert meta["run_id"] == "r1" and meta["exit_code"] == 0
+    assert meta["last_attempt"] == {
+        "run_id": "r2",
+        "start": "2026-10-02T10:00:00",
+        "end": "2026-10-01T10:05:00",
+        "exit_code": 137,
+        "error_msg": "oom at <url>",
+        "task_hash": "h",
+        "start_retries": 0,
+    }
+    render.render_task(tmp_path, "hcloud", "cax31", 0, plain_input(start="2026-10-03T10:00:00", run_id="r3"))
+    assert "last_attempt" not in schedule_meta(tmp_path)  # a newer success is the latest attempt again
+
+
+def test_last_attempt_continues_the_start_retries_chain_past_a_good_result(tmp_path):
+    render.render_task(tmp_path, "hcloud", "cax31", 0, plain_input())
+    for day in (2, 3, 4):
+        lost = plain_input(start=f"2026-10-0{day}T10:00:00", run_id=f"r{day}", exit_code=-4)
+        render.render_task(tmp_path, "hcloud", "cax31", None, lost)
+    attempt = schedule_meta(tmp_path)["last_attempt"]
+    assert (attempt["exit_code"], attempt["start_retries"]) == (-5, 3)
+    assert schedule_meta(tmp_path)["exit_code"] == 0
+
+
+def test_an_older_attempt_does_not_replace_last_attempt(tmp_path):
+    render.render_task(tmp_path, "hcloud", "cax31", 0, plain_input())
+    for day in (4, 2):
+        failed = plain_input(start=f"2026-10-0{day}T10:00:00", run_id=f"r{day}", exit_code=1)
+        render.render_task(tmp_path, "hcloud", "cax31", 0, failed)
+    assert schedule_meta(tmp_path)["last_attempt"]["run_id"] == "r4"
+
+
 def test_golden_schedule_meta_is_what_the_union_picks(tmp_path):
     inst = tmp_path / "data" / "hcloud" / "cax31"
     shutil.copytree(GOLDEN, inst / "0")
     golden = (FIXTURES / "hcloud_cax31" / "schedule" / "lscpu" / "meta.json").read_text()
-    th = json.loads(golden)["task_hash"]
-    path = render.refresh_schedule_meta(inst, "lscpu", th)
+    attempt = json.loads(golden)
+    path = render.refresh_schedule_meta(inst, "lscpu", attempt)
     # legacy rewrote the schedule meta through its model: the only difference is the then-missing `region`
     assert path.read_text() == golden[:-1] + ',"region":null}'
-    assert render.refresh_schedule_meta(inst, "no_such_task", th) is None
+    assert render.refresh_schedule_meta(inst, "no_such_task", attempt) is None
 
 
 def test_variantless_result_goes_to_schedule_only(tmp_path):
@@ -524,8 +567,9 @@ def test_minus_four_keeps_the_previous_failure_result_with_its_output(tmp_path):
 def test_failure_does_not_replace_a_good_schedule_meta(tmp_path, variant, exit_code):
     render.render_task(tmp_path, "hcloud", "cax31", 0, plain_input(start="2026-10-01T10:00:00"))
     failed = plain_input(start="2026-10-02T10:00:00", run_id="r2", exit_code=exit_code)
-    assert render.render_task(tmp_path, "hcloud", "cax31", variant, failed) == []
+    render.render_task(tmp_path, "hcloud", "cax31", variant, failed)
     assert sched_meta(tmp_path)["run_id"] == "r1" and sched_meta(tmp_path)["exit_code"] == 0
+    assert sched_meta(tmp_path)["last_attempt"]["run_id"] == "r2"
 
 
 def test_failure_does_not_replace_a_good_schedule_meta_without_variant_dirs(tmp_path):

@@ -62,7 +62,7 @@ the contract to keep.
 | `.../dmidecode/parsed.json`, `.../openssl/parsed.json` | parsers | yes |
 | `.../stressnglongrun/parsed.csv`, `.../lstopo/lstopo.svg` | parsers | no (website) |
 | `data/<vendor>/<sku>/<N>/timing/<run_id>/{api_start,api_end,machine_start,…}` | one ISO UTC line each | `api_start`, `machine_start` |
-| `data/<vendor>/<sku>/schedule/<task>/meta.json` | union view across variants (ported `select_schedule_meta`) | no (planner) |
+| `data/<vendor>/<sku>/schedule/<task>/meta.json` | union view across variants (ported `select_schedule_meta`), plus [`last_attempt`](#last_attempt) | no (planner) |
 | `dbaas/<vendor>/<id>/postgres/<ver>/standalone/<task>/{meta.json,stdout}` | DBaaS results | yes |
 | not carried over to git | `resource_tracker.jsonl`, `postgres.log`, `result.json`, `manifest.json`, `status.json`, `version`: object storage only | — |
 
@@ -90,6 +90,16 @@ Added fields (sc-crawler reads `meta.json` as a dict and ignores unknown keys):
 value the task ran at, from `sc-run`'s `result.json`; null when nice was disabled or could not be set).
 
 Exit codes: [exit codes](exit-codes.md).
+
+### last_attempt
+
+`schedule/<task>/meta.json` is the pick among the variants' metas, and a failure never replaces a good result in it.
+So it also records the latest attempt of the task on the SKU, whatever its outcome and variant (and whether it was kept
+out of the meta or written only to `schedule/`, like `-4`, `-5` and a `-1` without a node): `last_attempt` =
+`{run_id, start, end, exit_code, error_msg, task_hash, start_retries}`. It is omitted when the meta is that attempt
+itself, and an attempt older than the recorded one is not recorded. `start_retries` (and the `-5` after three in a row)
+continues the chain of the previous latest attempt. The planner reads `last_attempt`, else the meta itself (which also
+covers metas written before the field existed), to decide retries and [variant fills](configuration.md#autoplan).
 
 ## Commits
 
