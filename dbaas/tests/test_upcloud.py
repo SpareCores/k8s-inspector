@@ -131,3 +131,22 @@ def test_inventory_lists_the_tagged_postgres_services(upcloud_vendor, monkeypatc
         {"id": "u1", "run": "r1", "expires_at": "2026-11-20T16:00:00Z", "created_at": "2026-11-20T10:00:00Z"}
     ]
     assert len(seen) == 1
+
+
+def test_connection_uses_the_private_pg_component(upcloud_vendor):
+    components = [
+        {"component": "pg", "route": "public", "host": "pub.example", "port": 11},
+        {"component": "pg", "route": "private", "host": "priv.example", "port": "11569"},
+    ]
+    assert upcloud_vendor._connection(components) == ("priv.example", 11569)
+
+
+def test_connection_without_a_private_pg_component_is_an_error(upcloud_vendor):
+    with pytest.raises(RuntimeError, match="no private pg component"):
+        upcloud_vendor._connection([{"component": "pg", "route": "public", "host": "pub.example", "port": 11}])
+
+
+def test_labels_come_as_a_list_or_a_dict(upcloud_vendor):
+    assert upcloud_vendor.label_dict([{"key": "a", "value": "1"}]) == {"a": "1"}
+    assert upcloud_vendor.label_dict({"a": "1"}) == {"a": "1"}
+    assert upcloud_vendor.label_dict(None) == {}

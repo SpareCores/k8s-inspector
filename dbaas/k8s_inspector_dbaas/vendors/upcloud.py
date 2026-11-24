@@ -87,13 +87,13 @@ def plan_args(spec: DbSpec) -> dict:
     return {"plan": spec.database_id}  # a legacy plan includes its storage
 
 
-def _connection(values: list) -> tuple[str, int]:
-    """Host and port of the private endpoint of the service; the service's own host when no private route is listed."""
-    components, host, port = values
+def _connection(components: list) -> tuple[str, int]:
+    """Host and port of the private endpoint of the service. No private `pg` component is an error: the
+    service's own host is the public one, which the filters keep closed, so a fallback would be unreachable."""
     for component in components or []:
         if component["component"] == "pg" and component["route"] == "private":
             return component["host"], int(component["port"])
-    return host, int(port or 5432)
+    raise RuntimeError("the UpCloud database has no private pg component: it is not attached to the SDN network")
 
 
 def provision(spec: DbSpec) -> DbOutputs:
@@ -122,13 +122,20 @@ def provision(spec: DbSpec) -> DbOutputs:
         opts=pulumi.ResourceOptions(provider=provider, custom_timeouts=timeouts),
         **plan_args(spec),
     )
-    connection = pulumi.Output.all(db.components, db.service_host, db.service_port).apply(_connection)
+    connection = db.components.apply(_connection)
     return DbOutputs(
         host=connection.apply(lambda c: c[0]),
         port=connection.apply(lambda c: c[1]),
         admin_user=ADMIN_USER,
         admin_db=ADMIN_DB,
     )
+
+
+def label_dict(labels: list | dict | None) -> dict[str, str]:
+    """The API's labels as a dict; they come as a list of `{key, value}` (the documented-by-use format) or as a dict."""
+    if isinstance(labels, dict):
+        return labels
+    return {label["key"]: label["value"] for label in labels or []}
 
 
 def inventory() -> list[dict]:
@@ -140,7 +147,7 @@ def inventory() -> list[dict]:
         with urllib.request.urlopen(request, timeout=60) as response:  # noqa: S310 (a fixed https URL)
             page = json.load(response)
         for service in page:
-            labels = {label["key"]: label["value"] for label in service.get("labels") or []}
+            labels = label_dict(service.get("labels"))
             if service.get("type") == "pg" and RUN_LABEL in labels:
                 found.append(
                     {
