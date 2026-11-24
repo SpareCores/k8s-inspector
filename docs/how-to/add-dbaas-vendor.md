@@ -20,7 +20,10 @@ def inventory() -> list[dict]:
 `provision` runs inside a Pulumi program (`pulumi.Resource`s, `pulumi.Output`s). `inventory` runs outside Pulumi, in the
 periodic Job `dbaas-inventory-<vendor>` (same credentials and ServiceAccount as `up` and `down`, no state bucket). It
 is how a database that no state records is found (see [DBaaS](../explanation/dbaas.md#pulumi-state-and-leaks)); times
-are RFC 3339 and `run` is the tag's value. `fake.py` is the smallest example of both.
+are RFC 3339 and `run` is the tag's value. The Job also has `DBAAS_REGIONS`, the comma-separated, sorted keys of
+`dbaas.vendors.<vendor>.networks` (empty when none): the only regions with databases. A vendor whose API is per region
+lists exactly those (`aws.py`), never the regions an API returns, which include regions that are down or unused; it
+fails naming the region when one fails. `fake.py` is the smallest example of both.
 
 A module may add `cleanup(run: str) -> None`. `down` calls it with the BenchmarkRun name (all it, and the sweeper,
 know; the Job also has `DBAAS_VENDOR`) after the Pulumi destroy and before it removes the state (a failure keeps the

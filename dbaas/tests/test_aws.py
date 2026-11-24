@@ -133,6 +133,11 @@ def test_a_long_run_name_keeps_a_hash_so_two_runs_do_not_collide():
     assert len(a) <= 63 and len(b) <= 63 and a != b and a == aws.identifier("x" * 80 + "a")
 
 
+@pytest.fixture(autouse=True)
+def no_configured_regions(monkeypatch):
+    monkeypatch.delenv("DBAAS_REGIONS", raising=False)
+
+
 def fake_session(monkeypatch, expires="20261120t1600z", failing_region=None):
     created = datetime(2026, 11, 20, 10, 5, 3, tzinfo=UTC)
     tagged = {
@@ -169,7 +174,8 @@ def fake_session(monkeypatch, expires="20261120t1600z", failing_region=None):
         def __init__(self, region_name):
             pass
 
-        def client(self, service, region_name="us-east-1"):
+        def client(self, service, region_name="us-east-1", config=None):
+            assert config is aws.CLIENT_CONFIG  # bounded timeouts and retries on every client
             return Client(service, region_name)
 
     monkeypatch.setattr(aws.boto3.session, "Session", Session)
@@ -183,6 +189,20 @@ def test_inventory_lists_the_tagged_instances_of_every_region(monkeypatch):
     ]  # fmt: skip
 
 
+def test_inventory_lists_exactly_the_configured_regions(monkeypatch):
+    fake_session(monkeypatch, failing_region="us-east-1")  # would fail if listed
+    monkeypatch.setenv("DBAAS_REGIONS", "eu-west-1")
+    assert [d["run"] for d in aws.inventory()] == ["r1"]
+
+
+def test_a_failing_configured_region_is_named_in_the_error(monkeypatch):
+    fake_session(monkeypatch)
+    monkeypatch.setenv("DBAAS_REGIONS", "eu-west-1,me-south-1")
+    monkeypatch.setattr(aws, "_region_instances", lambda session, region: 1 / 0 if region == "me-south-1" else [])
+    with pytest.raises(RuntimeError, match="region me-south-1"):
+        aws.inventory()
+
+
 def test_a_failing_region_fails_the_inventory_and_is_logged(monkeypatch, caplog):
     fake_session(monkeypatch, failing_region="us-east-1")
     with pytest.raises(RuntimeError, match="AccessDenied"):
@@ -192,5 +212,5 @@ def test_a_failing_region_fails_the_inventory_and_is_logged(monkeypatch, caplog)
 
 def test_a_malformed_expiry_tag_fails_naming_the_database(monkeypatch):
     fake_session(monkeypatch, expires="tomorrow")
-    with pytest.raises(ValueError, match="arn:aws:rds:eu-west-1:1:db:sc-x"):
+    with pytest.raises(RuntimeError, match="arn:aws:rds:eu-west-1:1:db:sc-x"):
         aws.inventory()

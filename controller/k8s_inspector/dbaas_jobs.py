@@ -429,14 +429,18 @@ def down_job(run_name: str, vendor: str, cfg: Config, *, sweep: bool = False) ->
 
 def inventory_job(vendor: str, cfg: Config) -> dict:
     """`dbaas-inventory-<vendor>`: list the vendor's databases that carry the `sc_inspector_run` tag, with the vendor's
-    credentials and ServiceAccount like `up` and `down` (and no state bucket)."""
+    credentials and ServiceAccount like `up` and `down` (and no state bucket). `DBAAS_REGIONS` is the comma-separated,
+    sorted regions the platform configured for the vendor (`dbaas.vendors.<vendor>.networks`): the only ones with
+    databases."""
+    vendor_config = cfg.settings.dbaas.vendors.get(vendor)
+    regions = ",".join(sorted(vendor_config.networks)) if vendor_config else ""
     return _job(
         inventory_job_name(vendor),
         "inventory",
         kind="inventory",
         vendor=vendor,
         cfg=cfg,
-        env=[{"name": "DBAAS_VENDOR", "value": vendor}],
+        env=[{"name": "DBAAS_VENDOR", "value": vendor}, {"name": "DBAAS_REGIONS", "value": regions}],
         deadline_seconds=INVENTORY_DEADLINE_SECONDS,
         run=None,
         owner=None,
