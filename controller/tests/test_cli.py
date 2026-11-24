@@ -11,7 +11,7 @@ from fakes import Clock
 from fakes import FakeKube as ClusterKube
 from lightkube import ApiError
 
-from k8s_inspector import cli, crd, planner
+from k8s_inspector import cli, crd, dbaas_plan, dbaas_sweep, planner
 from k8s_inspector import kube as kube_mod
 from k8s_inspector import runner as runner_mod
 from k8s_inspector.kube import NotFound
@@ -497,7 +497,7 @@ def free_port() -> int:
 @pytest.fixture
 def controller(monkeypatch):
     """Fake Runner, Publisher, planner loop and Storage; `started` is set once all three loops run."""
-    started = {"runner": threading.Event(), "planner": threading.Event(), "publisher": threading.Event()}
+    started = {name: threading.Event() for name in ("runner", "planner", "publisher", "dbaas-planner", "dbaas-sweeper")}
     stopped = []
 
     class FakeRunner:
@@ -524,6 +524,9 @@ def controller(monkeypatch):
         def read_first_seen(self, vendor, sku, variant):
             return None
 
+        def read_dbaas_metas(self, vendor):
+            return {}
+
         def run_forever(self, settings_provider, stop):
             assert settings_provider() is SETTINGS
             started["publisher"].set()
@@ -542,6 +545,19 @@ def controller(monkeypatch):
         stop.wait()
         stopped.append("planner")
 
+    def dbaas_plan_loop(kube, cfg_provider, reader, stop):
+        assert reader("oci") == {}
+        started["dbaas-planner"].set()
+        stop.wait()
+        stopped.append("dbaas-planner")
+
+    def sweep_loop(kube, cfg_provider, storage, stop, on_stacks, on_inventory):
+        started["dbaas-sweeper"].set()
+        stop.wait()
+        stopped.append("dbaas-sweeper")
+
+    monkeypatch.setattr(dbaas_plan, "run_forever", dbaas_plan_loop)
+    monkeypatch.setattr(dbaas_sweep, "run_forever", sweep_loop)
     monkeypatch.setattr(cli, "Runner", FakeRunner)
     monkeypatch.setattr(cli, "_MeteredPublisher", FakePublisher)
     monkeypatch.setattr(cli, "Storage", lambda env, uploads: object())
@@ -572,7 +588,7 @@ def test_serve_starts_everything_and_stops_on_event(controller):
         thread.join(10)
     assert not thread.is_alive()
     assert result == [0]
-    assert sorted(stopped) == ["planner", "publisher", "runner"]
+    assert sorted(stopped) == ["dbaas-planner", "dbaas-sweeper", "planner", "publisher", "runner"]
 
 
 def test_serve_keeps_running_while_the_api_is_throttled(controller, monkeypatch):
@@ -627,7 +643,12 @@ def test_serve_exits_1_when_a_component_dies(controller, monkeypatch):
     assert not thread.is_alive()
     assert result == [1]
     assert stop.is_set()
-    assert sorted(controller[1]) == ["publisher", "runner"]  # the others were stopped too
+    assert sorted(controller[1]) == [
+        "dbaas-planner",
+        "dbaas-sweeper",
+        "publisher",
+        "runner",
+    ]  # the others were stopped too
 
 
 def test_cmd_serve_installs_and_restores_signal_handlers(env, controller, monkeypatch):
@@ -643,3 +664,66 @@ def test_cmd_serve_installs_and_restores_signal_handlers(env, controller, monkey
 
     assert cli.main(["serve"]) == 0
     assert signal.getsignal(signal.SIGTERM) is before
+
+
+# --------------------------------------------------------------------------- DBaaS
+
+
+def test_run_with_a_database_forces_a_dbaas_run(env, monkeypatch, capsys):
+    monkeypatch.setenv("K8SI_DBAAS_IMAGE", "ghcr.io/x/dbaas@sha256:1")
+    seen = {}
+
+    def force_run(kube, cfg, vendor, database, **kwargs):
+        seen.update(vendor=vendor, database=database, **kwargs)
+        run = make_run("client", RunPhase.PENDING)
+        run.spec.tasks = ["pgbench_postgres_dbaas_ro_durable"]
+        return run
+
+    monkeypatch.setattr(dbaas_plan, "force_run", force_run)
+    assert cli.main(["run", "oci", "--database", "db1", "--region", "eu-1", "--force", "--hold", "1h"]) == 0
+    assert seen == {
+        "vendor": "oci", "database": "db1", "region": "eu-1", "client": None, "force": True,
+        "hold_after": timedelta(hours=1),
+    }  # fmt: skip
+    assert capsys.readouterr().out == "oci-client\n"
+    assert cli.main(["run", "oci", "my-client", "--database", "db1"]) == 0
+    assert seen["client"] == "my-client" and seen["region"] is None and seen["force"] is False
+
+
+@pytest.mark.parametrize(
+    ("argv", "message"),
+    [
+        (["run", "oci"], "a SKU is required"),
+        (["run", "oci", "sku", "--region", "eu-1"], "a SKU is required"),
+        (["run", "oci", "--database", "d", "--tasks", "lscpu"], "--tasks does not apply"),
+        (["run", "oci", "--database", "d"], "K8SI_DBAAS_IMAGE is empty"),
+    ],
+)
+def test_run_refuses_inconsistent_dbaas_arguments(env, capsys, argv, message):
+    assert cli.main(argv) == 2
+    assert message in capsys.readouterr().err
+
+
+def test_run_reports_a_refused_dbaas_run(env, monkeypatch, capsys):
+    monkeypatch.setenv("K8SI_DBAAS_IMAGE", "img@sha256:1")
+
+    def refuse(*args, **kwargs):
+        raise ValueError("vendor oci already has a DBaaS run in flight: oci-x")
+
+    monkeypatch.setattr(dbaas_plan, "force_run", refuse)
+    assert cli.main(["run", "oci", "--database", "d"]) == 1
+    assert "already has a DBaaS run in flight" in capsys.readouterr().err
+
+
+def test_plan_lists_the_databases_it_would_start(env, monkeypatch, capsys):
+    monkeypatch.setattr(planner, "plan_cycle", lambda *a, **kw: [])
+    seen = {}
+
+    def dbaas_cycle(kube, cfg, reader, dry_run=False):
+        seen["dry_run"] = dry_run
+        return [dbaas_plan.PlannedDatabase("oci", "db1", "18", "eu-1", "client", ("t",), "never run")]
+
+    monkeypatch.setattr(dbaas_plan, "plan_cycle", dbaas_cycle)
+    assert cli.main(["plan", "--dry-run"]) == 0
+    assert seen == {"dry_run": True}
+    assert capsys.readouterr().out == "oci database db1 in eu-1 with client t (never run)\n"

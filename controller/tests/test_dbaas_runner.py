@@ -1,0 +1,558 @@
+"""The database of a DBaaS run in the run state machine: create after the client node, bootstrap, benchmark, destroy in
+parallel with the node release, retries, restarts, the finalizer. Jobs and Pods are played by `fakes.Cluster`."""
+
+import base64
+import json
+from dataclasses import replace
+from datetime import timedelta
+
+import pytest
+from test_runner import START, Harness, in_step
+
+from k8s_inspector import crd, dbaas_jobs, dbaas_keeper, pods
+from k8s_inspector import keeper as sc_keeper
+from k8s_inspector.model import (
+    CapacityMode,
+    Config,
+    DbaasSettings,
+    DbaasVendor,
+    DbPhase,
+    EnvConfig,
+    ExitCode,
+    RunPhase,
+    RunSpec,
+    Settings,
+    VendorSettings,
+)
+
+TASK = "pgbench_postgres_dbaas_ro_durable"
+STEP = "pgbench-postgres-dbaas-ro-durable"
+DATABASE = {"vendor": "oci", "id": "PostgreSQL.VM.E5.2", "engineVersion": "18", "region": "eu-test-1"}
+DATABASE |= {"vcpus": 4, "memoryGib": 32.0}
+RECORD = {"api_reference": "PostgreSQL.VM.E5.2", "vcpus": 4, "memory_amount": 32768}
+CLIENT = "VM.Standard.E5.Flex.2-8"
+STATE_KEY = f"dbaas-state/.pulumi/stacks/k8s-inspector-dbaas/k8s-dbaas-{crd.run_name('oci', CLIENT)}.json"
+
+
+def make_dbaas_config(**dbaas) -> Config:
+    env = EnvConfig(
+        bucket="b",
+        bucket_region="eu-west-1",
+        role_arn="arn:aws:iam::1:role/x",
+        sc_run_image="ghcr.io/sparecores/sc-run@sha256:abc",
+        dbaas_image="ghcr.io/sparecores/k8s-inspector-dbaas@sha256:def",
+    )
+    vendors = {"oci": DbaasVendor(networks={"eu-test-1": {"vpc": "vcn-1", "subnet": "sn-1"}})}
+    return Config(
+        env=env,
+        settings=Settings(vendors={"oci": VendorSettings(enabled=True)}, dbaas=DbaasSettings(vendors=vendors, **dbaas)),
+    )
+
+
+class DbHarness(Harness):
+    def start_db(self, **spec) -> None:
+        spec = RunSpec(
+            vendor="oci",
+            sku=CLIENT,
+            run_id="r20261120t1000-aaaa",
+            tasks=[TASK],
+            capacity=CapacityMode.ON_DEMAND,
+            database=dict(DATABASE),
+            **spec,
+        )
+        self.name = crd.create_run(self.kube, spec).name
+
+    @property
+    def db(self):
+        return self.run.status.database
+
+    def run_pods(self) -> list[str]:
+        """The run's own Pods: the Pods of the provisioner Jobs are not among them."""
+        return [n for n in self.pod_names() if not n.endswith("-pod")]
+
+    def jobs(self) -> list[str]:
+        return sorted(j["metadata"]["name"] for j in self.kube.list("job"))
+
+    def secret(self, name: str) -> dict:
+        data = self.kube.get("secret", name)["data"]
+        return {k: base64.b64decode(v).decode() for k, v in data.items()}
+
+    def until_phase(self, phase, **kw):
+        return self.drive(stop=lambda run: run.status.database is not None and run.status.database.phase == phase, **kw)
+
+    def run_exists(self) -> bool:
+        return self.name in self.kube.objects["benchmarkrun"]
+
+
+@pytest.fixture(autouse=True)
+def keeper(monkeypatch):
+    monkeypatch.setattr(dbaas_keeper, "database", lambda env, vendor, database_id: dict(RECORD))
+
+
+@pytest.fixture
+def h() -> DbHarness:
+    return DbHarness(make_dbaas_config())
+
+
+# --------------------------------------------------------------------------- the whole way
+
+
+def test_a_dbaas_run_is_not_dropped_when_keeper_does_not_list_its_client(h, monkeypatch):
+    asks = []
+    monkeypatch.setattr(sc_keeper, "active_servers_block_reasons", lambda env, names: asks.append(names) or {})
+    h.start_db()
+    h.drive(stop=lambda run: run.status.phase == RunPhase.PROVISIONING)
+    h.clock.advance(minutes=11)
+    h.runner.reconcile(h.name)
+    assert h.run_exists() and h.run.status.phase == RunPhase.PROVISIONING and asks == []
+
+
+def test_the_client_node_comes_first_and_the_database_is_created_when_the_anchor_runs(h):
+    h.start_db()
+    h.drive(stop=lambda run: run.status.phase == RunPhase.PROVISIONING)
+    anchor = h.kube.get("pod", f"{h.name}-a1")
+    assert anchor["spec"]["nodeSelector"]["topology.kubernetes.io/region"] == "eu-test-1"  # the database's region
+    assert h.jobs() == [] and h.db is None  # no node, nothing that bills by the hour
+
+    h.until_phase(DbPhase.CREATING)
+    assert h.jobs() == [f"dbaas-up-{h.name}"]
+    (job,) = h.kube.list("job")
+    env = {e["name"]: e for e in job["spec"]["template"]["spec"]["containers"][0]["env"]}
+    spec = json.loads(env["DBAAS_SPEC"]["value"])
+    assert spec["databaseId"] == DATABASE["id"] and spec["region"] == "eu-test-1" and spec["zone"] == "eu-test-1a"
+    assert spec["network"] == {"vpc": "vcn-1", "subnet": "sn-1"} and spec["record"] == RECORD
+    assert spec["labels"]["sc_inspector_run"] == "r20261120t1000-aaaa"
+    assert spec["labels"]["sc_inspector_expires"].endswith("z") and spec["expiresAt"].endswith("Z")
+    assert env["DBAAS_PASSWORD"]["valueFrom"]["secretKeyRef"] == {"name": f"{h.name}-db", "key": "SC_DB_PASSWORD"}
+    assert "Sc1-" in h.secret(f"{h.name}-db")["SC_DB_PASSWORD"] and "DBAAS_PASSWORD" not in job["spec"]["template"][
+        "spec"
+    ]["containers"][0]["env"][0].get("value", "")
+    assert job["spec"]["template"]["spec"]["automountServiceAccountToken"] is False
+    assert job["spec"]["backoffLimit"] == 0 and job["spec"]["activeDeadlineSeconds"] == 3600
+    assert job["metadata"]["ownerReferences"][0]["name"] == h.name
+    assert h.db.expires > START + timedelta(hours=3)
+
+
+def test_a_dbaas_run_creates_bootstraps_benchmarks_and_destroys(h):
+    h.start_db()
+    h.until_phase(DbPhase.BOOTSTRAPPING)
+    facts = h.secret(f"{h.name}-db")  # the Job's connection facts, written by the controller
+    assert (facts["SC_DB_HOST"], facts["SC_DB_PORT"], facts["SC_DB_USER"], facts["SC_DB_NAME"]) == (
+        "10.0.0.5", "5432", "scadmin", "bench",
+    )  # fmt: skip
+    assert (facts["SC_DB_BOOTSTRAP_USER"], facts["SC_DB_BOOTSTRAP_DATABASE"], facts["PGSSLMODE"]) == (
+        "scadmin", "postgres", "require",
+    )  # fmt: skip
+    boot = h.kube.get("pod", dbaas_jobs.boot_pod_name(h.name, 1))
+    assert boot["spec"]["nodeName"] == f"node-{h.name}-a1" and boot["spec"]["hostNetwork"] is True
+    assert boot["spec"]["containers"][0]["command"] == ["python3", "/dbaas/bootstrap.py"]
+    assert boot["spec"]["containers"][0]["envFrom"] == [{"secretRef": {"name": f"{h.name}-db"}}]
+    assert boot["spec"]["containers"][0]["image"].startswith(
+        "ghcr.io/sparecores/benchmark-pgbench-postgres:main@sha256:"
+    )
+    assert "def run(" in h.kube.get("configmap", f"{h.name}-boot")["data"]["bootstrap.py"]
+
+    h.drive(stop=in_step(STEP))
+    assert h.db.phase == DbPhase.READY and dbaas_jobs.boot_pod_name(h.name, 1) not in h.pod_names()
+    step = h.kube.get("pod", f"{h.name}-a1-01-{STEP}")  # the only step: no hardware probes of the client node
+    container = step["spec"]["containers"][0]
+    assert container["envFrom"] == [{"secretRef": {"name": f"{h.name}-db"}}]
+    env = {e["name"]: e["value"] for e in container["env"] if "value" in e}
+    assert env["SC_DB_VCPUS"] == "4" and env["SC_DB_MEM_GIB"] == "32.0" and env["SC_CLIENT_VCPUS"] == "2"
+    assert (
+        env["SC_PROFILE_VUS"] == "1,2,4,8" and env["SC_WORKLOAD"] == "pgbench_ro" and env["SC_DURABILITY"] == "durable"
+    )
+    assert "/k8si/dbaas/postgres.json:postgres.json" in container["command"]
+    assert h.step_pods() == [f"1-01-{STEP}"] and "lscpu" not in h.codes()
+
+    h.storage.objects[f"dbaas-state/.pulumi/backups/k8s-inspector-dbaas/k8s-dbaas-{h.name}/x.json"] = b"old"
+    h.storage.objects["dbaas-state/.pulumi/stacks/k8s-inspector-dbaas/k8s-dbaas-other-1.json.bak"] = b"other"
+    run = h.drive(stop=lambda run: run.status.phase == RunPhase.PUBLISHING)
+    assert h.codes()[TASK] == (0, None)
+    # the same pass released the node and started the destroy; creating the database stopped
+    assert h.run_pods() == [] and h.db.phase == DbPhase.DESTROYING
+    assert h.jobs() == [f"dbaas-down-{h.name}"]
+    (down,) = h.kube.list("job")
+    assert down["spec"]["template"]["spec"]["containers"][0]["args"] == ["down"]
+    assert [
+        e["value"] for e in down["spec"]["template"]["spec"]["containers"][0]["env"] if e["name"] == "DBAAS_RUN"
+    ] == [h.name]
+    assert run.status.attempts[0].outcome.value == "Completed"
+
+    h.until_phase(DbPhase.DESTROYED)
+    assert not h.kube.get("benchmarkrun", h.name)["metadata"].get("finalizers")
+    assert ("secret", f"{h.name}-db") in h.kube.deleted and h.jobs() == []
+    assert not [k for k in h.storage.objects if "backups" in k]  # what Pulumi leaves behind is removed
+    assert "dbaas-state/.pulumi/stacks/k8s-inspector-dbaas/k8s-dbaas-other-1.json.bak" in h.storage.objects
+
+
+def test_the_job_pods_are_not_the_runs_pods(h):
+    h.start_db()
+    h.until_phase(DbPhase.BOOTSTRAPPING)
+    (pod,) = [p for p in h.kube.list("pod") if p["metadata"]["name"].endswith("-pod")]
+    assert crd.LABEL_RUN not in pod["metadata"]["labels"]  # the sweep of the run's Pods never touches a Job's
+    assert pods.LABEL_ROLE in pod["metadata"]["labels"]
+
+
+# --------------------------------------------------------------------------- failures: the database is destroyed anyway
+
+
+def test_a_failed_create_ends_the_task_minus_one_and_destroys_the_database(h):
+    h.cluster.jobs["up"] = ["fail"]
+    h.start_db()
+    h.drive(stop=lambda run: run.status.phase == RunPhase.FAILED)
+    code, message = h.codes()[TASK]
+    assert code == ExitCode.NO_NODE and message == "DBAAS_CREATE_FAILED: quota exceeded"
+    assert h.step_pods() == []
+    h.runner.reconcile(h.name)
+    assert h.db.phase == DbPhase.DESTROYING and "DBAAS_CREATE_FAILED" in h.db.error
+    assert h.pod_names("anchor") == []  # the node is released while the database is destroyed
+    h.until_phase(DbPhase.DESTROYED)
+    assert not h.kube.get("benchmarkrun", h.name)["metadata"].get("finalizers")
+
+
+def test_a_create_that_takes_too_long_ends_the_task_but_the_up_job_is_never_killed(h):
+    h.cluster.jobs["up"] = ["hang"]
+    h.start_db()
+    h.until_phase(DbPhase.CREATING)
+    h.cluster.react()
+    h.runner.reconcile(h.name)
+    assert h.db.phase == DbPhase.CREATING  # the Pod runs
+    h.clock.advance(minutes=66)
+    h.runner.reconcile(h.name)
+    assert h.codes()[TASK][1].startswith("DBAAS_CREATE_TIMEOUT") and h.run.status.phase == RunPhase.FAILED
+    assert h.db.phase == DbPhase.DESTROYING
+    assert h.jobs() == [f"dbaas-up-{h.name}"]  # still running: it ends within its own deadline, then the destroy
+    assert (("job", f"dbaas-up-{h.name}")) not in h.kube.deleted
+    h.cluster.finish_job(f"dbaas-up-{h.name}", "fail")  # the Job's deadline passed and Pulumi recorded what it did
+    h.runner.reconcile(h.name)
+    h.until_phase(DbPhase.DESTROYED)
+
+
+@pytest.mark.parametrize("how", ["cancel", "delete"])
+def test_a_teardown_waits_for_a_running_up_job_and_its_pod_before_the_destroy(h, how):
+    h.cluster.jobs["up"] = ["hang"]
+    h.start_db()
+    h.until_phase(DbPhase.CREATING)
+    h.cluster.react()
+    h.runner.reconcile(h.name)
+    if how == "cancel":
+        crd.request_cancel(h.kube, h.name)
+    else:
+        h.kube.delete("benchmarkrun", h.name)
+    for _ in range(3):
+        h.runner.reconcile(h.name)
+    assert h.db.phase == DbPhase.DESTROYING and h.run.status.phase == RunPhase.CANCELLED
+    assert h.jobs() == [f"dbaas-up-{h.name}"] and ("job", f"dbaas-up-{h.name}") not in h.kube.deleted
+    h.cluster.finish_job(f"dbaas-up-{h.name}", "ok")  # the creation finished within its deadline
+    keep = h.kube.delete
+
+    def slow(kind, name, grace_seconds=None):  # the Pod of a deleted Job lingers for its termination grace period
+        if kind == "job":
+            h.kube.deleted.append((kind, name))
+            h.kube.objects["job"].pop(name, None)
+            return
+        keep(kind, name, grace_seconds)
+
+    h.kube.delete = slow
+    h.runner.reconcile(h.name)
+    assert h.jobs() == []  # the Pulumi process may still be running: no destroy yet
+    h.kube.delete = keep
+    h.kube.delete("pod", f"dbaas-up-{h.name}-pod")
+    h.runner.reconcile(h.name)
+    assert h.jobs() == [f"dbaas-down-{h.name}"]
+    h.cluster.react()
+    h.runner.reconcile(h.name)
+    assert (how == "delete") != h.run_exists()  # a deleted run is gone once the database is destroyed
+    if how == "cancel":
+        assert h.db.phase == DbPhase.DESTROYED
+
+
+def test_a_failed_bootstrap_ends_the_task_and_destroys_the_database(h):
+    h.cluster.jobs["boot"] = ["fail"]
+    h.start_db()
+    h.drive(stop=lambda run: run.status.phase == RunPhase.FAILED)
+    assert h.codes()[TASK] == (ExitCode.NO_NODE, "DBAAS_BOOTSTRAP_FAILED: no route")
+    h.runner.reconcile(h.name)
+    assert h.db.phase == DbPhase.DESTROYING
+    h.until_phase(DbPhase.DESTROYED)
+
+
+def test_a_missing_network_fails_before_anything_is_created(h):
+    h.cfg = make_dbaas_config()
+    h.cfg.settings.dbaas.vendors["oci"].networks.clear()
+    h.start_db()
+    run = h.drive(stop=lambda run: run.status.phase == RunPhase.FAILED)
+    assert h.codes()[TASK][1].startswith("DBAAS_NO_NETWORK") and run.status.database is None
+    assert h.jobs() == [] and h.kube.list("secret") == []
+
+
+def test_a_missing_image_is_a_harness_error_not_a_database(h):
+    h.cfg = Config(env=EnvConfig(bucket="b", bucket_region="r", sc_run_image="x"), settings=h.cfg.settings)
+    h.start_db()
+    h.drive(stop=lambda run: run.status.phase == RunPhase.FAILED)
+    assert h.codes()[TASK] == (ExitCode.HARNESS_ERROR, "K8SI_DBAAS_IMAGE is empty") and h.jobs() == []
+
+
+def test_a_stack_left_from_an_earlier_run_is_destroyed_first_and_the_run_goes_on(h):
+    h.storage.objects[STATE_KEY] = b"{}"
+    h.start_db()
+    h.until_phase(DbPhase.CLEARING)
+    assert h.jobs() == [f"dbaas-down-{h.name}"]  # no `up` yet: only the destroy of the leftover
+    assert h.pod_names() == [] and h.run.status.phase == RunPhase.PENDING  # and no paid client node waits for it
+    h.storage.objects.pop(STATE_KEY)  # what the destroy removes
+    run = h.drive(stop=lambda run: run.status.phase == RunPhase.PUBLISHING)
+    assert h.codes()[TASK] == (0, None) and run.status.attempts[0].outcome.value == "Completed"  # no -1 result
+    h.until_phase(DbPhase.DESTROYED)
+
+
+def test_a_destroy_of_the_leftover_stack_that_fails_is_retried(h):
+    h.cluster.jobs["down"] = ["fail"]
+    h.storage.objects[STATE_KEY] = b"{}"
+    h.start_db()
+    h.until_phase(DbPhase.CLEARING)
+    h.cluster.react()
+    h.runner.reconcile(h.name)
+    assert h.db.phase == DbPhase.CLEARING and h.db.destroy_failures == 1 and h.jobs() == []
+    h.clock.advance(minutes=2)
+    h.storage.objects.pop(STATE_KEY)
+    h.drive(stop=lambda run: run.status.phase == RunPhase.PUBLISHING)
+    assert h.codes()[TASK] == (0, None)
+
+
+def test_a_leftover_stack_that_cannot_be_destroyed_ends_the_run_with_a_result_and_keeps_the_stack(h):
+    failures = []
+    h.runner._on_leftover_stack_failure = failures.append
+    h.cluster.jobs["down"] = ["fail"] * 5
+    h.storage.objects[STATE_KEY] = b"{}"
+    h.start_db()
+    h.until_phase(DbPhase.CLEARING)
+    for _ in range(3):
+        h.cluster.react()
+        h.runner.reconcile(h.name)
+        h.clock.advance(minutes=5)
+        h.runner.reconcile(h.name)
+    run = h.run
+    assert run.status.phase == RunPhase.FAILED and run.status.database is None  # nothing holds the vendor's slot
+    code, message = h.codes()[TASK]
+    assert code == ExitCode.NO_NODE and message.startswith("DBAAS_LEFTOVER_STACK: k8s-dbaas-")
+    assert "operator action needed" in message and failures == ["oci"]
+    assert STATE_KEY in h.storage.objects and h.pod_names() == []  # the sweeper and the operator take it from here
+
+
+@pytest.mark.parametrize("how", ["cancel", "delete"])
+def test_a_run_cancelled_while_clearing_records_nothing(h, how):
+    h.cluster.jobs["down"] = ["hang"]
+    h.storage.objects[STATE_KEY] = b"{}"
+    h.start_db()
+    h.until_phase(DbPhase.CLEARING)
+    if how == "cancel":
+        crd.request_cancel(h.kube, h.name)
+    else:
+        h.kube.delete("benchmarkrun", h.name)
+    h.runner.reconcile(h.name)
+    assert h.codes().get(TASK, (None, None)) == (None, None)  # no result for a database that was never created
+    assert h.db.phase == DbPhase.DESTROYING  # the leftover stack is still destroyed
+
+
+# ------------------------------------------------------------------ the node is lost, the run is cancelled or deleted
+
+
+def test_a_lost_client_node_ends_the_run_and_destroys_the_database(h):
+    h.start_db()
+    h.drive(stop=in_step(STEP))
+    h.kube.delete("pod", f"{h.name}-a1")  # a node lost on-demand: no spot retry
+    run = h.drive(stop=lambda run: run.status.phase == RunPhase.PUBLISHING)
+    assert h.codes()[TASK] == (ExitCode.NEVER_FINISHED, "NODE_LOST")
+    h.runner.reconcile(h.name)
+    assert h.db.phase == DbPhase.DESTROYING and h.jobs() == [f"dbaas-down-{h.name}"]
+    h.until_phase(DbPhase.DESTROYED)
+    assert run.status.database is not None
+
+
+def test_a_cancel_destroys_the_database(h):
+    h.start_db()
+    h.drive(stop=in_step(STEP))
+    crd.request_cancel(h.kube, h.name)
+    h.runner.reconcile(h.name)
+    assert h.run.status.phase == RunPhase.CANCELLED and h.db.phase == DbPhase.DESTROYING
+    assert h.jobs() == [f"dbaas-down-{h.name}"] and h.run_pods() == []
+
+
+def test_deleting_the_run_keeps_it_until_the_database_is_gone(h):
+    h.start_db()
+    h.drive(stop=in_step(STEP))
+    h.kube.delete("benchmarkrun", h.name)  # the finalizer keeps it
+    assert h.run_exists() and h.kube.get("benchmarkrun", h.name)["metadata"]["deletionTimestamp"]
+    h.runner.reconcile(h.name)  # a deleted run is a cancelled run
+    assert h.run.status.phase == RunPhase.CANCELLED and h.db.phase == DbPhase.DESTROYING
+    h.cluster.react()
+    h.runner.reconcile(h.name)  # the destroy succeeded
+    assert not h.run_exists()
+
+
+def test_deleting_a_run_that_never_created_a_database_releases_it_at_once(h):
+    h.start_db()
+    h.runner.reconcile(h.name)  # anchor created, no node yet
+    h.kube.delete("benchmarkrun", h.name)
+    h.runner.reconcile(h.name)
+    assert not h.run_exists() and h.jobs() == []
+    assert h.storage.status == {} and h.pod_names() == []  # a deleted run leaves no record, like a server run
+
+
+# --------------------------------------------------------------------------- retries and restarts
+
+
+def test_the_destroy_is_retried_with_a_growing_wait_until_it_succeeds(h):
+    h.cluster.jobs["down"] = ["fail", "fail"]
+    h.start_db()
+    h.drive(stop=lambda run: run.status.phase == RunPhase.PUBLISHING)
+    h.runner.reconcile(h.name)
+    h.cluster.react()
+    h.runner.reconcile(h.name)  # the first destroy failed
+    assert h.db.destroy_failures == 1 and h.db.phase == DbPhase.DESTROYING and "quota exceeded" in h.db.error
+    assert h.jobs() == [] and h.db.retry_after == START + timedelta(minutes=1)
+    h.runner.reconcile(h.name)
+    assert h.jobs() == []  # not before the wait is over
+    h.clock.advance(minutes=1, seconds=1)
+    h.runner.reconcile(h.name)
+    h.cluster.react()
+    h.runner.reconcile(h.name)
+    assert h.db.destroy_failures == 2 and h.db.retry_after == h.clock.now + timedelta(minutes=2)
+    h.clock.advance(minutes=3)
+    h.runner.reconcile(h.name)
+    h.cluster.react()
+    h.runner.reconcile(h.name)
+    assert h.db.phase == DbPhase.DESTROYED
+
+
+def test_a_restarted_controller_continues_creating_and_runs_the_destroy(h):
+    h.cluster.jobs["up"] = ["hang"]
+    h.start_db()
+    h.until_phase(DbPhase.CREATING)
+    second = h.new_runner()  # the controller restarts while the database is being created
+    second.reconcile(h.name)
+    assert h.jobs() == [f"dbaas-up-{h.name}"] and h.db.phase == DbPhase.CREATING
+    h.cluster.finish_job(f"dbaas-up-{h.name}", "ok")
+    h.drive(runner=second, stop=in_step(STEP))
+    crd.request_cancel(h.kube, h.name)
+    third = h.new_runner()  # and again, before the destroy
+    h.drive(runner=third, stop=lambda run: run.status.database.phase == DbPhase.DESTROYED)
+
+
+def test_a_restart_between_the_phase_and_the_job_creates_the_missing_job(h):
+    h.start_db()
+    h.until_phase(DbPhase.CREATING)
+    h.kube.delete("job", f"dbaas-up-{h.name}")  # the controller died after writing the phase
+    h.new_runner().reconcile(h.name)
+    assert h.jobs() == [f"dbaas-up-{h.name}"]
+
+
+def test_the_password_survives_a_restart_and_is_never_in_the_job_spec(h):
+    h.start_db()
+    h.until_phase(DbPhase.CREATING)
+    password = h.secret(f"{h.name}-db")["SC_DB_PASSWORD"]
+    h.kube.delete("job", f"dbaas-up-{h.name}")
+    h.new_runner().reconcile(h.name)
+    assert h.secret(f"{h.name}-db")["SC_DB_PASSWORD"] == password
+    assert password not in json.dumps(h.kube.get("job", f"dbaas-up-{h.name}"))
+
+
+def test_the_anchor_is_kept_alive_while_the_database_is_created(h):
+    h.cluster.jobs["up"] = ["hang"]
+    h.start_db()
+    h.until_phase(DbPhase.CREATING)
+    before = len(h.kube.heartbeats)
+    h.cluster.react()
+    h.runner.reconcile(h.name)
+    assert len(h.kube.heartbeats) > before
+
+
+def test_the_anchor_deadline_covers_the_creation_and_the_bootstrap(h):
+    h.start_db()
+    h.runner.reconcile(h.name)
+    deadline = h.kube.get("pod", f"{h.name}-a1")["spec"]["activeDeadlineSeconds"]
+    # one step (120 min task + 15 min pull + 1 + 10 + 5, two 15 min flushes) + 1 h + 60 min creation + 75 min bootstrap
+    assert deadline == (120 + 15 + 1 + 10 + 5 + 30 + 60 + 60 + 75) * 60
+
+
+def test_the_up_job_uses_the_vendor_service_account_and_credentials(h):
+    h.cfg.settings.dbaas.vendors["oci"] = DbaasVendor(networks={"eu-test-1": {}}, service_account="oci-dbaas")
+    h.start_db()
+    h.until_phase(DbPhase.CREATING)
+    (job,) = h.kube.list("job")
+    pod = job["spec"]["template"]["spec"]
+    assert pod["serviceAccountName"] == "oci-dbaas"
+    assert pod["containers"][0]["envFrom"] == [{"secretRef": {"name": "k8s-inspector-dbaas-oci", "optional": True}}]
+    env = {e["name"]: e for e in pod["containers"][0]["env"]}
+    assert env["PULUMI_CONFIG_PASSPHRASE"]["valueFrom"]["secretKeyRef"] == {
+        "name": "k8s-inspector-dbaas-state",
+        "key": "passphrase",
+    }
+    assert pod["nodeSelector"] == {"karpenter.sh/nodepool": "apps"}
+
+
+def test_the_state_bucket_credentials_are_a_profile_not_the_aws_environment(h):
+    h.cfg = Config(env=replace(h.cfg.env, dbaas_role_arn="arn:aws:iam::1:role/state"), settings=h.cfg.settings)
+    h.start_db()
+    h.until_phase(DbPhase.CREATING)
+    (job,) = h.kube.list("job")
+    container = job["spec"]["template"]["spec"]["containers"][0]
+    env = {e["name"]: e.get("value") for e in container["env"]}
+    assert env["PULUMI_BACKEND_URL"] == ("s3://b/dbaas-state?region=eu-west-1&awssdk=v2&profile=k8si-state")
+    assert not [name for name in env if name.startswith("AWS_")]  # nothing for a vendor's provider to pick up
+    config = env["K8SI_STATE_AWS_CONFIG"]
+    assert config.startswith("[profile k8si-state]\nrole_arn = arn:aws:iam::1:role/state\n")
+    assert "web_identity_token_file = /var/run/secrets/aws/token" in config
+    assert {"name": "aws-token", "mountPath": "/var/run/secrets/aws", "readOnly": True} in container["volumeMounts"]
+
+
+def test_the_jobs_are_not_disrupted_and_get_time_to_record_what_is_in_flight(h):
+    h.start_db()
+    h.until_phase(DbPhase.CREATING)
+    (up,) = h.kube.list("job")
+    h.drive(stop=lambda run: run.status.phase == RunPhase.PUBLISHING)
+    down = h.kube.get("job", dbaas_jobs.down_job_name(h.name))
+    for job in (up, down):
+        template = job["spec"]["template"]
+        assert template["metadata"]["annotations"] == {"karpenter.sh/do-not-disrupt": "true"}
+        assert template["spec"]["terminationGracePeriodSeconds"] == 900
+    assert up["spec"]["activeDeadlineSeconds"] == 3600 and h.db.phase == DbPhase.DESTROYING
+
+
+def test_the_vendor_module_gets_pulumi_timeouts_shorter_than_the_up_jobs_deadline(h):
+    h.start_db()
+    h.until_phase(DbPhase.CREATING)
+    (job,) = h.kube.list("job")
+    env = {e["name"]: e for e in job["spec"]["template"]["spec"]["containers"][0]["env"]}
+    spec = json.loads(env["DBAAS_SPEC"]["value"])
+    assert spec["createTimeoutMinutes"] == 50 and spec["deleteTimeoutMinutes"] == 110  # 60 and 120 minus 10
+
+
+def test_the_down_job_is_labelled_not_owned_so_foreground_deletion_cannot_wait_for_it(h):
+    h.start_db()
+    h.drive(stop=lambda run: run.status.phase == RunPhase.PUBLISHING)
+    down = h.kube.get("job", dbaas_jobs.down_job_name(h.name))
+    assert "ownerReferences" not in down["metadata"]
+    assert down["metadata"]["labels"][crd.LABEL_RUN] == h.name
+    assert down["metadata"]["annotations"][dbaas_jobs.ANNOTATION_RUN] == h.name
+    h.until_phase(DbPhase.DESTROYED)
+    assert h.jobs() == []  # cleaned up after the success
+
+
+def test_only_the_dbaas_finalizer_is_removed(h):
+    h.start_db()
+    h.kube.objects["benchmarkrun"][h.name]["metadata"]["finalizers"].append("example.com/other")
+    h.drive(stop=in_step(STEP))
+    crd.request_cancel(h.kube, h.name)
+    h.until_phase(DbPhase.DESTROYED)
+    assert h.kube.get("benchmarkrun", h.name)["metadata"]["finalizers"] == ["example.com/other"]
+
+
+def test_job_names_stay_within_the_limit_and_are_deterministic():
+    run = "o" * 63
+    for name in (dbaas_jobs.up_job_name(run), dbaas_jobs.down_job_name(run), dbaas_jobs.inventory_job_name("v" * 63)):
+        assert len(name) <= 63
+    assert dbaas_jobs.up_job_name(run) == dbaas_jobs.up_job_name(run)
+    assert dbaas_jobs.up_job_name(run) != dbaas_jobs.up_job_name("o" * 62 + "p")  # the hash tells long names apart
+    assert dbaas_jobs.up_job_name("aws-x-1") == "dbaas-up-aws-x-1"  # short names are kept as they are

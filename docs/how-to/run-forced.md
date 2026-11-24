@@ -60,3 +60,20 @@ With `--hold`, start a debug Pod on the node and use the host's tools:
 kubectl debug node/<node> --profile=sysadmin --attach=false -- sleep 3600
 kubectl exec -it <debug pod> -- chroot /host
 ```
+
+## Managed database
+
+A DBaaS run benchmarks one managed PostgreSQL ([DBaaS](../explanation/dbaas.md)). The vendor needs `dbaas.vendors.<vendor>`
+networks in the ConfigMap and `K8SI_DBAAS_IMAGE` must be set:
+
+```sh
+kubectl -n inspector exec deploy/k8s-inspector -- \
+  k8s-inspector run upcloud --database 1x1xCPU-1GB-10GB --force
+```
+
+The database is Keeper's `api_reference`. The region defaults to the cheapest one with a network (`--region <region>`
+picks one), and the client server to the one the picker chooses (the optional `<sku>` argument names one). Without
+`--force` Keeper must find the database eligible. The vendor's `dbaasMaxInFlight` and `dbaasMaxUsdPerHour` apply (a forced run is refused with the reason). Follow it with
+`kubectl -n inspector get benchmarkruns -w` and `get jobs`; the run ends with the database destroyed and the finalizer gone.
+`k8s-inspector cancel <run>` cancels it and destroys the database. `--tasks` and `--on-demand` do not apply: the run
+always benchmarks the DBaaS task, on demand.

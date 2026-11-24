@@ -14,7 +14,7 @@ Status: **accepted** (decided by the maintainers), **open** (recommendation in b
 | K8 | GPU fallback, vLLM ladder, nvbandwidth size | accepted | adaptive in the controller (ported) |
 | K9 | Memory limits | accepted | 0.85 × Node allocatable for geekbench and vLLM only; no CPU limits; step Pods request no memory |
 | K10 | Publish granularity | accepted | per task, every 5 minutes |
-| K11 | DBaaS provisioning | accepted | Job running Pulumi (DB only, networks pre-created), state in `dbaas-state/` of the controller bucket, client node first, DB destroy and node release in parallel on the way out ([DBaaS](explanation/dbaas.md)) |
+| K11 | DBaaS provisioning | accepted | Job running Pulumi (DB only, networks pre-created), state in `dbaas-state/` of the controller bucket, client node first, DB destroy and node release in parallel on the way out, run phase in `status.database`, finalizer, stack sweeper ([DBaaS](explanation/dbaas.md), [vendor contract](how-to/add-dbaas-vendor.md)) |
 | K12 | Multi-instance runs | accepted | deferred; nothing in the single-node design blocks two anchors per run |
 | K13 | First target vendor | accepted | OCI, with autoPlan selecting the SKUs (Keeper lists the OCI SKUs and its eligibility rules apply as for any vendor; Keeper unchanged); forced runs are for operators. Results pushed to sc-inspector-data `main` reach sc-crawler and the published data, so the first OCI SKUs are published only after their outputs are checked ([roadmap](roadmap.md)) |
 | K14 | Anchor implementation | accepted | `sc-run hold`, 45 min idle timeout, installs `sc-run` for the steps |

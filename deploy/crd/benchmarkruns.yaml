@@ -20,6 +20,7 @@ spec:
     - {name: Vendor, type: string, jsonPath: .spec.vendor}
     - {name: SKU, type: string, jsonPath: .spec.sku}
     - {name: Phase, type: string, jsonPath: .status.phase}
+    - {name: Database, type: string, jsonPath: .status.database.phase}
     - {name: Progress, type: string, jsonPath: .status.progress}
     - {name: Step, type: string, jsonPath: .status.currentStep}
     - {name: Capacity, type: string, jsonPath: .status.capacityType}
@@ -54,13 +55,17 @@ spec:
                 type: string
                 default: 0s
               database:
-                description: DBaaS runs only.
+                description: DBaaS runs only. `vendor` and `id` are Keeper's, `region` is where the client node and the database go.
                 type: object
                 nullable: true
                 properties:
                   vendor: {type: string}
                   id: {type: string}
                   engineVersion: {type: string}
+                  region: {type: string}
+                  vcpus: {type: integer}
+                  memoryGib: {type: number}
+                  usdPerHour: {type: number}
           status:
             type: object
             properties:
@@ -149,6 +154,19 @@ spec:
                     nodeClaim: {type: string}
                     launched: {type: string, format: date-time}
                     capacityType: {type: string, nullable: true}
+              database:
+                description: DBaaS runs only. The state of the managed database.
+                type: object
+                nullable: true
+                properties:
+                  phase:
+                    type: string
+                    enum: [Clearing, Creating, Bootstrapping, Ready, Destroying, Destroyed]
+                  since: {type: string, format: date-time}
+                  expires: {type: string, format: date-time}
+                  error: {type: string, nullable: true}
+                  destroyFailures: {type: integer}
+                  retryAfter: {type: string, format: date-time, nullable: true}
               conditions:
                 type: array
                 items:

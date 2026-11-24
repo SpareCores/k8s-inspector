@@ -13,7 +13,16 @@ on: no lscpu result), `_last_publish_timestamp_seconds`
 (runs that ended because no node could be launched, counted by the runner), `_launch_deferred_skus{vendor,reason}`
 and `_launch_blocked{vendor,reason}` (SKUs in the launch ConfigMap, and those of them still waiting for their
 retry), `_autoplan_vendor_skipped_total{vendor,reason}` (planner cycles that skipped a vendor, counted by the
-planner). Not yet: `_dbaas_instances` (P4).
+planner), `_dbaas_leftover_stack_failures_total{vendor}` (runs that gave up destroying a stack of an earlier run of the
+same name, counted by the runner). `_dbaas_instances{vendor}` and `_dbaas_oldest_age_seconds{vendor}`: the managed
+databases (stacks) that exist, from the stacks the sweeper sees (aged from their first update) and the DBaaS runs not
+yet destroyed that no stack shows yet (stacks of a vendor the configuration does not know are
+`vendor="unknown"`); alert when the oldest is over 8 h. `_dbaas_tagged_databases{vendor}` and
+`_dbaas_tagged_oldest_age_seconds{vendor}`: the databases the vendor's inventory Job found by their `sc_inspector_run`
+tag (also the ones no state records), refreshed every 30 minutes; alert when the oldest is over 8 h. A vendor whose
+inventory failed has no tagged metrics. `_dbaas_inventory_last_success_timestamp_seconds{vendor}`: when the last
+inventory of every configured vendor worked (the controller's start time until the first success); alert when it is over
+2 h old.
 `/healthz` answers 200 as long as the process serves.
 """
 
@@ -27,7 +36,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from k8s_inspector import crd, launch
 from k8s_inspector.kube import Kube
-from k8s_inspector.model import AttemptOutcome, ExitCode, RunPhase, Settings, TaskState
+from k8s_inspector.model import AttemptOutcome, DbPhase, ExitCode, RunPhase, Settings, TaskState
 from k8s_inspector.planner import ACTIVE_PHASES, spend_per_hour
 from k8s_inspector.publisher import publish_allowed
 
@@ -85,12 +94,27 @@ class Metrics:
         self._kube = kube
         self._settings = settings_provider
         self._clock = clock
+        self._started = clock()
         self._lock = threading.Lock()
         self._counters: dict[str, dict[Labels, float]] = defaultdict(lambda: defaultdict(float))
         self._seen: set[tuple] = set()
         self._gauges: list[str] = []  # last good snapshot, served when the API server is unreachable
         self._last_publish = time.time()  # process start until the first cycle: a stuck publisher still ages
         self._counters["unpublishable_tasks_total"][()] = 0
+        self._stacks: list = []  # `dbaas_sweep.Stack`s the sweeper saw last
+        self._tagged: dict = {}  # vendor -> `dbaas_sweep.Tagged`: the databases the last inventory found by their tag
+        self._inventory_success: dict[str, datetime] = {}  # vendor -> when its inventory last worked
+
+    def record_dbaas_stacks(self, stacks) -> None:
+        """The stacks the sweeper saw (`dbaas_sweep.Stack`), counted with their age since their first update."""
+        with self._lock:
+            self._stacks = list(stacks)
+
+    def record_dbaas_inventory(self, tagged: dict, last_success: dict) -> None:
+        """The latest good inventory of every vendor (`dbaas_sweep.Tagged` by vendor) and when each vendor's last one
+        worked."""
+        with self._lock:
+            self._tagged, self._inventory_success = dict(tagged), dict(last_success)
 
     def record_publish(self) -> None:
         """A publish cycle finished without error."""
@@ -107,6 +131,11 @@ class Metrics:
         """A planner cycle skipped the vendor (`planner.OFFERED_UNUSABLE`)."""
         with self._lock:
             self._counters["autoplan_vendor_skipped_total"][_labels(vendor=vendor, reason=reason)] += 1
+
+    def record_dbaas_leftover_failure(self, vendor: str) -> None:
+        """A run gave up destroying the stack an earlier run of its name left."""
+        with self._lock:
+            self._counters["dbaas_leftover_stack_failures_total"][_labels(vendor=vendor)] += 1
 
     def record_unpublishable(self, count: int) -> None:
         """Tasks the publisher gave up on (finished, but no lscpu result to pick a variant from)."""
@@ -139,11 +168,15 @@ class Metrics:
         }
         spend: dict[str, float] = defaultdict(float)
         node_age: dict[Labels, float] = {}
+        databases: dict[str, list[float]] = defaultdict(list)  # vendor -> ages of its existing databases
+        has_database: dict[str, bool] = {}  # run -> its database exists (not destroyed yet)
         backlog = 0
         oldest_unpublished: datetime | None = None
 
         for run in runs:
             vendor = run.spec.vendor
+            if run.status.database:
+                has_database[run.name] = run.status.database.phase != DbPhase.DESTROYED
             for phase in RunPhase:
                 phases.setdefault((vendor, phase.value), 0)
             phases[(vendor, run.status.phase.value)] += 1
@@ -169,7 +202,13 @@ class Metrics:
             for task in run.status.tasks:
                 if task.state != TaskState.DONE:
                     continue
-                if not task.published and publish_allowed(settings, vendor, run.spec.sku):
+                database = run.spec.database
+                allowed = (
+                    publish_allowed(settings, database["vendor"], database["id"])
+                    if database
+                    else publish_allowed(settings, vendor, run.spec.sku)
+                )
+                if not task.published and allowed:
                     backlog += 1
                     if task.end and (oldest_unpublished is None or task.end < oldest_unpublished):
                         oldest_unpublished = task.end
@@ -201,6 +240,42 @@ class Metrics:
         ]
         lines.append(f"# TYPE {PREFIX}node_age_seconds gauge")
         lines += [_line("node_age_seconds", labels, age) for labels, age in sorted(node_age.items())]
+        seen = {stack.run for stack in self._stacks}
+        for stack in self._stacks:  # a destroyed run's state may linger until the next sweep
+            if has_database.get(stack.run, True):
+                databases[stack.vendor or "unknown"].append((now - stack.created).total_seconds())
+        for run in runs:  # a database whose stack the sweeper has not seen yet
+            if has_database.get(run.name) and run.name not in seen:
+                databases[run.spec.vendor].append((now - run.created).total_seconds())
+        for vendor in settings.vendors:
+            databases.setdefault(vendor, [])  # a vendor without databases reports 0, not nothing
+        lines.append(f"# TYPE {PREFIX}dbaas_instances gauge")
+        lines += [_line("dbaas_instances", _labels(vendor=v), len(ages)) for v, ages in sorted(databases.items())]
+        lines.append(f"# TYPE {PREFIX}dbaas_oldest_age_seconds gauge")
+        lines += [
+            _line("dbaas_oldest_age_seconds", _labels(vendor=v), max(ages, default=0))
+            for v, ages in sorted(databases.items())
+        ]
+        lines.append(f"# TYPE {PREFIX}dbaas_tagged_databases gauge")
+        lines += [_line("dbaas_tagged_databases", _labels(vendor=v), t.count) for v, t in sorted(self._tagged.items())]
+        lines.append(f"# TYPE {PREFIX}dbaas_tagged_oldest_age_seconds gauge")
+        lines += [
+            _line(
+                "dbaas_tagged_oldest_age_seconds",
+                _labels(vendor=v),
+                (now - t.oldest_created).total_seconds() if t.oldest_created else 0,
+            )
+            for v, t in sorted(self._tagged.items())
+        ]
+        lines.append(f"# TYPE {PREFIX}dbaas_inventory_last_success_timestamp_seconds gauge")
+        lines += [
+            _line(
+                "dbaas_inventory_last_success_timestamp_seconds",
+                _labels(vendor=v),
+                self._inventory_success.get(v, self._started).timestamp(),
+            )
+            for v in sorted(settings.dbaas.vendors)
+        ]
         lines.append(f"# TYPE {PREFIX}publish_backlog gauge")
         lines.append(_line("publish_backlog", (), backlog))
         lines.append(f"# TYPE {PREFIX}publish_lag_seconds gauge")

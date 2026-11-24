@@ -2924,12 +2924,6 @@ def test_a_pending_run_with_done_tasks_whose_sku_left_keeper_ends_and_keeps_its_
     assert h.kube.list("nodeclaim") == []
 
 
-def test_a_dbaas_run_is_not_checked_against_keeper(h, keeper_answer, keeper_asks):
-    keeper_answer["oci"].clear()
-    _stuck_without_node(h, database={"engine": "postgres"})
-    assert h.run.status.phase == RunPhase.PROVISIONING and not keeper_asks
-
-
 def test_a_run_with_one_task_left_after_keeper_blocks_another_goes_on(h, keeper_answer):
     h.cluster.provision_enabled = False
     h.start(["geekbench", "lscpu"])

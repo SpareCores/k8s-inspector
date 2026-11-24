@@ -3,3 +3,4 @@ __pycache__/
 urls.json
 *.urls.json
 urls-new.json
+.venv/

@@ -27,7 +27,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from k8s_inspector import config as config_loader
-from k8s_inspector import crd, planner
+from k8s_inspector import crd, dbaas_plan, dbaas_sweep, planner
 from k8s_inspector.kube import Kube, NotFound, TransientApiError, call_with_retries
 from k8s_inspector.log import setup_logging
 from k8s_inspector.metrics import PORT as METRICS_PORT
@@ -70,9 +70,11 @@ def build_parser() -> argparse.ArgumentParser:
     plan = sub.add_parser("plan", help="run one planning cycle")
     plan.add_argument("--dry-run", action="store_true", help="print what would be started")
 
-    run = sub.add_parser("run", help="start a forced run of one SKU")
+    run = sub.add_parser("run", help="start a forced run of one SKU, or of one managed database (--database)")
     run.add_argument("vendor")
-    run.add_argument("sku")
+    run.add_argument("sku", nargs="?", help="the SKU; with --database the client server (default: picked)")
+    run.add_argument("--database", help="a DBaaS run of this database (Keeper's api_reference) instead of a server run")
+    run.add_argument("--region", help="with --database: the region (default: the cheapest with a DBaaS network)")
     run.add_argument(
         "--tasks", type=lambda s: [t for t in s.split(",") if t], default=[], help="comma-separated task names"
     )
@@ -186,6 +188,7 @@ def serve(kube: Kube, provider: ConfigProvider, stop: threading.Event, metrics_p
         env.namespace,
         on_launch_failure=metrics.record_launch_failure,
         keeper_cache=keeper_cache,
+        on_leftover_stack_failure=metrics.record_dbaas_leftover_failure,
     )
     publisher = _MeteredPublisher(
         kube,
@@ -222,6 +225,15 @@ def serve(kube: Kube, provider: ConfigProvider, stop: threading.Event, metrics_p
             publisher.read_first_seen,
             keeper_cache,
             metrics.record_vendor_skipped,
+        ),
+        "dbaas-planner": lambda: dbaas_plan.run_forever(kube, provider, publisher.read_dbaas_metas, stop),
+        "dbaas-sweeper": lambda: dbaas_sweep.run_forever(
+            kube,
+            provider,
+            storage,
+            stop,
+            on_stacks=metrics.record_dbaas_stacks,
+            on_inventory=metrics.record_dbaas_inventory,
         ),
         "publisher": lambda: publisher.run_forever(lambda: provider().settings, stop),
         "metrics": server.serve_forever,
@@ -273,9 +285,14 @@ def cmd_plan(args: argparse.Namespace) -> int:
             variant_reader=publisher.read_newest_variants,
             first_seen_reader=publisher.read_first_seen,
         )
+        databases = dbaas_plan.plan_cycle(kube, cfg, publisher.read_dbaas_metas, dry_run=args.dry_run)
     for run in planned:
         print(f"{run.vendor} {run.sku} {','.join(run.tasks)} ({run.reason})")
-    if not planned:
+    for db in databases:
+        print(
+            f"{db.vendor} database {db.database_id} in {db.region} with {db.client} {','.join(db.tasks)} ({db.reason})"
+        )
+    if not planned and not databases:
         print("nothing to plan")
     return 0
 
@@ -283,21 +300,40 @@ def cmd_plan(args: argparse.Namespace) -> int:
 def cmd_run(args: argparse.Namespace) -> int:
     """`planner.force_run`; print the run name. Exit 1 on `RunExists` / `ValueError`."""
     kube, provider = _connect(need_run_image=True)
+    if args.database is None and (args.sku is None or args.region):
+        raise CliError("a SKU is required (or --database, with --region)", 2)
+    if args.database is not None and args.tasks:
+        raise CliError("--tasks does not apply to --database: a DBaaS run runs the DBaaS tasks", 2)
     try:
-        run = planner.force_run(
-            kube,
-            provider(),
-            args.vendor,
-            args.sku,
-            tasks=args.tasks,
-            force=args.force,
-            capacity=CapacityMode.ON_DEMAND if args.on_demand else None,
-            hold_after=args.hold,
-        )
+        if args.database is not None:
+            if not provider().env.dbaas_image:
+                raise CliError("K8SI_DBAAS_IMAGE is empty: set it to the digest-pinned k8s-inspector-dbaas image", 2)
+            run = dbaas_plan.force_run(
+                kube,
+                provider(),
+                args.vendor,
+                args.database,
+                region=args.region,
+                client=args.sku,
+                force=args.force,
+                hold_after=args.hold,
+            )
+        else:
+            run = planner.force_run(
+                kube,
+                provider(),
+                args.vendor,
+                args.sku,
+                tasks=args.tasks,
+                force=args.force,
+                capacity=CapacityMode.ON_DEMAND if args.on_demand else None,
+                hold_after=args.hold,
+            )
     except crd.RunExists:
-        name = crd.run_name(args.vendor, args.sku)
+        name = crd.run_name(args.vendor, args.sku or "")
         raise CliError(
-            f"a run for {args.vendor}/{args.sku} exists: {name} (follow it with kubectl, or cancel it with "
+            f"a run for {args.vendor}/{args.sku or args.database} exists: {name} "
+            f"(follow it with kubectl, or cancel it with "
             f"`k8s-inspector cancel {name}`)"
         ) from None
     except ValueError as e:

@@ -13,6 +13,8 @@ Values are deployment configuration of the cluster platform, not part of this re
 | `KEEPER_API_BASE`, `KEEPER_API_KEY_FILE` | optional: Keeper API for eligibility (base default `https://keeper.sparecores.net`; key from Secret `k8s-inspector-keeper`; without the key file Keeper is called without a key) |
 | `K8SI_NAMESPACE` | namespace of runs (default `inspector`) |
 | `K8SI_SC_RUN_IMAGE` | the `sc-run` image of anchors and flush steps, digest-pinned (`ghcr.io/sparecores/k8s-inspector-sc-run@sha256:…`); `serve` and `run` refuse to start without it |
+| `K8SI_DBAAS_IMAGE` | the DBaaS provisioner image of the Jobs, digest-pinned (`ghcr.io/sparecores/k8s-inspector-dbaas@sha256:…`); only DBaaS runs need it (`run --database` refuses without it, a DBaaS run ends `256` without it) |
+| `K8SI_DBAAS_ROLE_ARN` | optional: IAM role of the provisioner Jobs for `dbaas-state/` (web identity of the ServiceAccount `k8s-inspector-dbaas`), limited to that prefix; the Jobs name it in an AWS profile `k8si-state` and set no `AWS_*` variable. Without it the Jobs get no state credentials from the controller |
 | `K8SI_S3_ENDPOINT_URL` | optional S3-compatible endpoint, for object storage that is not AWS S3 (OCI) |
 | `K8SI_KEY_PREFIX` | optional prefix of every object key, default empty (for example `k8s-inspector/spikes/` writes a first run under a scratch prefix); the bucket role must cover it ([output contract](output-contract.md)) |
 
@@ -40,6 +42,9 @@ vendors:
     maxUsdPerHour: 2.0           # checked before a run starts
     capacity: SpotFirst          # SpotFirst (the default) | OnDemand
     publish: false               # true, or a list of SKUs: the publisher pushes these results to sc-inspector-data
+    dbaasAutoPlan: false         # autoPlan also creates managed-database runs for this vendor (see DBaaS autoPlan)
+    dbaasMaxInFlight: 1          # DBaaS runs in flight; 0 pauses; counted over DBaaS runs only
+    # dbaasMaxUsdPerHour: 3.0   # database + client price of the DBaaS runs in flight; unset (the default): no cap
 defaults:
   maxInFlight: 2                 # conservative default for every vendor without its own maxInFlight
 spot:
@@ -61,6 +66,10 @@ deadlines:
   noOfferingFastMinutes: 2       # ... the same when Karpenter's FailedScheduling event says the bench pool is incompatible
   imagePullMinutes: 15
   holdIdleMinutes: 45
+dbaas:
+  engineVersion: "18"            # PostgreSQL major version to benchmark when the database offers it, else its newest
+  createMinutes: 60              # the database must be created within this time
+  sweepAfterHours: 6             # a stack without a live run this old is destroyed
 publish:
   intervalMinutes: 5
   keepRunHours: 24
@@ -129,6 +138,27 @@ SKUs that are not published are deleted after `keepRunHours`; their outputs stay
 `publish --rescan --sku` can publish them later). A vendor is enabled here when it is
 removed from the legacy pipeline ([roadmap](../roadmap.md)); there is no shared routing file.
 
+## DBaaS
+
+`dbaas.vendors` holds what the cluster platform provides per vendor ([add a DBaaS vendor](../how-to/add-dbaas-vendor.md#what-the-platform-provides));
+it is empty by default, which leaves DBaaS off (the sweeper still lists the stacks in the bucket and reports them):
+
+```yaml
+dbaas:
+  vendors:
+    gcp:
+      serviceAccount: k8s-inspector-dbaas-gcp   # optional: workload identity of the Jobs (default k8s-inspector-dbaas)
+      networks:                                  # region -> what the vendor module needs, passed through unchanged
+        europe-west4:
+          network: projects/p/global/networks/dbaas
+          subnet: projects/p/regions/europe-west4/subnetworks/dbaas
+```
+
+The values under `networks.<region>` are infrastructure outputs of the platform, opaque to the controller; only the
+vendor module reads them. A region without an entry is never used for a database of that vendor. The Jobs take the
+vendor's cloud credentials from the optional Secret `k8s-inspector-dbaas-<vendor>`, and the stack passphrase from the
+Secret `k8s-inspector-dbaas-state` (`passphrase`).
+
 ## autoPlan
 
 With `autoPlan` on (`planner.autoPlan`, overridable per vendor) for an enabled vendor, every `planner.intervalMinutes`
@@ -186,6 +216,30 @@ missing from it) are three reads in separate lock sections, the last two from th
 logs why: the planner never creates runs blindly. `k8s-inspector plan [--dry-run]` runs one cycle in its own
 checkout; with `--dry-run` it creates nothing and prints the first SKU that would start for each vendor.
 
+### DBaaS autoPlan
+
+`vendors.<vendor>.dbaasAutoPlan: true` (default `false`, and the vendor must be `enabled` and publish) lets autoPlan also
+create DBaaS runs for the vendor, in their own cycle every `planner.intervalMinutes` (`k8s-inspector plan` runs it too).
+It is independent of `planner.autoPlan` and of `autoPlan` of the vendor: server and DBaaS planning are switched
+separately. Per vendor:
+
+1. The vendor must have networks in `dbaas.vendors.<vendor>`, be below `dbaasMaxInFlight` (default 1; the runs that hold
+   a client node or a database not yet destroyed) and must not be launch-paused. A database is skipped when the running
+   DBaaS runs plus its own price (database plus client, from Keeper) would pass `dbaasMaxUsdPerHour` (default: no cap).
+   Server runs and the client node do not count against `maxInFlight` or `maxUsdPerHour`, and server runs do not count
+   against the DBaaS limits. At most one DBaaS run per vendor is created per cycle.
+2. The candidate databases are the ACTIVE PostgreSQL databases Keeper lists for the vendor that Keeper does not block for
+   the DBaaS task (`/inspector/databases/task_block_reason_codes`, cached for 30 minutes), whose results may be published
+   (`publish` true or listing the database's id), in the order crc32 of `<vendor>/<database>`.
+3. A database is due by the same rules as a server task (step 4 above), read from
+   `dbaas/<vendor>/<id>/postgres/<version>/standalone/<task>/meta.json`; the version is `dbaas.engineVersion` when the
+   database offers it, else its newest. A malformed meta skips the database.
+4. The first due database gets a run in its cheapest region with a network (the region of the last failed attempt
+   last), with the client the picker chooses there ([DBaaS](../explanation/dbaas.md#which-database-where-with-which-client)).
+   A database without such a region or client is skipped.
+
+If Keeper or git cannot be read the cycle (or that vendor) plans nothing and logs why.
+
 ### Offered types
 
 SCarpenter publishes which instance types it can launch in ConfigMap `scarpenter-offered-<benchClass>-<vendor>`
@@ -222,6 +276,7 @@ without `truncated` counts as complete; the optional `zonesOmitted` field is ign
 ## CLI
 
 `k8s-inspector serve | plan [--dry-run] | run <vendor> <sku> [--tasks …] [--force] [--on-demand] [--hold 2h] |
+run <vendor> --database <id> [--region <region>] [<client sku>] [--force] [--hold 2h] |
 status [--failing] | cancel <run> | publish [--rescan --since 7d [--sku <sku>]…]`. Inside the cluster:
 `kubectl -n inspector exec deploy/k8s-inspector -- k8s-inspector …`.
 

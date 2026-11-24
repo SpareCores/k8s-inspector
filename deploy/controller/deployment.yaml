@@ -1,8 +1,12 @@
 # Platform-provided objects this Deployment expects (External Secrets / platform config, not in this repository):
 #   ConfigMap k8s-inspector-platform: required K8SI_BUCKET, K8SI_BUCKET_REGION, K8SI_ROLE_ARN;
-#                                     optional K8SI_GIT_URL, K8SI_GIT_BRANCH, KEEPER_API_BASE, K8SI_KEY_PREFIX
+#                                     optional K8SI_GIT_URL, K8SI_GIT_BRANCH, KEEPER_API_BASE, K8SI_KEY_PREFIX, K8SI_DBAAS_ROLE_ARN (DBaaS)
 #   Secret    k8s-inspector-git-key:  optional, ssh-privatekey (sc-inspector-data deploy key)
 #   Secret    k8s-inspector-keeper:   optional, api-key
+# DBaaS (optional, see docs/how-to/add-dbaas-vendor.md "What the platform provides"):
+#   Secret    k8s-inspector-dbaas-state:     passphrase, the secrets provider of the Pulumi stacks
+#   Secret    k8s-inspector-dbaas-<vendor>:  the vendor's cloud credentials, environment variables of its Jobs
+#   ConfigMap k8s-inspector (config.yaml):   dbaas.vendors.<vendor>.networks.<region>, the network references
 # The settings ConfigMap k8s-inspector is platform-managed and read through the API; it is deliberately not mounted.
 apiVersion: apps/v1
 kind: Deployment
@@ -45,6 +49,8 @@ spec:
         - {name: K8SI_GIT_URL, valueFrom: {configMapKeyRef: {name: k8s-inspector-platform, key: K8SI_GIT_URL, optional: true}}}
         - {name: K8SI_GIT_BRANCH, valueFrom: {configMapKeyRef: {name: k8s-inspector-platform, key: K8SI_GIT_BRANCH, optional: true}}}
         - {name: K8SI_SC_RUN_IMAGE, value: "ghcr.io/sparecores/k8s-inspector-sc-run@sha256:0000000000000000000000000000000000000000000000000000000000000000"}  # placeholder, as above
+        - {name: K8SI_DBAAS_IMAGE, value: "ghcr.io/sparecores/k8s-inspector-dbaas@sha256:0000000000000000000000000000000000000000000000000000000000000000"}  # placeholder, as above; DBaaS runs only
+        - {name: K8SI_DBAAS_ROLE_ARN, valueFrom: {configMapKeyRef: {name: k8s-inspector-platform, key: K8SI_DBAAS_ROLE_ARN, optional: true}}}
         - {name: KEEPER_API_BASE, valueFrom: {configMapKeyRef: {name: k8s-inspector-platform, key: KEEPER_API_BASE, optional: true}}}
         - {name: K8SI_GIT_KEY_FILE, value: /etc/k8s-inspector/git/ssh-privatekey}
         - {name: KEEPER_API_KEY_FILE, value: /etc/k8s-inspector/keeper/api-key}

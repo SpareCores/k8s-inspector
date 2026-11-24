@@ -763,7 +763,7 @@ def test_rescan_routes_dbaas_runs_by_run_json(tmp_path, origin, cluster):
     git(seed, "push", "origin", "HEAD:main")
     today = datetime.now(UTC).date()
     run = RunKey("hcloud", "cax31", today, "r-db")
-    database = {"vendor": "hcloud", "id": "db1", "engineVersion": 16}
+    database = {"vendor": "hcloud", "id": "db1", "engineVersion": 16, "vcpus": 2, "memoryGib": 8.0}
     storage.put_task("pgbench", {"start": "2026-10-01T10:00:00", "end": "2026-10-01T10:05:00", "exit_code": 0,
                                  "task_hash": "h", "run_id": "r-db"}, b"tps", run=run)  # fmt: skip
     storage.objects[okey(run, "run.json")] = json.dumps({"database": database}).encode()
@@ -1112,3 +1112,104 @@ def test_read_first_seen_reads_variant_json_from_git(tmp_path, origin, storage):
     assert pub.read_first_seen("hcloud", "a", 1) == datetime(2026, 3, 1, 10)
     assert [pub.read_first_seen("hcloud", "a", n) for n in (2, 3, 4, 5, 6)] == [None] * 5
     assert pub.read_first_seen("hcloud", "nothing", 0) is None
+
+
+# --------------------------------------------------------------------------- DBaaS
+
+
+def test_read_dbaas_metas_checks_out_the_databases_metas(tmp_path, origin, storage, caplog):
+    seed = clone(origin, tmp_path, "seed4")
+    files = {
+        "db-a/postgres/18/standalone/pgbench/meta.json": json.dumps({"exit_code": 0}),
+        "db-a/postgres/17/standalone/pgbench/meta.json": json.dumps({"exit_code": -1}),
+        "db-b/postgres/18/standalone/pgbench/meta.json": "{damaged",
+        "db-b/postgres/18/standalone/pgbench/stdout": "x",
+    }
+    for name, text in files.items():
+        path = seed / "dbaas" / "gcp" / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text)
+    other = seed / "dbaas" / "aws" / "z" / "postgres" / "18" / "standalone" / "pgbench" / "meta.json"
+    other.parent.mkdir(parents=True)
+    other.write_text("{}")
+    git(seed, "add", "-A")
+    git(seed, "commit", "-m", "dbaas")
+    git(seed, "push", "origin", "HEAD:main")
+
+    metas = make_publisher(tmp_path, origin, storage).read_dbaas_metas("gcp")
+
+    assert metas == {
+        "db-a": {"18": {"pgbench": {"exit_code": 0}}, "17": {"pgbench": {"exit_code": -1}}},
+        "db-b": {"18": {"pgbench": None}},
+    }
+    assert "malformed dbaas/gcp/db-b/postgres/18/standalone/pgbench/meta.json" in caplog.text
+    assert make_publisher(tmp_path, origin, storage).read_dbaas_metas("nothing") == {}
+
+
+def test_a_dbaas_result_is_published_with_the_bootstrap_settings_merged_into_stdout(tmp_path, origin, cluster):
+    storage = FakeStorage()
+    seed = clone(origin, tmp_path, "seed5")
+    (seed / "data/hcloud/cax31").mkdir(parents=True)
+    (seed / "data/hcloud/cax31/.keep").write_text("")
+    git(seed, "add", "-A")
+    git(seed, "commit", "-m", "sku exists")
+    git(seed, "push", "origin", "HEAD:main")
+    run = RunKey("hcloud", "cax31", datetime.now(UTC).date(), "r-db")
+    status = {
+        "start": "2026-10-01T10:00:00",
+        "end": "2026-10-01T10:05:00",
+        "exit_code": 0,
+        "task_hash": "h",
+        "run_id": "r-db",
+    }
+    storage.put_task("pgbench", status, b'{"score": 7, "sslmode": ""}', run=run)
+    storage.objects[okey(run, "tasks/pgbench/postgres.json")] = json.dumps(
+        {
+            "postgres": {"version": "PostgreSQL 18.1"},
+            "extra": {"sslmode": "require", "sync_commit_session_settable": True},
+        }
+    ).encode()
+    storage.objects[okey(run, "run.json")] = json.dumps(
+        {"database": {"vendor": "gcp", "id": "db1", "engineVersion": 18, "region": "r", "vcpus": 4, "memoryGib": 16.0}}
+    ).encode()
+    tasks = {**TASKS, "pgbench": TaskDef("pgbench", "img", None, timedelta(minutes=5))}
+    env = EnvConfig(bucket="b", bucket_region="r", git_url=origin.as_uri())
+    settings = Settings(
+        vendors={
+            "hcloud": VendorSettings(enabled=True, publish=True),
+            "gcp": VendorSettings(enabled=True, publish=True),
+        }
+    )
+    pub = publisher.Publisher(None, storage, env, tmp_path / "work", get_task=tasks.__getitem__)
+    assert pub.rescan(1, settings=settings).tasks_published == 1
+    base = clone(origin, tmp_path) / "dbaas/gcp/db1/postgres/18/standalone/pgbench"
+    published = json.loads((base / "stdout").read_text())
+    assert published["score"] == 7 and published["postgres"] == {"version": "PostgreSQL 18.1"}
+    assert published["sslmode"] == "require" and published["sync_commit_session_settable"] is True
+    assert not (base / "postgres.json").exists()  # merged, not a file of its own
+    assert {k: published[k] for k in published if k not in ("score", "postgres", "sslmode")} == {
+        "sync_commit_session_settable": True,
+        "db_vcpus": 4,
+        "db_mem_gib": 16.0,
+        "profile_vus": [1, 2, 4, 8],
+        "profile_search": False,
+        "profile_max_clients": 8,
+        "profile_hard_max_clients": 8,
+        "benchmark_image": "img",
+        "durability": "durable",
+        "workload_kind": "pgbench_ro",
+        "cpu_scale": 1,
+        "schema_gib": 0.17,
+    }  # the fields the legacy runner added
+
+
+def test_a_dbaas_run_is_published_by_its_database_not_by_its_client_sku():
+    database = {"vendor": "gcp", "id": "db1", "engineVersion": "18"}
+    run = BenchmarkRun(
+        "gcp-x-1", "inspector", "u", "1", datetime.now(UTC), RunSpec("gcp", "client-sku", "r", database=database)
+    )
+    only_listed = Settings(vendors={"gcp": VendorSettings(enabled=True, publish=("db1",))})
+    assert publisher._publishable(only_listed, run)  # the client SKU is not in the list, the database is
+    assert not publisher._publishable(Settings(vendors={"gcp": VendorSettings(enabled=True, publish=("other",))}), run)
+    server_run = BenchmarkRun("gcp-x-1", "inspector", "u", "1", datetime.now(UTC), RunSpec("gcp", "client-sku", "r"))
+    assert not publisher._publishable(only_listed, server_run)

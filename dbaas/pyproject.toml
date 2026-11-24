@@ -1,0 +1,38 @@
+[project]
+name = "k8s-inspector-dbaas"
+version = "0.1.0"
+description = "Provisioner of k8s-inspector: creates and destroys one managed PostgreSQL per DBaaS benchmark run with Pulumi"
+readme = "README.md"
+requires-python = ">=3.15"
+dependencies = [
+    "pulumi==3.277.0",  # keep equal to the CLI version in the Dockerfile
+]
+
+[dependency-groups]
+# One provider package per vendor, pinned by `uv.lock` (`uv add --group vendors pulumi-aws`). The vendor module
+# `k8s_inspector_dbaas/vendors/<vendor>.py` imports it; the image installs its Pulumi plugin (`install_plugins.py`).
+vendors = []
+dev = [
+    "pytest",
+    "ruff",
+]
+
+[tool.uv]
+default-groups = ["dev", "vendors"]  # a plain `uv sync --locked` (CI) installs the vendor packages the tests import
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["k8s_inspector_dbaas"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py314"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "SIM"]

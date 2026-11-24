@@ -42,6 +42,7 @@ Status: **design**. Pages marked *planned* describe procedures that will exist o
 | [Start a forced run](how-to/run-forced.md) | planned |
 | [Rerun a task](how-to/rerun-task.md) | planned |
 | [Add a vendor](how-to/add-vendor.md) | planned |
+| [Add a DBaaS vendor](how-to/add-dbaas-vendor.md) | the vendor contract of the managed-database provisioner |
 
 ## Tutorials
 

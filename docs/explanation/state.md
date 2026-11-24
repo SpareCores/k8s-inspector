@@ -7,6 +7,8 @@
 | What is running now: run lease, plan, attempt, current step, per-task progress | Kubernetes: `BenchmarkRun` (spec + status), anchor and step Pods | controller | until the run is published, plus 24 h |
 | Task outputs and the per-task result (`status.json`) | object storage, at the final location | `sc-run` (outputs), controller (`status.json`) | bucket lifecycle (as today's task logs) |
 | Published results, history, retry counters, failure records | git: sc-inspector-data `meta.json` files | publisher (the only git writer) | forever |
+| Managed databases of DBaaS runs: phase, destroy retries | Kubernetes: `status.database` of the `BenchmarkRun` (finalizer until destroyed) | controller | until the database is destroyed |
+| Pulumi state of a DBaaS database | object storage, `dbaas-state/` | the provisioner Jobs | until its destroy succeeded |
 | Spot interruption statistics per SKU | ConfigMap `k8s-inspector-spot` | controller | best effort; losing it only means trying spot again |
 | Launch failures per SKU: reason, count, next try | ConfigMap `k8s-inspector-launch-<vendor>` ([launch retries](launch-retries.md)) | controller | best effort; losing it only means an earlier retry |
 | Offerings, capacity and quota errors | SCarpenter | SCarpenter | |

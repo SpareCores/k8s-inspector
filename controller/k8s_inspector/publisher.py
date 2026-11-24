@@ -64,7 +64,7 @@ from datetime import UTC, date, datetime, timedelta
 from functools import partial
 from pathlib import Path
 
-from k8s_inspector import crd, launch, render, tasks
+from k8s_inspector import crd, dbaas_bench, launch, render, tasks
 from k8s_inspector import storage as storage_keys
 from k8s_inspector import variant as variants
 from k8s_inspector.kube import Kube, NotFound
@@ -155,11 +155,11 @@ def publish_allowed(settings: Settings, vendor: str, sku: str) -> bool:
 
 
 def _publishable(settings: Settings, run: BenchmarkRun) -> bool:
-    """The run's SKU, and for a DBaaS run its database, may be published."""
+    """The run's SKU may be published; for a DBaaS run (whose SKU is only its client) its database."""
     database = run.spec.database
-    return publish_allowed(settings, run.spec.vendor, run.spec.sku) and (
-        not database or publish_allowed(settings, database["vendor"], database["id"])
-    )
+    if database:
+        return publish_allowed(settings, database["vendor"], database["id"])
+    return publish_allowed(settings, run.spec.vendor, run.spec.sku)
 
 
 def _safe_part(value: str) -> str:
@@ -409,6 +409,10 @@ class Publisher:
             return None
         task = self._get_task(item.key)
         stdout = self._storage.read_bytes(storage_keys.object_key(item.run, item.key, "stdout")) or b""
+        if item.database and stdout:  # the bootstrap's PostgreSQL settings belong into the published output
+            document = self._storage.read_json(item.run, item.key, "postgres.json") or {}
+            extra = dbaas_bench.repro_extra(task, item.database) | document.get("extra", {})
+            stdout = dbaas_bench.merge_postgres(stdout, {**document, "extra": extra})
         stderr = self._storage.read_bytes(storage_keys.object_key(item.run, item.key, "stderr")) or b""
         if item.run not in cache:
             cache[item.run] = self._read_run_facts(item.run)
@@ -724,6 +728,27 @@ class Publisher:
                     log.warning("malformed %s: %s", path.relative_to(self._repo), e)
                     meta = None
                 found.setdefault(path.parts[-4], {})[path.parts[-2]] = meta
+            return found
+
+    def read_dbaas_metas(self, vendor: str) -> dict[str, dict[str, dict[str, dict | None]]]:
+        """`{database: {engine version: {task: meta}}}` from the
+        `dbaas/<vendor>/<id>/postgres/<version>/standalone/<task>/meta.json` files of origin/<branch>, for the DBaaS
+        planner (checked out like `read_schedule_metas`). A malformed file is logged and its meta is None: the planner
+        then skips that database."""
+        _safe_part(vendor)
+        with self._lock:
+            self._sync([f"/dbaas/{vendor}/*/postgres/*/standalone/*/meta.json"], cone=False)
+            found: dict[str, dict[str, dict[str, dict | None]]] = {}
+            for path in (self._repo / "dbaas" / vendor).glob("*/postgres/*/standalone/*/meta.json"):
+                try:
+                    meta = json.loads(path.read_text())
+                    if not isinstance(meta, dict):
+                        raise ValueError("not a JSON object")
+                except ValueError as e:
+                    log.warning("malformed %s: %s", path.relative_to(self._repo), e)
+                    meta = None
+                database, version, task = path.parts[-6], path.parts[-4], path.parts[-2]
+                found.setdefault(database, {}).setdefault(version, {})[task] = meta
             return found
 
     def read_newest_variants(self, vendor: str) -> dict[str, tuple[int, frozenset[str]]]:

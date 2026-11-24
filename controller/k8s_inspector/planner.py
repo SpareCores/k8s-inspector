@@ -58,12 +58,19 @@ def spend_per_hour(runs: list[BenchmarkRun]) -> float:
 
 
 def holding_runs(kube: Kube, runs: list[BenchmarkRun], vendor: str) -> list[BenchmarkRun]:
-    """Runs of `vendor` that hold or are acquiring a node: in an active phase, or (Failed, Cancelled) with an
-    anchor Pod still alive."""
+    """Server runs of `vendor` that hold or are acquiring a node: in an active phase, or (Failed, Cancelled) with an
+    anchor Pod still alive. DBaaS runs are not counted: they have their own limit of one per vendor
+    (`dbaas_plan.check_vendor`)."""
     anchored = {
         _labels(pod).get(crd.LABEL_RUN) for pod in kube.list("pod", labels={pods.LABEL_ROLE: PodRole.ANCHOR.value})
     }
-    return [r for r in runs if r.spec.vendor == vendor and (r.status.phase in ACTIVE_PHASES or r.name in anchored)]
+    return [
+        r
+        for r in runs
+        if r.spec.vendor == vendor
+        and r.spec.database is None
+        and (r.status.phase in ACTIVE_PHASES or r.name in anchored)
+    ]
 
 
 def _labels(pod: dict) -> dict:
@@ -91,7 +98,14 @@ def check_vendor_budget(kube: Kube, cfg: Config, vendor: str, runs: list[Benchma
     if limit is None:
         limit = settings.defaults.max_in_flight
     active = holding_runs(kube, runs, vendor)
-    in_flight = max(len(active), live_nodeclaims(kube, cfg, vendor))
+    client_nodes = sum(
+        1
+        for r in runs
+        if r.spec.vendor == vendor and r.spec.database and r.status.node and r.status.phase in ACTIVE_PHASES
+    )
+    in_flight = max(
+        len(active), live_nodeclaims(kube, cfg, vendor) - client_nodes
+    )  # a DBaaS client is not a server run
     if in_flight >= limit:
         raise ValueError(f"vendor {vendor} is at its maxInFlight limit ({in_flight} of {limit} instances in flight)")
     cap = vendor_settings.max_usd_per_hour

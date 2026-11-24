@@ -28,19 +28,24 @@ def _read_key(env: EnvConfig) -> str | None:
         return None
 
 
-def _get(url: str, key: str | None) -> dict | None:
-    """Parsed JSON object of a GET, None on 404; `RuntimeError` for everything else."""
+def _fetch(url: str, key: str | None) -> object | None:
+    """Parsed JSON of a GET, None on 404; `RuntimeError` for everything else."""
     request = urllib.request.Request(url, headers={"Authorization": f"Bearer {key}"} if key else {})
     try:
         with urllib.request.urlopen(request, timeout=TIMEOUT_SECONDS) as response:  # noqa: S310 (configured base URL)
-            data = json.loads(response.read())
+            return json.loads(response.read())
     except urllib.error.HTTPError as e:
         if e.code == 404:
             return None
         raise RuntimeError(f"keeper HTTP {e.code} for {url}") from e
     except (OSError, ValueError) as e:  # URLError, timeouts, bad JSON
         raise RuntimeError(f"keeper request failed: {url}: {e}") from e
-    if not isinstance(data, dict):
+
+
+def _get(url: str, key: str | None) -> dict | None:
+    """Parsed JSON object of a GET, None on 404; `RuntimeError` for everything else."""
+    data = _fetch(url, key)
+    if data is not None and not isinstance(data, dict):
         raise RuntimeError(f"keeper returned unexpected JSON type for {url}")
     return data
 

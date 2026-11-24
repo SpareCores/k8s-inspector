@@ -157,6 +157,23 @@ def test_merge_patch_status_subresource_with_resource_version():
     assert sent == body
 
 
+def test_json_patch_sends_the_operations_as_rfc_6902():
+    seen = []
+
+    def handler(request):
+        seen.append((request.method, request.url.path, request.headers["content-type"], json.loads(request.content)))
+        return json_response(
+            200, {"apiVersion": "inspector.sparecores.com/v1alpha1", "kind": "BenchmarkRun", "metadata": {"name": "r"}}
+        )
+
+    operations = [
+        {"op": "test", "path": "/metadata/finalizers/0", "value": "f"},
+        {"op": "remove", "path": "/metadata/finalizers/0"},
+    ]
+    make_kube(handler).json_patch("benchmarkrun", "r", operations)
+    assert seen == [("PATCH", f"{CRD_BASE}/r", "application/json-patch+json", operations)]
+
+
 def test_apply_secret_replaces_when_it_exists():
     seen = []
     manifest = {"apiVersion": "v1", "kind": "Secret", "metadata": {"name": "run-urls"}, "stringData": {"a": "b"}}
@@ -255,3 +272,32 @@ def test_list_node_pods_forbidden_is_translated():
     kube = make_kube(lambda request: json_response(403, status_body(403, "Forbidden")))
     with pytest.raises(Forbidden):
         kube.list_node_pods("node-1")
+
+
+def test_a_job_is_deleted_in_the_background_so_its_pods_go_too():
+    seen = []
+
+    def handler(request):
+        seen.append((request.method, request.url.path, dict(request.url.params)))
+        return json_response(200, {"kind": "Status", "status": "Success"})
+
+    kube = make_kube(handler)
+    kube.delete("job", "dbaas-down-aws-x-1")
+    assert seen[0][:2] == ("DELETE", "/apis/batch/v1/namespaces/inspector/jobs/dbaas-down-aws-x-1")
+    assert seen[0][2]["propagationPolicy"] == "Background"
+    kube.delete("pod", "p")
+    assert "propagationPolicy" not in seen[1][2]  # a Pod needs no cascade
+
+
+def test_jobs_are_listed_by_label_in_the_namespace():
+    seen = []
+
+    def handler(request):
+        seen.append((request.url.path, dict(request.url.params)))
+        body = {"apiVersion": "batch/v1", "kind": "JobList", "metadata": {"resourceVersion": "1"}, "items": [
+            {"apiVersion": "batch/v1", "kind": "Job", "metadata": {"name": "dbaas-up-x"}}]}  # fmt: skip
+        return json_response(200, body)
+
+    jobs = make_kube(handler).list("job", labels={"inspector.sparecores.com/run": "x"})
+    assert [j["metadata"]["name"] for j in jobs] == ["dbaas-up-x"]
+    assert seen[0][0] == "/apis/batch/v1/namespaces/inspector/jobs"
