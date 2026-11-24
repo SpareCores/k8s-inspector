@@ -108,6 +108,7 @@ SKU_NOT_SELECTABLE = "SKU name is not a valid label value; SCarpenter cannot sel
 ACTIVE = (RunPhase.PENDING, RunPhase.PROVISIONING, RunPhase.RUNNING, RunPhase.RELEASING)
 MAX_PROVISION_RETRIES = 3  # attempts lost before a node was usable (stale node, anchor deleted)
 EXTRA_ATTEMPTS = 2  # attempts beyond `max_spot_attempts` (the on-demand one plus one spare)
+ELIGIBILITY_CHECK_INTERVAL = timedelta(minutes=10)  # per run without a node: how often Keeper is asked again
 MAX_LAUNCH_FAILURES = 2  # distinct NodeClaims that failed to launch in one attempt before the run gives up; ICE
 # ones go on while SCarpenter still offers the SKU (`_launch_failures_exhausted`)
 SPOT_FALLBACK_ERRORS = (
@@ -420,6 +421,8 @@ class Runner:
         self._signed_at: dict[str, datetime] = {}  # when the urls Secret was last signed, per run
         # run -> since when its node has had DiskPressure. In memory: a controller restart restarts the wait.
         self._disk_wait: dict[str, datetime] = {}
+        self._keeper_cache = planner.KeeperCache()  # the planner's bulk Keeper answer, for `_drop_if_ineligible`
+        self._eligibility_checked: dict[str, datetime] = {}  # run -> when Keeper was last asked about its SKU
 
     def check_config(self) -> None:
         """Fail fast when `K8SI_SC_RUN_IMAGE` is empty (anchor and flush Pods could not be created)."""
@@ -570,6 +573,7 @@ class Runner:
         self._nodes.pop(name, None)
         self._signed_at.pop(name, None)
         self._disk_wait.pop(name, None)
+        self._eligibility_checked.pop(name, None)
         self._known.discard(name)
         for pod in self.kube.list("pod", labels={LABEL_RUN: name}):
             self.kube.delete("pod", _meta(pod)["name"])
@@ -902,6 +906,8 @@ class Runner:
 
     def _pending(self, run: BenchmarkRun, cfg: Config, live: dict[str, dict]) -> None:
         self.check_config()
+        if self._drop_if_ineligible(run, live):
+            return
         settings = cfg.settings
         selected = self._selected(run)
         attempt = run.status.attempt + 1
@@ -940,6 +946,8 @@ class Runner:
     # ----------------------------------------------------------------------- Provisioning
 
     def _provisioning(self, run: BenchmarkRun, cfg: Config, live: dict[str, dict]) -> None:
+        if self._drop_if_ineligible(run, live):
+            return
         attempt = run.status.attempt
         anchor = live.get(pods.anchor_name(run.name, attempt))
         if anchor is None:
@@ -991,6 +999,14 @@ class Runner:
         ):
             message = _bench_pool_message(events, cfg.settings.bench_pool, started)
             error = f"SCARPENTER_NO_OFFERING: {message}" if message else None
+        if (
+            error is None
+            and failures
+            and not claims
+            and waited > timedelta(minutes=cfg.settings.deadlines.no_offering_minutes)
+            and self._not_offered(run, cfg)
+        ):
+            error = self._launch_error(failures[-1].message)  # no claim will follow: SCarpenter stopped offering it
         if error is None and bound:
             error = self._anchor_ready_error(run, cfg, anchor, claims)
         if error is None and not bound and waited > budget and not any(_is_true(c, "Launched") for c in claims):
@@ -1021,6 +1037,42 @@ class Runner:
             return True
         on_demand_only = not pods.allows_spot(anchor)
         return not planner.is_offered(self.kube, cfg, run.spec.vendor, run.spec.sku, on_demand_only, self._now())
+
+    def _not_offered(self, run: BenchmarkRun, cfg: Config) -> bool:
+        """SCarpenter's offered-types listing is readable and does not offer the SKU. An unreadable or stale
+        listing is not an answer (False): the run keeps waiting."""
+        skipped = planner.not_offered(self.kube, cfg, run.spec.vendor, [run.spec.sku], self._now())
+        return bool(skipped)
+
+    def _drop_if_ineligible(self, run: BenchmarkRun, live: dict[str, dict]) -> bool:
+        """A run without a node whose SKU Keeper no longer lists as ACTIVE, or blocks for all of the run's server
+        tasks, is deleted: no result is recorded and no NodeClaim stays (`_delete_run_claims`). Asked at most every
+        `ELIGIBILITY_CHECK_INTERVAL` per run; a forced run skips Keeper by design, and an unreachable Keeper is not
+        an answer. True when the run was deleted."""
+        now = self._now()
+        last = self._eligibility_checked.get(run.name)
+        if run.spec.force or (last and now - last < ELIGIBILITY_CHECK_INTERVAL):
+            return False
+        self._eligibility_checked[run.name] = now
+        names = [t.name for t in self._selected(run) if not t.dbaas]
+        if not names:
+            return False
+        try:
+            blocked = self._keeper_cache.get(self._cfg().env, [t.name for t in tasks.all_tasks() if not t.dbaas])
+        except Exception:
+            log.warning("run %s: cannot check its eligibility, Keeper is not reachable", run.name, exc_info=True)
+            return False
+        reasons = blocked.get(run.spec.vendor, {}).get(run.spec.sku)  # None: not ACTIVE
+        if reasons is not None and not all(name in reasons for name in names):
+            return False
+        log.warning(
+            "run %s: %s/%s is no longer eligible in Keeper, deleting the run", run.name, run.spec.vendor, run.spec.sku
+        )
+        self._delete_run_claims(run, live)
+        self._delete_secret(run)
+        crd.delete_run(self.kube, run.name)
+        self._forget(run.name)  # deletes the anchor with the Pods
+        return True
 
     @staticmethod
     def _is_gpu(run: BenchmarkRun, claims: list[dict]) -> bool:

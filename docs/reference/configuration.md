@@ -111,7 +111,15 @@ from the condition or from that Event, in `status.launchFailures` and, at the se
 provisioning pre-launch budget passes after a failure), ends the run with the reason of the class SCarpenter put in the last message
 ([launch retries](../explanation/launch-retries.md)) and deletes the anchor; when the attempt allowed spot and the
 reason is `LAUNCH_REJECTED`, it instead ends `LaunchFailed` and the next attempt is on-demand only
-([spot](../explanation/spot.md)). A single transient failure is tolerated.
+([spot](../explanation/spot.md)). A single transient failure is tolerated, but not forever: once an attempt has a launch
+failure, no claim is pending and `noOfferingMinutes` have passed, a run ends with the last failure's reason when
+SCarpenter's offered-types listing is readable and does not offer the SKU ([Offered types](#offered-types)); with an
+unreadable or stale listing it keeps waiting for the pre-launch budget.
+
+A run in Pending or Provisioning also ends when its SKU is no longer eligible in Keeper: not ACTIVE any more, or every
+server task of the run blocked. The controller asks Keeper (the planner's cached bulk answer) at most every 10 minutes per run,
+deletes the run's NodeClaims and the run itself, and records nothing (the run had no node and no result). A forced run is never checked, and an
+unreachable Keeper changes nothing.
 
 Only vendors listed with `enabled: true` are touched, and their results reach sc-inspector-data only with
 `publish: true` or a list of SKUs (default `false`: runs and outputs happen, git stays untouched, and the runs of
@@ -138,8 +146,8 @@ it is due and the vendor has room. Per vendor:
    lease, also while it is finished and not yet published) is skipped, and so is a SKU whose name is not a valid label
    value (the anchor selects the SKU by label; one warning per vendor and cycle) or whose `meta.json` in git is
    malformed (logged by the publisher). If Keeper lists no servers for the vendor, the planner logs it at info level.
-   A SKU that SCarpenter does not offer is skipped too (see [Offered types](#offered-types)); forced runs are never
-   filtered.
+   A SKU that SCarpenter does not offer is skipped too, and so is the whole vendor when SCarpenter's listing is
+   missing, unreadable or stale (see [Offered types](#offered-types)); forced runs are never filtered.
 4. A task of a SKU is due when Keeper does not block it (a block reason drops the task; the `keeper_gated` tasks are
    blocked by Keeper except on its allowlist, so they run only where Keeper allows them) and its
    `data/<vendor>/<sku>/schedule/<task>/meta.json` in sc-inspector-data `main` says so: no meta yet, or a
@@ -193,6 +201,11 @@ wins), when:
 
 One info line per vendor and cycle gives the count and a few examples with SCarpenter's `reason`. Such SKUs would
 only end in a `NO_OFFERING` launch failure after the fail-fast wait.
+
+The filter fails closed: when the ConfigMap is missing, unreadable, malformed or stale (`generatedAt` older than 30
+minutes: SCarpenter stopped writing it), nothing is known about the SKUs, so the planner logs a warning and plans
+nothing for that vendor in that cycle. Forced runs are not affected. A running provisioning treats such a listing the
+same way: no answer, keep waiting.
 
 Every `available: false` entry is skipped; SCarpenter rewrites the entry when a mark expires. The `reason` and
 `offerings[].until` (RFC3339) of an offering that a launch error marked (for example `DailyLimit`, until the next

@@ -14,7 +14,7 @@ import pytest
 from fakes import Clock, Cluster, FakeKube, FakeStorage, iso
 from lightkube import ApiError
 
-from k8s_inspector import crd, launch, pods, spot, steps, tasks
+from k8s_inspector import crd, keeper, launch, pods, spot, steps, tasks
 from k8s_inspector import kube as kube_mod
 from k8s_inspector import runner as runner_mod
 from k8s_inspector.kube import WatchEvent
@@ -121,6 +121,21 @@ class Harness:
 @pytest.fixture
 def h() -> Harness:
     return Harness()
+
+
+@pytest.fixture(autouse=True)
+def keeper_answer(monkeypatch):
+    """Keeper's bulk answer ({vendor: {sku: {task: reasons}}}); every SKU of these tests is ACTIVE and unblocked.
+    `keeper_calls` counts the asks."""
+    answer = {"oci": {sku: {} for sku in ("VM.Standard.E5.Flex.2-16", "BM.Standard3.64", "VM.Standard.E5 Flex")}}
+    answer["calls"] = 0
+
+    def ask(env, task_names):
+        answer["calls"] += 1
+        return {vendor: skus for vendor, skus in answer.items() if vendor != "calls"}
+
+    monkeypatch.setattr(keeper, "active_servers_block_reasons", ask)
+    return answer
 
 
 def in_step(step_suffix: str):
@@ -2793,5 +2808,135 @@ def test_ice_failures_with_an_unschedulable_anchor_are_not_a_missing_offering(h)
     _ice_event(h, "bench-aaaaa", lastTimestamp=iso(h.clock.now))
     h.runner.reconcile(h.name)
     h.clock.advance(minutes=20)
+    h.runner.reconcile(h.name)
+    assert h.run.status.phase == RunPhase.PROVISIONING
+
+
+# --------------------------------------------------------------------------- stuck launch failures
+
+
+def _ice_then_unoffered(h, *, offered_after: bool | None):
+    """One ICE claim (deleted by Karpenter), then `waited` past `noOfferingMinutes` with no claim. `offered_after`:
+    the listing at that time (None: no listing at all)."""
+    _offer(h, available=True)
+    h.cluster.provision_enabled = False
+    h.start(["geekbench"], capacity=CapacityMode.ON_DEMAND)
+    h.runner.reconcile(h.name)
+    _launch_failed(h, "bench-aaaaa", "InsufficientCapacity (X): none")
+    h.runner.reconcile(h.name)
+    h.kube.delete("nodeclaim", "bench-aaaaa")
+    h.clock.advance(minutes=15)
+    if offered_after is None:
+        h.kube.objects["configmap/scarpenter-system"] = {}
+    else:
+        _offer(h, available=offered_after)
+    h.runner.reconcile(h.name)
+
+
+def test_a_run_whose_sku_is_no_longer_offered_ends_after_one_launch_failure(h):
+    _ice_then_unoffered(h, offered_after=False)
+    assert h.kube.list("benchmarkrun") == [] and h.entry()["reason"] == "ICE"  # deferred like any launch failure
+    assert h.failures == [("oci", "ICE")]
+
+
+def test_a_run_keeps_waiting_while_scarpenter_still_offers_the_sku(h):
+    _ice_then_unoffered(h, offered_after=True)
+    assert h.run.status.phase == RunPhase.PROVISIONING
+
+
+def test_an_unreadable_or_stale_listing_keeps_the_run_waiting(h):
+    _ice_then_unoffered(h, offered_after=None)
+    assert h.run.status.phase == RunPhase.PROVISIONING
+    _offer(h, available=False)  # readable, but generated 31 minutes ago
+    h.clock.advance(minutes=31)
+    h.runner.reconcile(h.name)
+    assert h.run.status.phase == RunPhase.PROVISIONING
+
+
+def test_the_unoffered_sku_ends_the_run_only_after_the_no_offering_wait(h):
+    _offer(h, available=True)
+    h.cluster.provision_enabled = False
+    h.start(["geekbench"], capacity=CapacityMode.ON_DEMAND)
+    h.runner.reconcile(h.name)
+    _launch_failed(h, "bench-aaaaa", "InsufficientCapacity (X): none")
+    h.kube.delete("nodeclaim", "bench-aaaaa")
+    h.runner.reconcile(h.name)
+    h.clock.advance(minutes=5)
+    _offer(h, available=False)
+    h.runner.reconcile(h.name)
+    assert h.run.status.phase == RunPhase.PROVISIONING
+
+
+def test_a_pending_claim_keeps_the_run_waiting_even_when_the_sku_is_not_offered(h):
+    _ice_then_unoffered(h, offered_after=True)
+    h.cluster.fail_launch(
+        h.kube.get("pod", f"{h.name}-a1"), "", name="bench-bbbbb", status="Unknown", reason="Launching"
+    )
+    _offer(h, available=False)
+    h.runner.reconcile(h.name)
+    assert h.run.status.phase == RunPhase.PROVISIONING
+
+
+def _stuck_without_node(h, **start):
+    h.cluster.provision_enabled = False
+    h.start(["geekbench"], **start)
+    h.runner.reconcile(h.name)
+    assert h.run.status.phase == RunPhase.PROVISIONING
+
+
+def test_a_run_whose_sku_left_keeper_is_deleted_with_its_nodeclaims(h, keeper_answer):
+    _stuck_without_node(h)
+    h.cluster.fail_launch(
+        h.kube.get("pod", f"{h.name}-a1"), "", name="bench-aaaaa", status="Unknown", reason="Launching"
+    )
+    del keeper_answer["oci"]["VM.Standard.E5.Flex.2-16"]  # inactive now
+    h.runner = h.new_runner()  # nothing cached
+    h.runner.reconcile(h.name)
+    assert h.kube.list("benchmarkrun") == [] and h.kube.list("nodeclaim") == [] and h.pod_names() == []
+
+
+def test_a_run_whose_tasks_are_all_blocked_by_keeper_is_deleted(h, keeper_answer):
+    _stuck_without_node(h)
+    keeper_answer["oci"]["VM.Standard.E5.Flex.2-16"] = {"geekbench": ["KEEPER_X"]}
+    h.runner = h.new_runner()
+    h.runner.reconcile(h.name)
+    assert h.kube.list("benchmarkrun") == []
+
+
+def test_a_run_with_one_task_left_after_keeper_blocks_another_goes_on(h, keeper_answer):
+    h.cluster.provision_enabled = False
+    h.start(["geekbench", "lscpu"])
+    h.runner.reconcile(h.name)
+    keeper_answer["oci"]["VM.Standard.E5.Flex.2-16"] = {"geekbench": ["KEEPER_X"]}
+    h.runner = h.new_runner()
+    h.runner.reconcile(h.name)
+    assert h.run.status.phase == RunPhase.PROVISIONING
+
+
+def test_a_forced_run_skips_the_keeper_check(h, keeper_answer):
+    keeper_answer["oci"].clear()
+    _stuck_without_node(h, force=True)
+    h.runner.reconcile(h.name)
+    assert h.run.status.phase == RunPhase.PROVISIONING and keeper_answer["calls"] == 0
+
+
+def test_keeper_is_asked_at_most_every_ten_minutes_per_run(h, keeper_answer):
+    _stuck_without_node(h)
+    assert keeper_answer["calls"] == 1
+    h.clock.advance(minutes=9)
+    h.runner.reconcile(h.name)
+    assert keeper_answer["calls"] == 1
+    h.clock.advance(minutes=2)
+    h.runner.reconcile(h.name)  # asked again (the planner's cache may still answer)
+    assert h.runner._eligibility_checked[h.name] == h.clock.now
+
+
+def test_an_unreachable_keeper_keeps_the_run(h, monkeypatch):
+    def down(env, task_names):
+        raise RuntimeError("keeper request failed")
+
+    monkeypatch.setattr(keeper, "active_servers_block_reasons", down)
+    _stuck_without_node(h)
+    h.clock.advance(minutes=11)
     h.runner.reconcile(h.name)
     assert h.run.status.phase == RunPhase.PROVISIONING

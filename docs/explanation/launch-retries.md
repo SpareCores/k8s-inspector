@@ -39,6 +39,12 @@ requirements and has capacity`). The controller therefore treats every message s
 `ICE` (never `LAUNCH_REJECTED`, so no on-demand fallback), except when the last candidate's class is `QuotaExceeded`
 (`QUOTA`).
 
+Karpenter creates the next claim only while it can still launch the SKU. When the attempt has a launch failure, no
+NodeClaim is pending, `noOfferingMinutes` have passed since the attempt started and SCarpenter's offered-types
+listing is readable and does not offer the SKU (the planner's rules, [Offered types](../reference/configuration.md#offered-types)),
+no claim will follow and the run ends at once with the reason of the last failure, like any launch failure. A listing that is missing, unreadable or stale
+is no answer: the run keeps waiting for the pre-launch budget.
+
 The controller sees the Event on its next reconcile, which can be up to the 300 s resync after the claim failed, so a
 3rd or 4th ICE claim may be launched before the cap applies. That costs nothing: an ICE claim never bills.
 
@@ -93,7 +99,7 @@ until `next`. The count is of failures in a row with the same reason (another re
 | `QUOTA`, `VENDOR` | 6 h |
 | `BOOT_FAILURE` | 24 h at once (no doubling): every try bills a VM that never joins |
 | `NO_LSCPU` | 24 h at once (no doubling: a node clears the count every run, and a big SKU relaunched hourly costs money); recorded by the publisher, not by a launch: a run ended without an `lscpu` result and its successful tasks were given up ([outputs](outputs.md#publishing-to-git)) |
-| `NO_OFFERING` | 24 h at once (no doubling): where the offered-types filter fails open nothing else stops the retries |
+| `NO_OFFERING` | 24 h at once (no doubling) |
 | `DAILY_LIMIT` | `next` is the SKU's `until` in SCarpenter's offered-types ConfigMap when it has one (the vendor's reset), else 6 h |
 
 SCarpenter's own short marks handle the fast path; this wait only bounds how often a failing SKU is tried. An entry
@@ -108,8 +114,9 @@ come up whichever the SKU. A node of the vendor becoming ready removes every `la
 ends the pause; the other entries keep their count and wait. The pause also ends 24 h after the newest failure. A
 forced run is never blocked.
 
-The planner also skips a SKU that SCarpenter's offered-types ConfigMap lists as unavailable; the rules, and where
-`until` comes from, are in [Offered types](../reference/configuration.md#offered-types). A damaged launch ConfigMap
+The planner also skips a SKU that SCarpenter's offered-types ConfigMap lists as unavailable, and a whole vendor whose
+listing is missing, unreadable or stale; the rules, and where `until` comes from, are in
+[Offered types](../reference/configuration.md#offered-types). A damaged launch ConfigMap
 (not a JSON object, entries that are not objects, a `next` that is not a timezone-aware time) is treated as having no
 such entries. `k8s-inspector plan --dry-run` reads it but never prunes it.
 
