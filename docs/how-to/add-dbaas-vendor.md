@@ -27,16 +27,20 @@ are RFC 3339 and `run` is the tag's value. `fake.py` is the smallest example of 
 | Field | Meaning |
 |---|---|
 | `vendor`, `database_id`, `engine_version` | Keeper's `api_reference` of the database SKU (the vendor's own name for it) and the PostgreSQL major version |
-| `region`, `zone` | the client node's region (the database goes there) and zone (`None` when unknown; use it to place the database next to the client, or ignore it) |
+| `region`, `client_region`, `zone` | the database's region (Keeper's `api_reference` of a database price row) and the client node's region, which is `region` unless the vendor's database regions are not its server regions (OVH: the controller then picks a region of the same Keeper city), and the client's zone (`None` when unknown; use it to place the database next to the client, or ignore it) |
 | `run`, `run_id`, `expires_at` | the run, its id and the time after which the database is a leak |
 | `labels` | `sc_inspector_run` and `sc_inspector_expires`, already label-safe (lowercase, digits, `-`, `_`): apply them as tags or labels wherever the vendor supports them |
 | `create_timeout`, `delete_timeout` | Pulumi duration strings (`"50m"`, `"110m"`), 10 minutes shorter than the up and down Jobs' deadlines (`dbaas.createMinutes` and 2 h): use them as `custom_timeouts` |
-| `network` | the platform's opaque references for this vendor and region (VPC, subnet, subnet group, delegated subnet, private DNS zone ...): the mapping from the ConfigMap, unchanged. `DbSpec` has no client address: for a vendor that needs an allowlist (OVH, UpCloud, Vultr, OCI) the platform puts the client CIDRs in this mapping, and the module applies them |
+| `network` | the platform's opaque references for this vendor and the client's region (VPC, subnet, subnet group, delegated subnet, private DNS zone ...): the ConfigMap's `networks.<client region>` mapping, unchanged. For a vendor that needs an allowlist on a private network (UpCloud, Vultr, OCI) the platform puts the client CIDRs in this mapping, and the module applies them |
+| `client_addresses` | the client Node's `ExternalIP` addresses as `/32` or `/128` (`list[str]`, empty when the node has none). Only for a vendor whose nodes have no private network (OVH): the module allows exactly these on a public endpoint. A module that needs them and gets none raises a clear error |
 | `record` | Keeper's record of the database: `vcpus`, `memory_amount` (MiB), `storage_size`, `storage_extra_min/max`, `compatible_storage_ids`, `api_reference_object` (vendor-specific plan data) ...; `spec.vcpus` and `spec.memory_gib` read the first two |
 | `password_output()` | the admin password as a Pulumi secret. Use it, never `spec.password`, in a resource, or it lands in the state in plain text |
 
 **`DbOutputs`**: `host`, `admin_user`, `admin_db`, `port` (5432), `sslmode` (`require`; use the vendor's real policy:
-`prefer` or `disable` only when it cannot do better), and optionally `user` and `grant_role`. `admin_user` is the user the
+`prefer` or `disable` only when it cannot do better), and optionally `user`, `grant_role` and `password`. `password` is for
+a vendor that generates the admin password and cannot be given one (OVH): a Pulumi secret, which the controller uses as
+`SC_DB_PASSWORD` instead of its own and which travels to it sealed
+([DBaaS](../explanation/dbaas.md#the-admin-password)); a vendor that takes the password never sets it. `admin_user` is the user the
 vendor created and the bootstrap connects as, to `admin_db`, a database that exists from the start (`postgres`,
 `defaultdb`). When the workload user must differ (Cloud SQL: `postgres` cannot create a database it can then use), set
 `user`; the bootstrap creates it with the run's password and the `grant_role` (`cloudsqlsuperuser`) and lets it create
@@ -44,10 +48,12 @@ the database `bench`. Fields may be Pulumi outputs.
 
 What the module must do:
 
-- **Reachable from the client node**: the database joins the client's private network (`spec.network`), with no public
-  access; the client's network range (the CIDRs the platform put in `spec.network`) is allowed through the vendor's
-  firewall or security group.
-- **Explicit provider**: create the vendor's provider yourself with `region=spec.region` and take its credentials from the
+- **Reachable from the client node**: private network first. The database joins the client's private network
+  (`spec.network`), with no public access; the client's network range (the CIDRs the platform put in `spec.network`) is
+  allowed through the vendor's firewall or security group. Only where the vendor's nodes have no private network (OVH
+  today) the database goes on a public endpoint with TLS (`sslmode` `require` or stronger) and an IP allowlist of
+  `spec.client_addresses`, and nothing else.
+- **Explicit provider**: create the vendor's provider yourself with `region=spec.region` (the database's) and take its credentials from the
   environment (the vendor's Secret or workload identity), never as provider arguments: those are stored in the state, and
   `down` must keep working after a key is rotated. The Job has no `AWS_*` variables of the state backend (it uses a
   profile), so an AWS provider takes its own credentials from names the module reads itself.

@@ -6,6 +6,7 @@ their termination message. See docs/explanation/dbaas.md and docs/how-to/add-dba
 """
 
 import hashlib
+import ipaddress
 import json
 import urllib.parse
 from collections.abc import Iterable
@@ -178,15 +179,26 @@ def labels(run_id: str, expires: datetime) -> dict[str, str]:
     return {"sc_inspector_run": run_id.lower(), "sc_inspector_expires": _stamp(expires)}
 
 
-def build_spec(run: BenchmarkRun, cfg: Config, record: dict, network: dict, expires: datetime) -> dict:
+def client_addresses(node: dict) -> list[str]:
+    """The ExternalIP addresses of the client Node as `/32` and `/128` networks, for the allowlist of a vendor whose
+    database is on a public endpoint. Empty when the Node has none."""
+    found = (a["address"] for a in node.get("status", {}).get("addresses") or [] if a.get("type") == "ExternalIP")
+    return [ipaddress.ip_network(address).with_prefixlen for address in found]
+
+
+def build_spec(
+    run: BenchmarkRun, cfg: Config, record: dict, network: dict, expires: datetime, addresses: list[str]
+) -> dict:
     """`DBAAS_SPEC` of the provisioner (`k8s_inspector_dbaas.spec.DbSpec` without the password). The Pulumi timeouts
-    the vendor module must set are shorter than the Jobs' deadlines, so Pulumi fails cleanly and records what it did."""
+    the vendor module must set are shorter than the Jobs' deadlines, so Pulumi fails cleanly and records what it did.
+    `network` is the ConfigMap's entry of the client's region, `addresses` the client node's public ones."""
     db = run.spec.database
     return {
         "vendor": db["vendor"],
         "databaseId": db["id"],
         "engineVersion": str(db["engineVersion"]),
         "region": db["region"],
+        "clientRegion": pods.client_region(db),
         "zone": run.status.zone,
         "run": run.name,
         "runId": run.spec.run_id,
@@ -195,6 +207,7 @@ def build_spec(run: BenchmarkRun, cfg: Config, record: dict, network: dict, expi
         "createTimeoutMinutes": max(cfg.settings.dbaas.create_minutes - PULUMI_TIMEOUT_MARGIN_MINUTES, 1),
         "deleteTimeoutMinutes": max(DOWN_DEADLINE_SECONDS // 60 - PULUMI_TIMEOUT_MARGIN_MINUTES, 1),
         "network": network,
+        "clientAddresses": addresses,
         "record": record,
     }
 
@@ -204,6 +217,7 @@ def connection_secret(run: BenchmarkRun, owner: OwnerRef, password: str, outputs
     benchmark and the bootstrap; without, only the password the up Job reads."""
     data = {"SC_DB_PASSWORD": password}
     if outputs:
+        data["SC_DB_PASSWORD"] = outputs.get("password") or password  # a vendor that generates the admin password
         user = outputs.get("user") or outputs["admin_user"]
         sslmode = outputs.get("sslmode", "require")
         data |= {

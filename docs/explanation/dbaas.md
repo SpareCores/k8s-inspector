@@ -27,11 +27,13 @@ the cluster platform. The benchmark creates only the database (and its user/fire
 
 ## The flow (decision K11)
 
-A DBaaS run is a `BenchmarkRun` with a `database` block (`vendor`, `id`, `engineVersion`, `region` and the database's
-`vcpus` and `memoryGib`). Its SKU is the client server, so the run's lease is the client's. Order: **client node first,
+A DBaaS run is a `BenchmarkRun` with a `database` block (`vendor`, `id`, `engineVersion`, `region`, optionally
+`clientRegion`, and the database's `vcpus` and `memoryGib`). `region` is the database's region; `clientRegion` is the
+client node's and defaults to `region` (they differ where a vendor's database regions are not its server regions, see
+[Which database, where, with which client](#which-database-where-with-which-client)). Its SKU is the client server, so the run's lease is the client's. Order: **client node first,
 database second; on the way out, database destroy and node release in parallel.**
 
-1. **Client node.** The anchor is created in the database's region (`topology.kubernetes.io/region`) with a cheap
+1. **Client node.** The anchor is created in the client's region (`topology.kubernetes.io/region`) with a cheap
    client type picked from Keeper's server data (below), always on demand: a lost client would leave a database billing
    with nobody to use it. If no node comes up, nothing was created that bills by the hour and no database is created.
 2. **Database.** When the anchor is Running, the controller writes `status.database.phase: Creating`, creates the
@@ -39,7 +41,8 @@ database second; on the way out, database destroy and node release in parallel.*
    The Job runs the vendor's Pulumi program ([vendor contract](../how-to/add-dbaas-vendor.md)) for the stack
    `k8s-dbaas-<run>`; the password is passed as an environment variable from the Secret and used as a Pulumi secret. The
    Job has no Kubernetes API access: it reports host, port, admin user, admin database and sslmode in its termination
-   message, and the controller writes them, with the password, to the Secret `<run>-db` as the `SC_DB_*` variables.
+   message, and the controller writes them, with the password, to the Secret `<run>-db` as the `SC_DB_*` variables. A
+   vendor that generates the admin password reports it too, sealed ([the admin password](#the-admin-password)).
    Creation has a deadline of 60 minutes (`dbaas.createMinutes`), which is the Job's `activeDeadlineSeconds`. The vendor
    module sets Pulumi `customTimeouts` 10 minutes shorter (`spec.create_timeout`), so Pulumi fails by itself and records
    the resource. The Job's Pod is annotated `karpenter.sh/do-not-disrupt` and has a 15 minute termination grace period:
@@ -98,10 +101,15 @@ rules; every input is Keeper's data, nothing is a static table:
 - **Due** is decided from `dbaas/<vendor>/<id>/postgres/<version>/standalone/<task>/meta.json` in git with the same
   function as for servers: a changed task hash, `-1` after 2 h, `-4` after 2 h and 6 h, `-5` after three failures in a
   row, never again for the other results. There is no schedule directory and no variant.
-- **Region**: the database's regions with a standalone on-demand price (Keeper's `none` level, else `single-zone`), that
-  have a DBaaS network in the ConfigMap (`dbaas.vendors.<vendor>.networks.<region>`), cheapest first; after a failed
-  attempt the region of that attempt goes last, so the retry tries another.
-- **Client**: Keeper's servers in that region that are x86_64 (the benchmark image is amd64 only), without
+- **Region**: the database's regions with a standalone on-demand price (Keeper's `none` level, else `single-zone`) that
+  have a client region, cheapest first; after a failed attempt the database region whose client region that attempt used
+  goes last, so the retry tries another. The client regions of a database region, in the order they are tried, are the
+  region itself and the regions with the same Keeper `city`, each only when the ConfigMap has a network for it
+  (`dbaas.vendors.<vendor>.networks.<client region>`); the first with a client wins. For most vendors the database and
+  server regions are the same names, so the region is its own client region. OVH's are not (databases in `GRA`, servers in
+  `GRA7`, `GRA9`, `GRA11`), and the city ties them. The run records `database.region` and, when it differs,
+  `database.clientRegion`. An operator may name both (`run --region`, `--client-region`).
+- **Client**: Keeper's servers in the client region that are x86_64 (the benchmark image is amd64 only), without
   accelerator, with 2-4 vCPUs and 4-8 GiB, dedicated CPUs when there are any (else shared), cheapest after a Tukey price
   fence (Q3 + 1.5 IQR over the region's own candidates), without SKUs SCarpenter does not offer, that wait for a launch
   retry or that already have a run. Same sizing as the legacy `rank_dbaas_client_instances`, so results stay comparable.
@@ -111,11 +119,36 @@ rules; every input is Keeper's data, nothing is a static table:
 
 The database joins the client node's private network. The cluster platform creates that network once per vendor and
 region (free prerequisites: networks, subnets, delegated subnets, DNS zones) and describes it in the ConfigMap
-`k8s-inspector`, `dbaas.vendors.<vendor>.networks.<region>`: an opaque mapping that the controller passes unchanged to the
-vendor module (`spec.network`). A region without an entry is not used. The same section names an optional ServiceAccount
+`k8s-inspector`, `dbaas.vendors.<vendor>.networks.<client region>`: an opaque mapping, keyed by the region of the client
+node (the bench region), that the controller passes unchanged to the vendor module (`spec.network`). A region without an
+entry is not used as a client region. The same section names an optional ServiceAccount
 for workload identity. The Job's cloud credentials come from the optional Secret `k8s-inspector-dbaas-<vendor>`
-(`envFrom`). `DbSpec` has no client address: for a vendor that needs an allowlist (OVH, UpCloud, Vultr, OCI) the platform
-puts the client CIDRs in the `network` mapping, and the module applies them.
+(`envFrom`).
+
+The rule: **private network first.** Where the vendor's databases can join a private network that the client node is on,
+the database goes there, and an allowlist the vendor needs (UpCloud, Vultr, OCI) is the platform's client CIDRs in the
+`network` mapping. **Only where the vendor's nodes have no private network (OVH today)** the database gets a public
+endpoint with TLS and an IP allowlist of the client node's public addresses. The controller reads them from the client
+Node's `ExternalIP` addresses when it creates the up Job and passes them as `DbSpec.client_addresses` (`/32` for IPv4,
+`/128` for IPv6; an empty list when the Node has none, and a vendor that needs them fails with a clear error).
+
+### The admin password
+
+The controller generates the run's password into the Secret `<run>-db` and the Job gets it by `secretKeyRef`. A vendor
+that generates the admin password itself and cannot be given one (OVH) returns it as `DbOutputs.password`, a Pulumi
+secret, and the controller uses it as `SC_DB_PASSWORD` instead of its own.
+
+The up Job reports through its termination message, which anyone who can read Pods in the namespace can read, so the
+password must not be in it in plain text. The Job seals it with the run's own password before it reports it: HMAC-SHA256
+in counter mode as the keystream and an HMAC-SHA256 tag over nonce and ciphertext (`sealing.py` in the image,
+`dbaas_seal.py` in the controller, stdlib only), keyed by the 192 random bits of the run's password. The controller opens
+it with the password it already holds. This was chosen over the alternatives because the Jobs have no API access by
+design (so the Job cannot write a Secret), reading the stack output through another Job would again report through a
+termination message, and a crypto library would add a heavy dependency to both packages. What Pod readers see is the
+sealed value, useless without the run's password, which only the controller (and the Job's `secretKeyRef`, never shown in
+the Pod spec) holds. Pod logs and events do not carry it: Pulumi prints secrets as `[secret]`. The password is also in the
+Pulumi state, encrypted by the stack passphrase like every secret there. The sealing is a small construction of standard
+primitives written for this one use, not a reviewed library; a reader of Secrets has the password anyway.
 
 ### Limits
 
@@ -187,7 +220,7 @@ costs that minimum; creating the database only after the client node is up avoid
 
 ### Operators
 
-`k8s-inspector run <vendor> --database <id> [--region <region>] [<client sku>] [--force]` starts a DBaaS run of one
+`k8s-inspector run <vendor> --database <id> [--region <region>] [--client-region <region>] [<client sku>] [--force]` starts a DBaaS run of one
 database now ([forced run](../how-to/run-forced.md#managed-database)); `k8s-inspector plan --dry-run` also prints the
 database it would start.
 

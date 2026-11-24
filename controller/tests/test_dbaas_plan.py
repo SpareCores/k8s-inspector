@@ -394,3 +394,68 @@ def test_an_unknown_price_is_refused_when_a_cap_is_set(kube, world):
     with pytest.raises(ValueError, match="price of the database or client is unknown"):
         force(kube, world, cfg, region="eu-1", client="my-client")  # Keeper lists no such client
     assert force(kube, world, make_config(auto=False), region="eu-1", client="my-client")  # no cap: fine
+
+
+# --------------------------------------------------------------------------- database and client regions differ (OVH)
+
+CITIES = {"db-a": "Alpha", "db-b": "Beta", "srv-a": "Alpha", "srv-b": "Beta", "srv-a2": "Alpha"}
+SPLIT_NETWORKS = {"srv-a": {"net": "a"}, "srv-b": {"net": "b"}}  # keyed by the client's region
+
+
+def split_config(networks) -> Config:
+    return make_config(auto=False, networks=networks, dbaas_max_in_flight=9)
+
+
+@pytest.fixture
+def split(world, monkeypatch):
+    """Databases are priced in db-a and db-b, servers exist in srv-a, srv-a2 and srv-b (same cities)."""
+    world.prices = {"db-a": 0.30, "db-b": 0.20}
+    monkeypatch.setattr(dbaas_keeper, "region_cities", lambda env, vendor: dict(CITIES))
+    monkeypatch.setattr(dbaas_keeper, "region_ids", lambda env, vendor: {r: f"id-{r}" for r in CITIES})
+    return world
+
+
+def test_the_client_goes_to_a_region_of_the_databases_city(kube, split):
+    run = force(kube, split, split_config(SPLIT_NETWORKS))
+    assert (run.spec.database["region"], run.spec.database["clientRegion"]) == ("db-b", "srv-b")  # cheapest database
+    assert split.asked == ["id-srv-b"]  # the servers are those of the client's region, not the database's
+
+
+def test_a_forced_database_region_finds_its_client_region_by_city(kube, split):
+    run = force(kube, split, split_config(SPLIT_NETWORKS), region="db-a")
+    assert (run.spec.database["region"], run.spec.database["clientRegion"]) == ("db-a", "srv-a")
+    assert run.spec.database["usdPerHour"] == pytest.approx(0.30 + 0.03)  # database price of db-a plus the client's
+
+
+def test_the_explicit_client_region_overrides_the_city_but_must_have_a_network(kube, split):
+    cfg = split_config(SPLIT_NETWORKS)
+    run = force(kube, split, cfg, region="db-a", client_region="srv-b")
+    assert (run.spec.database["region"], run.spec.database["clientRegion"]) == ("db-a", "srv-b")
+    run = force(kube, split, cfg, client_region="srv-a")  # no --region: a database region of that city
+    assert (run.spec.database["region"], run.spec.database["clientRegion"]) == ("db-a", "srv-a")
+    with pytest.raises(ValueError, match="no DBaaS network of oci in srv-a2"):
+        force(kube, split, cfg, client_region="srv-a2")
+
+
+def test_a_database_region_without_a_network_in_its_city_is_not_used(kube, split):
+    cfg = split_config({"srv-a": {}})
+    assert force(kube, split, cfg).spec.database["region"] == "db-a"  # db-b is cheaper but its city has no network
+    with pytest.raises(ValueError, match="no DBaaS network of oci in db-b or in a region of its city"):
+        force(kube, split, cfg, region="db-b")
+
+
+def test_a_region_that_is_its_own_client_region_is_tried_first_and_leaves_no_client_region(kube, split):
+    cfg = split_config({"db-a": {}, "srv-a": {}})
+    run = force(kube, split, cfg, region="db-a")
+    assert run.spec.database["region"] == "db-a" and "clientRegion" not in run.spec.database
+    split.servers = []  # no client there: the city's other region is next
+    with pytest.raises(ValueError, match="no client server"):
+        force(kube, split, cfg, region="db-a")
+    assert split.asked[-2:] == ["id-db-a", "id-srv-a"]
+
+
+def test_autoplan_retries_in_another_database_region_after_a_failure_in_the_client_region(kube, split):
+    split.records = {"db-a": split.records["db-a"]}
+    split.metas = {"db-a": {"18": {TASK: good_meta(exit_code=-4, region="srv-b", end="2020-01-01T00:00:00")}}}
+    (planned,) = plan(kube, make_config(networks=SPLIT_NETWORKS), split, dry_run=True)
+    assert (planned.region, planned.client_region) == ("db-a", "srv-a")  # db-b (cheaper) failed in srv-b: last

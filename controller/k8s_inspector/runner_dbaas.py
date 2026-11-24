@@ -24,7 +24,7 @@ import logging
 import secrets
 from datetime import timedelta
 
-from k8s_inspector import crd, dbaas_jobs, dbaas_keeper, pods
+from k8s_inspector import crd, dbaas_jobs, dbaas_keeper, dbaas_seal, pods
 from k8s_inspector.kube import NotFound
 from k8s_inspector.model import (
     AttemptOutcome,
@@ -104,9 +104,10 @@ class DbaasMixin:
         vendor_config = cfg.settings.dbaas.vendors.get(db["vendor"])
         if not cfg.env.dbaas_image:
             return self._end_run(run, ExitCode.HARNESS_ERROR, "K8SI_DBAAS_IMAGE is empty", AttemptOutcome.HARNESS_ERROR)
-        if not (vendor_config and db["region"] in vendor_config.networks):
+        client_region = pods.client_region(db)
+        if not (vendor_config and client_region in vendor_config.networks):
             return self._database_fail(
-                run, "DBAAS_NO_NETWORK", f"no network of {db['vendor']} in {db['region']} in the ConfigMap"
+                run, "DBAAS_NO_NETWORK", f"no network of {db['vendor']} in {client_region} in the ConfigMap"
             )
         now = self._now()
         expires = dbaas_jobs.expiry(now, cfg, self._dbaas_task(run))
@@ -172,8 +173,11 @@ class DbaasMixin:
         if record is None:
             return self._database_fail(run, "DBAAS_UNKNOWN_DATABASE", f"Keeper does not know {db['vendor']}/{db['id']}")
         self._password(run)
-        network = cfg.settings.dbaas.vendors[db["vendor"]].networks[db["region"]]
-        spec = dbaas_jobs.build_spec(run, cfg, record, network, run.status.database.expires)
+        network = cfg.settings.dbaas.vendors[db["vendor"]].networks[pods.client_region(db)]
+        node = self._get_node(self._nodes[run.name].facts.node_name) or {}
+        spec = dbaas_jobs.build_spec(
+            run, cfg, record, network, run.status.database.expires, dbaas_jobs.client_addresses(node)
+        )
         self._create("job", dbaas_jobs.up_job(run, cfg, spec, self._run_owner(run)))
 
     def _database_creating(self, run: BenchmarkRun, cfg: Config, live: dict[str, dict]) -> None:
@@ -196,6 +200,11 @@ class DbaasMixin:
         outputs = dbaas_jobs.job_message(self.kube, name)
         if "host" not in outputs:
             return self._database_fail(run, "DBAAS_CREATE_FAILED", "the Job reported no connection facts")
+        if "password" in outputs:  # sealed with the run's password (docs/explanation/dbaas.md)
+            try:
+                outputs["password"] = dbaas_seal.unseal(self._password(run), outputs["password"])
+            except ValueError:
+                return self._database_fail(run, "DBAAS_CREATE_FAILED", "the Job's sealed password cannot be opened")
         self.kube.apply_secret(dbaas_jobs.connection_secret(run, self._run_owner(run), self._password(run), outputs))
         now = self._now()
 

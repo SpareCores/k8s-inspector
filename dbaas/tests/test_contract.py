@@ -1,3 +1,4 @@
+import importlib.util
 import json
 import os
 import signal
@@ -10,7 +11,7 @@ import pulumi
 import pytest
 
 from k8s_inspector_dbaas import __main__ as entry
-from k8s_inspector_dbaas import stack, vendors
+from k8s_inspector_dbaas import sealing, stack, vendors
 from k8s_inspector_dbaas.spec import DbOutputs, load_spec
 
 SPEC_JSON = {
@@ -86,6 +87,59 @@ def test_up_reports_the_connection_facts_in_the_termination_message(spec, tmp_pa
         "port": 5432,
         "sslmode": "require",
     }
+
+
+def load_controller_seal():
+    """The controller's `dbaas_seal.py` (a separate package, stdlib only): it must open what `sealing` seals."""
+    path = Path(__file__).parents[2] / "controller/k8s_inspector/dbaas_seal.py"
+    module = importlib.util.module_from_spec(importlib.util.spec_from_file_location("dbaas_seal", path))
+    module.__spec__.loader.exec_module(module)
+    return module
+
+
+def test_a_vendor_generated_password_is_sealed_with_the_runs_in_the_termination_message(spec, tmp_path, monkeypatch):
+    log = tmp_path / "termination"
+    monkeypatch.setenv(entry.TERMINATION_LOG_ENV, str(log))
+    monkeypatch.setenv("DBAAS_SPEC", json.dumps(SPEC_JSON))
+    monkeypatch.setenv("DBAAS_PASSWORD", "run-pw")
+    out = DbOutputs(host="h", admin_user="u", admin_db="d", password="Generated-by-vendor")
+    monkeypatch.setattr(stack, "up", lambda spec: out)
+    assert entry.run("up") == 0
+    assert "Generated-by-vendor" not in log.read_text()
+    opened = load_controller_seal().unseal("run-pw", json.loads(log.read_text())["password"])
+    assert opened == "Generated-by-vendor"
+
+
+def test_a_sealed_value_is_random_and_only_opens_with_the_password_and_unchanged():
+    seal = load_controller_seal()
+    a, b = sealing.seal("pw", "secret"), sealing.seal("pw", "secret")
+    assert a != b and "secret" not in a  # a fresh nonce each time
+    assert seal.unseal("pw", a) == "secret" and seal.unseal("pw", sealing.seal("pw", "x" * 100)) == "x" * 100
+    for bad in (a, a[:-4] + ("AAAA" if not a.endswith("AAAA") else "BBBB"), "", "!!"):
+        with pytest.raises(ValueError, match="sealed|password"):
+            seal.unseal("other" if bad == a else "pw", bad)
+
+
+def test_a_password_cannot_be_reported_without_the_run_password_to_seal_it():
+    with pytest.raises(ValueError, match="run's password"):
+        DbOutputs(host="h", admin_user="u", admin_db="d", password="x").to_json()
+    assert "password" not in repr(DbOutputs(host="h", admin_user="u", admin_db="d", password="x"))
+
+
+def test_the_password_is_exported_as_a_secret(monkeypatch):
+    exported = {}
+    monkeypatch.setattr(pulumi, "export", exported.__setitem__)
+    monkeypatch.setattr(pulumi.Output, "secret", staticmethod(lambda value: ("secret", value)))
+    DbOutputs(host="h", admin_user="u", admin_db="d", password="x").export()
+    assert exported["password"] == ("secret", "x") and exported["host"] == "h"
+
+
+def test_the_spec_has_the_client_region_and_addresses():
+    spec = load_spec({"DBAAS_SPEC": json.dumps(SPEC_JSON)})
+    assert spec.client_region == "eu-test-1" and spec.client_addresses == []  # default: the database's region
+    data = {**SPEC_JSON, "clientRegion": "eu-test-2", "clientAddresses": ["203.0.113.7/32"]}
+    spec = load_spec({"DBAAS_SPEC": json.dumps(data)})
+    assert (spec.region, spec.client_region, spec.client_addresses) == ("eu-test-1", "eu-test-2", ["203.0.113.7/32"])
 
 
 def test_a_failed_up_reports_the_error_without_the_password(tmp_path, monkeypatch, capsys):

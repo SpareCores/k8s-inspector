@@ -10,6 +10,7 @@ def spec() -> DbSpec:
         database_id="db-8",
         engine_version="18",
         region="eu-test-1",
+        client_region="eu-test-1",
         zone="eu-test-1a",
         run="fake-m5-large-1234abcd",
         run_id="r20261120t1000-aaaa",

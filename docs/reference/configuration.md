@@ -148,14 +148,16 @@ dbaas:
   vendors:
     gcp:
       serviceAccount: k8s-inspector-dbaas-gcp   # optional: workload identity of the Jobs (default k8s-inspector-dbaas)
-      networks:                                  # region -> what the vendor module needs, passed through unchanged
+      networks:                                  # client region -> what the vendor module needs, passed through unchanged
         europe-west4:
           network: projects/p/global/networks/dbaas
           subnet: projects/p/regions/europe-west4/subnetworks/dbaas
 ```
 
 The values under `networks.<region>` are infrastructure outputs of the platform, opaque to the controller; only the
-vendor module reads them. A region without an entry is never used for a database of that vendor. The Jobs take the
+vendor module reads them. The key is the region of the client (bench) node, which is the database's region unless the
+vendor's database regions are not its server regions (OVH): then the database goes to the database region of the same
+Keeper city. A region without an entry is never used as a client region for a database of that vendor. The Jobs take the
 vendor's cloud credentials from the optional Secret `k8s-inspector-dbaas-<vendor>`, and the stack passphrase from the
 Secret `k8s-inspector-dbaas-state` (`passphrase`).
 
@@ -234,9 +236,10 @@ separately. Per vendor:
 3. A database is due by the same rules as a server task (step 4 above), read from
    `dbaas/<vendor>/<id>/postgres/<version>/standalone/<task>/meta.json`; the version is `dbaas.engineVersion` when the
    database offers it, else its newest. A malformed meta skips the database.
-4. The first due database gets a run in its cheapest region with a network (the region of the last failed attempt
-   last), with the client the picker chooses there ([DBaaS](../explanation/dbaas.md#which-database-where-with-which-client)).
-   A database without such a region or client is skipped.
+4. The first due database gets a run in its cheapest database region that has a client region (the database region of the
+   last failed attempt last): the region itself or one of the same Keeper city, with a `networks` entry. The client is the
+   one the picker chooses there ([DBaaS](../explanation/dbaas.md#which-database-where-with-which-client)). A database
+   without such a region or client is skipped.
 
 If Keeper or git cannot be read the cycle (or that vendor) plans nothing and logs why.
 
@@ -276,7 +279,7 @@ without `truncated` counts as complete; the optional `zonesOmitted` field is ign
 ## CLI
 
 `k8s-inspector serve | plan [--dry-run] | run <vendor> <sku> [--tasks …] [--force] [--on-demand] [--hold 2h] |
-run <vendor> --database <id> [--region <region>] [<client sku>] [--force] [--hold 2h] |
+run <vendor> --database <id> [--region <region>] [--client-region <region>] [<client sku>] [--force] [--hold 2h] |
 status [--failing] | cancel <run> | publish [--rescan --since 7d [--sku <sku>]…]`. Inside the cluster:
 `kubectl -n inspector exec deploy/k8s-inspector -- k8s-inspector …`.
 

@@ -2,9 +2,11 @@
 parallel with the node release, retries, restarts, the finalizer. Jobs and Pods are played by `fakes.Cluster`."""
 
 import base64
+import importlib.util
 import json
 from dataclasses import replace
 from datetime import timedelta
+from pathlib import Path
 
 import pytest
 from test_runner import START, Harness, in_step
@@ -47,6 +49,14 @@ def make_dbaas_config(**dbaas) -> Config:
         env=env,
         settings=Settings(vendors={"oci": VendorSettings(enabled=True)}, dbaas=DbaasSettings(vendors=vendors, **dbaas)),
     )
+
+
+def load_sealing():
+    """The image's `sealing.py` (a separate package, stdlib only): what the Job seals the controller must open."""
+    path = Path(__file__).parents[2] / "dbaas/k8s_inspector_dbaas/sealing.py"
+    module = importlib.util.module_from_spec(importlib.util.spec_from_file_location("sealing", path))
+    module.__spec__.loader.exec_module(module)
+    return module
 
 
 class DbHarness(Harness):
@@ -556,3 +566,62 @@ def test_job_names_stay_within_the_limit_and_are_deterministic():
     assert dbaas_jobs.up_job_name(run) == dbaas_jobs.up_job_name(run)
     assert dbaas_jobs.up_job_name(run) != dbaas_jobs.up_job_name("o" * 62 + "p")  # the hash tells long names apart
     assert dbaas_jobs.up_job_name("aws-x-1") == "dbaas-up-aws-x-1"  # short names are kept as they are
+
+
+def test_the_client_goes_to_its_own_region_when_the_database_is_in_another(h):
+    h.cfg.settings.dbaas.vendors["oci"].networks.clear()
+    h.cfg.settings.dbaas.vendors["oci"].networks["eu-test-1"] = {"vpc": "client-side"}  # keyed by the client's region
+    spec = RunSpec(
+        vendor="oci", sku=CLIENT, run_id="r20261120t1000-aaaa", tasks=[TASK], capacity=CapacityMode.ON_DEMAND,
+        database={**DATABASE, "region": "db-test-1", "clientRegion": "eu-test-1"},
+    )  # fmt: skip
+    h.name = crd.create_run(h.kube, spec).name
+    h.drive(stop=lambda run: run.status.phase == RunPhase.PROVISIONING)
+    anchor = h.kube.get("pod", f"{h.name}-a1")
+    assert anchor["spec"]["nodeSelector"]["topology.kubernetes.io/region"] == "eu-test-1"  # the client's
+    h.until_phase(DbPhase.CREATING)
+    (job,) = h.kube.list("job")
+    env = {e["name"]: e.get("value") for e in job["spec"]["template"]["spec"]["containers"][0]["env"]}
+    spec = json.loads(env["DBAAS_SPEC"])
+    assert (spec["region"], spec["clientRegion"]) == ("db-test-1", "eu-test-1")
+    assert spec["network"] == {"vpc": "client-side"}
+
+
+def test_the_up_job_gets_the_public_addresses_of_the_client_node(h):
+    h.cluster.node_addresses = [
+        {"type": "InternalIP", "address": "10.1.2.3"},
+        {"type": "ExternalIP", "address": "203.0.113.7"},
+        {"type": "ExternalIP", "address": "2001:db8::7"},
+    ]
+    h.start_db()
+    h.until_phase(DbPhase.CREATING)
+    (job,) = h.kube.list("job")
+    env = {e["name"]: e.get("value") for e in job["spec"]["template"]["spec"]["containers"][0]["env"]}
+    assert json.loads(env["DBAAS_SPEC"])["clientAddresses"] == ["203.0.113.7/32", "2001:db8::7/128"]
+
+
+def test_a_node_without_public_addresses_gives_an_empty_list(h):
+    h.start_db()
+    h.until_phase(DbPhase.CREATING)
+    (job,) = h.kube.list("job")
+    env = {e["name"]: e.get("value") for e in job["spec"]["template"]["spec"]["containers"][0]["env"]}
+    assert json.loads(env["DBAAS_SPEC"])["clientAddresses"] == []
+
+
+def test_a_vendor_generated_password_replaces_the_runs_and_is_never_in_the_message_in_plain_text(h):
+    h.start_db()
+    h.until_phase(DbPhase.CREATING)
+    run_password = h.secret(f"{h.name}-db")["SC_DB_PASSWORD"]
+    sealed = load_sealing().seal(run_password, "Vendor-Generated-pw")
+    h.cluster.db_outputs = {**h.cluster.db_outputs, "password": sealed}
+    h.until_phase(DbPhase.BOOTSTRAPPING)
+    assert h.secret(f"{h.name}-db")["SC_DB_PASSWORD"] == "Vendor-Generated-pw"
+    pod = h.kube.get("pod", f"dbaas-up-{h.name}-pod")
+    assert "Vendor-Generated-pw" not in json.dumps(pod)
+
+
+def test_a_sealed_password_that_does_not_open_fails_the_creation(h):
+    h.cluster.db_outputs = {**h.cluster.db_outputs, "password": "AAAA"}
+    h.start_db()
+    h.drive(stop=lambda run: run.status.phase == RunPhase.FAILED)
+    assert h.codes()[TASK][1].startswith("DBAAS_CREATE_FAILED: the Job's sealed password cannot be opened")

@@ -31,10 +31,11 @@ class PlannedDatabase:
     vendor: str
     database_id: str
     engine_version: str
-    region: str
+    region: str  # the database's region
     client: str  # the client server's SKU: the run's SKU
     tasks: tuple[str, ...]
     reason: str  # for logs and `plan --dry-run`
+    client_region: str | None = None  # where the client runs when it is not `region`
 
 
 def dbaas_tasks() -> list[TaskDef]:
@@ -51,7 +52,8 @@ def holds_database(run: BenchmarkRun) -> bool:
 
 @dataclass(frozen=True)
 class Placement:
-    region: str
+    region: str  # the database's region
+    client_region: str  # the client node's region: `region`, or one of its city
     client: str  # the client server's SKU
     usd_per_hour: float | None  # database + client node (Keeper's on-demand prices); None: one of them is unknown
 
@@ -110,6 +112,14 @@ def region_order(prices: dict[str, float], networks: dict, last_failed: str | No
     return ordered
 
 
+def client_regions(region: str, networks: dict, cities: dict[str, str]) -> list[str]:
+    """The regions the client of a database in `region` may run in, in the order they are tried: the region itself, then
+    the regions of the same Keeper city; only those the platform has a network for."""
+    city = cities.get(region)
+    same_city = [r for r in sorted(networks) if r != region and city and cities.get(r) == city]
+    return ([region] if region in networks else []) + same_city
+
+
 def _failed_region(meta: dict | None) -> str | None:
     attempt = meta.get("last_attempt") or meta if meta else {}
     return attempt.get("region") if attempt.get("exit_code") in (ExitCode.NO_NODE, ExitCode.NEVER_FINISHED) else None
@@ -160,6 +170,7 @@ def _create_run(
             "id": record["api_reference"],
             "engineVersion": version,
             "region": placement.region,
+            **({"clientRegion": placement.client_region} if placement.client_region != placement.region else {}),
             "vcpus": int(record["vcpus"]),
             "memoryGib": float(record["memory_amount"]) / 1024,
         },
@@ -181,25 +192,45 @@ def _resolve(
     region: str | None,
     client: str | None,
     last_failed: str | None,
+    client_region: str | None = None,
 ) -> Placement:
-    """The given region and client, else the cheapest region with a network and the client Keeper's data picks there,
-    with the hourly price of database and client from Keeper. Raise `ValueError` when there is none."""
+    """The given database region, client region and client, else the cheapest database region that has a client region
+    (its own or one of its city, with a network) and the client Keeper's data picks there, with the hourly price of
+    database and client from Keeper. Raise `ValueError` when there is none."""
     networks = cfg.settings.dbaas.vendors[vendor].networks
     database_id = record["api_reference"]
     prices = dbaas_keeper.standalone_prices(cfg.env, vendor, database_id)
-    regions = [region] if region else region_order(prices, networks, last_failed)
-    if region and region not in networks:
-        raise ValueError(f"no DBaaS network of {vendor} in {region} in the ConfigMap")
+    cities = dbaas_keeper.region_cities(cfg.env, vendor)
+
+    def clients_of(database_region: str) -> list[str]:
+        automatic = client_regions(database_region, networks, cities)
+        if client_region is None:
+            return automatic
+        usable = client_region in networks and (region is not None or client_region in automatic)
+        return [client_region] if usable else []
+
+    if client_region and client_region not in networks:
+        raise ValueError(f"no DBaaS network of {vendor} in {client_region} in the ConfigMap")
+    if region:
+        if not clients_of(region):
+            raise ValueError(f"no DBaaS network of {vendor} in {region} or in a region of its city in the ConfigMap")
+        regions = [region]
+    else:
+        reachable = {r: price for r, price in prices.items() if clients_of(r)}
+        # a run records the region of its node, which is the client's
+        failed = next((r for r in reachable if last_failed in (r, *clients_of(r))), None)
+        regions = region_order(reachable, reachable, failed)
     if not regions:
         raise ValueError(f"{vendor}/{database_id} has no standalone price in a region that has a DBaaS network")
     ids = dbaas_keeper.region_ids(cfg.env, vendor)
     for candidate in regions:
-        if candidate not in ids:
-            continue
-        servers = dbaas_keeper.client_servers(cfg.env, vendor, ids[candidate])
-        chosen = client or pick_client(kube, cfg, vendor, servers, leased)
-        if chosen:
-            return Placement(candidate, chosen, _hourly(prices.get(candidate), servers, chosen))
+        for client_at in clients_of(candidate):
+            if client_at not in ids:
+                continue
+            servers = dbaas_keeper.client_servers(cfg.env, vendor, ids[client_at])
+            chosen = client or pick_client(kube, cfg, vendor, servers, leased)
+            if chosen:
+                return Placement(candidate, client_at, chosen, _hourly(prices.get(candidate), servers, chosen))
     raise ValueError(f"no client server for {vendor}/{database_id} in {', '.join(regions)}")
 
 
@@ -218,15 +249,16 @@ def force_run(
     database_id: str,
     *,
     region: str | None = None,
+    client_region: str | None = None,
     client: str | None = None,
     force: bool = True,
     hold_after: timedelta = timedelta(0),
 ) -> BenchmarkRun:
     """`k8s-inspector run <vendor> --database <id>`: a DBaaS run of one database now. Raise `ValueError` for validation
     errors and `crd.RunExists` when the client server already has a run. Without `force` Keeper must find the database
-    eligible (unreachable Keeper: refused); with it only Keeper's record must exist. `region` and `client` default
-    to the
-    cheapest region with a network and the client the picker chooses."""
+    eligible (unreachable Keeper: refused); with it only Keeper's record must exist. `region` is the database's;
+    `region`, `client_region` and `client` default to the cheapest database region with a client region (its own or
+    one of its city, with a network) and the client the picker chooses."""
     check_vendor(cfg, vendor, crd.list_runs(kube))
     try:
         record = dbaas_keeper.database(cfg.env, vendor, database_id)
@@ -250,7 +282,17 @@ def force_run(
         raise ValueError(f"{vendor}/{database_id} has no PostgreSQL version in Keeper")
     try:
         leased = {run.name for run in crd.list_runs(kube)}
-        placement = _resolve(kube, cfg, vendor, record, leased, region=region, client=client, last_failed=None)
+        placement = _resolve(
+            kube,
+            cfg,
+            vendor,
+            record,
+            leased,
+            region=region,
+            client=client,
+            last_failed=None,
+            client_region=client_region,
+        )
     except RuntimeError as e:
         raise ValueError(f"cannot read regions or servers from Keeper: {e}") from e
     check_spend(cfg, vendor, crd.list_runs(kube), placement.usd_per_hour)
@@ -341,7 +383,16 @@ def plan_cycle(
                     continue
             reason = ", ".join(f"{name}: {why}" for name, why in due.items())
             planned.append(
-                PlannedDatabase(vendor, database_id, version, placement.region, placement.client, tuple(due), reason)
+                PlannedDatabase(
+                    vendor,
+                    database_id,
+                    version,
+                    placement.region,
+                    placement.client,
+                    tuple(due),
+                    reason,
+                    placement.client_region,
+                )
             )
             break  # at most one new DBaaS run per vendor and cycle; the next cycle checks the limits again
     return planned

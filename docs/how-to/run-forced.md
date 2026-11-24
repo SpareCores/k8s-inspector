@@ -71,8 +71,9 @@ kubectl -n inspector exec deploy/k8s-inspector -- \
   k8s-inspector run upcloud --database 1x1xCPU-1GB-10GB --force
 ```
 
-The database is Keeper's `api_reference`. The region defaults to the cheapest one with a network (`--region <region>`
-picks one), and the client server to the one the picker chooses (the optional `<sku>` argument names one). Without
+The database is Keeper's `api_reference`. The database's region defaults to the cheapest one that has a client region
+with a network (`--region <region>` picks one); the client's region defaults to the database's, else a region of the same
+Keeper city (`--client-region <region>` picks one, and needs a network in the ConfigMap), and the client server to the one the picker chooses (the optional `<sku>` argument names one). Without
 `--force` Keeper must find the database eligible. The vendor's `dbaasMaxInFlight` and `dbaasMaxUsdPerHour` apply (a forced run is refused with the reason). Follow it with
 `kubectl -n inspector get benchmarkruns -w` and `get jobs`; the run ends with the database destroyed and the finalizer gone.
 `k8s-inspector cancel <run>` cancels it and destroys the database. `--tasks` and `--on-demand` do not apply: the run
