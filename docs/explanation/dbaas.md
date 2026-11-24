@@ -105,9 +105,10 @@ rules; every input is Keeper's data, nothing is a static table:
   have a client region, cheapest first; after a failed attempt the database region whose client region that attempt used
   goes last, so the retry tries another. The client regions of a database region, in the order they are tried: the
   region itself when the ConfigMap has a network for it (`dbaas.vendors.<vendor>.networks.<client region>`), and only
-  then, if it has none, the regions with the same Keeper country and `city` that have one; the first with a client wins.
-  For most vendors the database and server regions are the same names, so the region is its own client region. OVH's are
-  not (databases in `GRA`, servers in `GRA7`, `GRA9`, `GRA11`), and the city ties them. The run records `database.region`
+  then, if it has none and the vendor sets `dbaas.vendors.<vendor>.clientRegionByCity` (default false), the regions
+  with the same Keeper country and `city` that have one; the first with a client wins. For most vendors the database
+  and server regions are the same names, so the region is its own client region and the flag stays off. OVH's are not
+  (databases in `GRA`, servers in `GRA7`, `GRA9`, `GRA11`), and the city ties them, so OVH sets it. The run records `database.region`
   and, when it differs, `database.clientRegion`. An operator may name both (`run --region`, `--client-region`); an
   explicit client region is an override with no city check, with or without `--region`.
 - **Client**: Keeper's servers in the client region that are x86_64 (the benchmark image is amd64 only), without

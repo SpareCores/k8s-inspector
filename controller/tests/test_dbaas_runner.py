@@ -297,12 +297,38 @@ def test_a_missing_image_is_a_harness_error_not_a_database(h):
     assert h.codes()[TASK] == (ExitCode.HARNESS_ERROR, "K8SI_DBAAS_IMAGE is empty") and h.jobs() == []
 
 
+def down_password_ref(job: dict) -> dict:
+    env = {e["name"]: e for e in job["spec"]["template"]["spec"]["containers"][0]["env"]}
+    return env["DBAAS_PASSWORD"]["valueFrom"]["secretKeyRef"]
+
+
+def test_the_down_job_does_not_need_the_password_but_the_up_job_does(h):
+    h.start_db()
+    h.until_phase(DbPhase.CREATING)
+    assert "optional" not in down_password_ref(h.kube.get("job", f"dbaas-up-{h.name}"))
+    assert down_password_ref(dbaas_jobs.down_job(h.name, "oci", h.cfg)) == {
+        "name": f"{h.name}-db",
+        "key": "K8SI_RUN_PASSWORD",
+        "optional": True,
+    }
+
+
+def test_starting_the_bootstrap_deletes_an_up_job_left_by_a_restart(h):
+    h.start_db()
+    h.until_phase(DbPhase.BOOTSTRAPPING)
+    h.kube.create("job", dbaas_jobs.up_job(h.run, h.cfg, {}, h.runner._run_owner(h.run)))  # the delete did not happen
+    h.runner._start_bootstrap(h.run, h.cfg, {p["metadata"]["name"]: p for p in h.kube.list("pod")})
+    assert f"dbaas-up-{h.name}" not in h.jobs()
+
+
 def test_a_stack_left_from_an_earlier_run_is_destroyed_first_and_the_run_goes_on(h):
     h.storage.objects[STATE_KEY] = b"{}"
     h.start_db()
     h.until_phase(DbPhase.CLEARING)
     assert h.jobs() == [f"dbaas-down-{h.name}"]  # no `up` yet: only the destroy of the leftover
     assert h.pod_names() == [] and h.run.status.phase == RunPhase.PENDING  # and no paid client node waits for it
+    assert h.kube.list("secret") == []  # no Secret of the run yet: the down Job must start without its password
+    assert down_password_ref(h.kube.get("job", f"dbaas-down-{h.name}")).get("optional") is True
     h.storage.objects.pop(STATE_KEY)  # what the destroy removes
     run = h.drive(stop=lambda run: run.status.phase == RunPhase.PUBLISHING)
     assert h.codes()[TASK] == (0, None) and run.status.attempts[0].outcome.value == "Completed"  # no -1 result
@@ -631,4 +657,8 @@ def test_a_restart_after_the_secret_was_written_keeps_the_runs_own_password_for_
     h.drive(runner=second, stop=lambda run: run.status.phase == RunPhase.PUBLISHING)
     down = h.kube.get("job", dbaas_jobs.down_job_name(h.name))
     (env,) = [e for e in down["spec"]["template"]["spec"]["containers"][0]["env"] if e["name"] == "DBAAS_PASSWORD"]
-    assert env["valueFrom"]["secretKeyRef"] == {"name": f"{h.name}-db", "key": "K8SI_RUN_PASSWORD"}
+    assert env["valueFrom"]["secretKeyRef"] == {
+        "name": f"{h.name}-db",
+        "key": "K8SI_RUN_PASSWORD",
+        "optional": True,
+    }

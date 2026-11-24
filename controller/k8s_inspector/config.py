@@ -217,11 +217,13 @@ def _dbaas_vendor(value: Any, path: str) -> DbaasVendor:
     for region, network in _mapping(section.pop("networks", None), f"{path}.networks").items():
         networks[str(region)] = dict(_mapping(network, f"{path}.networks.{region}"))
     service_account = section.pop("serviceAccount", None)
+    by_city = section.pop("clientRegionByCity", False)
     for key in section:
         log.warning("unknown config key %s.%s (ignored)", path, key)
     return DbaasVendor(
         networks=networks,
         service_account=None if service_account is None else _str(service_account, f"{path}.serviceAccount"),
+        client_region_by_city=_bool(by_city, f"{path}.clientRegionByCity"),
     )
 
 

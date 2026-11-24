@@ -378,17 +378,18 @@ def _job(
     }
 
 
-def _run_password_env(run_name: str) -> dict:
-    return {
-        "name": "DBAAS_PASSWORD",
-        "valueFrom": {"secretKeyRef": {"name": db_secret_name(run_name), "key": RUN_PASSWORD_KEY}},
-    }
+def _run_password_env(run_name: str, *, optional: bool) -> dict:
+    ref = {"name": db_secret_name(run_name), "key": RUN_PASSWORD_KEY}
+    return {"name": "DBAAS_PASSWORD", "valueFrom": {"secretKeyRef": ref | ({"optional": True} if optional else {})}}
 
 
 def up_job(run: BenchmarkRun, cfg: Config, spec: dict, owner: OwnerRef) -> dict:
     """`dbaas-up-<run>`: create the database. The spec is not secret, the password comes from the run's Secret. The
     Job's deadline is `dbaas.createMinutes`; the vendor module's Pulumi timeouts are shorter (`build_spec`)."""
-    env = [{"name": "DBAAS_SPEC", "value": json.dumps(spec, separators=(",", ":"))}, _run_password_env(run.name)]
+    env = [
+        {"name": "DBAAS_SPEC", "value": json.dumps(spec, separators=(",", ":"))},
+        _run_password_env(run.name, optional=False),
+    ]
     return _job(
         up_job_name(run.name),
         "up",
@@ -405,14 +406,17 @@ def up_job(run: BenchmarkRun, cfg: Config, spec: dict, owner: OwnerRef) -> dict:
 def down_job(run_name: str, vendor: str, cfg: Config, *, sweep: bool = False) -> dict:
     """`dbaas-down-<run>`: destroy the stack and remove its state. It is labelled with the run, not owned by it (the run
     waits for it under foreground deletion), and the one that finishes it deletes it. A `sweep` Job is for a stack whose
-    run is gone: it carries no run label, and the sweeper deletes it when it is over."""
+    run is gone: it carries no run label, and the sweeper deletes it when it is over. The run's password is optional
+    here: `down` only uses it to mask error text, and the Secret or its key may be missing (a leftover stack, a lost
+    Secret, a run from before the key); a required reference would stall the Pod and never destroy the database."""
     job = _job(
         down_job_name(run_name),
         "down",
         kind="down",
         vendor=vendor,
         cfg=cfg,
-        env=[{"name": "DBAAS_RUN", "value": run_name}] + ([] if sweep else [_run_password_env(run_name)]),
+        env=[{"name": "DBAAS_RUN", "value": run_name}]
+        + ([] if sweep else [_run_password_env(run_name, optional=True)]),
         deadline_seconds=DOWN_DEADLINE_SECONDS,
         run=None if sweep else run_name,
         owner=None,

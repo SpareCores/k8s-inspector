@@ -50,8 +50,8 @@ RUNNING_PHASES = (RunPhase.PENDING, RunPhase.PROVISIONING, RunPhase.RUNNING)
 
 def _new_password() -> str:
     """28 characters (vendors cap at 30 or 32), with a letter of each case, a digit and a symbol, which the password
-    policies of the vendors ask for; only letters, digits, `-` and `_`, which none of them rejects."""
-    return f"Sc1-{secrets.token_urlsafe(18)}"
+    policies of the vendors ask for; the only symbol is `-`, and the rest are letters and digits."""
+    return f"Sc1-{secrets.token_hex(12)}"
 
 
 def database_over(run: BenchmarkRun) -> bool:
@@ -214,6 +214,7 @@ class DbaasMixin:
     # ----------------------------------------------------------------------- bootstrapping
 
     def _start_bootstrap(self, run: BenchmarkRun, cfg: Config, live: dict[str, dict]) -> None:
+        self.kube.delete("job", dbaas_jobs.up_job_name(run.name))  # again: the controller may have restarted before
         nd = self._nodes[run.name]
         owner = self._anchor_owner(run, live)
         self._create("configmap", dbaas_jobs.boot_configmap(run, self._run_owner(run)))

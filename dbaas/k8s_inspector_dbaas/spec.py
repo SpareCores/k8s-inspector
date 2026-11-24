@@ -36,10 +36,9 @@ class DbSpec:
     database_id: str  # Keeper's `api_reference` of the database SKU, the vendor's own name for it
     engine_version: str  # PostgreSQL major version, e.g. "18"
     region: str  # the region of the database (Keeper `api_reference`)
-    client_region: (
-        str  # the region of the client node: `region`, or a region of its city when the vendor's database and
-    )
-    # server regions differ (OVH); the key of `network`
+    # the region of the client node: `region`, or a region of its city when the vendor's database and server regions
+    # differ (OVH); the key of `network`
+    client_region: str
     zone: str | None  # the zone of the client node, None when unknown; a vendor may place the database in it
     run: str  # BenchmarkRun name
     run_id: str  # `spec.runId` of the run
@@ -47,11 +46,9 @@ class DbSpec:
     labels: dict[str, str]  # run id and expiry as label-safe strings; apply them as tags/labels where supported
     create_timeout_minutes: int  # shorter than the up Job's deadline: the `create` custom timeout of slow resources
     delete_timeout_minutes: int  # shorter than the down Job's deadline: the `delete` custom timeout
-    network: (
-        dict  # opaque outputs of the platform from the ConfigMap `dbaas.vendors.<vendor>.networks.<client region>`;
-    )
-    # for a vendor that needs an allowlist on a private network (UpCloud, Vultr, OCI) the platform puts the client CIDRs
-    # in it
+    # opaque outputs of the platform from the ConfigMap `dbaas.vendors.<vendor>.networks.<client region>`; for a vendor
+    # that needs an allowlist on a private network (UpCloud, Vultr, OCI) the platform puts the client CIDRs in it
+    network: dict
     record: dict  # Keeper's record of the database (vcpus, memory_amount, storage_size, api_reference_object ...)
     # ExternalIP addresses of the client node as /32 or /128, for a vendor whose nodes have no private network (OVH):
     # the database is on a public endpoint with TLS and allows these. Empty when the node has none.

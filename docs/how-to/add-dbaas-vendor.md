@@ -27,7 +27,7 @@ are RFC 3339 and `run` is the tag's value. `fake.py` is the smallest example of 
 | Field | Meaning |
 |---|---|
 | `vendor`, `database_id`, `engine_version` | Keeper's `api_reference` of the database SKU (the vendor's own name for it) and the PostgreSQL major version |
-| `region`, `client_region`, `zone` | the database's region (Keeper's `api_reference` of a database price row) and the client node's region, which is `region` unless the vendor's database regions are not its server regions (OVH: the controller then picks a region of the same Keeper city), and the client's zone (`None` when unknown; use it to place the database next to the client, or ignore it) |
+| `region`, `client_region`, `zone` | the database's region (Keeper's `api_reference` of a database price row) and the client node's region, which is `region` unless the vendor's database regions are not its server regions (OVH: the platform sets `clientRegionByCity: true` for the vendor and the controller then picks a region of the same Keeper city), and the client's zone (`None` when unknown; use it to place the database next to the client, or ignore it) |
 | `run`, `run_id`, `expires_at` | the run, its id and the time after which the database is a leak |
 | `labels` | `sc_inspector_run` and `sc_inspector_expires`, already label-safe (lowercase, digits, `-`, `_`): apply them as tags or labels wherever the vendor supports them |
 | `create_timeout`, `delete_timeout` | Pulumi duration strings (`"50m"`, `"110m"`), 10 minutes shorter than the up and down Jobs' deadlines (`dbaas.createMinutes` and 2 h): use them as `custom_timeouts` |
@@ -102,6 +102,7 @@ For every vendor (sc-infra, not this repository):
 
 | Object | Purpose |
 |---|---|
+| ConfigMap `k8s-inspector`, `dbaas.vendors.<vendor>.clientRegionByCity` | `true` only for a vendor whose database regions are not its server regions (OVH); default `false` |
 | ConfigMap `k8s-inspector`, `dbaas.vendors.<vendor>.networks.<region>` | the vendor module's network references for each region where a DBaaS network exists. A region without an entry is never used. Infrastructure outputs, not catalogue data |
 | Secret `k8s-inspector-dbaas-<vendor>` (optional) | the vendor's cloud credentials as environment variables of its Jobs (`envFrom`), for `up`, `down` and `inventory`. The state backend uses an AWS profile (`AWS_CONFIG_FILE`) and sets no `AWS_*` credential variable, so the vendor's variables are the vendor's |
 | ServiceAccount (optional), named in `dbaas.vendors.<vendor>.serviceAccount` | workload identity for the vendor's cloud API instead of a credential Secret. With `K8SI_DBAAS_ROLE_ARN` set, a projected ServiceAccount token (audience `sts.amazonaws.com`) is at `/var/run/secrets/aws/token` in `up`, `down` and `inventory` alike, which a module may use for its own web-identity login; the state backend variables exist only in `up` and `down` |

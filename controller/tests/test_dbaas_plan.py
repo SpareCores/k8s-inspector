@@ -33,9 +33,11 @@ def everything_offered(monkeypatch):
     monkeypatch.setattr(planner, "not_offered", lambda kube, cfg, vendor, skus, now=None: {})
 
 
-def make_config(*, auto=True, networks=None, publish=True, **vendor) -> Config:
+def make_config(*, auto=True, networks=None, by_city=False, publish=True, **vendor) -> Config:
     vendors = {"oci": VendorSettings(enabled=True, dbaas_auto_plan=auto, publish=publish, **vendor)}
-    dbaas = DbaasSettings(vendors={"oci": DbaasVendor(networks=NETWORKS if networks is None else networks)})
+    dbaas = DbaasSettings(
+        vendors={"oci": DbaasVendor(networks=NETWORKS if networks is None else networks, client_region_by_city=by_city)}
+    )
     return Config(
         EnvConfig(bucket="b", bucket_region="r", dbaas_image="img@sha256:1"), Settings(vendors=vendors, dbaas=dbaas)
     )
@@ -409,8 +411,8 @@ CITIES = {
 SPLIT_NETWORKS = {"srv-a": {"net": "a"}, "srv-b": {"net": "b"}}  # keyed by the client's region
 
 
-def split_config(networks) -> Config:
-    return make_config(auto=False, networks=networks, dbaas_max_in_flight=9)
+def split_config(networks, by_city=True) -> Config:
+    return make_config(auto=False, networks=networks, by_city=by_city, dbaas_max_in_flight=9)
 
 
 @pytest.fixture
@@ -465,12 +467,23 @@ def test_a_database_region_with_a_network_but_no_client_does_not_spill_into_its_
 
 def test_the_city_is_matched_with_its_country():
     networks = {"srv-a": {}, "srv-x": {}}
-    assert dbaas_plan.client_regions("db-a", networks, CITIES) == ["srv-a"]  # srv-x: Alpha of another country
-    assert dbaas_plan.client_regions("db-a", networks, {**CITIES, "db-a": ("XX", "Alpha")}) == ["srv-x"]
+    by_city = {"by_city": True}
+    assert dbaas_plan.client_regions("db-a", networks, CITIES, **by_city) == ["srv-a"]  # srv-x: another country
+    assert dbaas_plan.client_regions("db-a", networks, {**CITIES, "db-a": ("XX", "Alpha")}, **by_city) == ["srv-x"]
+
+
+def test_without_client_region_by_city_a_region_without_a_network_has_no_client_region(kube, split):
+    assert dbaas_plan.client_regions("db-a", SPLIT_NETWORKS, CITIES) == []
+    assert dbaas_plan.client_regions("srv-a", SPLIT_NETWORKS, CITIES) == ["srv-a"]
+    cfg = split_config(SPLIT_NETWORKS, by_city=False)
+    with pytest.raises(ValueError, match="no DBaaS network of oci in db-a in the ConfigMap"):
+        force(kube, split, cfg, region="db-a")
+    with pytest.raises(ValueError, match="no standalone price in a region that has a DBaaS network"):
+        force(kube, split, cfg)
 
 
 def test_autoplan_retries_in_another_database_region_after_a_failure_in_the_client_region(kube, split):
     split.records = {"db-a": split.records["db-a"]}
     split.metas = {"db-a": {"18": {TASK: good_meta(exit_code=-4, region="srv-b", end="2020-01-01T00:00:00")}}}
-    (planned,) = plan(kube, make_config(networks=SPLIT_NETWORKS), split, dry_run=True)
+    (planned,) = plan(kube, make_config(networks=SPLIT_NETWORKS, by_city=True), split, dry_run=True)
     assert (planned.region, planned.client_region) == ("db-a", "srv-a")  # db-b (cheaper) failed in srv-b: last

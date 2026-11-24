@@ -108,12 +108,16 @@ def region_order(prices: dict[str, float], networks: dict, failed: Collection[st
     return sorted((r for r in prices if r in networks), key=lambda r: (r in failed, prices[r], r))
 
 
-def client_regions(region: str, networks: dict, cities: dict[str, tuple[str, str]]) -> list[str]:
+def client_regions(
+    region: str, networks: dict, cities: dict[str, tuple[str, str]], *, by_city: bool = False
+) -> list[str]:
     """The regions the client of a database in `region` may run in, in the order they are tried: the region itself when
-    the platform has a network there; otherwise (OVH: databases and servers are in differently named regions) the
-    regions of the same Keeper city (country and city) that have one."""
+    the platform has a network there; otherwise, only for a vendor with `clientRegionByCity` (OVH: databases and servers
+    are in differently named regions), the regions of the same Keeper city (country and city) that have one."""
     if region in networks:
         return [region]
+    if not by_city:
+        return []
     city = cities.get(region)
     return [r for r in sorted(networks) if city and cities.get(r) == city]
 
@@ -195,19 +199,25 @@ def _resolve(
     """The given database region, client region and client, else the cheapest database region that has a client region
     (its own or one of its city, with a network) and the client Keeper's data picks there, with the hourly price of
     database and client from Keeper. Raise `ValueError` when there is none."""
-    networks = cfg.settings.dbaas.vendors[vendor].networks
+    vendor_config = cfg.settings.dbaas.vendors[vendor]
+    networks = vendor_config.networks
     database_id = record["api_reference"]
     prices = dbaas_keeper.standalone_prices(cfg.env, vendor, database_id)
     cities = dbaas_keeper.region_cities(cfg.env, vendor)
 
     def clients_of(database_region: str) -> list[str]:
-        return [client_region] if client_region else client_regions(database_region, networks, cities)
+        return (
+            [client_region]
+            if client_region
+            else client_regions(database_region, networks, cities, by_city=vendor_config.client_region_by_city)
+        )
 
     if client_region and client_region not in networks:
         raise ValueError(f"no DBaaS network of {vendor} in {client_region} in the ConfigMap")
     if region:
         if not clients_of(region):
-            raise ValueError(f"no DBaaS network of {vendor} in {region} or in a region of its city in the ConfigMap")
+            where = f"{region} or in a region of its city" if vendor_config.client_region_by_city else region
+            raise ValueError(f"no DBaaS network of {vendor} in {where} in the ConfigMap")
         regions = [region]
     else:
         reachable = {r: price for r, price in prices.items() if clients_of(r)}

@@ -529,6 +529,7 @@ class DbaasVendor:
 
     networks: dict[str, dict] = field(default_factory=dict)  # region -> opaque network references for the vendor module
     service_account: str | None = None  # ServiceAccount of the Jobs (workload identity); None: the default one
+    client_region_by_city: bool = False  # a database region without a network uses one of its Keeper city (OVH)
 
 
 @dataclass(frozen=True)

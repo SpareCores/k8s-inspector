@@ -148,6 +148,7 @@ dbaas:
   vendors:
     gcp:
       serviceAccount: k8s-inspector-dbaas-gcp   # optional: workload identity of the Jobs (default k8s-inspector-dbaas)
+      clientRegionByCity: false                  # optional (default false): see below
       networks:                                  # client region -> what the vendor module needs, passed through unchanged
         europe-west4:
           network: projects/p/global/networks/dbaas
@@ -156,8 +157,11 @@ dbaas:
 
 The values under `networks.<region>` are infrastructure outputs of the platform, opaque to the controller; only the
 vendor module reads them. The key is the region of the client (bench) node, which is the database's region unless the
-vendor's database regions are not its server regions (OVH): then the database goes to the database region of the same
-Keeper city. A region without an entry is never used as a client region for a database of that vendor. The Jobs take the
+vendor's database regions are not its server regions (OVH). `clientRegionByCity: true` is for such a vendor only: a
+database region without a `networks` entry then uses the client region of the same Keeper city (country and city) that
+has one. Without it (the default) a database region without an entry is not used, so a missing entry never pairs a
+database with another region's network. A region without an entry is never used as a client region for a database of
+that vendor. The Jobs take the
 vendor's cloud credentials from the optional Secret `k8s-inspector-dbaas-<vendor>`, and the stack passphrase from the
 Secret `k8s-inspector-dbaas-state` (`passphrase`).
 
@@ -237,7 +241,7 @@ separately. Per vendor:
    `dbaas/<vendor>/<id>/postgres/<version>/standalone/<task>/meta.json`; the version is `dbaas.engineVersion` when the
    database offers it, else its newest. A malformed meta skips the database.
 4. The first due database gets a run in its cheapest database region that has a client region (the database region of the
-   last failed attempt last): the region itself or one of the same Keeper city, with a `networks` entry. The client is the
+   last failed attempt last): the region itself or, for a vendor with `clientRegionByCity`, one of the same Keeper city, with a `networks` entry. The client is the
    one the picker chooses there ([DBaaS](../explanation/dbaas.md#which-database-where-with-which-client)). A database
    without such a region or client is skipped.
 

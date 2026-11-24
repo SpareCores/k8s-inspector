@@ -288,3 +288,9 @@ def test_the_dbaas_image_is_an_optional_environment_variable():
     assert load_env({**MINIMAL_ENV, "K8SI_DBAAS_IMAGE": "img@sha256:1"}).dbaas_image == "img@sha256:1"
     assert load_env(MINIMAL_ENV).dbaas_role_arn is None
     assert load_env({**MINIMAL_ENV, "K8SI_DBAAS_ROLE_ARN": "arn:r"}).dbaas_role_arn == "arn:r"
+
+
+def test_client_region_by_city_is_a_per_vendor_flag_that_is_off_by_default():
+    parsed = parse_settings({"dbaas": {"vendors": {"ovh": {"clientRegionByCity": True}, "oci": {}}}})
+    assert parsed.dbaas.vendors["ovh"].client_region_by_city is True
+    assert parsed.dbaas.vendors["oci"].client_region_by_city is False
