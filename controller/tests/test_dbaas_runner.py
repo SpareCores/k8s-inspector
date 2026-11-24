@@ -137,6 +137,7 @@ def test_the_client_node_comes_first_and_the_database_is_created_when_the_anchor
 def test_a_dbaas_run_creates_bootstraps_benchmarks_and_destroys(h):
     h.start_db()
     h.until_phase(DbPhase.BOOTSTRAPPING)
+    assert h.db.timing.keys() == {"api_start", "api_end"} and h.db.timing["api_end"] == h.db.since
     facts = h.secret(f"{h.name}-db")  # the Job's connection facts, written by the controller
     assert (facts["SC_DB_HOST"], facts["SC_DB_PORT"], facts["SC_DB_USER"], facts["SC_DB_NAME"]) == (
         "10.0.0.5", "5432", "scadmin", "bench",
@@ -172,6 +173,7 @@ def test_a_dbaas_run_creates_bootstraps_benchmarks_and_destroys(h):
     assert h.codes()[TASK] == (0, None)
     # the same pass released the node and started the destroy; creating the database stopped
     assert h.run_pods() == [] and h.db.phase == DbPhase.DESTROYING
+    assert h.db.timing.keys() == {"api_start", "api_end", "api_destroy_start"}
     assert h.jobs() == [f"dbaas-down-{h.name}"]
     (down,) = h.kube.list("job")
     assert down["spec"]["template"]["spec"]["containers"][0]["args"] == ["down"]
@@ -180,6 +182,7 @@ def test_a_dbaas_run_creates_bootstraps_benchmarks_and_destroys(h):
     assert run.status.attempts[0].outcome.value == "Completed"
 
     h.until_phase(DbPhase.DESTROYED)
+    assert "api_destroy_end" in h.db.timing
     assert not h.kube.get("benchmarkrun", h.name)["metadata"].get("finalizers")
     assert ("secret", f"{h.name}-db") in h.kube.deleted and h.jobs() == []
     assert not [k for k in h.storage.objects if "backups" in k]  # what Pulumi leaves behind is removed

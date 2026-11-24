@@ -45,6 +45,8 @@ Decisions:
 - Timing files come from `run.json`: the latest attempt that has an lscpu result (`attempts[]`: `api_start`,
   `api_end`, `machine_start`, `node_registered`, `node_ready`), else its `timing` object, completed with
   `inspector_start`/`inspector_end` = first task start / last task end. They go to the variant of that attempt.
+- A DBaaS run's timing files (`render.render_dbaas_timing`) come from `status.database.timing`, rendered once its
+  results are published and again when the timing grew (the destroy ends later).
 - `rescan` finds the SKUs of a vendor from the git tree (`data/<vendor>/*`): a SKU never published has to be
   passed with `skus`. A DBaaS run is recognised by `run.json` `database`.
 """
@@ -227,6 +229,7 @@ class Publisher:
         self._get_task = get_task
         self._lock = threading.Lock()  # one cycle at a time (run_forever, CLI, trigger)
         self._wake = threading.Event()
+        self._timing_rendered: dict[str, dict[str, str]] = {}  # DBaaS run name -> the timing files last published
 
     # ------------------------------------------------------------------ public
 
@@ -247,7 +250,9 @@ class Publisher:
             items = []
             for run in runs:
                 items.extend(self._items_of(run, settings))
-            return self._publish(items, settings)
+            result = self._publish(items, settings)
+            self._publish_dbaas_timing(runs, settings)
+            return result
 
     def rescan(self, since_days: int, skus: Iterable[str] = (), settings: Settings | None = None) -> PublishResult:
         """Disaster recovery (`publish --rescan --since 7d`): list recent date prefixes of the enabled
@@ -377,6 +382,66 @@ class Publisher:
             )
             for t in pending
         ]
+
+    def _publish_dbaas_timing(self, runs: list[BenchmarkRun], settings: Settings) -> None:
+        """`timing/<run_id>/*` of the DBaaS runs whose results are published. The destroy ends after the results are
+        published, so a run is rendered again when its timing grew (a run whose destroy never finishes has no destroy
+        files). Idempotent: a restarted controller renders each run once more and commits nothing new."""
+        todo = []
+        names = set()
+        for run in runs:
+            db = run.status.database
+            if not (run.spec.database and db and _all_published(run) and _publishable(settings, run)):
+                continue
+            names.add(run.name)
+            try:
+                for part in (*(run.spec.database[k] for k in ("vendor", "id", "engineVersion")), run.spec.run_id):
+                    _safe_part(str(part))
+                timings = self._dbaas_timings(run)
+            except Exception:
+                log.exception("cannot render the timing of %s, skipping", run.name)
+                continue
+            if timings and self._timing_rendered.get(run.name) != timings:
+                todo.append((run, timings))
+        self._timing_rendered = {n: t for n, t in self._timing_rendered.items() if n in names}
+        if not todo:
+            return
+        rendered = []
+        for attempt in range(1, MAX_PUSH_ATTEMPTS + 1):
+            self._sync(sorted({f"dbaas/{r.spec.database['vendor']}/{r.spec.database['id']}" for r, _ in todo}))
+            rendered = []
+            for run, timings in todo:
+                try:
+                    render.render_dbaas_timing(self._repo, run.spec.database, run.spec.run_id, timings)
+                    rendered.append((run, timings))
+                except Exception:
+                    log.exception("cannot render the timing of %s, skipping", run.name)
+            run_ids = ", ".join(r.spec.run_id for r, _ in rendered)
+            if self._commit([], f"k8s-inspector: DBaaS timing ({run_ids})") is None:
+                break
+            if self._push():
+                break
+            log.warning("push rejected (attempt %d), starting again from a fresh fetch", attempt)
+        else:
+            raise RuntimeError(f"push rejected {MAX_PUSH_ATTEMPTS} times")
+        for run, timings in rendered:
+            self._timing_rendered[run.name] = timings
+
+    @staticmethod
+    def _dbaas_timings(run: BenchmarkRun) -> dict[str, str]:
+        """The database's timing plus `inspector_start` (the first task start) and `inspector_end` (the last task
+        end). A run without `api_start` and `api_end` (an old run, or one from before the CRD kept `timing`) has
+        none."""
+        timing = dict(run.status.database.timing)
+        if "api_start" not in timing or "api_end" not in timing:
+            return {}
+        starts = [t.start for t in run.status.tasks if t.start]
+        if starts:
+            timing["inspector_start"] = min(starts)
+        ends = [t.end for t in run.status.tasks if t.end]
+        if ends:
+            timing["inspector_end"] = max(ends)
+        return {name: render.format_timing_utc(value) for name, value in timing.items()}
 
     def _items_in_bucket(self, settings: Settings, vendor: str, sku: str, day: date) -> list[_Item]:
         prefix = storage_keys.day_prefix(vendor, sku, day)
@@ -803,7 +868,7 @@ class Publisher:
                 dirs.add(f"dbaas/{_safe_part(db['vendor'])}/{_safe_part(db['id'])}")
         return sorted(dirs)
 
-    def _commit(self, rendered: list[tuple[_Loaded, int | None]]) -> str | None:
+    def _commit(self, rendered: list[tuple[_Loaded, int | None]], message: str | None = None) -> str | None:
         """Commit what was rendered (only below data/ and dbaas/); the new SHA, None without changes."""
         roots = [d for d in ("data", "dbaas") if (self._repo / d).exists()]
         if not roots:
@@ -812,7 +877,7 @@ class Publisher:
         if not self._git("status", "--porcelain").strip():
             return None
         run_ids = sorted({one.item.run.run_id for one, _ in rendered})
-        self._git("commit", "-m", f"k8s-inspector: publish {len(rendered)} results ({', '.join(run_ids)})")
+        self._git("commit", "-m", message or f"k8s-inspector: publish {len(rendered)} results ({', '.join(run_ids)})")
         return self._git("rev-parse", "HEAD").strip()
 
     def _push(self) -> bool:

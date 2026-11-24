@@ -92,13 +92,23 @@ def test_every_status_key_the_controller_writes_is_in_the_crd_schema():
         ],
         launch_failures=[LaunchFailure(node_claim="nc", message="m", time=NOW)],
         conditions=[{"type": "Published", "status": "True"}],
-        database=DbStatus(DbPhase.DESTROYING, NOW, NOW, error="e", destroy_failures=1, retry_after=NOW),
+        database=DbStatus(
+            DbPhase.DESTROYING, NOW, NOW, error="e", destroy_failures=1, retry_after=NOW, timing={"api_start": NOW}
+        ),
     )
     emitted = crd.status_to_dict(status)
     assert unknown_keys(emitted, schema()["status"], "status") == []
     assert emitted["tasks"][0].keys() >= {"errorMsg", "gpuFallback"}  # the sample really sets every optional key
     assert "node" in emitted["attempts"][0]
-    assert emitted["database"].keys() == {"phase", "since", "expires", "error", "destroyFailures", "retryAfter"}
+    assert emitted["database"].keys() == {
+        "phase",
+        "since",
+        "expires",
+        "error",
+        "destroyFailures",
+        "retryAfter",
+        "timing",
+    }
 
 
 def test_every_spec_key_the_controller_writes_is_in_the_crd_schema():

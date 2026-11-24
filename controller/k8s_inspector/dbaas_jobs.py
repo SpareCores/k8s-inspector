@@ -258,6 +258,12 @@ def job_state(job: dict) -> str:
     return "running"
 
 
+def job_completed_at(job: dict, default: datetime) -> datetime:
+    """When the Job completed (`status.completionTime`), else `default` (the time the controller noticed)."""
+    text = job.get("status", {}).get("completionTime")
+    return datetime.fromisoformat(text) if text else default
+
+
 def termination_message(pod: dict) -> dict:
     """The JSON in the termination message of the Pod's container (how Jobs and the bootstrap report); empty when there
     is none. A message that is not a JSON object counts as an error text."""

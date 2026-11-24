@@ -98,6 +98,10 @@ rules; every input is Keeper's data, nothing is a static table:
 - **Candidates** are the databases Keeper lists as ACTIVE for the vendor (`/databases`) and eligible for the task
   (`/inspector/databases/task_block_reason_codes`; fail closed). The PostgreSQL version is `dbaas.engineVersion` when the
   database offers it, else its newest.
+- **Timing** files go to `dbaas/<vendor>/<id>/postgres/<version>/standalone/timing/<run_id>/` (names in
+  [output-contract.md](../reference/output-contract.md)). The controller records them in `status.database.timing` as
+  the phases happen; the publisher writes them once the run's results are published, and again when the destroy
+  finishes (`api_destroy_start`, `api_destroy_end`).
 - **Due** is decided from `dbaas/<vendor>/<id>/postgres/<version>/standalone/<task>/meta.json` in git with the same
   function as for servers: a changed task hash, `-1` after 2 h, `-4` after 2 h and 6 h, `-5` after three failures in a
   row, never again for the other results. There is no schedule directory and no variant.

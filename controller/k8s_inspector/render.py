@@ -905,6 +905,8 @@ def render_dbaas_task(tree: Path, database: dict, inp: RenderInput) -> list[Path
     if meta["exit_code"] != ExitCode.OK and previous and previous.get("exit_code") == ExitCode.OK:
         return []  # a failure never replaces a good result (sc-crawler reads the stdout without the exit code)
     _apply_start_retries(meta, previous)
+    if meta["version"] is None:  # no version command runs against a managed database: the legacy wrote the image tag
+        meta["version"] = inp.task.image.rsplit(":", 1)[-1]
     stdout = inp.stdout if inp.stdout and meta["exit_code"] not in NOT_FINAL_CODES else b""
     meta["outputs"] = ["stdout"] if stdout else []
     meta["stdout_bytes"] = len(stdout) if stdout else None
@@ -939,6 +941,16 @@ def render_variant(
     fields = variants.parse_lscpu_stdout(lscpu_stdout)
     data = variants.build_variant_json(fields, source="observed", first_seen=first_seen, lscpu_version=lscpu_version)
     _write(path, json.dumps(data, indent=2) + "\n")
+
+
+def render_dbaas_timing(tree: Path, database: dict, run_id: str, timings: dict[str, str]) -> None:
+    """`dbaas/<vendor>/<id>/postgres/<engineVersion>/standalone/timing/<run_id>/<name>`: one ISO UTC line each."""
+    run_dir = (
+        tree / "dbaas" / database["vendor"] / database["id"] / "postgres" / str(database["engineVersion"])
+        / "standalone" / "timing" / run_id
+    )  # fmt: skip
+    for name, value in timings.items():
+        _write(run_dir / name, value + "\n")
 
 
 def render_timing(tree: Path, vendor: str, sku: str, variant: int, run: RunKey, timings: dict[str, str]) -> None:

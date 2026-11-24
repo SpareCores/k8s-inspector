@@ -448,7 +448,7 @@ def test_the_database_status_round_trips_and_the_deletion_timestamp_is_read():
     assert body["database"] == {
         "phase": "Destroying", "since": "2026-11-20T09:30:00Z", "expires": "2026-11-20T14:30:00Z",
         "error": "DBAAS_X: y",
-        "destroyFailures": 2, "retryAfter": "2026-11-20T09:33:00Z",
+        "destroyFailures": 2, "retryAfter": "2026-11-20T09:33:00Z", "timing": {},
     }  # fmt: skip
     manifest = crd.to_manifest(spec(), "inspector")
     manifest["metadata"].update(creationTimestamp="2026-11-20T09:30:00Z", deletionTimestamp="2026-11-20T10:00:00Z")
