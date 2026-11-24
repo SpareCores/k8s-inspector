@@ -18,6 +18,8 @@ from k8s_inspector.model import (
     BenchmarkRun,
     CapacityMode,
     CapacityType,
+    DbPhase,
+    DbStatus,
     LaunchFailure,
     RunKey,
     RunPhase,
@@ -33,6 +35,7 @@ KIND = "BenchmarkRun"
 LABEL_RUN = "inspector.sparecores.com/run"
 LABEL_VENDOR = "inspector.sparecores.com/vendor"
 ANNOTATION_CANCEL = "inspector.sparecores.com/cancel"
+FINALIZER_DBAAS = "inspector.sparecores.com/dbaas"  # on a DBaaS run until its database is destroyed
 
 MAX_NAME_LENGTH = 63  # DNS-1123 label, also the limit for label values and Pod name prefixes
 UPDATE_ATTEMPTS = 5
@@ -126,16 +129,14 @@ def to_manifest(spec: RunSpec, namespace: str) -> dict:
     }
     if spec.database is not None:
         spec_dict["database"] = spec.database
-    return {
-        "apiVersion": API_VERSION,
-        "kind": KIND,
-        "metadata": {
-            "name": name,
-            "namespace": namespace,
-            "labels": {LABEL_VENDOR: spec.vendor, LABEL_RUN: name},
-        },
-        "spec": spec_dict,
+    metadata = {
+        "name": name,
+        "namespace": namespace,
+        "labels": {LABEL_VENDOR: spec.vendor, LABEL_RUN: name},
     }
+    if spec.database is not None:
+        metadata["finalizers"] = [FINALIZER_DBAAS]
+    return {"apiVersion": API_VERSION, "kind": KIND, "metadata": metadata, "spec": spec_dict}
 
 
 def _task_from_dict(d: dict) -> TaskStatus:
@@ -166,6 +167,32 @@ def _attempt_from_dict(d: dict) -> AttemptStatus:
     )
 
 
+def _database_from_dict(d: dict | None) -> DbStatus | None:
+    if not d:
+        return None
+    return DbStatus(
+        phase=DbPhase(d["phase"]),
+        since=_parse_time(d["since"]),
+        expires=_parse_time(d["expires"]),
+        error=d.get("error"),
+        destroy_failures=d.get("destroyFailures", 0),
+        retry_after=_parse_time(d.get("retryAfter")),
+    )
+
+
+def _database_to_dict(db: DbStatus | None) -> dict | None:
+    if db is None:
+        return None
+    return {
+        "phase": db.phase.value,
+        "since": _format_time(db.since),
+        "expires": _format_time(db.expires),
+        "error": db.error,
+        "destroyFailures": db.destroy_failures,
+        "retryAfter": _format_time(db.retry_after),
+    }
+
+
 def _status_from_dict(d: dict) -> RunStatus:
     capacity_type = d.get("capacityType")
     return RunStatus(
@@ -193,6 +220,7 @@ def _status_from_dict(d: dict) -> RunStatus:
         ],
         spot_reclaims=d.get("spotReclaims", 0),
         conditions=list(d.get("conditions") or []),
+        database=_database_from_dict(d.get("database")),
     )
 
 
@@ -218,6 +246,7 @@ def from_dict(obj: dict) -> BenchmarkRun:
         ),
         status=_status_from_dict(obj.get("status") or {}),
         cancel_requested=(meta.get("annotations") or {}).get(ANNOTATION_CANCEL) == "true",
+        deleting=bool(meta.get("deletionTimestamp")),
     )
 
 
@@ -284,6 +313,7 @@ def status_to_dict(status: RunStatus) -> dict:
         ],
         "spotReclaims": status.spot_reclaims,
         "conditions": status.conditions,
+        "database": _database_to_dict(status.database),
     }
 
 
@@ -339,6 +369,12 @@ def request_cancel(kube: Kube, name: str) -> None:
     """Ask the serve runner to cancel the run (annotation). The runner does the cancelling, so a CLI and the
     runner never race on the same run. Raise `kube.NotFound`."""
     kube.merge_patch("benchmarkrun", name, {"metadata": {"annotations": {ANNOTATION_CANCEL: "true"}}})
+
+
+def remove_finalizer(kube: Kube, name: str) -> None:
+    """The database is destroyed (or never was created): let the API server delete the run. A merge patch replaces
+    the whole list; the DBaaS finalizer is the only one the controller puts there."""
+    kube.merge_patch("benchmarkrun", name, {"metadata": {"finalizers": None}})
 
 
 def delete_run(kube: Kube, name: str) -> None:

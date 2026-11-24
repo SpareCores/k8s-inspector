@@ -170,6 +170,8 @@ tasks:
     workload_proxy: read_heavy
     dbaas: true
     durability: durable
+    # The bootstrap's PostgreSQL settings (docs/explanation/dbaas.md); the publisher merges them into stdout. Not hashed.
+    collect: ["/k8si/dbaas/postgres.json:postgres.json"]
 
   # The "SCore" benchmark: all stress-ng `--cpu-method`s were compared on a few instances (x86_64 and ARM, with and
   # without HyperThreading) and `div16` scaled best.

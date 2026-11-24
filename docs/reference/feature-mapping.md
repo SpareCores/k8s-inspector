@@ -71,5 +71,9 @@ Legend: **P** planner, **R** run loop, **C** classification, **Pub** publisher, 
 |---|---|
 | `start-dbaas`: one Pulumi stack = managed DB + private network + client VM | Job running Pulumi for the DB only; networks pre-created; the client is a bench node ([DBaaS](../explanation/dbaas.md)) |
 | `cleanup-dbaas`, absolute timeout cleanup | controller `down` on every path + stack sweep + alert |
+| `rank_dbaas_client_instances` (cheapest small x86_64 client after a Tukey fence) | `dbaas_client.rank` over Keeper's server data, in the database's region |
+| `wait_db_ready`, role and database setup, durability, `pg_repro` | the bootstrap Pod on the client node, `postgres.json` merged into the published stdout |
+| `db_storage_plan`, `disk_profiles` | `k8s_inspector_dbaas.storage_plan`, called by the vendor modules; the per-vendor numbers and snapping are the modules' |
+| `available_managed_dbs` over sc-data SQLite | Keeper's `/databases`, `/database/<vendor>/<id>/prices` and `/regions`, with the DBaaS planner |
 | retry any failure every 2 h forever | normal backoff with the cap of three |
 | Azure pre-flight quota check: vCPUs per quota family for the Flexible Server SKU and the client VM | provisioner Job (Flexible Server, quota family from the ARM Resource SKUs API, [DBaaS](../explanation/dbaas.md#quota-pre-flight)); the client VM's quota is SCarpenter's (`QUOTA` / `QUOTA_ZERO`, [exit codes](exit-codes.md)) |

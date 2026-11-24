@@ -1,5 +1,5 @@
 # Static sc-run binaries for the benchmark nodes.
-.PHONY: test build clean
+.PHONY: test build clean dbaas-test dbaas-image
 LDFLAGS := -s -w
 
 test:
@@ -13,3 +13,9 @@ build:
 
 clean:
 	rm -rf dist
+
+dbaas-test:
+	cd dbaas && uv run ruff check . && uv run pytest
+
+dbaas-image:
+	docker build -t ghcr.io/sparecores/k8s-inspector-dbaas:dev dbaas

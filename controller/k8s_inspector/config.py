@@ -17,6 +17,8 @@ from k8s_inspector.kube import Kube, NotFound
 from k8s_inspector.model import (
     CapacityMode,
     Config,
+    DbaasSettings,
+    DbaasVendor,
     Deadlines,
     Defaults,
     EnvConfig,
@@ -62,6 +64,7 @@ def load_env(environ: Mapping[str, str]) -> EnvConfig:
         sc_run_image=optional("K8SI_SC_RUN_IMAGE") or "",
         s3_endpoint_url=optional("K8SI_S3_ENDPOINT_URL"),
         key_prefix=optional("K8SI_KEY_PREFIX") or "",
+        dbaas_image=optional("K8SI_DBAAS_IMAGE") or "",
     )
 
 
@@ -108,6 +111,13 @@ def _capacity(value: Any, path: str) -> CapacityMode:
         return CapacityMode(value)
     except ValueError:
         raise _fail(path, " or ".join(m.value for m in CapacityMode), value) from None
+
+
+def _version(value: Any, path: str) -> str:
+    """A PostgreSQL major version; YAML reads `18` as a number."""
+    if isinstance(value, bool) or not isinstance(value, int | float | str) or not str(value).strip():
+        raise _fail(path, 'a PostgreSQL major version such as "18"', value)
+    return str(value).strip()
 
 
 def _publish(value: Any, path: str) -> bool | tuple[str, ...]:
@@ -164,6 +174,12 @@ _VENDOR = {
     "maxUsdPerHour": ("max_usd_per_hour", _optional(_nonneg_float)),
     "capacity": ("capacity", _capacity),
     "publish": ("publish", _publish),
+    "dbaasAutoPlan": ("dbaas_auto_plan", _bool),
+}
+_DBAAS = {
+    "engineVersion": ("engine_version", _version),
+    "createMinutes": ("create_minutes", _pos_int),
+    "sweepAfterHours": ("sweep_after_hours", _pos_int),
 }
 
 
@@ -192,6 +208,29 @@ def _vendor(value: Any, path: str) -> VendorSettings:
     return VendorSettings(**_read(_mapping(value, path), path, _VENDOR))
 
 
+def _dbaas_vendor(value: Any, path: str) -> DbaasVendor:
+    section = dict(_mapping(value, path))
+    networks = {}
+    for region, network in _mapping(section.pop("networks", None), f"{path}.networks").items():
+        networks[str(region)] = dict(_mapping(network, f"{path}.networks.{region}"))
+    service_account = section.pop("serviceAccount", None)
+    for key in section:
+        log.warning("unknown config key %s.%s (ignored)", path, key)
+    return DbaasVendor(
+        networks=networks,
+        service_account=None if service_account is None else _str(service_account, f"{path}.serviceAccount"),
+    )
+
+
+def _dbaas(value: Any, path: str) -> DbaasSettings:
+    section = dict(_mapping(value, path))
+    vendors = _mapping(section.pop("vendors", None), f"{path}.vendors")
+    return DbaasSettings(
+        **_read(section, path, _DBAAS),
+        vendors={str(v): _dbaas_vendor(c, f"{path}.vendors.{v}") for v, c in vendors.items()},
+    )
+
+
 def parse_settings(data: Mapping) -> Settings:
     """Convert the parsed ConfigMap YAML (a dict, possibly empty) into `Settings`. Unknown keys are logged
     as warnings; invalid values raise `ValueError`."""
@@ -203,6 +242,7 @@ def parse_settings(data: Mapping) -> Settings:
     vendors = _mapping(sections.pop("vendors", None), "vendors")
     bench_pool = _str(sections.pop("benchPool", "bench"), "benchPool")
     bench_class = _str(sections.pop("benchClass", "bench"), "benchClass")
+    dbaas = _dbaas(sections.pop("dbaas", None), "dbaas")
     for key in sections:
         log.warning("unknown config key %s (ignored)", key)
 
@@ -216,6 +256,7 @@ def parse_settings(data: Mapping) -> Settings:
         deadlines=Deadlines(**_read(sub["deadlines"], "deadlines", _DEADLINES)),
         publish=PublishSettings(**_read(sub["publish"], "publish", _PUBLISH)),
         uploads=UploadSettings(**_read(sub["uploads"], "uploads", _UPLOADS)),
+        dbaas=dbaas,
     )
 
 

@@ -118,9 +118,17 @@ class FakeKube:
         return copy.deepcopy(obj)
 
     def delete(self, kind: str, name: str, grace_seconds: int | None = None) -> None:
-        obj = self._store(kind).pop(name, None)
+        obj = self._store(kind).get(name)
         if obj is None:
             return
+        if obj["metadata"].get("finalizers"):  # like the API server: the object stays until the finalizers are gone
+            obj["metadata"]["deletionTimestamp"] = iso(self.clock.now)
+            self._bump(obj)
+            return
+        self._remove(kind, name, grace_seconds)
+
+    def _remove(self, kind: str, name: str, grace_seconds: int | None = None) -> None:
+        self._store(kind).pop(name, None)
         if grace_seconds == 0:
             self.force_deleted.append(name)
         self.deleted.append((kind, name))
@@ -140,7 +148,11 @@ class FakeKube:
             raise Conflict(name)
         _merge(obj, patch)
         self._bump(obj)
-        return copy.deepcopy(obj)
+        result = copy.deepcopy(obj)
+        released = "finalizers" in (patch.get("metadata") or {}) and not obj["metadata"].get("finalizers")
+        if released and obj["metadata"].get("deletionTimestamp"):  # the last finalizer went: the object goes
+            self._remove(kind, name)
+        return result
 
     def apply_secret(self, manifest: dict) -> None:
         secret = copy.deepcopy(manifest)
@@ -193,6 +205,7 @@ class FakeStorage(Storage):
         self.cleared: list[str] = []  # keys passed to clear_task, in order
         self.signed = 0
         self.crash_after_status_json = False  # the process dies right after the next status.json
+        self.modified: dict[str, datetime] = {}  # last-modified time of `objects` keys, for `list_objects`
 
     def plan_uploads(self, run, containers):
         plans = []
@@ -245,6 +258,17 @@ class FakeStorage(Storage):
             self.crash_after_status_json = False
             raise RuntimeError("controller crashed")
 
+    def list_objects(self, prefix):
+        return [
+            (k, self.modified.get(k, datetime(2026, 1, 1, tzinfo=UTC)))
+            for k in sorted(self.objects)
+            if k.startswith(prefix)
+        ]
+
+    def delete_objects(self, keys):
+        for key in keys:
+            self.objects.pop(key, None)
+
     def write_run_json(self, run, doc):
         self.run_json = json.loads(json.dumps(doc))
         self.objects[run_json_key(run)] = json.dumps(doc).encode()
@@ -270,6 +294,10 @@ class Cluster:
         self.nodes = 0
         self.claim_conditions: list[dict] | None = None  # override: claim with these conditions, no node
         self.provision_enabled = True
+        # DBaaS: what the next Jobs `up` / `down` and the bootstrap Pod do, in order (default "ok"):
+        # "ok", "fail" or "hang"
+        self.jobs: dict[str, list[str]] = {"up": [], "down": [], "boot": []}
+        self.db_outputs = {"host": "10.0.0.5", "port": 5432, "admin_user": "scadmin", "admin_db": "postgres"}
 
     def node_name(self, anchor: dict) -> str:
         return f"node-{anchor['metadata']['name']}"
@@ -432,9 +460,69 @@ class Cluster:
         self.kube.set_status("pod", pod["metadata"]["name"], {"phase": "Succeeded", "containerStatuses": statuses})
         return True
 
+    def finish_job(self, name: str, outcome: str) -> None:
+        """The Pod of Job `name` ends: "ok" (Complete; an `up` reports the connection facts in its termination
+        message), "fail"
+        (Failed, an error message) or "hang" (the Pod keeps running)."""
+        job = self.kube.get("job", name)
+        kind = job["metadata"]["labels"]["inspector.sparecores.com/dbaas"]
+        pod_name = f"{name}-pod"
+        message = json.dumps(self.db_outputs if kind == "up" else {"destroyed": True})
+        phase = {"ok": "Succeeded", "fail": "Failed", "hang": "Running"}[outcome]
+        if outcome == "fail":
+            message = json.dumps({"error": "quota exceeded"})
+        status = {"phase": phase, "containerStatuses": [{"name": "provisioner", "state": {"running": {}}}]}
+        if outcome != "hang":
+            status["containerStatuses"] = [
+                {
+                    "name": "provisioner",
+                    "state": {"terminated": {"exitCode": 0 if outcome == "ok" else 1, "message": message}},
+                }
+            ]
+        if pod_name not in self.kube.objects.get("pod", {}):
+            labels = {"inspector.sparecores.com/dbaas-job": name, "inspector.sparecores.com/role": "dbaas"}
+            owner = [{"kind": "Job", "name": name}]  # the Job's Pods go with it (background deletion)
+            metadata = {"name": pod_name, "labels": labels, "ownerReferences": owner}
+            self.kube.create("pod", {"metadata": metadata, "spec": {}, "status": status})
+        else:
+            self.kube.set_status("pod", pod_name, status)
+        if outcome != "hang":
+            condition = {"type": "Complete" if outcome == "ok" else "Failed", "status": "True"}
+            self.kube.set_status("job", name, {"conditions": [condition]})
+        else:
+            self.kube.set_status("job", name, {"active": 1})
+
+    def react_dbaas(self) -> bool:
+        """Jobs and the bootstrap Pod that have not run yet."""
+        changed = False
+        for job in self.kube.list("job"):
+            if "status" in job:
+                continue
+            kind = job["metadata"]["labels"]["inspector.sparecores.com/dbaas"]
+            script = self.jobs[kind]
+            self.finish_job(job["metadata"]["name"], script.pop(0) if script else "ok")
+            changed = True
+        for pod in self.kube.list("pod"):
+            name = pod["metadata"]["name"]
+            if name.endswith("-dbaas-boot") and not pod["status"].get("containerStatuses"):
+                script = self.jobs["boot"]
+                outcome = script.pop(0) if script else "ok"
+                if outcome == "hang":
+                    continue
+                message = json.dumps(
+                    {"sync_commit_session_settable": True} if outcome == "ok" else {"error": "no route"}
+                )
+                state = {"terminated": {"exitCode": 0 if outcome == "ok" else 1, "message": message}}
+                phase = "Succeeded" if outcome == "ok" else "Failed"
+                self.kube.set_status(
+                    "pod", name, {"phase": phase, "containerStatuses": [{"name": "bootstrap", "state": state}]}
+                )
+                changed = True
+        return changed
+
     def react(self) -> bool:
         """One round of cluster activity; True when something changed."""
-        changed = False
+        changed = self.react_dbaas()
         for pod in self.kube.list("pod"):
             meta = pod["metadata"]
             role = meta["labels"]["inspector.sparecores.com/role"]

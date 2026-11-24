@@ -19,11 +19,28 @@ The Deployment expects objects that the cluster platform provides (listed at the
   controller reads it through the API every ~30 s, so a change applies without a restart; the Deployment does not
   mount or hash it. Without it the defaults apply and no vendor is enabled.
 
+## DBaaS
+
+Managed-database benchmarks need, besides the controller, what the cluster platform provides (see
+[add a DBaaS vendor](../docs/how-to/add-dbaas-vendor.md#what-the-platform-provides)); nothing here is needed while
+`dbaas.vendors` is empty in the settings:
+
+- the image `ghcr.io/sparecores/k8s-inspector-dbaas`, pinned in `K8SI_DBAAS_IMAGE` (the Deployment has a placeholder);
+- the ServiceAccount `k8s-inspector-dbaas` of the provisioner Jobs (`controller/dbaas-serviceaccount.yaml`, shipped here,
+  no Role: the Jobs do not call the Kubernetes API);
+- the controller's Role also allows `jobs` (create, get, list, watch, delete) for them;
+- platform: Secret `k8s-inspector-dbaas-state` (key `passphrase`), Secrets `k8s-inspector-dbaas-<vendor>` with the
+  vendors' cloud credentials, `dbaas.vendors.<vendor>.networks.<region>` in the settings ConfigMap, and the bucket role's
+  access to `dbaas-state/` (read, write, list, delete). The Jobs use the controller's role: their ServiceAccount token is
+  projected with the audience `sts.amazonaws.com`, so the role's trust policy must accept the ServiceAccount
+  `k8s-inspector-dbaas` (and any vendor ServiceAccount) as well as `k8s-inspector`.
+
 ## Pin the images
 
-The base references both images by a placeholder digest (`@sha256:000...0`): it cannot pull, so an unpinned install
+The base references the images by a placeholder digest (`@sha256:000...0`): it cannot pull, so an unpinned install
 fails loudly instead of running `:main`. Pin real digests in the overlay of your cluster. CI pushes
-`ghcr.io/sparecores/k8s-inspector` and `ghcr.io/sparecores/k8s-inspector-sc-run` (multi-arch indexes) tagged `main` and
+`ghcr.io/sparecores/k8s-inspector`, `ghcr.io/sparecores/k8s-inspector-sc-run` and
+`ghcr.io/sparecores/k8s-inspector-dbaas` (multi-arch indexes) tagged `main` and
 the commit SHA; get a digest with
 `docker buildx imagetools inspect ghcr.io/sparecores/k8s-inspector:<sha> --format '{{.Manifest.Digest}}'`.
 
@@ -41,7 +58,7 @@ patches:
       value: ghcr.io/sparecores/k8s-inspector-sc-run@sha256:<sc-run digest>
 ```
 
-The `sc-run` image is an environment variable, not a container image, so the `images:` transformer does not reach it.
+The `sc-run` and DBaaS images are environment variables, not container images, so the `images:` transformer does not reach them (patch `K8SI_DBAAS_IMAGE` the same way).
 
 ## Priority and quota
 

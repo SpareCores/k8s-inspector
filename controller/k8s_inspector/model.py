@@ -44,6 +44,16 @@ class RunPhase(StrEnum):
     CANCELLED = "Cancelled"
 
 
+class DbPhase(StrEnum):
+    """`status.database.phase`: where the managed database of a DBaaS run is. Absent: nothing was created yet."""
+
+    CREATING = "Creating"  # the Job `dbaas-up-<run>` is (about to be) running
+    BOOTSTRAPPING = "Bootstrapping"  # the database exists; the bootstrap Pod prepares it on the client node
+    READY = "Ready"  # the benchmark may run
+    DESTROYING = "Destroying"  # the Job `dbaas-down-<run>` runs until it succeeds
+    DESTROYED = "Destroyed"  # the stack is destroyed and its state removed; the finalizer is gone
+
+
 class TaskState(StrEnum):
     """`status.tasks[].state`. A failed task is `DONE` with a non-zero `exit_code`."""
 
@@ -202,7 +212,7 @@ class RunSpec:
     force: bool = False
     capacity: CapacityMode = CapacityMode.SPOT_FIRST
     hold_after: timedelta = timedelta(0)
-    database: dict | None = None  # DBaaS: {vendor, id, engineVersion}
+    database: dict | None = None  # DBaaS: {vendor, id, engineVersion, region}
 
 
 @dataclass
@@ -256,6 +266,19 @@ class UninitializedClaim:
 
 
 @dataclass
+class DbStatus:
+    """`status.database` of a DBaaS run. The controller writes the phase before it creates what the phase stands for,
+    so a restarted controller knows there may be a database to destroy."""
+
+    phase: DbPhase
+    since: datetime  # the phase began
+    expires: datetime  # the database is a leak after this (tagged on it, alerted on)
+    error: str | None = None  # why the database was not created or not usable
+    destroy_failures: int = 0  # failed `dbaas-down-<run>` Jobs so far
+    retry_after: datetime | None = None  # the next destroy Job is created at this time
+
+
+@dataclass
 class RunStatus:
     phase: RunPhase = RunPhase.PENDING
     progress: str = "0/0"
@@ -277,6 +300,7 @@ class RunStatus:
     uninitialized_claims: list[UninitializedClaim] = field(default_factory=list)  # of the current attempt
     spot_reclaims: int = 0  # spot claims of the current attempt reclaimed or gone before they were Initialized
     conditions: list[dict] = field(default_factory=list)
+    database: DbStatus | None = None  # DBaaS runs
 
 
 @dataclass
@@ -291,6 +315,9 @@ class BenchmarkRun:
     spec: RunSpec
     status: RunStatus = field(default_factory=RunStatus)
     cancel_requested: bool = False  # annotation `inspector.sparecores.com/cancel: "true"` (crd.request_cancel)
+    deleting: bool = (
+        False  # `metadata.deletionTimestamp` is set: the DBaaS finalizer keeps the object until `down` succeeded
+    )
 
 
 # --------------------------------------------------------------------------- node, outcomes
@@ -426,6 +453,9 @@ class EnvConfig:
     sc_run_image: str = ""  # K8SI_SC_RUN_IMAGE: "ghcr.io/sparecores/sc-run@sha256:..." (not in configuration.md)
     s3_endpoint_url: str | None = None  # K8SI_S3_ENDPOINT_URL: S3-compatible endpoint (OCI), optional
     key_prefix: str = ""  # K8SI_KEY_PREFIX: prepended to every object key (e.g. "k8s-inspector/spikes/"), optional
+    dbaas_image: str = (
+        ""  # K8SI_DBAAS_IMAGE: "ghcr.io/sparecores/k8s-inspector-dbaas@sha256:...", only DBaaS runs need it
+    )
 
 
 @dataclass(frozen=True)
@@ -436,6 +466,7 @@ class VendorSettings:
     max_usd_per_hour: float | None = None
     capacity: CapacityMode = CapacityMode.SPOT_FIRST  # same default as `RunSpec` and `crd.from_dict`
     publish: bool | tuple[str, ...] = False  # True: every SKU; a tuple: only these SKUs; False: none
+    dbaas_auto_plan: bool = False  # autoPlan also creates DBaaS runs for this vendor
 
 
 @dataclass(frozen=True)
@@ -485,6 +516,22 @@ class UploadSettings:
 
 
 @dataclass(frozen=True)
+class DbaasVendor:
+    """`dbaas.vendors.<vendor>`: infrastructure the cluster platform provides for that vendor's databases."""
+
+    networks: dict[str, dict] = field(default_factory=dict)  # region -> opaque network references for the vendor module
+    service_account: str | None = None  # ServiceAccount of the Jobs (workload identity); None: the default one
+
+
+@dataclass(frozen=True)
+class DbaasSettings:
+    engine_version: str = "18"  # PostgreSQL major version to benchmark, when the database offers it (else the newest)
+    create_minutes: int = 60  # the database must be created within this time
+    sweep_after_hours: int = 6  # a stack without a live run this old is destroyed
+    vendors: dict[str, DbaasVendor] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
 class Settings:
     """ConfigMap `k8s-inspector`, re-read every planning cycle."""
 
@@ -498,6 +545,7 @@ class Settings:
     deadlines: Deadlines = field(default_factory=Deadlines)
     publish: PublishSettings = field(default_factory=PublishSettings)
     uploads: UploadSettings = field(default_factory=UploadSettings)
+    dbaas: DbaasSettings = field(default_factory=DbaasSettings)
     from_configmap: bool = False  # False: the ConfigMap is missing or empty and these are the defaults
 
 

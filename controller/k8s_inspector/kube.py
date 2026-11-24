@@ -18,13 +18,13 @@ from dataclasses import dataclass
 import httpx2
 import lightkube
 from lightkube import ALL_NS, ApiError
-from lightkube.core.client import PatchType
+from lightkube.core.client import CascadeType, PatchType
 from lightkube.generic_resource import create_global_resource, create_namespaced_resource
-from lightkube.resources import core_v1
+from lightkube.resources import batch_v1, core_v1
 
 log = logging.getLogger(__name__)
 
-KINDS = ("pod", "secret", "configmap", "node", "nodeclaim", "event", "benchmarkrun")
+KINDS = ("pod", "secret", "configmap", "job", "node", "nodeclaim", "event", "benchmarkrun")
 
 # Must match deploy/crd/benchmarkruns.yaml.
 CRD_GROUP = "inspector.sparecores.com"
@@ -39,6 +39,7 @@ _RESOURCES = {
     "pod": (core_v1.Pod, True),
     "secret": (core_v1.Secret, True),
     "configmap": (core_v1.ConfigMap, True),
+    "job": (batch_v1.Job, True),
     "event": (core_v1.Event, True),
     "node": (core_v1.Node, False),
     "nodeclaim": (NodeClaimResource, False),
@@ -226,10 +227,11 @@ class Kube:
             raise _translate(e) from e
 
     def delete(self, kind: str, name: str, grace_seconds: int | None = None) -> None:
-        """Ignore `NotFound`."""
+        """Ignore `NotFound`. A Job is deleted in the background, so its Pods go too (the API default orphans them)."""
         resource, ns = self._target(kind)
+        cascade = CascadeType.BACKGROUND if kind == "job" else None
         try:
-            self._client.delete(resource, name, grace_period=grace_seconds, **ns)
+            self._client.delete(resource, name, grace_period=grace_seconds, cascade=cascade, **ns)
         except ApiError as e:
             if e.status.code != 404:
                 raise _translate(e) from e

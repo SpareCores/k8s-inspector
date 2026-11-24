@@ -12,7 +12,9 @@ on: no lscpu result), `_last_publish_timestamp_seconds`
 `_spend_usd_per_hour`, `_task_duration_seconds` (summary sum/count), `_launch_failures_total{vendor,reason}`
 (runs that ended because no node could be launched, counted by the runner), `_launch_deferred_skus{vendor,reason}`
 and `_launch_blocked{vendor,reason}` (SKUs in the launch ConfigMap, and those of them still waiting for their
-retry). Not yet: `_dbaas_instances` (P4).
+retry). `_dbaas_instances{vendor}` and `_dbaas_oldest_age_seconds{vendor}`: the managed databases (stacks) that exist,
+from the DBaaS
+runs not yet destroyed and the leaked stacks the sweeper sees; alert when the oldest is over 8 h.
 `/healthz` answers 200 as long as the process serves.
 """
 
@@ -26,7 +28,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from k8s_inspector import crd, launch
 from k8s_inspector.kube import Kube
-from k8s_inspector.model import AttemptOutcome, ExitCode, RunPhase, Settings, TaskState
+from k8s_inspector.model import AttemptOutcome, DbPhase, ExitCode, RunPhase, Settings, TaskState
 from k8s_inspector.planner import ACTIVE_PHASES, spend_per_hour
 from k8s_inspector.publisher import publish_allowed
 
@@ -90,6 +92,14 @@ class Metrics:
         self._gauges: list[str] = []  # last good snapshot, served when the API server is unreachable
         self._last_publish = time.time()  # process start until the first cycle: a stuck publisher still ages
         self._counters["unpublishable_tasks_total"][()] = 0
+        self._orphans: list[tuple[str, float]] = []  # (vendor, age in seconds) of the stacks without a run
+
+    def record_dbaas_stacks(self, stacks) -> None:
+        """The stacks the sweeper saw (`dbaas_sweep.Stack`); those without a BenchmarkRun are counted here, the others
+        come from their runs."""
+        now = self._clock()
+        with self._lock:
+            self._orphans = [(s.vendor, (now - s.modified).total_seconds()) for s in stacks if s.orphan]
 
     def record_publish(self) -> None:
         """A publish cycle finished without error."""
@@ -133,11 +143,14 @@ class Metrics:
         }
         spend: dict[str, float] = defaultdict(float)
         node_age: dict[Labels, float] = {}
+        databases: dict[str, list[float]] = defaultdict(list)  # vendor -> ages of its existing databases
         backlog = 0
         oldest_unpublished: datetime | None = None
 
         for run in runs:
             vendor = run.spec.vendor
+            if run.status.database and run.status.database.phase != DbPhase.DESTROYED:
+                databases[vendor].append((now - run.created).total_seconds())
             for phase in RunPhase:
                 phases.setdefault((vendor, phase.value), 0)
             phases[(vendor, run.status.phase.value)] += 1
@@ -163,7 +176,13 @@ class Metrics:
             for task in run.status.tasks:
                 if task.state != TaskState.DONE:
                     continue
-                if not task.published and publish_allowed(settings, vendor, run.spec.sku):
+                database = run.spec.database
+                allowed = (
+                    publish_allowed(settings, database["vendor"], database["id"])
+                    if database
+                    else publish_allowed(settings, vendor, run.spec.sku)
+                )
+                if not task.published and allowed:
                     backlog += 1
                     if task.end and (oldest_unpublished is None or task.end < oldest_unpublished):
                         oldest_unpublished = task.end
@@ -195,6 +214,17 @@ class Metrics:
         ]
         lines.append(f"# TYPE {PREFIX}node_age_seconds gauge")
         lines += [_line("node_age_seconds", labels, age) for labels, age in sorted(node_age.items())]
+        for vendor, age in self._orphans:
+            databases[vendor].append(age)
+        for vendor in settings.vendors:
+            databases.setdefault(vendor, [])  # a vendor without databases reports 0, not nothing
+        lines.append(f"# TYPE {PREFIX}dbaas_instances gauge")
+        lines += [_line("dbaas_instances", _labels(vendor=v), len(ages)) for v, ages in sorted(databases.items())]
+        lines.append(f"# TYPE {PREFIX}dbaas_oldest_age_seconds gauge")
+        lines += [
+            _line("dbaas_oldest_age_seconds", _labels(vendor=v), max(ages, default=0))
+            for v, ages in sorted(databases.items())
+        ]
         lines.append(f"# TYPE {PREFIX}publish_backlog gauge")
         lines.append(_line("publish_backlog", (), backlog))
         lines.append(f"# TYPE {PREFIX}publish_lag_seconds gauge")

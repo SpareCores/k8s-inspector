@@ -45,9 +45,11 @@ Transient API errors (429, 5xx, connection errors, timeouts, a 404 on the `Bench
 | `k8s_inspector_publish_lag_seconds` | (age of the oldest done, unpublished task; 0 when none) |
 | `k8s_inspector_last_publish_timestamp_seconds` | (last publish cycle without error; the process start until the first one) |
 | `k8s_inspector_spend_usd_per_hour` | vendor (sum of running node prices) |
+| `k8s_inspector_dbaas_instances` | vendor: managed databases that exist: DBaaS runs whose database is not yet destroyed, plus leaked stacks the sweeper sees (0 for a vendor without any) |
+| `k8s_inspector_dbaas_oldest_age_seconds` | vendor: age of the oldest of them (the run's age; a leaked stack's age since its last state change) |
 | `k8s_inspector_task_duration_seconds_sum`, `_count` | vendor, task |
 
-`k8s_inspector_dbaas_instances` (vendor, age bucket) arrives with the DBaaS phase. The `*_total` and `_sum`/`_count`
+The `*_total` and `_sum`/`_count`
 series count what the current process has seen and restart from zero with it.
 
 Logs are structured JSON lines with `run`, `vendor`, `sku`, `task` fields.
@@ -57,6 +59,7 @@ Logs are structured JSON lines with `run`, `vendor`, `sku`, `task` fields.
 | Alert | Condition | Independent of the controller? |
 |---|---|---|
 | **Bench node running too long** | a node in a bench pool older than its run's expected duration + 2 h, or older than 50 h regardless (past `expireAfter` plus grace) (from kube-state-metrics node creation time and pool label) | yes |
+| **DBaaS database running too long** | `k8s_inspector_dbaas_oldest_age_seconds` above 8 h (the run's databases are tagged with run id and expiry: look for `sc_inspector_run` in the cloud console when the metric is missing or the controller is down) | no: also alert on the metric being absent |
 | Bench NodeClaim without a run | NodeClaim in a bench pool with no anchor for 30 min | yes |
 | Controller down | no `/metrics` scrape for 10 min | yes |
 | Publish stalled | backlog > 0 and no successful publish for 1 h | no |

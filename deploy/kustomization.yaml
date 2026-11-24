@@ -3,6 +3,7 @@ kind: Kustomization
 resources:
 - crd/benchmarkruns.yaml
 - controller/serviceaccount.yaml
+- controller/dbaas-serviceaccount.yaml
 - controller/rbac.yaml
 - controller/deployment.yaml
 - controller/priorityclass.yaml

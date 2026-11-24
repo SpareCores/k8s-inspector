@@ -207,3 +207,60 @@ def test_max_in_flight_global_default_and_vendor_override():
     assert settings.defaults.max_in_flight == 4
     assert settings.vendors["aws"].max_in_flight is None  # falls back to defaults.maxInFlight
     assert settings.vendors["oci"].max_in_flight == 0  # pauses the vendor
+
+
+# --------------------------------------------------------------------------- DBaaS
+
+
+def test_dbaas_settings_and_the_vendor_flag():
+    parsed = parse_settings(
+        {
+            "vendors": {"gcp": {"enabled": True, "dbaasAutoPlan": True}, "aws": {"enabled": True}},
+            "dbaas": {
+                "engineVersion": 17,  # YAML reads a bare 17 as a number
+                "createMinutes": 45,
+                "sweepAfterHours": 4,
+                "vendors": {
+                    "gcp": {"serviceAccount": "gcp-dbaas", "networks": {"europe-west4": {"network": "projects/x/y"}}},
+                    "aws": None,
+                },
+            },
+        }
+    )
+    assert parsed.vendors["gcp"].dbaas_auto_plan is True and parsed.vendors["aws"].dbaas_auto_plan is False
+    assert (parsed.dbaas.engine_version, parsed.dbaas.create_minutes, parsed.dbaas.sweep_after_hours) == ("17", 45, 4)
+    gcp = parsed.dbaas.vendors["gcp"]
+    assert gcp.service_account == "gcp-dbaas" and gcp.networks == {"europe-west4": {"network": "projects/x/y"}}
+    assert parsed.dbaas.vendors["aws"].networks == {} and parsed.dbaas.vendors["aws"].service_account is None
+
+
+def test_dbaas_defaults_are_off():
+    parsed = parse_settings({})
+    assert (parsed.dbaas.engine_version, parsed.dbaas.create_minutes, parsed.dbaas.sweep_after_hours) == ("18", 60, 6)
+    assert parsed.dbaas.vendors == {} and VendorSettings().dbaas_auto_plan is False
+
+
+@pytest.mark.parametrize(
+    "data",
+    [
+        {"dbaas": {"createMinutes": 0}},
+        {"dbaas": {"engineVersion": ""}},
+        {"dbaas": {"vendors": {"gcp": {"networks": {"r": "not a mapping"}}}}},
+        {"dbaas": {"vendors": {"gcp": {"serviceAccount": ""}}}},
+        {"vendors": {"gcp": {"dbaasAutoPlan": "yes"}}},
+    ],
+)
+def test_invalid_dbaas_values_name_the_key(data):
+    with pytest.raises(ValueError, match="invalid config value for"):
+        parse_settings(data)
+
+
+def test_unknown_dbaas_keys_warn_and_are_ignored(caplog):
+    with caplog.at_level(logging.WARNING):
+        parse_settings({"dbaas": {"bogus": 1, "vendors": {"gcp": {"zone": "x"}}}})
+    assert "unknown config key dbaas.bogus" in caplog.text and "dbaas.vendors.gcp.zone" in caplog.text
+
+
+def test_the_dbaas_image_is_an_optional_environment_variable():
+    assert load_env(MINIMAL_ENV).dbaas_image == ""
+    assert load_env({**MINIMAL_ENV, "K8SI_DBAAS_IMAGE": "img@sha256:1"}).dbaas_image == "img@sha256:1"
