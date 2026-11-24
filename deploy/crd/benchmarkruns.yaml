@@ -168,6 +168,10 @@ spec:
                   error: {type: string, nullable: true}
                   destroyFailures: {type: integer}
                   retryAfter: {type: string, format: date-time, nullable: true}
+                  timing:
+                    description: Published as timing files; keys api_start, api_end, api_destroy_start, api_destroy_end.
+                    type: object
+                    additionalProperties: {type: string, format: date-time}
               conditions:
                 type: array
                 items:

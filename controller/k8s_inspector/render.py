@@ -943,6 +943,16 @@ def render_variant(
     _write(path, json.dumps(data, indent=2) + "\n")
 
 
+def render_dbaas_timing(tree: Path, database: dict, run_id: str, timings: dict[str, str]) -> None:
+    """`dbaas/<vendor>/<id>/postgres/<engineVersion>/standalone/timing/<run_id>/<name>`: one ISO UTC line each."""
+    run_dir = (
+        tree / "dbaas" / database["vendor"] / database["id"] / "postgres" / str(database["engineVersion"])
+        / "standalone" / "timing" / run_id
+    )  # fmt: skip
+    for name, value in timings.items():
+        _write(run_dir / name, value + "\n")
+
+
 def render_timing(tree: Path, vendor: str, sku: str, variant: int, run: RunKey, timings: dict[str, str]) -> None:
     """`timing/<run_id>/<name>`: one ISO UTC line each (`api_start`, `api_end`, `machine_start`,
     `node_registered`, `node_ready`, `inspector_start`, `inspector_end`); build the values with

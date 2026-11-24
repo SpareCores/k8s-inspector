@@ -277,6 +277,9 @@ class DbStatus:
     error: str | None = None  # why the database was not created or not usable
     destroy_failures: int = 0  # failed `dbaas-down-<run>` Jobs so far
     retry_after: datetime | None = None  # the next destroy Job is created at this time
+    # Timing file names (`api_start`, `api_end`, `api_destroy_start`, `api_destroy_end`) -> when: the create Job was
+    # about to start / succeeded (the bootstrap starts), the destroy Job was about to start / succeeded.
+    timing: dict[str, datetime] = field(default_factory=dict)
 
 
 @dataclass

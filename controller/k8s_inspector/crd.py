@@ -177,6 +177,7 @@ def _database_from_dict(d: dict | None) -> DbStatus | None:
         error=d.get("error"),
         destroy_failures=d.get("destroyFailures", 0),
         retry_after=_parse_time(d.get("retryAfter")),
+        timing={name: _parse_time(value) for name, value in (d.get("timing") or {}).items()},
     )
 
 
@@ -190,6 +191,7 @@ def _database_to_dict(db: DbStatus | None) -> dict | None:
         "error": db.error,
         "destroyFailures": db.destroy_failures,
         "retryAfter": _format_time(db.retry_after),
+        "timing": {name: _format_time(value) for name, value in db.timing.items()},
     }
 
 

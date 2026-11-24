@@ -113,7 +113,10 @@ class DbaasMixin:
         now = self._now()
         expires = dbaas_jobs.expiry(now, cfg, self._dbaas_task(run))
         run = self._set_database(
-            run, lambda status: setattr(status, "database", DbStatus(DbPhase.CREATING, now, expires))
+            run,
+            lambda status: setattr(
+                status, "database", DbStatus(DbPhase.CREATING, now, expires, timing={"api_start": now})
+            ),
         )
         self._database_creating(run, cfg, live)
 
@@ -206,6 +209,7 @@ class DbaasMixin:
 
         def mutate(status: RunStatus) -> None:
             status.database.phase, status.database.since = DbPhase.BOOTSTRAPPING, now
+            status.database.timing["api_end"] = now
 
         run = self._set_database(run, mutate)
         self.kube.delete("job", name)  # a vendor-generated password is in its Pod's termination message
@@ -269,6 +273,7 @@ class DbaasMixin:
 
             def mutate(status: RunStatus) -> None:
                 status.database.phase, status.database.since = DbPhase.DESTROYING, now
+                status.database.timing["api_destroy_start"] = now
 
             run = self._set_database(run, mutate)
             db = run.status.database
@@ -278,7 +283,13 @@ class DbaasMixin:
         if not self._drive_destroy(run, cfg, db)[0]:
             return
         self.kube.delete("secret", pods.db_secret_name(run.name))
-        self._set_database(run, lambda status: setattr(status.database, "phase", DbPhase.DESTROYED))
+        now = self._now()
+
+        def mutate(status: RunStatus) -> None:
+            status.database.phase = DbPhase.DESTROYED
+            status.database.timing["api_destroy_end"] = now
+
+        self._set_database(run, mutate)
         crd.remove_finalizer(self.kube, run.name)
         log.info("run %s: the database is destroyed", run.name)
 

@@ -219,6 +219,11 @@ status:
     error: "DBAAS_CREATE_FAILED: …"   # why it could not be created or used; or the last destroy failure
     destroyFailures: 0      # failed destroy Jobs so far
     retryAfter: null        # the next destroy Job is created at this time
+    timing:                 # published as timing files (output-contract.md); each key is set when it happens
+      api_start: …          # the create Job is about to start
+      api_end: …            # the create Job succeeded (the bootstrap starts)
+      api_destroy_start: …  # the destroy Job is about to start
+      api_destroy_end: …    # the destroy Job succeeded
 ```
 
 | Object | Purpose |

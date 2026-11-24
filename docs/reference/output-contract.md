@@ -66,11 +66,19 @@ the contract to keep.
 | `data/<vendor>/<sku>/<N>/timing/<run_id>/{api_start,api_end,machine_start,…}` | one ISO UTC line each | `api_start`, `machine_start` |
 | `data/<vendor>/<sku>/schedule/<task>/meta.json` | union view across variants (ported `select_schedule_meta`), plus [`last_attempt`](#last_attempt) | no (planner) |
 | `dbaas/<vendor>/<id>/postgres/<ver>/standalone/<task>/{meta.json,stdout}` | DBaaS results | yes |
+| `dbaas/<vendor>/<id>/postgres/<ver>/standalone/timing/<run_id>/{api_start,api_end,inspector_start,inspector_end,api_destroy_start,api_destroy_end}` | one ISO UTC line each | `inspector_start`, `inspector_end` |
 | not carried over to git | `resource_tracker.jsonl`, `postgres.log`, `result.json`, `manifest.json`, `status.json`, `version`: object storage only | — |
 
 Timing files (from the task's attempt in `run.json`): `api_start` = the attempt's anchor created, `api_end` =
 NodeClaim launched, `machine_start` = kernel boot time from `sc-run`, plus `node_registered`, `node_ready`,
 `inspector_start`/`inspector_end` (first task start and last task end).
+
+DBaaS timing files (from `status.database.timing` and the task ends): `api_start` = the create Job is about to start,
+`api_end` = the create Job succeeded, `inspector_start` = the same moment (the bootstrap starts), `inspector_end` = the
+last task ended, `api_destroy_start`/`api_destroy_end` = the destroy Job is about to start / succeeded. The first four
+are published with the results; the destroy files come in a later publish when the destroy succeeds (a run whose destroy
+never finishes has none). `meta.json` `version` of a DBaaS task is the image tag (no version command runs against a
+managed database).
 
 Variant dirs `<N>` are integers; the publisher picks the variant of a task from the `lscpu` output of its attempt with
 the ported `variant_id.py` (`ID_VERSION=1`).
