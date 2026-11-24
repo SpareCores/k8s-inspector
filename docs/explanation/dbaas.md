@@ -227,6 +227,24 @@ Retries follow the normal `-1`/`-4` backoff with the cap of three, instead of to
 Billing note: UpCloud and OVHcloud bill databases by the hour, AWS RDS has a 10-minute minimum, so a failed attempt
 costs that minimum; creating the database only after the client node is up avoids the common failure.
 
+### OVHcloud
+
+The module is `vendors/ovh.py`; its credentials are the OAuth2 service account of the Secret `k8s-inspector-dbaas-ovh`
+(`OVH_ENDPOINT`, `OVH_CLIENT_ID`, `OVH_CLIENT_SECRET`, `OVH_CLOUD_PROJECT_SERVICE`).
+
+- **Regions**: OVH's database regions (`GRA`, `BHS`, `DE`) are not its compute regions (`GRA11`, `BHS5`, `DE1`); Keeper lists
+  both, in the same city. The database is created in `spec.region`; the platform's network entry is keyed by
+  `spec.client_region`, the client node's compute region of that city (`clientRegionByCity: true`).
+- **Network**: SCarpenter's OVH nodes have a public address only (no vRack), so the database is reached through its public
+  endpoint (TLS only). Its IP restriction allows the IPv4 /32 entries of `spec.client_addresses` and nothing else; with none, the module
+  fails with a clear error, because OVH denies every client without a restriction.
+- **Plan and flavor** come from Keeper's `api_reference_object`; the plans Keeper lists run as OVH sells them, so some include replica nodes (`1 + max_read_replicas` nodes, which OVH requires); Keeper's listing and eligibility decide which plans run. The disk
+  is the schema-derived size, within the flavor's included size and maximum (Keeper's `storage_size` and
+  `storage_extra_max`), in steps of 10 GiB.
+- **Admin user**: `avnadmin` on `defaultdb`. OVH generates its password and it cannot be chosen; the module returns it in
+  `DbOutputs.password`.
+- **Tag**: OVH databases have no tags, so the description carries the run id and the expiry (`inventory` reads them).
+
 ### Operators
 
 `k8s-inspector run <vendor> --database <id> [--region <region>] [--client-region <region>] [<client sku>] [--force]` starts a DBaaS run of one

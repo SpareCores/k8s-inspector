@@ -22,6 +22,7 @@ vendors = [
     "google-auth>=2.63.1",
     "pulumi-gcp>=10.5.0",
     "requests>=2.34.2",
+    "pulumi-ovh>=2.22.0",
 ]
 dev = [
     "pytest",
