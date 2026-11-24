@@ -533,6 +533,16 @@ def test_dbaas_layout(tmp_path):
     assert sorted(p.name for p in written) == ["meta.json", "stdout"] and (base / "stdout").read_bytes() == b"out"
 
 
+def test_dbaas_version_is_the_image_tag_unless_the_status_has_one(tmp_path):
+    db = {"vendor": "ovh", "id": "pg", "engineVersion": "18"}
+    task = "pgbench_postgres_dbaas_ro_durable"
+    base = tmp_path / "dbaas/ovh/pg/postgres/18/standalone" / task
+    render.render_dbaas_task(tmp_path, db, plain_input(task))
+    assert json.loads((base / "meta.json").read_text())["version"] == "main"
+    render.render_dbaas_task(tmp_path, db, plain_input(task, start="2026-10-02T10:00:00", version="1.2"))
+    assert json.loads((base / "meta.json").read_text())["version"] == "1.2"
+
+
 # ------------------------------------------------- -4 not published, redaction, start failure, stale files
 
 

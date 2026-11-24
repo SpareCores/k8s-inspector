@@ -905,6 +905,8 @@ def render_dbaas_task(tree: Path, database: dict, inp: RenderInput) -> list[Path
     if meta["exit_code"] != ExitCode.OK and previous and previous.get("exit_code") == ExitCode.OK:
         return []  # a failure never replaces a good result (sc-crawler reads the stdout without the exit code)
     _apply_start_retries(meta, previous)
+    if meta["version"] is None:  # no version command runs against a managed database: the legacy wrote the image tag
+        meta["version"] = inp.task.image.rsplit(":", 1)[-1]
     stdout = inp.stdout if inp.stdout and meta["exit_code"] not in NOT_FINAL_CODES else b""
     meta["outputs"] = ["stdout"] if stdout else []
     meta["stdout_bytes"] = len(stdout) if stdout else None
