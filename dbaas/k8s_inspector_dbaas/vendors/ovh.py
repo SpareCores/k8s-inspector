@@ -14,8 +14,8 @@ which the controller picks from Keeper's region data.
 OVH generates the password of the admin user `avnadmin` (it cannot be chosen), so the module returns it in
 `DbOutputs.password`.
 
-The plan and the flavor are `spec.record["api_reference_object"]`. A plan with replicas (business, enterprise,
-production, advanced) has `1 + max_read_replicas` nodes, which OVH requires.
+The plan and the flavor are `spec.record["api_reference_object"]`. The plans Keeper lists run as OVH sells them, so
+some include replica nodes: `1 + max_read_replicas` nodes, which OVH requires.
 """
 
 import ipaddress

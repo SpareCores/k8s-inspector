@@ -137,7 +137,7 @@ def test_the_provider_has_no_credentials_and_the_timeouts_come_from_the_spec(ovh
 
 
 @pulumi.runtime.test
-def test_a_plan_with_replicas_has_a_node_for_each(ovh_spec, monkeypatch):
+def test_the_node_count_follows_the_max_read_replicas_of_keeper(ovh_spec, monkeypatch):
     databases = spy(monkeypatch, ovh.cloudproject, "Database")
     ovh_vendor.provision(dataclasses.replace(ovh_spec, record={**RECORD, "max_read_replicas": 2}))
     assert databases[0][1]["nodes"] == [{"region": "GRA"}] * 3
