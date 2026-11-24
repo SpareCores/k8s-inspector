@@ -10,7 +10,9 @@ the Job would have no credentials. It reports every stack it sees, for the metri
 
 Every `INVENTORY_INTERVAL` it also runs `dbaas-inventory-<vendor>` for each configured vendor. That Job lists the
 vendor's databases that carry the `sc_inspector_run` tag, which finds a database the state never recorded; the
-controller exports their number and the age of the oldest (`k8s_inspector_dbaas_tagged_*`, alert-only).
+controller exports their number and the age of the oldest (`k8s_inspector_dbaas_tagged_*`, alert-only). A failed or
+unreadable inventory drops the vendor's last result; `k8s_inspector_dbaas_inventory_last_success_timestamp_seconds`
+tells when the vendor's last one worked.
 """
 
 import contextlib
@@ -44,6 +46,7 @@ class Tagged:
 
     count: int
     oldest_created: datetime | None
+    at: datetime  # when the Job that found them was collected
 
 
 def known_vendors(cfg: Config) -> set[str]:
@@ -112,11 +115,21 @@ def sweep(kube: Kube, cfg: Config, storage, now: datetime) -> list[Stack]:
     return seen
 
 
-def inventory(kube: Kube, cfg: Config, now: datetime, started: dict[str, datetime]) -> dict[str, Tagged]:
+def _tagged(message: dict, now: datetime) -> Tagged:
+    """The result message of an inventory Job; a naive timestamp counts as UTC. Raises on anything unreadable."""
+    oldest = message.get("oldest_created_at")
+    created = datetime.fromisoformat(oldest) if oldest else None
+    if created is not None and created.tzinfo is None:
+        created = created.replace(tzinfo=UTC)
+    return Tagged(int(message["count"]), created, now)
+
+
+def inventory(kube: Kube, cfg: Config, now: datetime, started: dict[str, datetime]) -> dict[str, Tagged | None]:
     """One inventory cycle: collect the finished `dbaas-inventory-<vendor>` Jobs, start one for every configured vendor
     that has not had one for `INVENTORY_INTERVAL` (`started`: when, per vendor; updated). Returns what the finished
-    Jobs found."""
-    found = {}
+    Jobs found: `None` for a vendor whose Job failed or reported something unreadable. A finished Job is always
+    deleted."""
+    found: dict[str, Tagged | None] = {}
     for vendor in cfg.settings.dbaas.vendors:
         name = dbaas_jobs.inventory_job_name(vendor)
         try:
@@ -131,11 +144,16 @@ def inventory(kube: Kube, cfg: Config, now: datetime, started: dict[str, datetim
         if state == "running":
             continue
         message = dbaas_jobs.job_message(kube, name)
+        error = message.get("error", "no result")
+        tagged = None
         if state == "complete" and "count" in message:
-            oldest = message.get("oldest_created_at")
-            found[vendor] = Tagged(int(message["count"]), datetime.fromisoformat(oldest) if oldest else None)
-        else:
-            log.warning("the database inventory of vendor %s failed: %s", vendor, message.get("error", "no result"))
+            try:
+                tagged = _tagged(message, now)
+            except (ValueError, TypeError) as e:
+                error = f"unreadable result: {e}"
+        if tagged is None:
+            log.warning("the database inventory of vendor %s failed: %s", vendor, error)
+        found[vendor] = tagged
         kube.delete("job", name)
     return found
 
@@ -146,19 +164,25 @@ def run_forever(
     storage,
     stop: threading.Event,
     on_stacks=lambda stacks: None,
-    on_inventory=lambda tagged: None,
+    on_inventory=lambda tagged, last_success: None,
 ) -> None:
     """Every `INTERVAL_SECONDS`: `sweep` and `inventory`; exceptions are logged, never fatal. `on_stacks` gets the
-    stacks seen, `on_inventory` the latest result of every configured vendor."""
+    stacks seen, `on_inventory` the latest good result of every configured vendor (none for a vendor whose latest
+    inventory failed) and when each vendor's last inventory worked."""
     started: dict[str, datetime] = {}
     latest: dict[str, Tagged] = {}
+    last_success: dict[str, datetime] = {}
     while not stop.is_set():
         try:
             cfg, now = cfg_provider(), datetime.now(UTC)
             on_stacks(sweep(kube, cfg, storage, now))
+            for vendor, tagged in inventory(kube, cfg, now, started).items():
+                if tagged is None:
+                    latest.pop(vendor, None)
+                else:
+                    latest[vendor], last_success[vendor] = tagged, tagged.at
             latest = {vendor: tagged for vendor, tagged in latest.items() if vendor in cfg.settings.dbaas.vendors}
-            latest |= inventory(kube, cfg, now, started)
-            on_inventory(latest)
+            on_inventory(latest, dict(last_success))
         except Exception:
             log.exception("DBaaS sweep failed")
         deadline = time.monotonic() + INTERVAL_SECONDS

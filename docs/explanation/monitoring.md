@@ -48,6 +48,7 @@ Transient API errors (429, 5xx, connection errors, timeouts, a 404 on the `Bench
 | `k8s_inspector_dbaas_instances` | vendor: managed databases that exist: DBaaS runs whose database is not yet destroyed, plus leaked stacks the sweeper sees (0 for a vendor without any) |
 | `k8s_inspector_dbaas_oldest_age_seconds` | vendor: age of the oldest of them (the run's age; a leaked stack's age since its last state change). Stacks of a vendor the ConfigMap does not know are `vendor="unknown"` |
 | `k8s_inspector_dbaas_tagged_databases` | vendor: databases the vendor's inventory Job (every 30 minutes) found by their `sc_inspector_run` tag, also those no state records |
+| `k8s_inspector_dbaas_inventory_last_success_timestamp_seconds` | vendor: when its inventory Job last succeeded (0: not since the controller started); the tagged metrics are missing while the latest one failed |
 | `k8s_inspector_dbaas_tagged_oldest_age_seconds` | vendor: age of the oldest of them since its creation in the cloud |
 | `k8s_inspector_task_duration_seconds_sum`, `_count` | vendor, task |
 
@@ -62,6 +63,7 @@ Logs are structured JSON lines with `run`, `vendor`, `sku`, `task` fields.
 |---|---|---|
 | **Bench node running too long** | a node in a bench pool older than its run's expected duration + 2 h, or older than 50 h regardless (past `expireAfter` plus grace) (from kube-state-metrics node creation time and pool label) | yes |
 | **DBaaS database running too long** | `k8s_inspector_dbaas_tagged_oldest_age_seconds` or `k8s_inspector_dbaas_oldest_age_seconds` above 8 h (the databases are tagged with run id and expiry: look for `sc_inspector_run` in the cloud console). Alert only, nothing is deleted from the tag | no: also alert on the metrics being absent |
+| **DBaaS inventory stale** | `time() - k8s_inspector_dbaas_inventory_last_success_timestamp_seconds` above 2 h for a vendor: the tagged-database check is blind for it | no |
 | Bench NodeClaim without a run | NodeClaim in a bench pool with no anchor for 30 min | yes |
 | Controller down | no `/metrics` scrape for 10 min | yes |
 | Publish stalled | backlog > 0 and no successful publish for 1 h | no |

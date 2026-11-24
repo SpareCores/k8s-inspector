@@ -278,7 +278,8 @@ def test_the_inventory_result_is_collected_and_the_next_job_starts_after_the_int
     message = {"count": 2, "oldest_created_at": "2026-11-20T01:00:00Z", "databases": []}
     finish(kube, "dbaas-inventory-aws", message)
     found = dbaas_sweep.inventory(kube, cfg, NOW + timedelta(minutes=1), started)
-    assert found == {"aws": dbaas_sweep.Tagged(2, datetime(2026, 11, 20, 1, 0, tzinfo=UTC))}
+    at = NOW + timedelta(minutes=1)
+    assert found == {"aws": dbaas_sweep.Tagged(2, datetime(2026, 11, 20, 1, 0, tzinfo=UTC), at)}
     assert jobs(kube) == []
     dbaas_sweep.inventory(kube, cfg, NOW + timedelta(minutes=20), started)
     assert jobs(kube) == []  # too early
@@ -291,8 +292,43 @@ def test_a_failed_inventory_is_logged_and_tried_again_later(kube, caplog):
     cfg = make_sweep_config(dbaas_vendors=("aws",))
     dbaas_sweep.inventory(kube, cfg, NOW, started)
     finish(kube, "dbaas-inventory-aws", {"error": "no credentials"}, outcome="Failed")
-    assert dbaas_sweep.inventory(kube, cfg, NOW + timedelta(minutes=1), started) == {}
+    assert dbaas_sweep.inventory(kube, cfg, NOW + timedelta(minutes=1), started) == {"aws": None}
     assert "inventory of vendor aws failed: no credentials" in caplog.text and jobs(kube) == []
+
+
+@pytest.mark.parametrize("message", [{"count": 1, "oldest_created_at": "yesterday"}, {"count": "many"}])
+def test_an_unreadable_inventory_counts_as_failed_and_its_job_is_still_deleted(kube, message):
+    started = {}
+    cfg = make_sweep_config(dbaas_vendors=("aws",))
+    dbaas_sweep.inventory(kube, cfg, NOW, started)
+    finish(kube, "dbaas-inventory-aws", message)
+    assert dbaas_sweep.inventory(kube, cfg, NOW + timedelta(minutes=1), started) == {"aws": None}
+    assert jobs(kube) == []
+
+
+def test_a_naive_timestamp_of_the_inventory_is_utc(kube):
+    started = {}
+    cfg = make_sweep_config(dbaas_vendors=("aws",))
+    dbaas_sweep.inventory(kube, cfg, NOW, started)
+    finish(kube, "dbaas-inventory-aws", {"count": 1, "oldest_created_at": "2026-11-20T01:00:00"})
+    found = dbaas_sweep.inventory(kube, cfg, NOW, started)
+    assert found["aws"].oldest_created == datetime(2026, 11, 20, 1, 0, tzinfo=UTC)
+
+
+def test_a_failed_inventory_drops_the_last_result_and_the_metric_tells_the_last_success(kube):
+    settings = make_sweep_config().settings
+    metrics = Metrics(kube, lambda: settings, clock=lambda: NOW)
+    good = dbaas_sweep.Tagged(2, NOW - timedelta(hours=1), NOW - timedelta(hours=3))
+    metrics.record_dbaas_inventory({"aws": good}, {"aws": good.at})
+    text = metrics.render()
+    assert (
+        f'k8s_inspector_dbaas_inventory_last_success_timestamp_seconds{{vendor="aws"}} {good.at.timestamp():g}' in text
+    )
+    assert 'k8s_inspector_dbaas_inventory_last_success_timestamp_seconds{vendor="oci"} 0' in text  # never worked
+    metrics.record_dbaas_inventory({}, {"aws": good.at})  # the latest one failed: no stale count
+    text = metrics.render()
+    assert "dbaas_tagged_databases{" not in text
+    assert f'timestamp_seconds{{vendor="aws"}} {good.at.timestamp():g}' in text
 
 
 def test_the_metrics_export_the_tagged_databases_and_the_age_of_the_oldest(kube):
@@ -300,9 +336,10 @@ def test_the_metrics_export_the_tagged_databases_and_the_age_of_the_oldest(kube)
     metrics = Metrics(kube, lambda: settings, clock=lambda: NOW + timedelta(hours=2))
     metrics.record_dbaas_inventory(
         {
-            "aws": dbaas_sweep.Tagged(2, NOW - timedelta(hours=7)),
-            "oci": dbaas_sweep.Tagged(0, None),
-        }
+            "aws": dbaas_sweep.Tagged(2, NOW - timedelta(hours=7), NOW),
+            "oci": dbaas_sweep.Tagged(0, None, NOW),
+        },
+        {},
     )
     text = metrics.render()
     assert 'k8s_inspector_dbaas_tagged_databases{vendor="aws"} 2' in text

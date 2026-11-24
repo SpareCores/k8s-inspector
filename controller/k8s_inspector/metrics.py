@@ -17,7 +17,9 @@ from the DBaaS
 runs not yet destroyed and the leaked stacks the sweeper sees (stacks of a vendor the configuration does not know are
 `vendor="unknown"`); alert when the oldest is over 8 h. `_dbaas_tagged_databases{vendor}` and
 `_dbaas_tagged_oldest_age_seconds{vendor}`: the databases the vendor's inventory Job found by their `sc_inspector_run`
-tag (also the ones no state records), refreshed every 30 minutes; alert when the oldest is over 8 h.
+tag (also the ones no state records), refreshed every 30 minutes; alert when the oldest is over 8 h. A vendor whose
+inventory failed has no tagged metrics. `_dbaas_inventory_last_success_timestamp_seconds{vendor}`: when the last
+inventory of every configured vendor worked (0: not since the controller started); alert when it is over 2 h old.
 `/healthz` answers 200 as long as the process serves.
 """
 
@@ -97,6 +99,7 @@ class Metrics:
         self._counters["unpublishable_tasks_total"][()] = 0
         self._orphans: list[tuple[str, float]] = []  # (vendor, age in seconds) of the stacks without a run
         self._tagged: dict = {}  # vendor -> `dbaas_sweep.Tagged`: the databases the last inventory found by their tag
+        self._inventory_success: dict[str, datetime] = {}  # vendor -> when its inventory last worked
 
     def record_dbaas_stacks(self, stacks) -> None:
         """The stacks the sweeper saw (`dbaas_sweep.Stack`); those without a BenchmarkRun are counted here, the others
@@ -105,10 +108,11 @@ class Metrics:
         with self._lock:
             self._orphans = [(s.vendor or "unknown", (now - s.modified).total_seconds()) for s in stacks if s.orphan]
 
-    def record_dbaas_inventory(self, tagged: dict) -> None:
-        """The latest inventory of every vendor (`dbaas_sweep.Tagged` by vendor)."""
+    def record_dbaas_inventory(self, tagged: dict, last_success: dict) -> None:
+        """The latest good inventory of every vendor (`dbaas_sweep.Tagged` by vendor) and when each vendor's last one
+        worked."""
         with self._lock:
-            self._tagged = dict(tagged)
+            self._tagged, self._inventory_success = dict(tagged), dict(last_success)
 
     def record_publish(self) -> None:
         """A publish cycle finished without error."""
@@ -244,6 +248,15 @@ class Metrics:
                 (now - t.oldest_created).total_seconds() if t.oldest_created else 0,
             )
             for v, t in sorted(self._tagged.items())
+        ]
+        lines.append(f"# TYPE {PREFIX}dbaas_inventory_last_success_timestamp_seconds gauge")
+        lines += [
+            _line(
+                "dbaas_inventory_last_success_timestamp_seconds",
+                _labels(vendor=v),
+                self._inventory_success[v].timestamp() if v in self._inventory_success else 0,
+            )
+            for v in sorted(settings.dbaas.vendors)
         ]
         lines.append(f"# TYPE {PREFIX}publish_backlog gauge")
         lines.append(_line("publish_backlog", (), backlog))

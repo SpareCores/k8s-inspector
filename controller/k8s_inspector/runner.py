@@ -923,6 +923,10 @@ class Runner(DbaasMixin):
 
     def _pending(self, run: BenchmarkRun, cfg: Config, live: dict[str, dict]) -> None:
         self.check_config()
+        if run.spec.database is not None:
+            run = self._clear_leftover_stack(run, cfg)
+            if run is None:
+                return
         settings = cfg.settings
         selected = self._selected(run)
         attempt = run.status.attempt + 1

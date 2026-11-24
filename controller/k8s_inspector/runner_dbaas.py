@@ -9,7 +9,9 @@ The phase is written BEFORE what it stands for is created, so a controller that 
 database to destroy and creates the missing Job again. Creating and Bootstrapping are steps of the run's `Running`
 phase (`_database_up`); Destroying is driven on every pass of every run phase (`_database_teardown`) as soon as the
 benchmark is over, however it ended. The destroy Job is retried until it succeeds; only then is the finalizer removed.
-A stack left by an earlier run of the same name is destroyed first (`Clearing`, then back to `(none)`).
+A stack left by an earlier run of the same name is destroyed before the run asks for its client node (`Clearing` in
+`Pending`, then back to `(none)`); if that destroy fails `CLEAR_ATTEMPTS` times the run is dropped without a result and
+the stack is left to the sweeper.
 
 A running `dbaas-up` Job is never deleted: it ends within its own deadline (Pulumi records what it created) and only
 then the destroy starts. Deleting it would risk a database the state never recorded.
@@ -42,6 +44,7 @@ TIMEOUT_MARGIN = timedelta(minutes=5)  # the controller judges the create deadli
 POLL_SECONDS = 60  # while waiting for a Job: the Job and Pod watches wake the run, this bounds the wait for a deadline
 WAIT_FOR_POD_SECONDS = 10  # the up Job's Pod is still going away; the down Job must not start before it is gone
 RETRY_MIN_SECONDS, RETRY_MAX_SECONDS = 60, 1800  # between destroy attempts: doubles from a minute to half an hour
+CLEAR_ATTEMPTS = 3  # failed destroys of a leftover stack after which the run gives up and leaves it to the sweeper
 RUNNING_PHASES = (RunPhase.PENDING, RunPhase.PROVISIONING, RunPhase.RUNNING)
 
 
@@ -77,8 +80,6 @@ class DbaasMixin:
         db = run.status.database
         if db is None:
             return self._database_start(run, cfg, live)
-        if db.phase == DbPhase.CLEARING:
-            return self._database_clearing(run, cfg, live)
         if db.phase == DbPhase.CREATING:
             return self._database_creating(run, cfg, live)
         if db.phase == DbPhase.BOOTSTRAPPING:
@@ -107,28 +108,48 @@ class DbaasMixin:
             return self._database_fail(
                 run, "DBAAS_NO_NETWORK", f"no network of {db['vendor']} in {db['region']} in the ConfigMap"
             )
-        state_key = dbaas_jobs.stack_state_key(run.name)
         now = self._now()
-        if any(key == state_key for key, _ in self.storage.list_objects(state_key)):
-            # A stack of this name is left from an earlier run: destroy it before anything new is created.
-            log.warning("run %s: a Pulumi stack of this name exists, destroying it first", run.name)
-            run = self._set_database(
-                run, lambda status: setattr(status, "database", DbStatus(DbPhase.CLEARING, now, now))
-            )
-            return self._database_clearing(run, cfg, live)
         expires = dbaas_jobs.expiry(now, cfg, self._dbaas_task(run))
         run = self._set_database(
             run, lambda status: setattr(status, "database", DbStatus(DbPhase.CREATING, now, expires))
         )
         self._database_creating(run, cfg, live)
 
-    def _database_clearing(self, run: BenchmarkRun, cfg: Config, live: dict[str, dict]) -> None:
-        """Destroy the leftover stack; when that is done the run starts over with a fresh database, without a result
-        for the database."""
-        if not self._drive_destroy(run, cfg, run.status.database):
-            return
-        self._set_database(run, lambda status: setattr(status, "database", None))
-        self._database_start(crd.get_run(self.kube, run.name), cfg, live)
+    def _clear_leftover_stack(self, run: BenchmarkRun, cfg: Config) -> BenchmarkRun | None:
+        """Called from `Pending`, before the run asks for a client node: destroy a stack left by an earlier run of the
+        same name (`Clearing`). Returns the run to go on with, or None while the destroy is going on (or the run was
+        dropped). A destroy that fails `CLEAR_ATTEMPTS` times (pending operations, say) drops the run without a result:
+        the stack stays for the sweeper and the operator, and a paid client node never waits for it."""
+        db = run.status.database
+        if db is not None and db.phase != DbPhase.CLEARING:
+            return run  # an earlier attempt of this run made its database
+        state_key = dbaas_jobs.stack_state_key(run.name)
+        if db is None:
+            if not any(key == state_key for key, _ in self.storage.list_objects(state_key)):
+                return run
+            if not cfg.env.dbaas_image:
+                self._end_run(run, ExitCode.HARNESS_ERROR, "K8SI_DBAAS_IMAGE is empty", AttemptOutcome.HARNESS_ERROR)
+                return None
+            log.warning("run %s: a Pulumi stack of this name exists, destroying it first", run.name)
+            now = self._now()
+            run = self._set_database(
+                run, lambda status: setattr(status, "database", DbStatus(DbPhase.CLEARING, now, now))
+            )
+            db = run.status.database
+        if self._drive_destroy(run, cfg, db):
+            return self._set_database(run, lambda status: setattr(status, "database", None))
+        failures = crd.get_run(self.kube, run.name).status.database.destroy_failures
+        if failures >= CLEAR_ATTEMPTS:
+            log.error(
+                "run %s: the leftover stack cannot be destroyed (%d attempts), leaving it to the sweeper",
+                run.name,
+                failures,
+            )
+            self._delete_secret(run)
+            crd.remove_finalizer(self.kube, run.name)
+            crd.delete_run(self.kube, run.name)
+            self._forget(run.name)
+        return None
 
     def _password(self, run: BenchmarkRun) -> str:
         """The run's database password: generated once, kept in the run's Secret (so it survives a restart)."""

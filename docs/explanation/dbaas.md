@@ -44,7 +44,9 @@ database second; on the way out, database destroy and node release in parallel.*
    module sets Pulumi `customTimeouts` 10 minutes shorter (`spec.create_timeout`), so Pulumi fails by itself and records
    the resource. The Job's Pod is annotated `karpenter.sh/do-not-disrupt` and has a 15 minute termination grace period:
    on SIGTERM the provisioner passes SIGINT to the Pulumi CLI, which finishes the operation in flight and writes it to
-   the state.
+   the state. An operation that starts just before the custom timeout may still be running when the grace period ends;
+   Kubernetes then SIGKILLs the Pod, which leaves pending operations in the state. The down Job reports them (see
+   Removal) and an operator clears them.
 3. **Bootstrap.** The controller starts a Pod on the client node (phase `Bootstrapping`) that runs
    [`dbaas_bootstrap.py`](../../controller/k8s_inspector/dbaas_bootstrap.py) in the benchmark image (it has Python and
    psycopg, so no extra image is pulled; the script comes from the ConfigMap `<run>-boot`). It ports legacy
@@ -73,8 +75,10 @@ database second; on the way out, database destroy and node release in parallel.*
    removes only its own finalizer, with a JSON patch.
 
 `status.database.phase` is the state: `Clearing`, `Creating`, `Bootstrapping`, `Ready`, `Destroying`, `Destroyed`; absent
-means nothing was created. `Clearing` is a stack of an earlier run of the same name that is destroyed first; the run
-then starts over, without a result for the database. The phase is written before what it stands for is created, and the Job names follow from the run
+means nothing was created. `Clearing` is a stack of an earlier run of the same name that is destroyed first, while the run is still `Pending`: the
+client node is requested only after that. The down Job is retried like any other, up to 3 failures (for instance pending
+operations); then the run is deleted without a result of any kind, its stack is left to the sweeper and the operator
+(it counts in `k8s_inspector_dbaas_instances` and is logged), and the planner creates the run again in a later cycle. The phase is written before what it stands for is created, and the Job names follow from the run
 name, so a controller that restarts anywhere continues: it creates a missing Job again and runs the destroy of every
 run that is over.
 
@@ -121,7 +125,8 @@ not count against `maxInFlight` and `maxUsdPerHour`, and a server run does not c
   planner tries the next database; a forced run is refused with the reason. With a cap set, a price that Keeper does not
   know (a client it does not list) is refused too.
 
-The planner creates at most one new DBaaS run per vendor and cycle.
+The planner creates at most one new DBaaS run per vendor and cycle. The checks are not atomic: a forced run and an
+autoPlan cycle at the same instant can both pass, so the vendor may briefly exceed a limit by one run.
 
 ### Pulumi state and leaks
 
@@ -157,7 +162,7 @@ Guarantees:
   `dbaas.vendors` is empty or a vendor was removed from it: such a stack is destroyed with the vendor's ServiceAccount
   and Secret by their names (the default ServiceAccount when `dbaas.vendors.<vendor>` is gone). A stack of a vendor the
   ConfigMap does not know at all is only reported (the metrics with `vendor="unknown"`, and a log line): the Job would have
-  no credentials. A new run whose stack name already has a state file destroys it first (`Clearing`).
+  no credentials. A new run whose stack name already has a state file destroys it first, before its client node (`Clearing`).
 - **Database the state never recorded** (Job killed between the cloud create and the state write; the up Job is never
   deleted, but a node can die): every database is tagged with the run id (`sc_inspector_run`) and an expiry time
   (`sc_inspector_expires`), passed to the vendor module, which applies them where the vendor supports tags. The module's
@@ -166,7 +171,9 @@ Guarantees:
   exports `k8s_inspector_dbaas_tagged_databases{vendor}` and `k8s_inspector_dbaas_tagged_oldest_age_seconds{vendor}`.
   The monitoring alerts when the oldest is older than 8 h ([monitoring](monitoring.md)). The metrics
   `k8s_inspector_dbaas_instances` and `k8s_inspector_dbaas_oldest_age_seconds` count the databases the controller knows
-  about. This is alert-only; no tag-driven automatic delete.
+  about. An inventory Job that fails or reports something unreadable drops the vendor's tagged metrics, and
+  `k8s_inspector_dbaas_inventory_last_success_timestamp_seconds{vendor}` (0: no success since the controller started)
+  alerts when it is older than 2 h. This is alert-only; no tag-driven automatic delete.
 
 Retries follow the normal `-1`/`-4` backoff with the cap of three, instead of today's retry every 2 h forever.
 

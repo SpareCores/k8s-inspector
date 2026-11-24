@@ -288,6 +288,7 @@ def test_a_stack_left_from_an_earlier_run_is_destroyed_first_and_the_run_goes_on
     h.start_db()
     h.until_phase(DbPhase.CLEARING)
     assert h.jobs() == [f"dbaas-down-{h.name}"]  # no `up` yet: only the destroy of the leftover
+    assert h.pod_names() == [] and h.run.status.phase == RunPhase.PENDING  # and no paid client node waits for it
     h.storage.objects.pop(STATE_KEY)  # what the destroy removes
     run = h.drive(stop=lambda run: run.status.phase == RunPhase.PUBLISHING)
     assert h.codes()[TASK] == (0, None) and run.status.attempts[0].outcome.value == "Completed"  # no -1 result
@@ -306,6 +307,20 @@ def test_a_destroy_of_the_leftover_stack_that_fails_is_retried(h):
     h.storage.objects.pop(STATE_KEY)
     h.drive(stop=lambda run: run.status.phase == RunPhase.PUBLISHING)
     assert h.codes()[TASK] == (0, None)
+
+
+def test_a_leftover_stack_that_cannot_be_destroyed_drops_the_run_without_a_result_and_keeps_the_stack(h):
+    h.cluster.jobs["down"] = ["fail"] * 5
+    h.storage.objects[STATE_KEY] = b"{}"
+    h.start_db()
+    h.until_phase(DbPhase.CLEARING)
+    for _ in range(3):
+        h.cluster.react()
+        h.runner.reconcile(h.name)
+        h.clock.advance(minutes=5)
+        h.runner.reconcile(h.name)
+    assert not h.run_exists()  # dropped: nothing published, nothing holds a database for it
+    assert STATE_KEY in h.storage.objects and h.pod_names() == []  # the sweeper and the operator take it from here
 
 
 # ------------------------------------------------------------------ the node is lost, the run is cancelled or deleted
