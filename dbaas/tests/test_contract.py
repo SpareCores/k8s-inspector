@@ -131,6 +131,25 @@ def test_a_failed_up_reports_the_error_without_the_password(tmp_path, monkeypatc
     assert "hunter2" not in capsys.readouterr().err
 
 
+def test_a_long_failure_keeps_the_error_lines_and_the_tail(tmp_path, monkeypatch):
+    log = tmp_path / "termination"
+    monkeypatch.setenv(entry.TERMINATION_LOG_ENV, str(log))
+    monkeypatch.setenv("DBAAS_SPEC", json.dumps(SPEC_JSON))
+    noise = "\n".join(f' +  step {i} "creating" (0s)\n@ updating....' for i in range(200))
+    cause = " +  vultr:index:Database db error: plan 'x' is not available in ams"
+    output = f"{noise}\n{cause}\n{noise}\nRuntimeError: the end"
+
+    def failing(spec):
+        raise RuntimeError(output)
+
+    monkeypatch.setattr(stack, "up", failing)
+    assert entry.run("up") == 1
+    text = log.read_text()
+    assert len(text) <= entry.MAX_MESSAGE
+    error = json.loads(text)["error"]
+    assert "plan 'x' is not available in ams" in error and error.endswith("RuntimeError: the end")
+
+
 def test_down_needs_only_the_run_name_and_the_vendor(monkeypatch, tmp_path):
     monkeypatch.setenv(entry.TERMINATION_LOG_ENV, str(tmp_path / "termination"))
     destroyed = []

@@ -40,6 +40,7 @@ from k8s_inspector.model import (
 
 log = logging.getLogger(__name__)
 
+ERROR_CHARS = 2000  # of a Job's error in `status.database.error`: the provisioner condenses it to fit (`__main__`)
 TIMEOUT_MARGIN = timedelta(minutes=5)  # the controller judges the create deadline a little after the Job's own
 POLL_SECONDS = 60  # while waiting for a Job: the Job and Pod watches wake the run, this bounds the wait for a deadline
 WAIT_FOR_POD_SECONDS = 10  # the up Job's Pod is still going away; the down Job must not start before it is gone
@@ -90,7 +91,7 @@ class DbaasMixin:
     def _database_fail(self, run: BenchmarkRun, reason: str, message: str) -> None:
         """The database cannot be used: the run's task ends `-1` (retried by the usual rules). The destroy follows from
         the run leaving `Running`."""
-        text = f"{reason}: {message}"[:500]
+        text = f"{reason}: {message}"[:ERROR_CHARS]
         log.warning("run %s: %s", run.name, text)
 
         def mutate(status: RunStatus) -> None:
@@ -303,30 +304,39 @@ class DbaasMixin:
             up_job = self.kube.get("job", up)
         except NotFound:
             up_job = None
-        if up_job is not None:
+        keep_up = up_job is not None and dbaas_jobs.job_state(up_job) == "failed"  # its logs stay for `kubectl logs`
+        if up_job is not None and not keep_up:
             if dbaas_jobs.job_state(up_job) == "running":
                 self._enqueue_later(run.name, POLL_SECONDS)
                 return None, run
             self.kube.delete("job", up)
-        if self.kube.list("pod", labels={dbaas_jobs.LABEL_JOB: up}):  # it must be gone before the destroy starts
+        if not keep_up and self.kube.list("pod", labels={dbaas_jobs.LABEL_JOB: up}):  # gone before the destroy starts
             self._enqueue_later(run.name, WAIT_FOR_POD_SECONDS)
             return None, run
         name = dbaas_jobs.down_job_name(run.name)
         try:
             job = self.kube.get("job", name)
         except NotFound:
+            job = None
+        if job is not None and dbaas_jobs.job_state(job) == "failed":
+            if not dbaas_jobs.failure_counted(job, db):
+                return None, self._destroy_failed(run, name, db)
+            if db.retry_after and self._now() < db.retry_after:  # the failed Job stays until its retry replaces it
+                self._enqueue_later(run.name, max(1.0, (db.retry_after - self._now()).total_seconds()))
+                return None, run
+            self.kube.delete("job", name)
+            job = None
+        if job is None:
             if db.retry_after and self._now() < db.retry_after:
                 self._enqueue_later(run.name, max(1.0, (db.retry_after - self._now()).total_seconds()))
                 return None, run
-            self._create("job", dbaas_jobs.down_job(run.name, run.spec.vendor, cfg))
+            self._create("job", dbaas_jobs.down_job(run.name, run.spec.vendor, cfg, failures=db.destroy_failures))
             self._enqueue_later(run.name, POLL_SECONDS)
             return None, run
         state = dbaas_jobs.job_state(job)
         if state == "running":
             self._enqueue_later(run.name, POLL_SECONDS)
             return None, run
-        if state == "failed":
-            return None, self._destroy_failed(run, name, db)
         dbaas_jobs.clean_state(self.storage, run.name)
         self.kube.delete("job", name)
         return dbaas_jobs.job_completed_at(job, self._now()), run
@@ -341,9 +351,8 @@ class DbaasMixin:
 
         def mutate(status: RunStatus) -> None:
             status.database.destroy_failures, status.database.retry_after = failures, retry_after
-            status.database.error = f"DBAAS_DESTROY_FAILED: {message}"[:500]
+            status.database.error = f"DBAAS_DESTROY_FAILED: {message}"[:ERROR_CHARS]
 
         run = self._set_database(run, mutate)
-        self.kube.delete("job", name)
         self._enqueue_later(run.name, wait)
         return run
