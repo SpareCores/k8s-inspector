@@ -59,12 +59,15 @@ def up(spec: DbSpec, on_output: Callable[[str], None] = print) -> DbOutputs:
     return DbOutputs.from_exports({name: output.value for name, output in result.outputs.items()})
 
 
-def down(run: str, on_output: Callable[[str], None] = print) -> None:
+def down(run: str, vendor: str, on_output: Callable[[str], None] = print) -> None:
     """Destroy everything of the run and remove its state (only when the destroy succeeded). A run without a stack
     has nothing to destroy. The destroy follows `cancel` (a killed `up` leaves a lock) and refreshes the state first
     (so a half-created resource that exists is destroyed, and one that does not is dropped). Pending operations in the
     state (an `up` that was killed in the middle of a create) are an error: the resource may exist without a record, and
-    the state is kept."""
+    the state is kept. When the vendor module has a `cleanup(run)` function it runs after the destroy, before the
+    state is removed, so a failed cleanup makes the next `down` run it again."""
+    # Loaded first: a broken vendor module fails before anything is destroyed.
+    cleanup = getattr(vendors.load(vendor), "cleanup", None)
     try:
         stack = auto.select_stack(stack_name(run), project_name=PROJECT, program=lambda: None, opts=_options(None))
     except auto.StackNotFoundError:
@@ -81,4 +84,7 @@ def down(run: str, on_output: Callable[[str], None] = print) -> None:
             "clear the pending operations (`pulumi refresh --clear-pending-creates`) and let the destroy run again. "
             "The state is kept."
         )
-    stack.destroy(on_output=on_output, refresh=True, remove=True, show_secrets=False)
+    stack.destroy(on_output=on_output, refresh=True, show_secrets=False)
+    if cleanup:
+        cleanup(run)
+    stack.workspace.remove_stack(stack_name(run))

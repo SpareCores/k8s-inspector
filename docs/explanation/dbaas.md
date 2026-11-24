@@ -198,6 +198,10 @@ Guarantees:
 - **Create failure or timeout:** `down` runs anyway, after the up Job has ended; the Pulumi state holds what was already
   created. The task ends `-1` with `DBAAS_CREATE_FAILED`, `DBAAS_CREATE_TIMEOUT` or `DBAAS_BOOTSTRAP_FAILED`
   ([exit codes](../reference/exit-codes.md)), which the usual retry rules bound.
+- **Create failure leaves an untracked database:** a provider may drop a resource from the state when its create fails
+  or times out. `down` therefore calls the vendor module's optional `cleanup(run)` (the BenchmarkRun name, which the
+  controller's and the sweeper's `down` Jobs both have) after the destroy, which deletes what the run's tag still
+  matches. A module without that function relies on the state alone.
 - **`BenchmarkRun` deleted:** a finalizer keeps the object until `down` succeeded; deleting an active run cancels it.
 - **Run gone, stack left:** the sweeper (every 10 minutes) lists the stacks `k8s-dbaas-*` in the bucket; one whose first update is older than
   `dbaas.sweepAfterHours` (6 h) and whose run does not exist is destroyed by a `dbaas-down-<run>` Job that belongs to no run,
