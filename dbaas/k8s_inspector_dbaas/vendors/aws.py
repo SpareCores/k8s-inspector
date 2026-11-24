@@ -11,12 +11,14 @@ the region is the provider's `region`.
 
 import hashlib
 import logging
+import os
 import re
 from datetime import UTC, datetime
 
 import boto3
 import pulumi
 import pulumi_aws as aws
+from botocore.config import Config
 
 from k8s_inspector_dbaas.spec import DbOutputs, DbSpec
 from k8s_inspector_dbaas.storage_plan import DiskProfile, plan
@@ -27,6 +29,8 @@ ADMIN_USER = "scadmin"
 ADMIN_DB = "postgres"
 RUN_TAG = "sc_inspector_run"
 EXPIRES_TAG = "sc_inspector_expires"
+# One slow or dead regional endpoint must not use up the Job's deadline: fail it in about a minute, naming the region.
+CLIENT_CONFIG = Config(connect_timeout=10, read_timeout=30, retries={"max_attempts": 3, "mode": "standard"})
 EXPIRES_FORMAT = "%Y%m%dt%H%Mz"  # the controller's label-safe stamp of `sc_inspector_expires`
 
 # RDS for PostgreSQL gp3 (https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/CHAP_Storage.html): the IOPS and
@@ -103,24 +107,29 @@ def provision(spec: DbSpec) -> DbOutputs:
 
 
 def inventory() -> list[dict]:
-    """The tagged instances of every enabled region. The credentials are the Job's environment. A region that cannot
-    be listed, or an unreadable expiry tag, fails the whole call after logging which, so the staleness alert fires and
-    a partial list does not hide leaks."""
+    """The tagged instances of the regions in `DBAAS_REGIONS` (comma-separated; the controller sets it to the regions
+    the platform configured, the only ones with databases), else of every enabled region. The credentials are the
+    Job's environment. A region that cannot be listed, or an unreadable expiry tag, fails the whole call after logging
+    which, so the staleness alert fires and a partial list does not hide leaks."""
     found = []
     session = boto3.session.Session(region_name="us-east-1")
-    for region in session.client("ec2").describe_regions()["Regions"]:
-        name = region["RegionName"]
+    configured = os.environ.get("DBAAS_REGIONS", "")
+    if configured:
+        regions = [region.strip() for region in configured.split(",") if region.strip()]
+    else:
+        regions = [r["RegionName"] for r in session.client("ec2", config=CLIENT_CONFIG).describe_regions()["Regions"]]
+    for region in regions:
         try:
-            found += _region_instances(session, name)
-        except Exception:
-            log.exception("listing RDS instances failed in region %s", name)
-            raise
+            found += _region_instances(session, region)
+        except Exception as err:
+            log.exception("listing RDS instances failed in region %s", region)
+            raise RuntimeError(f"listing RDS instances failed in region {region}: {err}") from err
     return found
 
 
 def _region_instances(session: boto3.session.Session, region: str) -> list[dict]:
     found = []
-    rds = session.client("rds", region_name=region)
+    rds = session.client("rds", region_name=region, config=CLIENT_CONFIG)
     for page in rds.get_paginator("describe_db_instances").paginate():
         for db in page["DBInstances"]:
             tags = {tag["Key"]: tag["Value"] for tag in db.get("TagList", [])}

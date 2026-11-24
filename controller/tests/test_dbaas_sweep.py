@@ -306,7 +306,10 @@ def test_an_inventory_job_runs_per_configured_vendor_with_its_credentials_and_no
     assert jobs(kube) == ["dbaas-inventory-aws", "dbaas-inventory-oci"]
     job = kube.get("job", "dbaas-inventory-aws")
     container = job["spec"]["template"]["spec"]["containers"][0]
-    assert container["args"] == ["inventory"] and container["env"] == [{"name": "DBAAS_VENDOR", "value": "aws"}]
+    assert container["args"] == ["inventory"] and container["env"] == [
+        {"name": "DBAAS_VENDOR", "value": "aws"},
+        {"name": "DBAAS_REGIONS", "value": ""},
+    ]
     assert container["envFrom"] == [{"secretRef": {"name": "k8s-inspector-dbaas-aws", "optional": True}}]
     assert job["spec"]["template"]["metadata"]["annotations"] == {"karpenter.sh/do-not-disrupt": "true"}
     assert job["spec"]["activeDeadlineSeconds"] == 900
@@ -414,3 +417,12 @@ def test_the_metric_counts_databases_that_exist_and_the_age_of_the_oldest(kube, 
     assert 'k8s_inspector_dbaas_oldest_age_seconds{vendor="aws"} 36000' in text  # 9 h + 1 h
     assert 'k8s_inspector_dbaas_instances{vendor="oci"} 1' in text  # `a`; `b` is destroyed
     assert 'k8s_inspector_dbaas_oldest_age_seconds{vendor="oci"}' in text
+
+
+def test_the_inventory_job_gets_the_sorted_configured_regions_of_the_vendor():
+    cfg = make_sweep_config()
+    networks = {"us-east-1": {}, "eu-central-1": {}}
+    dbaas = replace(cfg.settings.dbaas, vendors={"aws": DbaasVendor(networks=networks)})
+    cfg = type(cfg)(cfg.env, replace(cfg.settings, dbaas=dbaas))
+    env = dbaas_jobs.inventory_job("aws", cfg)["spec"]["template"]["spec"]["containers"][0]["env"]
+    assert {"name": "DBAAS_REGIONS", "value": "eu-central-1,us-east-1"} in env
