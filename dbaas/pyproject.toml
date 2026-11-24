@@ -16,6 +16,8 @@ vendors = [
     "pulumi-aws>=7.55.0",
     "pulumi-upcloud>=0.24.1",
     "ediri-vultr>=2.27.1",
+    "oci>=2.193.0",
+    "pulumi-oci>=5.8.0",
 ]
 dev = [
     "pytest",
