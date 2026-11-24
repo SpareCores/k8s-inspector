@@ -10,6 +10,7 @@ import pytest
 from test_runner import START, Harness, in_step
 
 from k8s_inspector import crd, dbaas_jobs, dbaas_keeper, pods
+from k8s_inspector import keeper as sc_keeper
 from k8s_inspector.model import (
     CapacityMode,
     Config,
@@ -94,6 +95,16 @@ def h() -> DbHarness:
 
 
 # --------------------------------------------------------------------------- the whole way
+
+
+def test_a_dbaas_run_is_not_dropped_when_keeper_does_not_list_its_client(h, monkeypatch):
+    asks = []
+    monkeypatch.setattr(sc_keeper, "active_servers_block_reasons", lambda env, names: asks.append(names) or {})
+    h.start_db()
+    h.drive(stop=lambda run: run.status.phase == RunPhase.PROVISIONING)
+    h.clock.advance(minutes=11)
+    h.runner.reconcile(h.name)
+    assert h.run_exists() and h.run.status.phase == RunPhase.PROVISIONING and asks == []
 
 
 def test_the_client_node_comes_first_and_the_database_is_created_when_the_anchor_runs(h):

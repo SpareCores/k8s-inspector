@@ -118,9 +118,11 @@ def _failed_region(meta: dict | None) -> str | None:
 def pick_client(kube: Kube, cfg: Config, vendor: str, servers: list[dict], leased: set[str]) -> str | None:
     """The client server for a database: `dbaas_client.rank` over Keeper's servers in its region, without SKUs that
     SCarpenter does not offer, that wait for a launch retry or that already have a run (`leased`: run names). None when
-    there is none."""
+    there is none or SCarpenter's offered-types listing is unusable."""
     ranked = dbaas_client.rank(servers)
     skipped = planner.not_offered(kube, cfg, vendor, ranked)
+    if skipped is None:  # no usable offered-types listing: nothing is known about the SKUs
+        return None
     waiting = launch.deferred(kube, vendor, ranked, datetime.now(UTC), prune=False)
     for sku in ranked:
         if (

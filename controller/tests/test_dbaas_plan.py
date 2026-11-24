@@ -27,6 +27,12 @@ NETWORKS = {"eu-1": {"vpc": "a"}, "eu-2": {"vpc": "b"}}
 PRICES = {"eu-1": 0.40, "eu-2": 0.30, "ap-1": 0.10}  # ap-1 is the cheapest but has no network
 
 
+@pytest.fixture(autouse=True)
+def everything_offered(monkeypatch):
+    """SCarpenter offers every SKU (the offered-types listing is tested in test_planner.py)."""
+    monkeypatch.setattr(planner, "not_offered", lambda kube, cfg, vendor, skus, now=None: {})
+
+
 def make_config(*, auto=True, networks=None, publish=True, **vendor) -> Config:
     vendors = {"oci": VendorSettings(enabled=True, dbaas_auto_plan=auto, publish=publish, **vendor)}
     dbaas = DbaasSettings(vendors={"oci": DbaasVendor(networks=NETWORKS if networks is None else networks)})

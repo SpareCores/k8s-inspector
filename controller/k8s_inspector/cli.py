@@ -180,12 +180,14 @@ def serve(kube: Kube, provider: ConfigProvider, stop: threading.Event, metrics_p
     env = cfg.env
     storage = Storage(env, cfg.settings.uploads)
     metrics = Metrics(kube, lambda: provider().settings)
+    keeper_cache = planner.KeeperCache()  # one Keeper answer for the planner and the runner
     runner = Runner(
         kube,
         storage,
         provider,
         env.namespace,
         on_launch_failure=metrics.record_launch_failure,
+        keeper_cache=keeper_cache,
         on_leftover_stack_failure=metrics.record_dbaas_leftover_failure,
     )
     publisher = _MeteredPublisher(
@@ -221,6 +223,8 @@ def serve(kube: Kube, provider: ConfigProvider, stop: threading.Event, metrics_p
             stop,
             publisher.read_newest_variants,
             publisher.read_first_seen,
+            keeper_cache,
+            metrics.record_vendor_skipped,
         ),
         "dbaas-planner": lambda: dbaas_plan.run_forever(kube, provider, publisher.read_dbaas_metas, stop),
         "dbaas-sweeper": lambda: dbaas_sweep.run_forever(

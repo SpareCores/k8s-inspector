@@ -162,13 +162,19 @@ limit plus 7-8 s (10 s poll): with a 5 minute limit the anchor ended after 5 m 8
 stateDiagram-v2
   [*] --> Provisioning: anchor created
   Provisioning --> Running: anchor Running on a fresh node
-  Provisioning --> Failed: pre-launch budget passed / ICE / quota / node did not come up (-1)
+  Provisioning --> Failed: pre-launch budget passed / ICE / quota / SKU no longer offered after a launch failure / node did not come up (-1)
+  Provisioning --> [*]: SKU no longer eligible in Keeper (run deleted, no result; a run with finished tasks ends Failed instead)
   Running --> Running: next step
   Running --> Releasing: all tasks done, uploads confirmed
   Running --> Interrupted: node or anchor gone (spot, expiry, manual delete)
   Releasing --> [*]: anchor deleted, node removed
   Interrupted --> [*]: remaining tasks go to the next attempt or end as -4
 ```
+
+A run without a node ends when its SKU stops being possible: SCarpenter no longer offers it after a launch failure
+(the failure's reason, [launch retries](launch-retries.md)), or Keeper no longer lists it as ACTIVE or blocks the run's
+unfinished tasks (the run and its NodeClaims are deleted, no result is recorded; a run with a finished task or a node ends Failed instead, so the finished tasks are published; a forced run is not checked). Neither waits for
+the pre-launch budget.
 
 A run has one or more attempts. Only the [spot strategy](spot.md) and a failed provisioning (a node older than its
 anchor, a vanished anchor) create more than one. An anchor that ends while its node is healthy is a `NODE_LOST` attempt without a spot

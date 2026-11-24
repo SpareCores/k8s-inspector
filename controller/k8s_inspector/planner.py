@@ -211,6 +211,7 @@ def _check_keeper(cfg: Config, vendor: str, sku: str, names: list[str]) -> None:
 
 
 KEEPER_CACHE_SECONDS = 30 * 60
+OFFERED_UNUSABLE = "offered_types_unusable"  # `reason` of `on_vendor_skipped`
 
 
 class KeeperCache:
@@ -334,8 +335,9 @@ def read_offered(
     (`offerings[].until`, else None). Entries without an `apiReference` are ignored; of two with the same one the
     available wins and `until` is the latest of both. `now` (default the current time) judges staleness.
 
-    None (fail open, the reason is logged) when the ConfigMap is absent, unreadable (a corrupt gzip too), malformed or
-    stale (`generatedAt` missing, without timezone or older than `OFFERED_MAX_AGE`), or has a malformed entry."""
+    None (the reason is logged; it means neither "offered" nor "not offered") when the ConfigMap is absent,
+    unreadable (a corrupt gzip too), malformed or stale (`generatedAt` missing, without timezone or older than
+    `OFFERED_MAX_AGE`), or has a malformed entry."""
     name = f"scarpenter-offered-{cfg.settings.bench_class}-{vendor}"
     try:
         configmap = kube.get_configmap_in(SCARPENTER_NAMESPACE, name)
@@ -369,9 +371,9 @@ def read_offered(
                 }
             old["until"] = max(untils, default=None)
     except NotFound:
-        log.debug("offered types of vendor %s unusable: ConfigMap %s not found", vendor, name)
+        log.warning("offered types of vendor %s unusable: ConfigMap %s not found", vendor, name)
         return None
-    except Exception as e:  # unreadable, bad JSON or a missing key: one reason, fail open
+    except Exception as e:  # unreadable, bad JSON or a missing key: one reason
         log.warning("offered types of vendor %s unusable: cannot use ConfigMap %s: %r", vendor, name, e)
         return None
     if (now or datetime.now(UTC)) - generated > OFFERED_MAX_AGE:
@@ -400,18 +402,21 @@ def is_offered(
     )
 
 
-def not_offered(kube: Kube, cfg: Config, vendor: str, skus: list[str]) -> dict[str, str]:
+def not_offered(
+    kube: Kube, cfg: Config, vendor: str, skus: list[str], now: datetime | None = None
+) -> dict[str, str] | None:
     """The SKUs (of `skus`) that SCarpenter's offered-types ConfigMap (`read_offered`) does not offer for the
     vendor's capacity mode, with the reason. A SKU is not offered when its entry is missing, `available` is false
     (whatever its offerings' `until`: SCarpenter rewrites the listing when a mark expires) or it has no capacity
     type, or when the mode is OnDemand and `on-demand` is not in its `capacityTypes` (SpotFirst takes either
     type).
 
-    Fails open: when `read_offered` returns nothing, nothing is filtered. In a truncated list a missing entry
-    proves nothing, so only entries with `available` false count."""
-    offered = read_offered(kube, cfg, vendor)
+    Fails closed: None when `read_offered` returns nothing (the listing is missing, unreadable or stale), because
+    then nothing is known about the SKUs. In a truncated list a missing entry proves nothing, so only entries with
+    `available` false count."""
+    offered = read_offered(kube, cfg, vendor, now)
     if offered is None:
-        return {}
+        return None
     entries, truncated = offered
     if truncated:
         log.warning(
@@ -449,6 +454,7 @@ def plan_cycle(
     keeper_cache: KeeperCache | None = None,
     variant_reader: VariantReader | None = None,
     first_seen_reader: FirstSeenReader | None = None,
+    on_vendor_skipped: Callable[[str, str], None] | None = None,
 ) -> list[PlannedRun]:
     """One autoPlan cycle. For each enabled vendor with autoPlan whose results are published (`publish`; without it
     git would never record them and the SKU would be run again and again) and that is below its caps
@@ -459,15 +465,17 @@ def plan_cycle(
     for a SKU whose `nvidia_smi` Keeper blocks (no GPU); a SKU with only GPU tasks due is not planned. A vendor
     whose publishing is stalled (`publisher.publishing_stalled`) is skipped: new runs would only pile up
     unpublished. A vendor that is `launch.paused` (BOOT_FAILURE on several SKUs, no node ready since) is skipped
-    too. SKUs SCarpenter does not offer (`not_offered`) and SKUs waiting for a launch retry (`launch.deferred`,
-    which also drops the entries of SKUs Keeper no longer lists, except in a dry run) are skipped.
+    too, and so is a vendor whose SCarpenter offered-types listing is missing, unreadable or stale (`not_offered`
+    fails closed). SKUs SCarpenter does not offer (`not_offered`) and SKUs waiting for a launch retry
+    (`launch.deferred`, which also drops the entries of SKUs Keeper no longer lists, except in a dry run) are skipped.
     When a run's node lands on new hardware, `pick_variant` creates a new variant directory that only gets the
     tasks that ran. So a task Keeper allows that the SKU's newest variant `N` has no `meta.json` for
     (`variant_reader`) is due too (`NEW_VARIANT`) when its latest attempt on the SKU (`fill_reason`: `last_attempt`
     of `schedule/<task>/meta.json`, else the meta) started before `N`'s `first_seen` (`first_seen_reader`, from
     `variant.json`; none: no fill for the SKU). After an attempt since then only the retry bounds of `due_reason`
     on that attempt apply, wherever it landed. The planner cannot choose the hardware.
-    With `dry_run` nothing is created and the first such SKU of each vendor is returned.
+    With `dry_run` nothing is created and the first such SKU of each vendor is returned. `on_vendor_skipped(vendor,
+    reason)` is called for a vendor skipped for its unusable offered-types listing (`OFFERED_UNUSABLE`; metrics).
 
     Fails closed: when Keeper or git cannot be read the cycle plans nothing (for git: nothing for that vendor)
     and logs why."""
@@ -525,6 +533,11 @@ def plan_cycle(
         if not skus:
             log.info("autoPlan: Keeper lists no ACTIVE servers for vendor %s", vendor)
         skipped = not_offered(kube, cfg, vendor, skus) if skus else {}
+        if skipped is None:
+            log.warning("autoPlan skips vendor %s: its SCarpenter offered-types listing is unusable", vendor)
+            if on_vendor_skipped:
+                on_vendor_skipped(vendor, OFFERED_UNUSABLE)
+            continue
         waiting = launch.deferred(kube, vendor, skus, datetime.now(UTC), prune=not dry_run)
         if skipped:
             examples = ", ".join(f"{sku} ({why})" for sku, why in list(skipped.items())[:3])
@@ -596,10 +609,12 @@ def run_forever(
     stop: threading.Event,
     variant_reader: VariantReader | None = None,
     first_seen_reader: FirstSeenReader | None = None,
+    keeper_cache: KeeperCache | None = None,
+    on_vendor_skipped: Callable[[str, str], None] | None = None,
 ) -> None:
     """Every `planner.interval_minutes`: `plan_cycle`; exceptions are logged, never fatal. `cfg_provider` is a
-    zero-argument callable returning the current `Config`."""
-    keeper_cache = KeeperCache()
+    zero-argument callable returning the current `Config`. `keeper_cache` is shared with the runner."""
+    keeper_cache = keeper_cache or KeeperCache()
     while not stop.is_set():
         interval_minutes = 5
         try:
@@ -612,6 +627,7 @@ def run_forever(
                 keeper_cache=keeper_cache,
                 variant_reader=variant_reader,
                 first_seen_reader=first_seen_reader,
+                on_vendor_skipped=on_vendor_skipped,
             ):
                 log.info("planned run", extra={"vendor": planned.vendor, "sku": planned.sku, "reason": planned.reason})
         except Exception:

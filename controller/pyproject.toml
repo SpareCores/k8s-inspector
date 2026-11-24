@@ -33,6 +33,7 @@ packages = ["k8s_inspector"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = ["offered: the planner test reads the real SCarpenter offered-types listing"]
 
 [tool.ruff]
 line-length = 120

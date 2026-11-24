@@ -363,6 +363,13 @@ def all_done(**overrides) -> dict[str, dict]:
     return metas
 
 
+@pytest.fixture(autouse=True)
+def everything_offered(request, monkeypatch):
+    """SCarpenter offers every SKU, unless the test is about the listing (`@pytest.mark.offered`)."""
+    if not request.node.get_closest_marker("offered"):
+        monkeypatch.setattr(planner, "not_offered", lambda kube, cfg, vendor, skus, now=None: {})
+
+
 @pytest.fixture
 def keeper_skus(monkeypatch):
     """`keeper.active_servers_block_reasons` answers with this dict ({vendor: {sku: {task: reasons}}})."""
@@ -646,10 +653,15 @@ OFFERED = {"available": True, "capacityTypes": ["on-demand", "spot"]}
 QUOTA = {"available": False, "reason": "QuotaGate", "detail": "headroom 6, need 16"}
 
 
+def not_offered_of(kube):
+    return planner.not_offered(kube, auto_config(), "oci", ["s1"])
+
+
 def planned_skus(kube, cfg=None) -> list[str]:
     return [p.sku for p in plan(kube, cfg or auto_config(), {}, dry_run=True)]
 
 
+@pytest.mark.offered
 def test_offered_types_skip_unavailable_skus(kube, keeper_skus, caplog):
     keeper_skus["oci"] = {"quota": {}, "ok": {}}
     publish_offered(kube, offered_configmap({"quota": QUOTA, "ok": OFFERED}))
@@ -658,12 +670,14 @@ def test_offered_types_skip_unavailable_skus(kube, keeper_skus, caplog):
     assert "autoPlan skips 1 SKUs of vendor oci not offered by SCarpenter, e.g. quota (QuotaGate)" in caplog.text
 
 
+@pytest.mark.offered
 def test_offered_types_skip_a_sku_without_an_entry(kube, keeper_skus):
     keeper_skus["oci"] = {"unknown": {}, "ok": {}}
     publish_offered(kube, offered_configmap({"ok": OFFERED}))
     assert planned_skus(kube) == ["ok"]
 
 
+@pytest.mark.offered
 def test_offered_types_on_demand_mode_needs_an_on_demand_offering(kube, keeper_skus):
     keeper_skus["oci"] = {"spot-only": {}}
     publish_offered(kube, offered_configmap({"spot-only": {"available": True, "capacityTypes": ["spot"]}}))
@@ -671,6 +685,7 @@ def test_offered_types_on_demand_mode_needs_an_on_demand_offering(kube, keeper_s
     assert planned_skus(kube, auto_config(capacity=CapacityMode.SPOT_FIRST)) == ["spot-only"]
 
 
+@pytest.mark.offered
 @pytest.mark.parametrize(
     "configmap",
     [
@@ -698,14 +713,21 @@ def test_offered_types_on_demand_mode_needs_an_on_demand_offering(kube, keeper_s
         "null-offerings",
     ],
 )
-def test_offered_types_unusable_configmap_filters_nothing(kube, keeper_skus, caplog, configmap):
+def test_an_unusable_offered_types_listing_skips_the_vendor_with_a_warning(kube, keeper_skus, caplog, configmap):
     if configmap:
         publish_offered(kube, configmap)
-    with caplog.at_level("DEBUG"):
-        assert planned_skus(kube) == ["s1"]
+    assert planned_skus(kube) == []
     assert "offered types of vendor oci unusable" in caplog.text
+    assert "autoPlan skips vendor oci: its SCarpenter offered-types listing is unusable" in caplog.text
+    assert not_offered_of(kube) is None
+    skipped = []
+    plan(kube, auto_config(), {}, dry_run=True, on_vendor_skipped=lambda *args: skipped.append(args))
+    assert skipped == [("oci", planner.OFFERED_UNUSABLE)]  # the metric's source
+    publish_offered(kube, offered_configmap({"s1": OFFERED}))  # a usable listing plans again
+    assert planned_skus(kube) == ["s1"]
 
 
+@pytest.mark.offered
 def test_offered_types_read_the_gzipped_listing(kube, keeper_skus):
     keeper_skus["oci"] = {"quota": {}, "ok": {}}
     configmap = offered_configmap({"quota": QUOTA, "ok": OFFERED}, gz=True)
@@ -716,6 +738,7 @@ def test_offered_types_read_the_gzipped_listing(kube, keeper_skus):
     assert planned_skus(kube) == ["ok"]
 
 
+@pytest.mark.offered
 def test_offered_types_prefer_the_gzipped_listing_over_data(kube, keeper_skus):
     keeper_skus["oci"] = {"s1": {}}
     gz = offered_configmap({"s1": OFFERED}, gz=True)
@@ -726,6 +749,7 @@ def test_offered_types_prefer_the_gzipped_listing_over_data(kube, keeper_skus):
     assert planned_skus(kube) == []
 
 
+@pytest.mark.offered
 def test_offered_types_without_truncated_field_are_complete(kube, keeper_skus):
     keeper_skus["oci"] = {"unknown": {}}
     configmap = offered_configmap({"ok": OFFERED})
@@ -735,18 +759,21 @@ def test_offered_types_without_truncated_field_are_complete(kube, keeper_skus):
     assert planned_skus(kube) == []  # a missing entry counts: the list is complete
 
 
+@pytest.mark.offered
 def test_offered_types_truncated_list_skips_only_listed_unavailable(kube, keeper_skus):
     keeper_skus["oci"] = {"quota": {}, "unknown": {}}
     publish_offered(kube, offered_configmap({"quota": QUOTA}, truncated=True))
     assert planned_skus(kube) == ["unknown"]
 
 
+@pytest.mark.offered
 def test_force_run_ignores_offered_types(kube):
     publish_offered(kube, offered_configmap({"s1": QUOTA}))
     run = planner.force_run(kube, make_config(), "oci", "s1", force=True)
     assert run.spec.sku == "s1"
 
 
+@pytest.mark.offered
 def test_offered_types_accept_an_offset_time_and_ignore_entries_without_api_reference(kube, keeper_skus):
     keeper_skus["oci"] = {"quota": {}, "ok": {}}
     configmap = offered_configmap({"quota": QUOTA, "ok": OFFERED})
@@ -757,6 +784,7 @@ def test_offered_types_accept_an_offset_time_and_ignore_entries_without_api_refe
     assert planned_skus(kube) == ["ok"]
 
 
+@pytest.mark.offered
 def test_offered_types_duplicate_api_reference_prefers_the_available_entry(kube, keeper_skus):
     configmap = offered_configmap({"s1": OFFERED})
     document = json.loads(configmap["data"]["types.json"])
@@ -766,12 +794,14 @@ def test_offered_types_duplicate_api_reference_prefers_the_available_entry(kube,
         assert planned_skus(kube) == ["s1"]
 
 
+@pytest.mark.offered
 @pytest.mark.parametrize("capacity", [CapacityMode.SPOT_FIRST, CapacityMode.ON_DEMAND])
 def test_offered_types_available_without_capacity_types_is_skipped(kube, keeper_skus, capacity):
     publish_offered(kube, offered_configmap({"s1": {"available": True, "capacityTypes": []}}))
     assert planned_skus(kube, auto_config(capacity=capacity)) == []
 
 
+@pytest.mark.offered
 def test_offered_types_truncated_list_with_on_demand_mode(kube, keeper_skus):
     keeper_skus["oci"] = {"spot-only": {}, "quota": {}, "unknown": {}, "ok": {}}
     publish_offered(
@@ -827,6 +857,7 @@ MARKED = {
 }  # fmt: skip
 
 
+@pytest.mark.offered
 def test_a_marked_sku_is_skipped_whatever_its_until(kube, keeper_skus, caplog):
     for until in ("2099-01-01T00:00:00Z", "2000-01-01T00:00:00Z", "tomorrow"):  # SCarpenter drops an expired mark
         offerings = [{**o, "until": until} if "until" in o else o for o in MARKED["offerings"]]
@@ -836,6 +867,7 @@ def test_a_marked_sku_is_skipped_whatever_its_until(kube, keeper_skus, caplog):
         assert "e.g. s1 (UnavailableCache)" in caplog.text
 
 
+@pytest.mark.offered
 def test_offered_until_is_the_latest_until_of_the_unavailable_offerings(kube):
     cfg = make_config()
     publish_offered(kube, offered_configmap({"s1": MARKED}))
@@ -856,6 +888,7 @@ def test_offered_until_is_the_latest_until_of_the_unavailable_offerings(kube):
     assert planner.offered_until(kube, cfg, "oci", "s1") == datetime(2026, 11, 21, 9, 5, tzinfo=UTC)
 
 
+@pytest.mark.offered
 def test_offered_until_has_the_checks_of_not_offered(kube):
     cfg = make_config()
     for configmap in (
@@ -887,6 +920,7 @@ def test_a_live_cycle_prunes_the_skus_keeper_no_longer_lists(kube, keeper_skus):
     assert set(launch.read(kube, "oci")) == {"s1"}
 
 
+@pytest.mark.offered
 def test_offered_until_keeps_the_latest_until_of_duplicate_api_references(kube):
     cfg = make_config()
     soon = {"capacityType": "on-demand", "zones": ["z"], "available": False, "until": "2026-11-21T10:05:00Z"}
@@ -899,6 +933,7 @@ def test_offered_until_keeps_the_latest_until_of_duplicate_api_references(kube):
         assert planner.offered_until(kube, cfg, "oci", "s1") == datetime(2026, 11, 22, tzinfo=UTC)
 
 
+@pytest.mark.offered
 def test_offered_until_judges_staleness_by_the_given_time(kube):
     cfg = make_config()
     publish_offered(kube, offered_configmap({"s1": MARKED}))
@@ -907,6 +942,7 @@ def test_offered_until_judges_staleness_by_the_given_time(kube):
     assert planner.offered_until(kube, cfg, "oci", "s1") is not None
 
 
+@pytest.mark.offered
 def test_an_entry_without_offerings_is_usable_and_a_wrong_type_is_not(kube, keeper_skus):
     configmap = offered_configmap({"s1": OFFERED})
     document = json.loads(configmap["data"]["types.json"])
@@ -1208,6 +1244,7 @@ def test_a_temporary_launch_failure_defers_the_fill_through_the_backoff(kube, qu
     assert [p.tasks for p in plan_variant(kube, variants)] == [("lscpu",)]
 
 
+@pytest.mark.offered
 def test_is_offered_needs_an_available_listing_of_the_sku(kube):
     cfg = make_config()
     assert not planner.is_offered(kube, cfg, "oci", "s1", False)  # no ConfigMap
@@ -1219,6 +1256,7 @@ def test_is_offered_needs_an_available_listing_of_the_sku(kube):
     )
 
 
+@pytest.mark.offered
 def test_is_offered_of_an_on_demand_attempt_needs_on_demand_capacity(kube):
     cfg = make_config()
     spot_only = {**MARKED, "available": True, "capacityTypes": ["spot"]}

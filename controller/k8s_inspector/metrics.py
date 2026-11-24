@@ -12,7 +12,8 @@ on: no lscpu result), `_last_publish_timestamp_seconds`
 `_spend_usd_per_hour`, `_task_duration_seconds` (summary sum/count), `_launch_failures_total{vendor,reason}`
 (runs that ended because no node could be launched, counted by the runner), `_launch_deferred_skus{vendor,reason}`
 and `_launch_blocked{vendor,reason}` (SKUs in the launch ConfigMap, and those of them still waiting for their
-retry), `_dbaas_leftover_stack_failures_total{vendor}` (runs that gave up destroying a stack of an earlier run of the
+retry), `_autoplan_vendor_skipped_total{vendor,reason}` (planner cycles that skipped a vendor, counted by the
+planner), `_dbaas_leftover_stack_failures_total{vendor}` (runs that gave up destroying a stack of an earlier run of the
 same name, counted by the runner). `_dbaas_instances{vendor}` and `_dbaas_oldest_age_seconds{vendor}`: the managed
 databases (stacks) that exist, from the stacks the sweeper sees (aged from their first update) and the DBaaS runs not
 yet destroyed that no stack shows yet (stacks of a vendor the configuration does not know are
@@ -125,6 +126,11 @@ class Metrics:
         reason = reason if reason in LAUNCH_REASONS else "OTHER"
         with self._lock:
             self._counters["launch_failures_total"][_labels(vendor=vendor, reason=reason)] += 1
+
+    def record_vendor_skipped(self, vendor: str, reason: str) -> None:
+        """A planner cycle skipped the vendor (`planner.OFFERED_UNUSABLE`)."""
+        with self._lock:
+            self._counters["autoplan_vendor_skipped_total"][_labels(vendor=vendor, reason=reason)] += 1
 
     def record_dbaas_leftover_failure(self, vendor: str) -> None:
         """A run gave up destroying the stack an earlier run of its name left."""
