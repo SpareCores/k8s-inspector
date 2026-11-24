@@ -46,7 +46,7 @@ a forced run of such a SKU takes the SKU's lease like any other run, so autoPlan
 
 - Cancel a run: `k8s-inspector cancel <run name>` sets the annotation `inspector.sparecores.com/cancel: "true"`
   and returns; the controller then records the unfinished tasks as `-4 CANCELLED` (not published: the SKU's
-  previous results stay), releases the node and keeps the `BenchmarkRun` (phase `Cancelled`). The SKU is planned
+  previous results stay), releases the node (a node that is still booting is deleted with its NodeClaim) and keeps the `BenchmarkRun` (phase `Cancelled`). The SKU is planned
   again once the cancelled run is purged, `keepRunHours` later; to stop that, pause the vendor or block the SKU.
   Check with `k8s-inspector status`. Deleting the `BenchmarkRun` with `kubectl` also releases the node but drops
   the record.

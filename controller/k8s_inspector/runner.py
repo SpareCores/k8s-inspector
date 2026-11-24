@@ -609,6 +609,22 @@ class Runner:
             if (_meta(pod).get("labels") or {}).get("inspector.sparecores.com/role") == PodRole.ANCHOR and name != keep:
                 self.kube.delete("pod", name)
 
+    def _delete_run_claims(self, run: BenchmarkRun, live: dict[str, dict]) -> None:
+        """Delete the NodeClaims of a run that stops waiting for its node: the ones remembered as uninitialized, the
+        current attempt's and those created for its live anchors. Deleting the anchor alone is not enough: Karpenter
+        consolidates only nodes that initialized, so a claim still booting would keep billing and hold a
+        `maxInFlight` slot. Initialized claims go too (their node serves only this run, and the anchor is going),
+        which spares checking each claim. Idempotent: a claim that is gone is ignored (`Kube.delete`)."""
+        names = {c.node_claim for c in run.status.uninitialized_claims}
+        attempt = self._attempt(run)
+        if attempt and attempt.node_claim:
+            names.add(attempt.node_claim)
+        for pod in live.values():
+            if (_meta(pod).get("labels") or {}).get(pods.LABEL_ROLE) == PodRole.ANCHOR:
+                names |= {_meta(c)["name"] for c in self._pending_claims(pod)}
+        for name in sorted(names):
+            self.kube.delete("nodeclaim", name)
+
     def _delete_secret(self, run: BenchmarkRun) -> None:
         self.kube.delete("secret", pods.urls_secret_name(run.name))
         self._signed_at.pop(run.name, None)
@@ -769,8 +785,10 @@ class Runner:
         self._write_run_json(run, self._nodes.pop(run.name, None))
         self._delete_secret(run)
 
-    def _fail_run(self, run: BenchmarkRun, message: str) -> None:
-        """No usable node: unfinished tasks end `-1`, unless the failure is temporary (`_defer_launch`)."""
+    def _fail_run(self, run: BenchmarkRun, live: dict[str, dict], message: str) -> None:
+        """No usable node: its claims are deleted, unfinished tasks end `-1`, unless the failure is temporary
+        (`_defer_launch`)."""
+        self._delete_run_claims(run, live)
         if not self._defer_launch(run, message):
             self._end_run(run, ExitCode.NO_NODE, message, AttemptOutcome.PROVISIONING_FAILED)
 
@@ -909,7 +927,9 @@ class Runner:
             return self._retry_provisioning(run, cfg, live, "the anchor Pod disappeared")
         if pods.is_finished(anchor):
             reason = anchor.get("status", {}).get("reason") or anchor["status"].get("phase")
-            return self._fail_run(run, launch.error_message("ANCHOR_FAILED", f"anchor ended before running ({reason})"))
+            return self._fail_run(
+                run, live, launch.error_message("ANCHOR_FAILED", f"anchor ended before running ({reason})")
+            )
         if pods.is_running(anchor) and pods.is_ready(anchor):
             return self._node_ready(run, cfg, live, anchor)
 
@@ -965,7 +985,7 @@ class Runner:
         if on_demand_retry and pods.allows_spot(anchor):
             # The next attempt (`spot.capacity_for_next_attempt`) is on-demand only.
             return self._retry_on_demand(run, live, error)
-        self._fail_run(run, error)
+        self._fail_run(run, live, error)
 
     def _launch_failures_exhausted(
         self, run: BenchmarkRun, cfg: Config, anchor: dict, failures: list[LaunchFailure]
@@ -1155,6 +1175,7 @@ class Runner:
         """A spot-allowed attempt whose NodeClaim failed to launch or boot: close it and start the next one, which
         is on-demand only (`spot.capacity_for_next_attempt`). A second failure ends the run, so this happens once."""
         log.warning("run %s attempt %d: %s, retrying on-demand", run.name, run.status.attempt, error)
+        self._delete_run_claims(run, live)
         self._delete_anchors(live)
 
         def mutate(status: RunStatus) -> None:
@@ -1167,8 +1188,9 @@ class Runner:
         """The attempt never got a usable node: close it and start the next one, a few times."""
         lost = sum(1 for a in run.status.attempts if a.outcome == AttemptOutcome.PROVISIONING_FAILED)
         if lost + 1 >= MAX_PROVISION_RETRIES:
-            return self._fail_run(run, launch.error_message("ANCHOR_FAILED", f"{why}, {lost + 1} attempts"))
+            return self._fail_run(run, live, launch.error_message("ANCHOR_FAILED", f"{why}, {lost + 1} attempts"))
         log.warning("run %s attempt %d: %s, retrying", run.name, run.status.attempt, why)
+        self._delete_run_claims(run, live)
         self._delete_anchors(live)
 
         def mutate(status: RunStatus) -> None:
@@ -1810,6 +1832,7 @@ class Runner:
     def _cancel(self, run: BenchmarkRun, cfg: Config, live: dict[str, dict]) -> None:
         run = self._ensure_tasks(run)  # a run cancelled before its first attempt still needs its tasks
         key = crd.run_key(run)
+        self._delete_run_claims(run, live)  # a node that is still booting is not consolidated by Karpenter
         for pod_name in live:
             self.kube.delete("pod", pod_name)
         for t in run.status.tasks:  # cancelled outputs are not kept: drop the open uploads

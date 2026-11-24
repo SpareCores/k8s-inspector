@@ -1564,6 +1564,98 @@ def test_cancel_annotation_on_a_pending_run_and_on_a_finished_one(h):
     assert other.run.status.phase == RunPhase.PUBLISHING and other.codes()["geekbench"] == (0, None)
 
 
+def _claim_deletes(h):
+    return [name for kind, name in h.kube.deleted if kind == "nodeclaim"]
+
+
+def test_cancel_while_the_node_boots_deletes_its_uninitialized_claim(h):
+    _boot_run(h)
+    h.runner.reconcile(h.name)  # remembers the claim as launched and not Initialized
+    assert [c.node_claim for c in h.run.status.uninitialized_claims] == ["claim-1"]
+    crd.request_cancel(h.kube, h.name)
+    h.runner.reconcile(h.name)
+    assert h.run.status.phase == RunPhase.CANCELLED
+    assert _claim_deletes(h) == ["claim-1"] and h.kube.list("nodeclaim") == []
+
+
+def test_cancel_deletes_a_claim_the_run_has_not_recorded_yet(h):
+    _boot_run(h)  # launched, but no pass has seen it
+    crd.request_cancel(h.kube, h.name)
+    h.runner.reconcile(h.name)
+    assert h.run.status.phase == RunPhase.CANCELLED and _claim_deletes(h) == ["claim-1"]
+
+
+def test_cancel_ignores_a_claim_that_is_already_gone(h):
+    _boot_run(h)
+    h.runner.reconcile(h.name)
+    h.kube.objects.pop("nodeclaim")  # Karpenter removed it between the passes
+    crd.request_cancel(h.kube, h.name)
+    h.runner.reconcile(h.name)
+    assert h.run.status.phase == RunPhase.CANCELLED and _claim_deletes(h) == []
+
+
+def test_cancel_of_a_running_run_deletes_the_claim_of_its_node(h):
+    h.start(["membench", "geekbench"])
+    h.drive(stop=in_step("02-geekbench"))
+    crd.request_cancel(h.kube, h.name)
+    h.runner.reconcile(h.name)
+    assert h.run.status.phase == RunPhase.CANCELLED and _claim_deletes(h) == [f"claim-node-{h.name}-a1"]
+
+
+def test_a_run_that_succeeds_does_not_delete_claims_itself(h):
+    h.start(["geekbench"])
+    run = h.drive()
+    assert run.status.phase == RunPhase.PUBLISHING and _claim_deletes(h) == []
+
+
+def test_an_anchor_that_never_gets_ready_deletes_the_initialized_claim(h):
+    _boot_run(h)
+    _set_conditions(h, "claim-1", Launched=True, Registered=True, Initialized=True)
+    h.clock.advance(minutes=16)
+    h.runner.reconcile(h.name)
+    assert h.entry()["reason"] == "ANCHOR_FAILED" and _claim_deletes(h) == ["claim-1"]
+
+
+def test_a_finished_anchor_deletes_the_claim_of_the_failed_run(h):
+    _boot_run(h)
+    h.kube.merge_patch("pod", f"{h.name}-a1", {"status": {"phase": "Failed", "reason": "Evicted"}})
+    h.runner.reconcile(h.name)
+    assert h.entry()["reason"] == "ANCHOR_FAILED" and _claim_deletes(h) == ["claim-1"]
+
+
+def test_exhausted_launch_failures_delete_the_failed_claims(h):
+    h.cluster.provision_enabled = False
+    h.start(["geekbench"], capacity=CapacityMode.ON_DEMAND)
+    h.runner.reconcile(h.name)
+    anchor = h.kube.get("pod", f"{h.name}-a1")
+    h.cluster.fail_launch(anchor, "Fatal (X): first", name="bench-a1", status="Unknown", reason="LaunchFailed")
+    h.cluster.fail_launch(anchor, "Fatal (X): second", name="bench-a2", status="Unknown", reason="LaunchFailed")
+    h.runner.reconcile(h.name)
+    assert h.run.status.phase == RunPhase.FAILED and _claim_deletes(h) == ["bench-a1", "bench-a2"]
+
+
+def test_the_on_demand_retry_deletes_the_claims_of_the_spot_attempt(h):
+    h.cluster.provision_enabled = False
+    h.start(["geekbench"])
+    h.runner.reconcile(h.name)
+    anchor = h.kube.get("pod", f"{h.name}-a1")
+    h.cluster.fail_launch(anchor, "Fatal (X): first", name="bench-a1", status="Unknown", reason="LaunchFailed")
+    h.cluster.fail_launch(anchor, "Fatal (X): second", name="bench-a2", status="Unknown", reason="LaunchFailed")
+    h.runner.reconcile(h.name)
+    assert h.run.status.phase == RunPhase.PENDING and _claim_deletes(h) == ["bench-a1", "bench-a2"]
+
+
+def test_the_provisioning_retry_deletes_the_claim_of_the_lost_attempt(h):
+    h.cluster.provision_enabled = False
+    h.start(["geekbench"])
+    h.runner.reconcile(h.name)
+    _launched_claim(h, h.kube.get("pod", f"{h.name}-a1"), "claim-1")
+    h.runner.reconcile(h.name)  # remembers the claim
+    h.kube.delete("pod", f"{h.name}-a1")  # the anchor disappeared
+    h.runner.reconcile(h.name)
+    assert h.run.status.phase == RunPhase.PENDING and _claim_deletes(h) == ["claim-1"]
+
+
 def test_deleted_run_leaves_no_pods_behind(h):
     h.start(["geekbench"])
     h.drive(stop=lambda run: run.status.phase == RunPhase.RUNNING)
