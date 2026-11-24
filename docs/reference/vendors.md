@@ -42,3 +42,22 @@ Consequences:
   are the limit.
 - **Admin user** `scadmin`, database `defaultdb`, `sslmode=require`. Services carry the labels `sc_inspector_run` and
   `sc_inspector_expires`; `inventory` lists them with `GET /1.3/database`.
+
+## Vultr DBaaS
+
+`dbaas/k8s_inspector_dbaas/vendors/vultr.py`. Vultr Managed Databases for PostgreSQL, through the Pulumi package `ediri-vultr` (a community provider bridged from
+Vultr's Terraform provider; its releases trail the Terraform provider, and the plugin binary exists for linux amd64 and
+arm64).
+
+- **Plan**: the database id is the plan (`vultr-dbaas-<tier>-...`), which fixes vCPUs, RAM and disk, so the module sizes
+  no storage. A plan whose Keeper `ha` has no `none` (the business and premium tiers) is refused.
+- **Network**: the database joins the bench VPC of the region (`networks.<region>.vpc_id`) and is reached on its private
+  host. `networks.<region>.trusted_ips` is the VPC's CIDR, the only range allowed to connect; `sslmode` is `require`.
+- **User**: `vultradmin` on `defaultdb`, both read back from the API. The provider sets the run's password in a second
+  call after the database is active.
+- **Credentials**: the API key in the Secret `k8s-inspector-dbaas-vultr` (`VULTR_API_KEY`), the key of a sub-user of its
+  own. Vultr keys have no scope below the ACLs: the account's API access control must admit the cluster's egress
+  addresses. The module keeps the key out of the provider arguments, so it is not in the Pulumi state.
+- **Tag**: Vultr has one tag per database, so the module writes the run labels into it (`sc_inspector_expires:<time>:sc_inspector_run:<id>`);
+  `inventory` lists `GET /v2/databases` and reads them back. There is no region argument on the provider: the region is
+  on the database.
