@@ -27,25 +27,40 @@ the cluster platform. The benchmark creates only the database (and its user/fire
 
 ## Recommended flow (decision K11)
 
-A DBaaS run is a `BenchmarkRun` with a `database` block. Order: **client node first, database second, database
-removed first.**
+A DBaaS run is a `BenchmarkRun` with a `database` block. Order: **client node first, database second; on the way out,
+database destroy and node release in parallel.**
 
 1. **Client node.** The anchor is created in the database's region (`topology.kubernetes.io/region`) with a cheap
    client type (ported `companion_picker`). If no node comes up, nothing was created that bills by the hour.
 2. **Database.** When the anchor is Running, the controller creates a Job `dbaas-up-<run>` (image
-   `k8s-inspector-dbaas`: Pulumi + only the needed providers; one stack per run, state in object storage). The
-   controller generates the password and passes it as secret config; the Job writes host and port to a Secret owned by
-   the run. The node waits on a cheap client meanwhile (a few cents for the 5-15 minutes a database takes).
+   `k8s-inspector-dbaas`: Pulumi + only the needed providers). The controller generates the password and passes it as
+   secret config; the Job writes host and port to a Secret owned by the run. The node waits on a cheap client
+   meanwhile (a few cents for the 5-15 minutes a database takes).
 3. **Benchmark.** The pgbench step runs with `SC_DB_*` from that Secret.
-4. **Removal.** Right after the pgbench step ends (success or not), the controller runs `dbaas-down-<run>` and only then
-   releases the node.
+4. **Removal.** When the pgbench Pod ends for any reason (success, failure, timeout, OOM, lost node), the controller
+   starts `dbaas-down-<run>` and releases the client node at the same time. The down Job runs on the `apps` pool and
+   does not need the node. The destroy is retried until it succeeds.
 
-Deadlines: database create 60 min (today's wait), benchmark 120 min, destroy retried until it succeeds. On every
-failure path the controller runs `down` first. Every database is tagged with the run id and an expiry time.
+Pulumi state: the controller's bucket (`K8SI_BUCKET`), prefix `dbaas-state/`, Pulumi file (DIY) backend. One stack per
+run, named `k8s-dbaas-<run>`, so the stack follows from the run name. Secrets in the state (the database password) are
+encrypted with a passphrase from a Kubernetes Secret. The prefix has no expiry lifecycle rule; a stack's state is
+deleted only after its destroy succeeds.
 
-Leak protection: the controller lists stacks `k8s-dbaas-*` older than 6 h without a live run and runs `down`; the
-monitoring alerts on managed databases older than 8 h ([monitoring](monitoring.md)). Retries follow the normal
-`-1`/`-4` backoff with the cap of three, instead of today's retry every 2 h forever.
+Deadlines: database create 60 min (today's wait), benchmark 120 min, destroy retried until it succeeds.
+
+Guarantees:
+
+- **Controller restart:** the run phase is in the `BenchmarkRun` status and the stack name follows from the run name,
+  so the controller resumes and runs `down`.
+- **Create failure or timeout:** `down` runs anyway; the Pulumi state holds what was already created.
+- **`BenchmarkRun` deleted:** a finalizer keeps the object until `down` succeeded.
+- **Run gone, stack left:** the controller lists stacks `k8s-dbaas-*` older than 6 h without a live run and runs
+  `down`.
+- **Database the state never recorded** (Job killed between the cloud create and the state write): every database is
+  tagged with the run id and an expiry time, and the monitoring alerts on tagged databases older than 8 h
+  ([monitoring](monitoring.md)). This is alert-only; no tag-driven automatic delete.
+
+Retries follow the normal `-1`/`-4` backoff with the cap of three, instead of today's retry every 2 h forever.
 
 Billing note: UpCloud and OVHcloud bill databases by the hour, AWS RDS has a 10-minute minimum, so a failed attempt
 costs that minimum; creating the database only after the client node is up avoids the common failure.
