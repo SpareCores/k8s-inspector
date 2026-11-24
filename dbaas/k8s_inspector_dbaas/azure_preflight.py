@@ -12,8 +12,8 @@ Port of the legacy `azure_dbaas_quota.py`. Before anything is created it checks,
   for v6 SKUs): a family it does not list is not an error, only the regional cores are checked.
 
 A failed check raises `PreflightError` with a message that names what is missing; the up Job then fails before a
-single resource exists. A check that cannot be made (ARM unreachable, an unexpected answer) is logged and passes: ARM
-itself refuses the create with the real reason.
+single resource exists. A check that cannot be made (ARM unreachable, an unexpected answer) is logged and passes (the
+client node's zone is then requested as is): ARM itself refuses the create with the real reason.
 """
 
 import json
@@ -42,7 +42,7 @@ def subscription_id() -> str:
     return os.environ["ARM_SUBSCRIPTION_ID"]
 
 
-def _token() -> str:
+def token() -> str:
     """An ARM token for the workload identity: the projected Kubernetes token (`ARM_OIDC_TOKEN_FILE_PATH`) is the client
     assertion of the Entra app named by `ARM_CLIENT_ID` and `ARM_TENANT_ID`, the variables the Pulumi provider reads."""
     body = urllib.parse.urlencode(
@@ -59,9 +59,8 @@ def _token() -> str:
         return json.load(response)["access_token"]
 
 
-def arm_list(path: str, api_version: str, **params: str) -> Iterator[dict]:
-    """The `value` items of a (paged) ARM list call under `path`."""
-    token = _token()
+def arm_list(token: str, path: str, api_version: str, **params: str) -> Iterator[dict]:
+    """The `value` items of a (paged) ARM list call under `path`, with an ARM token from `token()`."""
     url: str | None = f"{ARM}{path}?{urllib.parse.urlencode({'api-version': api_version, **params})}"
     while url:
         request = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}"})
@@ -71,10 +70,10 @@ def arm_list(path: str, api_version: str, **params: str) -> Iterator[dict]:
         url = page.get("nextLink")
 
 
-def _sku_family(region: str, sku: str) -> str | None:
+def _sku_family(token: str, region: str, sku: str) -> str | None:
     """The quota family of a compute size from the ARM Resource SKUs of the region (the listing ends at the SKU)."""
     path = f"/subscriptions/{subscription_id()}/providers/Microsoft.Compute/skus"
-    for item in arm_list(path, COMPUTE_API_VERSION, **{"$filter": f"location eq '{region}'"}):
+    for item in arm_list(token, path, COMPUTE_API_VERSION, **{"$filter": f"location eq '{region}'"}):
         if item.get("name") == sku and item.get("resourceType") == "virtualMachines":
             return item.get("family")
     return None
@@ -95,6 +94,8 @@ def offer_restricted(capabilities: list[dict]) -> bool:
         for feature in capability.get("supportedFeatures") or []:
             if feature.get("name") == "OfferRestricted" and feature.get("status") == "Enabled":
                 return True
+        if "restricted" in (capability.get("reason") or "").lower():
+            return True
     return False
 
 
@@ -120,19 +121,27 @@ def headroom(usages: dict[str, dict], family: str | None, vcpus: int) -> str | N
     return None
 
 
-def check(region: str, sku: str, vcpus: int, storage_edition: str) -> list[str]:
+def check(region: str, sku: str, vcpus: int, storage_edition: str) -> list[str] | None:
     """Raise `PreflightError` when the database cannot be created; else return the availability zones of the SKU
-    (the zone of the client node is used only when it is one of them)."""
-    base = f"/subscriptions/{subscription_id()}/providers/Microsoft.DBforPostgreSQL/locations/{region}"
+    (the zone of the client node is used only when it is one of them), or None when the check could not be made."""
     try:
-        capabilities = list(arm_list(f"{base}/capabilities", API_VERSION))
-        usages = {
-            i["name"]["value"].lower(): i for i in arm_list(f"{base}/resourceType/flexibleServers/usages", API_VERSION)
-        }
-        family = _sku_family(region, sku)
+        return _check(region, sku, vcpus, storage_edition)
+    except PreflightError:
+        raise
     except Exception as e:  # the check could not be made: ARM refuses a create it cannot do, with its own reason
         log.warning("azure pre-flight for %s in %s skipped: %s", sku, region, e)
-        return []
+        return None
+
+
+def _check(region: str, sku: str, vcpus: int, storage_edition: str) -> list[str]:
+    base = f"/subscriptions/{subscription_id()}/providers/Microsoft.DBforPostgreSQL/locations/{region}"
+    arm_token = token()
+    capabilities = list(arm_list(arm_token, f"{base}/capabilities", API_VERSION))
+    usages = {
+        i["name"]["value"].lower(): i
+        for i in arm_list(arm_token, f"{base}/resourceType/flexibleServers/usages", API_VERSION)
+    }
+    family = _sku_family(arm_token, region, sku)
     if offer_restricted(capabilities):
         raise PreflightError(
             f"azure pre-flight: PostgreSQL Flexible Server is restricted for this subscription in {region}"

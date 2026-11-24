@@ -1,12 +1,13 @@
 """The `azure` vendor: Azure Database for PostgreSQL Flexible Server in the bench VNet (private access).
 
-Port of sc-runner's `azure_dbaas.py`, without the VM: the server joins the delegated subnet of the region's bench VNet
-and registers in the region's private DNS zone, both made by the platform (`spec.network`, the ConfigMap's
-`dbaas.vendors.azure.networks.<region>`):
+Port of sc-runner's `azure_dbaas.py`, without the VM: the server joins the delegated `dbaas` subnet of the region's
+bench VNet and registers in the private DNS zone (one for all regions), both made by the platform (`spec.network`,
+the ConfigMap's `dbaas.vendors.azure.networks.<region>`):
 
-- `resource_group`: the region's bench resource group, which holds the server (the identity may write there only);
+- `resource_group`: the dedicated resource group of the DBaaS servers (the identity may write servers there only);
 - `subnet_id`: the subnet delegated to `Microsoft.DBforPostgreSQL/flexibleServers`;
-- `private_dns_zone_id`: the private DNS zone linked to the VNet (`privatelink.postgres.database.azure.com`).
+- `private_dns_zone_id`: the global private DNS zone `privatelink.postgres.database.azure.com`, linked to every
+  region's VNet.
 
 The server has no public access, so the clients' network range needs no allowlist. Credentials: the Job's workload
 identity (`ARM_CLIENT_ID`, `ARM_TENANT_ID`, `ARM_SUBSCRIPTION_ID`, `ARM_USE_OIDC`, `ARM_OIDC_TOKEN_FILE_PATH`
@@ -14,6 +15,7 @@ from the Secret `k8s-inspector-dbaas-azure`); the provider reads them from the e
 region: every resource takes `location=spec.region`.
 """
 
+import contextlib
 import hashlib
 import math
 import re
@@ -29,17 +31,21 @@ ADMIN_USER = "scadmin"  # the legacy name; the server's admin may create databas
 ADMIN_DB = "postgres"
 TIERS = {"B": "Burstable", "GP": "GeneralPurpose", "MO": "MemoryOptimized"}  # prefixes of Keeper's `sku_name`
 # Premium SSD v2 (the legacy choice, https://learn.microsoft.com/azure/virtual-machines/disks-types#premium-ssd-v2):
-# 3000 IOPS and 125 MB/s are free, throughput is at most 0.25 MB/s per IOPS; the SKUs that do not offer it
+# 3000 IOPS and 125 MB/s are free (the module provisions at least the P30 equivalent), throughput is at most
+# 0.25 MB/s per IOPS; the SKUs that do not offer it
 # (Keeper's `compatible_storage_ids` lacks ManagedDiskV2: Burstable) get Premium SSD, as the legacy did.
 PREMIUM_V2 = "ManagedDiskV2"
-PREMIUM_V2_BASE_IOPS = 3000
-PREMIUM_V2_BASE_MBPS = 125
+PREMIUM_V2_MIN_IOPS = (
+    5000  # the floor of the legacy sc-runner: the performance of Premium SSD P30 (5000 IOPS, 200 MB/s),
+)
+PREMIUM_V2_MIN_MBPS = 200  # more only when the storage plan asks for more
 PREMIUM_V2_MBPS_PER_IOPS = 0.25
 PREMIUM_V2_PROFILE = {"max_write_iops": 80_000, "max_write_mbps": 1200, "independently_provisioned": True}
 PREMIUM_SIZES_GIB = (32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768)  # Premium SSD disk sizes
 PREMIUM_TIER = "P30"  # the legacy performance tier of Premium SSD (5000 IOPS, 200 MB/s) ...
 PREMIUM_TIER_MAX_GIB = 1024  # ... which a disk of at most 1 TiB can be set to
 NAME_MAX = 63
+UNKNOWN_CREATED_AT = "1970-01-01T00:00:00Z"
 
 
 def sku_of(spec: DbSpec) -> tuple[str, str]:
@@ -63,9 +69,9 @@ def storage_for(spec: DbSpec) -> dbforpostgresql.StorageArgs:
             spec.memory_gib, spec.vcpus, storage_plan.DiskProfile(min_size_gib=min_gib, **PREMIUM_V2_PROFILE)
         )
         size = plan.storage_gib
-        # a disk allows 500 IOPS per GiB above 6 GiB; the plan's 64 GiB and up is far above 3000
-        iops = max(PREMIUM_V2_BASE_IOPS, plan.iops or 0)
-        mbps = min(max(PREMIUM_V2_BASE_MBPS, plan.throughput_mb_s or 0), iops * PREMIUM_V2_MBPS_PER_IOPS)
+        # a disk allows 500 IOPS per GiB above 6 GiB; the plan's 64 GiB and up is far above 5000
+        iops = max(PREMIUM_V2_MIN_IOPS, plan.iops or 0)
+        mbps = min(max(PREMIUM_V2_MIN_MBPS, plan.throughput_mb_s or 0), iops * PREMIUM_V2_MBPS_PER_IOPS)
         args = {"type": "PremiumV2_LRS", "iops": iops, "throughput": int(mbps)}
     else:
         size = next(
@@ -79,20 +85,24 @@ def storage_for(spec: DbSpec) -> dbforpostgresql.StorageArgs:
     return dbforpostgresql.StorageArgs(storage_size_gb=size, **args)
 
 
-def server_name(run: str) -> str:
-    """The server name (and DNS label): lowercase letters, digits and `-`, at most 63; a longer run name is cut and
-    suffixed with a hash of itself, so that two runs never share a name."""
-    name = re.sub(r"[^a-z0-9-]", "-", f"sc-{run}".lower())
+def server_name(run_id: str) -> str:
+    """The server name (and globally unique DNS label): lowercase letters, digits and `-`, at most 63. It comes from the
+    run id, which is new for every run (the run name repeats for the same client SKU, and a server of an earlier run
+    may still be deleting); a longer id is cut and suffixed with a hash of itself."""
+    name = re.sub(r"[^a-z0-9-]", "-", f"sc-{run_id}".lower())
     if len(name) > NAME_MAX:
-        name = f"{name[: NAME_MAX - 9]}-{hashlib.sha256(run.encode()).hexdigest()[:8]}"
+        name = f"{name[: NAME_MAX - 9]}-{hashlib.sha256(run_id.encode()).hexdigest()[:8]}"
     return name
 
 
-def zone_of(spec: DbSpec, supported: list[str]) -> str | None:
+def zone_of(spec: DbSpec, supported: list[str] | None) -> str | None:
     """The availability zone of the client node (`westeurope-1` or `1`) when the SKU offers it there, else None: Azure
-    picks one."""
+    picks one. `supported` is None when the pre-flight could not list the SKU's zones: the client's zone is then
+    requested as is."""
     zone = (spec.zone or "").rsplit("-", 1)[-1]
-    return zone if zone in supported else None
+    if not zone:
+        return None
+    return zone if supported is None or zone in supported else None
 
 
 def provision(spec: DbSpec) -> DbOutputs:
@@ -106,7 +116,7 @@ def provision(spec: DbSpec) -> DbOutputs:
     )  # credentials from the ARM_* environment, never as arguments (they would go to the state)
     server = dbforpostgresql.Server(
         "server",
-        server_name=server_name(spec.run),
+        server_name=server_name(spec.run_id),
         resource_group_name=network["resource_group"],
         location=spec.region,
         version=spec.engine_version,
@@ -129,19 +139,25 @@ def provision(spec: DbSpec) -> DbOutputs:
 
 
 def inventory() -> list[dict]:
-    """The Flexible Servers of the subscription that carry `sc_inspector_run`."""
+    """The Flexible Servers of the subscription that carry `sc_inspector_run`. A server without an expiry tag has
+    `expires_at` None; one without a creation time (`systemData`) counts as created at the epoch, so it stands out as
+    the oldest."""
     path = f"/subscriptions/{azure_preflight.subscription_id()}/providers/Microsoft.DBforPostgreSQL/flexibleServers"
     found = []
-    for server in azure_preflight.arm_list(path, azure_preflight.API_VERSION):
+    for server in azure_preflight.arm_list(azure_preflight.token(), path, azure_preflight.API_VERSION):
         tags = server.get("tags") or {}
-        if "sc_inspector_run" in tags:
-            expires = datetime.strptime(tags["sc_inspector_expires"], "%Y%m%dt%H%Mz").replace(tzinfo=UTC)
-            found.append(
-                {
-                    "id": server["id"],
-                    "run": tags["sc_inspector_run"],
-                    "expires_at": expires.isoformat().replace("+00:00", "Z"),
-                    "created_at": server["systemData"]["createdAt"],
-                }
-            )
+        if "sc_inspector_run" not in tags:
+            continue
+        expires = None
+        if raw := tags.get("sc_inspector_expires"):
+            with contextlib.suppress(ValueError):  # an unreadable expiry is an unknown one
+                expires = datetime.strptime(raw, "%Y%m%dt%H%Mz").replace(tzinfo=UTC).isoformat().replace("+00:00", "Z")
+        found.append(
+            {
+                "id": server["id"],
+                "run": tags["sc_inspector_run"],
+                "expires_at": expires,
+                "created_at": (server.get("systemData") or {}).get("createdAt") or UNKNOWN_CREATED_AT,
+            }
+        )
     return found

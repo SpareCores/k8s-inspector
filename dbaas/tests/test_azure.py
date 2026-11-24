@@ -83,7 +83,7 @@ def test_the_server_joins_the_delegated_subnet_without_public_access(mocks, chec
         out, _, server = found
         inputs = server.inputs
         assert inputs["resourceGroupName"] == "sc-azure-main-westeurope" and inputs["location"] == "westeurope"
-        assert inputs["serverName"] == "sc-azure-standard-d2ds-v5-1234abcd" and inputs["version"] == "18"
+        assert inputs["serverName"] == "sc-r1" and inputs["version"] == "18"
         assert inputs["sku"] == {"name": "Standard_D4ds_v5", "tier": "GeneralPurpose"}
         assert inputs["network"] == {
             "delegatedSubnetResourceId": NETWORK["subnet_id"],
@@ -158,11 +158,11 @@ def test_the_tier_comes_from_the_prefix_of_keepers_sku_name():
         assert azure.sku_of(make_spec(record=record))[1] == tier
 
 
-def test_premium_v2_gets_the_free_baseline_at_least_and_the_plan_above_it():
+def test_premium_v2_gets_the_p30_equivalent_at_least_and_the_plan_above_it():
     storage = azure.storage_for(make_spec())
-    assert (storage.type, storage.storage_size_gb, storage.iops, storage.throughput) == ("PremiumV2_LRS", 64, 3000, 125)
+    assert (storage.type, storage.storage_size_gb, storage.iops, storage.throughput) == ("PremiumV2_LRS", 64, 5000, 200)
     big = azure.storage_for(make_spec(record={**RECORD, "vcpus": 128, "memory_amount": 1024 * 1024}))
-    assert big.iops == 3200 and big.throughput == 192 and big.storage_size_gb == 151  # 64 GiB schema x 2, over 0.85
+    assert big.iops == 5000 and big.throughput == 200 and big.storage_size_gb == 151  # 64 GiB schema x 2, over 0.85
 
 
 def test_a_sku_without_premium_v2_gets_premium_ssd_in_a_valid_size_and_tier():
@@ -176,6 +176,14 @@ def test_a_sku_without_premium_v2_gets_premium_ssd_in_a_valid_size_and_tier():
 def test_a_disk_above_the_skus_maximum_is_an_error():
     with pytest.raises(ValueError, match="maximum"):
         azure.storage_for(make_spec(record={**RECORD, "storage_extra_max": 10}))
+
+
+@pulumi.runtime.test
+def test_the_server_is_named_after_the_run_id(mocks, checked):
+    def check(found):
+        assert found[2].inputs["serverName"] == "sc-r1"
+
+    return registered(mocks, make_spec()).apply(check)
 
 
 def test_server_names_are_dns_labels_and_unique_when_cut():
@@ -215,7 +223,10 @@ def arm(monkeypatch):
         "skus": [{"name": "Standard_D4ds_v5", "resourceType": "virtualMachines", "family": "standardDdsv5Family"}],
     }
     monkeypatch.setenv("ARM_SUBSCRIPTION_ID", "sub")
-    monkeypatch.setattr(azure_preflight, "arm_list", lambda path, api, **params: iter(answers[path.rsplit("/", 1)[1]]))
+    monkeypatch.setattr(azure_preflight, "token", lambda: "t")
+    monkeypatch.setattr(
+        azure_preflight, "arm_list", lambda token, path, api, **params: iter(answers[path.rsplit("/", 1)[1]])
+    )
     return answers
 
 
@@ -227,6 +238,7 @@ def test_the_pre_flight_passes_and_returns_the_zones_of_the_sku(arm):
     ("change", "message"),
     [
         ({"capabilities": capabilities(features=("OfferRestricted",))}, "restricted"),
+        ({"capabilities": [{**capabilities()[0], "reason": "Offer is Restricted"}]}, "restricted"),
         ({"capabilities": []}, "does not offer the SKU"),
         ({"capabilities": capabilities(status="Disabled")}, "disabled"),
         ({"capabilities": capabilities(storages=("ManagedDisk",))}, "not ManagedDiskV2"),
@@ -255,12 +267,31 @@ def test_a_check_that_cannot_be_made_passes(monkeypatch, caplog):
         raise OSError("no route")
 
     monkeypatch.setattr(azure_preflight, "arm_list", unreachable)
-    assert azure_preflight.check("westeurope", "Standard_D4ds_v5", 4, "ManagedDiskV2") == []
+    assert azure_preflight.check("westeurope", "Standard_D4ds_v5", 4, "ManagedDiskV2") is None
     assert "skipped" in caplog.text
+
+
+def test_an_unexpected_answer_passes_too(arm, caplog):
+    arm["usages"] = [{"name": None}]
+    assert azure_preflight.check("westeurope", "Standard_D4ds_v5", 4, "ManagedDiskV2") is None
+    assert "skipped" in caplog.text
+
+
+def test_the_pre_flight_fetches_one_token(arm, monkeypatch):
+    tokens = []
+    monkeypatch.setattr(azure_preflight, "token", lambda: tokens.append(1) or "t")
+    azure_preflight.check("westeurope", "Standard_D4ds_v5", 4, "ManagedDiskV2")
+    assert len(tokens) == 1
+
+
+def test_an_unchecked_pre_flight_still_requests_the_client_zone():
+    assert azure.zone_of(make_spec(zone="westeurope-3"), None) == "3"
+    assert azure.zone_of(make_spec(zone=None), None) is None
 
 
 def test_inventory_lists_the_tagged_servers(monkeypatch):
     monkeypatch.setenv("ARM_SUBSCRIPTION_ID", "sub")
+    monkeypatch.setattr(azure_preflight, "token", lambda: "t")
     created = {"createdAt": "2026-11-20T10:00:00Z"}
     servers = [
         {"id": "/s/a", "tags": {"sc_inspector_run": "r1", "sc_inspector_expires": "20261120t1600z"},
@@ -269,9 +300,19 @@ def test_inventory_lists_the_tagged_servers(monkeypatch):
         {"id": "/s/c", "systemData": created},
     ]  # fmt: skip
     seen = []
-    monkeypatch.setattr(azure_preflight, "arm_list", lambda path, api, **p: seen.append((path, api)) or iter(servers))
+    monkeypatch.setattr(
+        azure_preflight, "arm_list", lambda token, path, api, **p: seen.append((path, api)) or iter(servers)
+    )
     assert azure.inventory() == [
         {"id": "/s/a", "run": "r1", "expires_at": "2026-11-20T16:00:00Z", "created_at": "2026-11-20T10:00:00Z"}
     ]
     assert seen == [("/subscriptions/sub/providers/Microsoft.DBforPostgreSQL/flexibleServers", "2025-08-01")]
     json.dumps(azure.inventory())
+
+
+def test_inventory_reports_a_server_with_missing_facts_as_unknown(monkeypatch):
+    monkeypatch.setenv("ARM_SUBSCRIPTION_ID", "sub")
+    monkeypatch.setattr(azure_preflight, "token", lambda: "t")
+    servers = [{"id": "/s/a", "tags": {"sc_inspector_run": "r1"}}]
+    monkeypatch.setattr(azure_preflight, "arm_list", lambda token, path, api, **p: iter(servers))
+    assert azure.inventory() == [{"id": "/s/a", "run": "r1", "expires_at": None, "created_at": "1970-01-01T00:00:00Z"}]
