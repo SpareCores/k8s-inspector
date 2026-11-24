@@ -61,3 +61,28 @@ arm64).
 - **Tag**: Vultr has one tag per database, so the module writes the run labels into it (`sc_inspector_expires:<time>:sc_inspector_run:<id>`);
   `inventory` lists `GET /v2/databases` and reads them back. There is no region argument on the provider: the region is
   on the database.
+
+## OCI DBaaS
+
+OCI Database with PostgreSQL (`dbaas/k8s_inspector_dbaas/vendors/oci.py`, Pulumi provider `pulumi-oci`). There is no legacy
+implementation; the module is written against the provider's `oci.psql.DbSystem`.
+
+- **Database**: one DB system with one node (no read replicas, no HA). Shape, OCPUs and memory are Keeper's
+  `api_reference_object` of the database (`PostgreSQL.<shape>` with `instance_ocpu_count` and
+  `instance_memory_size_in_gbs`); Keeper's `vcpus` are twice the OCPUs.
+- **Storage**: database optimized storage has no size to choose, only a performance tier (guaranteed IOPS regardless of
+  size). The module takes the lowest tier of the record's `compatible_storage_ids` (75,000 IOPS), far above the I/O budget
+  of `storage_plan` (25 write IOPS per vCPU). Storage is AD-local, in the availability domain of the client node: the
+  nearest thing to the single-zone setup of the other vendors. Regional storage writes every commit to a second
+  availability domain, which a durable-commit benchmark would measure as latency.
+- **Network**: the DB system has a private endpoint in the bench subnet of the region, with the network security group
+  the platform names in `networks.<region>` (`compartment_id`, `subnet_id`, `nsg_ids`). No allowlist is applied; the
+  security group decides.
+- **Credentials**: the Job's identity is an API key (Secret `k8s-inspector-dbaas-oci`: `TF_VAR_tenancy_ocid`,
+  `TF_VAR_user_ocid`, `TF_VAR_fingerprint`, `TF_VAR_private_key`, which the provider and the OCI SDK both read) whose
+  policy manages `postgres-db-systems` in the bench compartment and nothing else. `inventory` also reads
+  `K8SI_OCI_COMPARTMENT_ID` and `K8SI_OCI_REGIONS` from that Secret.
+- **Admin user**: `scadmin` with the run's password, database `postgres`, `sslmode=require`. Automated backups are off
+  (`NONE`): a benchmark database holds nothing to restore, and backups would outlive the DB system.
+- **Tags**: the run labels are free-form tags; `inventory` lists the compartment's DB systems of the configured regions
+  that carry `sc_inspector_run`.
