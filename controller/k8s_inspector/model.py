@@ -245,7 +245,7 @@ class LaunchFailure:
 
 @dataclass
 class UninitializedClaim:
-    """`status.uninitializedClaims[]`: a NodeClaim of the current attempt seen `Launched` and not yet `Registered`.
+    """`status.uninitializedClaims[]`: a NodeClaim of the current attempt seen `Launched` and not yet `Initialized`.
     Karpenter deletes a claim that never registers, so the run remembers it to notice that it is gone."""
 
     node_claim: str

@@ -7,6 +7,8 @@
 A benchmark needs the whole machine and a clean state, so a node is never shared between runs or reused after one.
 The bench NodePool has billing retention off, and the controller checks that the anchor's node was created after the
 anchor (otherwise it deletes the anchor and that NodeClaim and tries again; the third failed attempt ends the run).
+A run that ends or retries because its node did not come up (provisioning failure) or is cancelled deletes its NodeClaims
+itself: Karpenter does not consolidate a node that never initialized, so deleting the anchor alone would leave it billing.
 A NodeClaim that fails to launch (`LaunchFailed`) is replaced by Karpenter with a new one; the second distinct
 launch failure of an attempt ends the run; a temporary one leaves no record, a final one is `-1 SCARPENTER_LAUNCH_REJECTED` ([launch retries](launch-retries.md), [exit codes](../reference/exit-codes.md)).
 
@@ -29,7 +31,8 @@ The anchor is the only Pod the scheduler and SCarpenter ever see for a run.
   directory (`/var/lib/k8s-inspector/runs/<run_id>`): `sc-run exec` touches it every 10 s while a task runs, and
   `kubectl exec <anchor> -- /sc-run heartbeat <dir>` touches it between steps. The idle clock starts when the anchor
   starts.
-- Releasing the node = deleting the anchor (or its own exit). Terminal Pods do not count, so the node is empty and
+- Releasing the node after a successful run = deleting the anchor (or its own exit). A run that is cancelled or fails
+  before or while its node is up deletes the run's NodeClaims as well. Terminal Pods do not count, so the node is empty and
   `WhenEmpty`/`consolidateAfter: 0s` removes it. Measured on OCI: the Node is gone 79-91 s after the
   anchor is deleted and the NodeClaim 0-1 s after the Node (see [teardown time](#node-boot-and-teardown)).
 
