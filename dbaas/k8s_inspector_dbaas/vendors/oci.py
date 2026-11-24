@@ -1,8 +1,9 @@
 """The `oci` vendor: OCI Database with PostgreSQL, one standalone DB system (one node) in the bench VCN.
 
-`spec.network` (the platform's `dbaas.vendors.oci.networks.<region>`): `compartment_id`, `subnet_id` (the bench subnet
-of the region) and `nsg_ids` (network security groups of the DB system; one that lets the client nodes reach port 5432).
-The DB system has only a private endpoint in that subnet, so no allowlist is applied here.
+`spec.network` (the platform's `dbaas.vendors.oci.networks.<region>`): `compartment_id`, `subnet_id` (a private subnet
+of the region's bench VCN without IPv6: OCI creates DB systems only in such subnets, so it is not the bench nodes'
+subnet) and `nsg_ids` (network security groups of the DB system; one that lets the client nodes reach port 5432). The
+DB system has only a private endpoint in that subnet, so no allowlist is applied here.
 
 Sizing comes from Keeper's record: `api_reference_object` holds the flex shape and its OCPU and memory, which OCI takes
 as they are. OCI sizes no disk: storage is database optimized, grows with the data and has a performance tier
@@ -49,6 +50,9 @@ def provision(spec: DbSpec) -> DbOutputs:
     domains = pulumi_oci.identity.get_availability_domains(
         compartment_id=compartment_id, opts=pulumi.InvokeOptions(provider=provider)
     )
+    # At OCI the DB system's endpoint is in the client's VCN, so the database region is the client's region and the
+    # client's zone matches this region's availability domains. If DbSpec gains a separate client region, match the zone
+    # only when the two regions are equal.
     availability_domain = pick_availability_domain([d.name for d in domains.availability_domains], spec.zone)
     db = pulumi_oci.psql.DbSystem(
         spec.run,

@@ -75,9 +75,10 @@ implementation; the module is written against the provider's `oci.psql.DbSystem`
   of `storage_plan` (25 write IOPS per vCPU). Storage is AD-local, in the availability domain of the client node: the
   nearest thing to the single-zone setup of the other vendors. Regional storage writes every commit to a second
   availability domain, which a durable-commit benchmark would measure as latency.
-- **Network**: the DB system has a private endpoint in the bench subnet of the region, with the network security group
-  the platform names in `networks.<region>` (`compartment_id`, `subnet_id`, `nsg_ids`). No allowlist is applied; the
-  security group decides.
+- **Network**: the DB system has a private endpoint in a private, IPv4-only subnet of the region's bench VCN (OCI creates DB
+  systems only in subnets without IPv6, so not in the bench nodes' subnet), with the network security group the platform names
+  in `networks.<region>` (`compartment_id`, `subnet_id`, `nsg_ids`; the group admits TCP 5432 from the bench nodes). No
+  allowlist is applied; the security group decides.
 - **Credentials**: the Job's identity is an API key (Secret `k8s-inspector-dbaas-oci`: `TF_VAR_tenancy_ocid`,
   `TF_VAR_user_ocid`, `TF_VAR_fingerprint`, `TF_VAR_private_key`, which the provider and the OCI SDK both read) whose
   policy manages `postgres-db-systems` in the bench compartment and nothing else. `inventory` also reads
