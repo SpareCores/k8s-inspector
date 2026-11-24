@@ -131,19 +131,21 @@ def test_a_failed_up_reports_the_error_without_the_password(tmp_path, monkeypatc
     assert "hunter2" not in capsys.readouterr().err
 
 
-def test_down_needs_only_the_run_name(monkeypatch, tmp_path):
+def test_down_needs_only_the_run_name_and_the_vendor(monkeypatch, tmp_path):
     monkeypatch.setenv(entry.TERMINATION_LOG_ENV, str(tmp_path / "termination"))
     destroyed = []
     monkeypatch.setenv("DBAAS_RUN", "fake-x-1")
-    monkeypatch.setattr(stack, "down", destroyed.append)
-    assert entry.run("down") == 0 and destroyed == ["fake-x-1"]
+    monkeypatch.setenv("DBAAS_VENDOR", "fake")
+    monkeypatch.setattr(stack, "down", lambda run, vendor: destroyed.append((run, vendor)))
+    assert entry.run("down") == 0 and destroyed == [("fake-x-1", "fake")]
 
 
 def test_a_failed_down_reports_why_in_the_termination_message(monkeypatch, tmp_path):
     log = tmp_path / "termination"
     monkeypatch.setenv(entry.TERMINATION_LOG_ENV, str(log))
     monkeypatch.setenv("DBAAS_RUN", "fake-x-1")
-    monkeypatch.setattr(stack, "down", lambda run: 1 / 0)
+    monkeypatch.setenv("DBAAS_VENDOR", "fake")
+    monkeypatch.setattr(stack, "down", lambda run, vendor: 1 / 0)
     assert entry.run("down") == 1
     assert "division by zero" in json.loads(log.read_text())["error"]
 
@@ -211,6 +213,7 @@ def test_the_state_profile_is_written_to_a_file_that_the_aws_config_names(monkey
 class FakeStack:
     def __init__(self, pending):
         self.pending, self.calls = pending, []
+        self.workspace = types.SimpleNamespace(remove_stack=lambda name: self.calls.append(("remove", name)))
 
     def cancel(self):
         self.calls.append("cancel")
@@ -219,7 +222,7 @@ class FakeStack:
         return types.SimpleNamespace(deployment={"pending_operations": self.pending})
 
     def destroy(self, **kwargs):
-        self.calls.append(("destroy", kwargs["refresh"], kwargs["remove"]))
+        self.calls.append(("destroy", kwargs["refresh"]))
 
 
 def test_down_refuses_a_state_with_pending_operations_and_keeps_it(monkeypatch):
@@ -228,7 +231,7 @@ def test_down_refuses_a_state_with_pending_operations_and_keeps_it(monkeypatch):
     monkeypatch.setenv("PULUMI_BACKEND_URL", "file:///x")
     monkeypatch.setattr(stack.auto, "select_stack", lambda *a, **k: fake)
     with pytest.raises(stack.PendingOperations, match=r"creating urn:x::db.*Operator action.*state is kept"):
-        stack.down("fake-x-1")
+        stack.down("fake-x-1", "fake")
     assert fake.calls == ["cancel"]  # no destroy, no remove
 
 
@@ -236,8 +239,32 @@ def test_down_destroys_with_refresh_and_removes_the_state_when_nothing_is_pendin
     fake = FakeStack([])
     monkeypatch.setenv("PULUMI_BACKEND_URL", "file:///x")
     monkeypatch.setattr(stack.auto, "select_stack", lambda *a, **k: fake)
-    stack.down("fake-x-1")
-    assert fake.calls == ["cancel", ("destroy", True, True)]
+    stack.down("fake-x-1", "fake")
+    assert fake.calls == ["cancel", ("destroy", True), ("remove", "k8s-dbaas-fake-x-1")]
+
+
+def test_down_runs_the_vendors_cleanup_with_the_run_name_and_keeps_the_state_when_it_fails(monkeypatch):
+    fake = FakeStack([])
+    cleaned = []
+
+    def cleanup(run):
+        fake.calls.append("cleanup")
+        cleaned.append(run)
+        if len(cleaned) == 1:
+            raise RuntimeError("busy")
+
+    monkeypatch.setenv("PULUMI_BACKEND_URL", "file:///x")
+    monkeypatch.setattr(stack.auto, "select_stack", lambda *a, **k: fake)
+    monkeypatch.setattr(stack.vendors, "load", lambda vendor: types.SimpleNamespace(cleanup=cleanup))
+    with pytest.raises(RuntimeError, match="busy"):
+        stack.down("gcp-x-1", "gcp")
+    assert ("remove", "k8s-dbaas-gcp-x-1") not in fake.calls
+    stack.down("gcp-x-1", "gcp")
+    assert cleaned == ["gcp-x-1", "gcp-x-1"] and fake.calls[-3:] == [
+        ("destroy", True),
+        "cleanup",
+        ("remove", "k8s-dbaas-gcp-x-1"),
+    ]
 
 
 def test_usage():

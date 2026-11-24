@@ -22,6 +22,15 @@ periodic Job `dbaas-inventory-<vendor>` (same credentials and ServiceAccount as 
 is how a database that no state records is found (see [DBaaS](../explanation/dbaas.md#pulumi-state-and-leaks)); times
 are RFC 3339 and `run` is the tag's value. `fake.py` is the smallest example of both.
 
+A module may add `cleanup(run: str) -> None`. `down` calls it with the BenchmarkRun name (all it, and the sweeper,
+know; the Job also has `DBAAS_VENDOR`) after the Pulumi destroy and before it removes the state (a failure keeps the
+state, so the next `down` calls it again). Use it when the provider can lose a resource that bills: Terraform-based
+providers often clear a resource's id when its create fails or times out, so the state does not record it. Tag the
+resource with `spec.run` in `provision` (a run name is a DNS label of at most 63 characters, valid as a tag or label
+value); `cleanup` finds the resources by that tag, deletes them, waits a few minutes for them to be gone (the Job's
+deadline is 2 h and the destroy may have used most of it; a longer deletion fails the Job and the next `down` waits
+again) and does nothing when nothing is left.
+
 **`DbSpec`** (`spec.py`; the controller's JSON in `DBAAS_SPEC`, the password in `DBAAS_PASSWORD`):
 
 | Field | Meaning |

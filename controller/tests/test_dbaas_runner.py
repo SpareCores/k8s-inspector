@@ -175,9 +175,8 @@ def test_a_dbaas_run_creates_bootstraps_benchmarks_and_destroys(h):
     assert h.jobs() == [f"dbaas-down-{h.name}"]
     (down,) = h.kube.list("job")
     assert down["spec"]["template"]["spec"]["containers"][0]["args"] == ["down"]
-    assert [
-        e["value"] for e in down["spec"]["template"]["spec"]["containers"][0]["env"] if e["name"] == "DBAAS_RUN"
-    ] == [h.name]
+    env = {e["name"]: e.get("value") for e in down["spec"]["template"]["spec"]["containers"][0]["env"]}
+    assert (env["DBAAS_RUN"], env["DBAAS_VENDOR"]) == (h.name, "oci")
     assert run.status.attempts[0].outcome.value == "Completed"
 
     h.until_phase(DbPhase.DESTROYED)

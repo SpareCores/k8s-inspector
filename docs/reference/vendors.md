@@ -87,3 +87,32 @@ implementation; the module is written against the provider's `oci.psql.DbSystem`
   (`NONE`): a benchmark database holds nothing to restore, and backups would outlive the DB system.
 - **Tags**: the run labels are free-form tags; `inventory` lists the compartment's DB systems of the configured regions
   that carry `sc_inspector_run`.
+
+## GCP DBaaS
+
+`dbaas/k8s_inspector_dbaas/vendors/gcp.py`. Cloud SQL for PostgreSQL. The database id is the Cloud SQL tier (`db-perf-optimized-N-8`,
+`db-c4a-highmem-4`, `db-n1-standard-2`).
+
+- **Instance**: standalone (`ZONAL`) in the client's zone, deletion protection off, backups disabled explicitly, disk
+  autoresize off, the run's labels and the run name (`sc_inspector_run_name`) as `userLabels`. The edition follows the tier name (performance and memory optimized
+  tiers and C4A are Enterprise Plus, the others Enterprise); Enterprise Plus gets the data cache switched off.
+- **Network**: private IP only, through private services access on the bench VPC. The platform creates the allocated
+  range and the service networking connection once per VPC; `networks.<region>` holds `network`
+  (`projects/<project>/global/networks/<vpc>`) and `allocated_range` (the range's name).
+- **Storage**: Hyperdisk Balanced when Keeper lists `cloudsql-hyperdisk` as the tier's only storage (C4 and C4A),
+  otherwise PD-SSD. PD-SSD sizes come from the storage plan with the documented pd-ssd rates (IOPS and throughput grow
+  with the size, capped per VM by its vCPUs); Hyperdisk keeps its default IOPS and throughput and gets the
+  schema-derived size.
+- **Users**: `postgres` with the run's password is the admin the bootstrap connects as; the bootstrap creates `scadmin`
+  with the role `cloudsqlsuperuser` as the workload user (`postgres` cannot create a database it can then use).
+- **Credentials**: environment of the Jobs from the Secret `k8s-inspector-dbaas-gcp`: `GOOGLE_PROJECT` and
+  `GOOGLE_CREDENTIALS`, the workload identity federation configuration (no secret in it) of a service account that may
+  only manage Cloud SQL instances and users. `inventory` lists every instance of the project through the Cloud SQL
+  Admin API and keeps those with the `sc_inspector_run` label.
+- **Names**: `sc-<run id>`. Cloud SQL keeps an instance name unavailable for up to a week after its deletion; the run id
+  is unique per run and the same in all its attempts, whereas the BenchmarkRun name repeats for a client SKU.
+- **Untracked instance**: the Terraform-based provider forgets an instance whose create fails or times out, so `down`
+  runs the module's `cleanup(run)` after the destroy: it lists the project's instances through the Cloud SQL Admin API,
+  deletes those labelled `sc_inspector_run_name=<run>` (the BenchmarkRun name) and waits up to 5 minutes until they are
+  gone; a slower deletion fails the Job and the next `down` waits again. The run-name match assumes one cluster (one
+  state bucket) per GCP project: a second cluster's runs in the same project would share the label namespace.

@@ -9,13 +9,19 @@ A vendor module `vendors/<vendor>.py` exposes two functions:
   Pulumi, as `{"id", "run", "expires_at", "created_at"}` (RFC 3339 times): how a database that no state records is
   found. It reads the vendor's credentials from the environment, like `provision`.
 
+A vendor module may also expose `cleanup(run: str) -> None`, which `down` calls with the BenchmarkRun name after the
+Pulumi destroy and before it removes the state, for what the state cannot hold: a create that failed or timed out can
+leave a resource that the provider no longer tracks. It finds the run's resources by a tag or label that `provision`
+put on them from `spec.run`, waits (briefly) until they are gone, and does nothing when nothing is left.
+
 Rules for `provision` that make `down` work from the state alone:
 
 - Create an explicit provider with `region=spec.region`; take its credentials from the environment, never as provider
   arguments (those are stored in the state and go stale when a key is rotated).
 - Set `ResourceOptions(custom_timeouts=...)` with `spec.create_timeout` and `spec.delete_timeout` on every slow
   resource, so Pulumi fails by itself before the Job's deadline and records the resource.
-- Name every resource deterministically (from `spec.run`), so a retry finds what an earlier attempt created.
+- Name every resource deterministically (from `spec.run` or `spec.run_id`), so a retry finds what an earlier attempt
+  created.
 """
 
 import json
