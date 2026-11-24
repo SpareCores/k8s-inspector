@@ -1585,13 +1585,48 @@ def test_cancel_deletes_a_claim_the_run_has_not_recorded_yet(h):
     assert h.run.status.phase == RunPhase.CANCELLED and _claim_deletes(h) == ["claim-1"]
 
 
-def test_cancel_ignores_a_claim_that_is_already_gone(h):
+def test_cancel_deletes_only_the_claims_of_its_own_anchor(h):
     _boot_run(h)
-    h.runner.reconcile(h.name)
-    h.kube.objects.pop("nodeclaim")  # Karpenter removed it between the passes
+    anchor = h.kube.get("pod", f"{h.name}-a1")
+    vendor, api = "scarpenter.sparecores.com/vendor", "scarpenter.sparecores.com/api-reference"
+    for name, labels in (("other-sku", {api: "other"}), ("other-vendor", {vendor: "other"}), ("old", {})):
+        _launched_claim(h, anchor, name)
+        h.kube.merge_patch("nodeclaim", name, {"metadata": {"labels": labels}})
+    h.kube.merge_patch("nodeclaim", "old", {"metadata": {"creationTimestamp": iso(START - timedelta(hours=1))}})
     crd.request_cancel(h.kube, h.name)
     h.runner.reconcile(h.name)
-    assert h.run.status.phase == RunPhase.CANCELLED and _claim_deletes(h) == []
+    assert h.run.status.phase == RunPhase.CANCELLED
+    assert _claim_deletes(h) == ["claim-1"]
+    assert sorted(c["metadata"]["name"] for c in h.kube.list("nodeclaim")) == ["old", "other-sku", "other-vendor"]
+
+
+def test_a_failing_claim_delete_does_not_change_how_the_run_is_cancelled(h, monkeypatch):
+    _boot_run(h)
+    _fail_claim_deletes(h, monkeypatch)
+    crd.request_cancel(h.kube, h.name)
+    h.runner.reconcile(h.name)
+    assert h.run.status.phase == RunPhase.CANCELLED and h.codes()["geekbench"] == (-4, "CANCELLED")
+    assert h.pod_names() == []
+
+
+def test_a_failing_claim_delete_does_not_change_how_the_run_fails(h, monkeypatch):
+    _boot_run(h, force=True)
+    _fail_claim_deletes(h, monkeypatch)
+    h.clock.advance(minutes=8, seconds=1)
+    h.runner.reconcile(h.name)
+    assert h.run.status.phase == RunPhase.FAILED
+    assert h.codes()["geekbench"][1].startswith("SCARPENTER_BOOT_FAILURE")
+
+
+def _fail_claim_deletes(h, monkeypatch):
+    delete = h.kube.delete
+
+    def failing(kind, name, grace_seconds=None):
+        if kind == "nodeclaim":
+            raise RuntimeError("forbidden")
+        delete(kind, name, grace_seconds)
+
+    monkeypatch.setattr(h.kube, "delete", failing)
 
 
 def test_cancel_of_a_running_run_deletes_the_claim_of_its_node(h):
@@ -1886,6 +1921,16 @@ def test_outage_shorter_than_half_an_hour_does_not_end_the_run(h, monkeypatch):
     assert h.run.status.phase == RunPhase.RUNNING
     run = h.drive()
     assert run.status.phase == RunPhase.PUBLISHING and h.codes()["geekbench"] == (0, None)
+
+
+def test_giving_up_on_a_provisioning_run_deletes_its_booting_claim(h, monkeypatch):
+    _boot_run(h)
+    h.runner.reconcile(h.name)
+    break_reconcile(h, monkeypatch)
+    fail_reconciles(h, 1)
+    h.clock.advance(minutes=31)
+    fail_reconciles(h, 1)
+    assert h.run.status.phase == RunPhase.FAILED and _claim_deletes(h) == ["claim-1"]
 
 
 def test_reconcile_failing_for_half_an_hour_ends_the_run_without_deleting_the_anchor_first(h, monkeypatch):

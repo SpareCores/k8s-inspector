@@ -445,7 +445,7 @@ class Runner:
             self._forget(run_name)
             return
         cfg = self._cfg()
-        live = {_meta(p)["name"]: p for p in self.kube.list("pod", labels={LABEL_RUN: run.name})}
+        live = self._live_pods(run)
         for name, pod in live.items():  # a Pod wedged in Terminating keeps the node busy
             if pods.terminating_overdue(pod, self._now()):
                 log.warning("run %s: Pod %s is stuck terminating, force-deleting it", run.name, name)
@@ -518,6 +518,10 @@ class Runner:
             return self._forget(name)
         if run.status.phase in ACTIVE:
             message = f"the controller gave up on the run: {type(error).__name__}"  # no details: may hold URLs
+            try:
+                self._delete_run_claims(run, self._live_pods(run))
+            except Exception:
+                log.warning("run %s: cannot list its Pods, not deleting its NodeClaims", run.name, exc_info=True)
             self._end_run(run, ExitCode.HARNESS_ERROR, message, AttemptOutcome.HARNESS_ERROR)
 
     def _watch(self, kind: str, labels: dict | None, stop: threading.Event) -> None:
@@ -597,6 +601,9 @@ class Runner:
         anchor = live[pods.anchor_name(run.name, run.status.attempt)]
         return OwnerRef("v1", "Pod", _meta(anchor)["name"], _meta(anchor).get("uid", ""))
 
+    def _live_pods(self, run: BenchmarkRun) -> dict[str, dict]:
+        return {_meta(p)["name"]: p for p in self.kube.list("pod", labels={LABEL_RUN: run.name})}
+
     def _selected(self, run: BenchmarkRun) -> list[TaskDef]:
         return tasks.select_tasks(run.spec.tasks)
 
@@ -614,16 +621,28 @@ class Runner:
         current attempt's and those created for its live anchors. Deleting the anchor alone is not enough: Karpenter
         consolidates only nodes that initialized, so a claim still booting would keep billing and hold a
         `maxInFlight` slot. Initialized claims go too (their node serves only this run, and the anchor is going),
-        which spares checking each claim. Idempotent: a claim that is gone is ignored (`Kube.delete`)."""
-        names = {c.node_claim for c in run.status.uninitialized_claims}
-        attempt = self._attempt(run)
-        if attempt and attempt.node_claim:
-            names.add(attempt.node_claim)
-        for pod in live.values():
-            if (_meta(pod).get("labels") or {}).get(pods.LABEL_ROLE) == PodRole.ANCHOR:
-                names |= {_meta(c)["name"] for c in self._pending_claims(pod)}
+        which spares checking each claim. Idempotent: a claim that is gone is ignored (`Kube.delete`). Never
+        raises: a failing API call is logged, so it cannot change how the run ends."""
+        try:
+            names = {c.node_claim for c in run.status.uninitialized_claims}
+            attempt = self._attempt(run)
+            if attempt and attempt.node_claim:
+                names.add(attempt.node_claim)
+            for pod in live.values():
+                if (_meta(pod).get("labels") or {}).get(pods.LABEL_ROLE) == PodRole.ANCHOR:
+                    names |= {_meta(c)["name"] for c in self._pending_claims(pod)}
+        except Exception:
+            log.warning("run %s: cannot list its NodeClaims, not deleting them", run.name, exc_info=True)
+            return
         for name in sorted(names):
+            self._delete_claim(name)
+
+    def _delete_claim(self, name: str) -> None:
+        """Best effort: a failing delete is logged and never changes how a run ends."""
+        try:
             self.kube.delete("nodeclaim", name)
+        except Exception as e:
+            log.warning("cannot delete NodeClaim %s: %s", name, e)
 
     def _delete_secret(self, run: BenchmarkRun) -> None:
         self.kube.delete("secret", pods.urls_secret_name(run.name))
@@ -1074,8 +1093,7 @@ class Runner:
         return None
 
     def _boot_failure(self, claim: dict, message: str) -> str:
-        with contextlib.suppress(NotFound):
-            self.kube.delete("nodeclaim", _meta(claim)["name"])
+        self._delete_claim(_meta(claim)["name"])
         return launch.error_message("BOOT_FAILURE", message)
 
     def _remember_uninitialized(

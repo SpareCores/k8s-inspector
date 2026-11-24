@@ -134,6 +134,12 @@ def test_delete_ignores_not_found_and_sends_grace():
     assert seen[0][2]["gracePeriodSeconds"] == "0"
 
 
+def test_delete_of_a_missing_nodeclaim_is_ignored_and_other_errors_raise():
+    make_kube(lambda request: json_response(404, status_body(404, "NotFound"))).delete("nodeclaim", "gone")
+    with pytest.raises(Forbidden):
+        make_kube(lambda request: json_response(403, status_body(403, "Forbidden"))).delete("nodeclaim", "x")
+
+
 def test_merge_patch_status_subresource_with_resource_version():
     seen = []
 
