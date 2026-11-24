@@ -91,14 +91,21 @@ def _list_databases() -> Iterator[dict]:
         with urllib.request.urlopen(request, timeout=60) as response:  # noqa: S310
             page = json.load(response)
         yield from page["databases"]
-        cursor = page["meta"]["links"]["next"]
+        cursor = page.get("meta", {}).get("links", {}).get("next")
         if not cursor:
             return
 
 
-def _rfc3339(stamp: str) -> str:
-    """`20261121t0905z` (the label form of the expiry) as `2026-11-21T09:05:00Z`."""
+def _expires_at(stamp: str | None) -> str | None:
+    """`20261121t0905z` (the label form of the expiry) as `2026-11-21T09:05:00Z`; None when the label is missing."""
+    if not stamp:
+        return None
     return datetime.strptime(stamp, "%Y%m%dt%H%Mz").replace(tzinfo=UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _created_at(stamp: str) -> str:
+    """Vultr's `2022-05-09 10:13:31` (UTC, no zone) as `2022-05-09T10:13:31Z`."""
+    return datetime.strptime(stamp, "%Y-%m-%d %H:%M:%S").replace(tzinfo=UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def inventory() -> list[dict]:
@@ -110,8 +117,8 @@ def inventory() -> list[dict]:
                 {
                     "id": database["id"],
                     "run": labels[RUN_LABEL],
-                    "expires_at": _rfc3339(labels[EXPIRES_LABEL]),
-                    "created_at": database["date_created"],
+                    "expires_at": _expires_at(labels.get(EXPIRES_LABEL)),
+                    "created_at": _created_at(database["date_created"]),
                 }
             )
     return found

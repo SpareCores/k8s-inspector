@@ -140,22 +140,30 @@ def test_the_inventory_lists_tagged_databases_across_pages(monkeypatch):
     requested = pages(
         monkeypatch,
         {
-            "databases": [{"id": "d1", "tag": tag, "date_created": "2026-11-20T10:00:00+00:00"}],
+            "databases": [{"id": "d1", "tag": tag, "date_created": "2026-11-20 10:00:00"}],
             "meta": {"links": {"next": "abc"}},
         },
         {
             "databases": [
-                {"id": "d2", "tag": "created-by:sc-runner", "date_created": "2026-11-01T00:00:00+00:00"},
-                {"id": "d3", "tag": "", "date_created": "2026-11-02T00:00:00+00:00"},
+                {"id": "d2", "tag": "created-by:sc-runner", "date_created": "2026-11-01 00:00:00"},
+                {"id": "d3", "tag": "", "date_created": "2026-11-02 00:00:00"},
             ],
             "meta": {"links": {"next": ""}},
         },
     )
     assert vendor.inventory() == [
-        {"id": "d1", "run": "r1-aaaa", "expires_at": "2026-11-21T09:05:00Z", "created_at": "2026-11-20T10:00:00+00:00"}
+        {"id": "d1", "run": "r1-aaaa", "expires_at": "2026-11-21T09:05:00Z", "created_at": "2026-11-20T10:00:00Z"}
     ]
     assert [url for url, _ in requested] == [
         "https://api.vultr.com/v2/databases?per_page=500",
         "https://api.vultr.com/v2/databases?per_page=500&cursor=abc",
     ]
     assert {auth for _, auth in requested} == {"Bearer k"}
+
+
+def test_the_inventory_reports_a_missing_expiry_and_a_missing_cursor(monkeypatch):
+    database = {"id": "d1", "tag": "sc_inspector_run:r1-aaaa", "date_created": "2022-05-09 10:13:31"}
+    pages(monkeypatch, {"databases": [database]})
+    assert vendor.inventory() == [
+        {"id": "d1", "run": "r1-aaaa", "expires_at": None, "created_at": "2022-05-09T10:13:31Z"}
+    ]
