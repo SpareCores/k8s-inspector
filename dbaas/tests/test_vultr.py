@@ -167,3 +167,31 @@ def test_the_inventory_reports_a_missing_expiry_and_a_missing_cursor(monkeypatch
     assert vendor.inventory() == [
         {"id": "d1", "run": "r1-aaaa", "expires_at": None, "created_at": "2022-05-09T10:13:31Z"}
     ]
+
+
+def test_the_inventory_accepts_a_null_meta(monkeypatch):
+    database = {"id": "d1", "tag": "sc_inspector_run:r1-aaaa", "date_created": "2022-05-09 10:13:31"}
+    pages(monkeypatch, {"databases": [database], "meta": None})
+    assert [found["id"] for found in vendor.inventory()] == ["d1"]
+
+
+def test_the_cursor_is_url_encoded(monkeypatch):
+    requested = pages(
+        monkeypatch,
+        {"databases": [], "meta": {"links": {"next": "a+b/c=&d"}}},
+        {"databases": []},
+    )
+    vendor.inventory()
+    assert requested[1][0].endswith("&cursor=a%2Bb/c%3D%26d")
+
+
+@pytest.mark.parametrize(
+    ("stamp", "expected"),
+    [
+        ("2022-05-09 10:13:31", "2022-05-09T10:13:31Z"),
+        ("2022-05-09T10:13:31Z", "2022-05-09T10:13:31Z"),
+        ("2022-05-09T12:13:31+02:00", "2022-05-09T10:13:31Z"),
+    ],
+)
+def test_the_creation_stamp_is_utc(stamp, expected):
+    assert vendor._created_at(stamp) == expected

@@ -18,6 +18,7 @@ reads them back.
 import contextlib
 import json
 import os
+import urllib.parse
 import urllib.request
 from collections.abc import Iterator
 from datetime import UTC, datetime
@@ -86,12 +87,12 @@ def provision(spec: DbSpec) -> DbOutputs:
 def _list_databases() -> Iterator[dict]:
     cursor = ""
     while True:
-        url = f"{API}/databases?per_page={PAGE_SIZE}" + (f"&cursor={cursor}" if cursor else "")
+        url = f"{API}/databases?per_page={PAGE_SIZE}" + (f"&cursor={urllib.parse.quote(cursor)}" if cursor else "")
         request = urllib.request.Request(url, headers={"Authorization": f"Bearer {os.environ[API_KEY_ENV]}"})
         with urllib.request.urlopen(request, timeout=60) as response:  # noqa: S310
             page = json.load(response)
         yield from page["databases"]
-        cursor = page.get("meta", {}).get("links", {}).get("next")
+        cursor = (page.get("meta") or {}).get("links", {}).get("next")
         if not cursor:
             return
 
@@ -104,8 +105,11 @@ def _expires_at(stamp: str | None) -> str | None:
 
 
 def _created_at(stamp: str) -> str:
-    """Vultr's `2022-05-09 10:13:31` (UTC, no zone) as `2022-05-09T10:13:31Z`."""
-    return datetime.strptime(stamp, "%Y-%m-%d %H:%M:%S").replace(tzinfo=UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+    """Vultr's `2022-05-09 10:13:31` or an ISO stamp as `2022-05-09T10:13:31Z`; a stamp without a zone is UTC."""
+    created = datetime.fromisoformat(stamp)
+    if created.tzinfo is None:
+        created = created.replace(tzinfo=UTC)
+    return created.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def inventory() -> list[dict]:
