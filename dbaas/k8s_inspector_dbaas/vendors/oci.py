@@ -50,10 +50,12 @@ def provision(spec: DbSpec) -> DbOutputs:
     domains = pulumi_oci.identity.get_availability_domains(
         compartment_id=compartment_id, opts=pulumi.InvokeOptions(provider=provider)
     )
-    # At OCI the DB system's endpoint is in the client's VCN, so the database region is the client's region and the
-    # client's zone matches this region's availability domains. If DbSpec gains a separate client region, match the zone
-    # only when the two regions are equal.
-    availability_domain = pick_availability_domain([d.name for d in domains.availability_domains], spec.zone)
+    # The zone names an availability domain of the client's region: use it only when the database is in that region.
+    zone = spec.zone
+    if spec.region != spec.client_region:
+        pulumi.log.warn(f"the client is in {spec.client_region}, not {spec.region}: using the first AD")
+        zone = None
+    availability_domain = pick_availability_domain([d.name for d in domains.availability_domains], zone)
     db = pulumi_oci.psql.DbSystem(
         spec.run,
         compartment_id=compartment_id,

@@ -1,4 +1,5 @@
 import asyncio
+import dataclasses
 from datetime import UTC, datetime
 from types import SimpleNamespace
 
@@ -46,8 +47,16 @@ class Mocks(pulumi.runtime.Mocks):
 
 @pytest.fixture
 def oci_spec(spec) -> DbSpec:
-    return DbSpec(**{**spec.__dict__, "vendor": "oci", "region": "eu-frankfurt-1", "zone": "EU-FRANKFURT-1-AD-2",
-                     "network": NETWORK, "record": RECORD, "run": "oci-e5-2-32-1234abcd"})  # fmt: skip
+    return dataclasses.replace(
+        spec,
+        vendor="oci",
+        region="eu-frankfurt-1",
+        client_region="eu-frankfurt-1",
+        zone="EU-FRANKFURT-1-AD-2",
+        network=NETWORK,
+        record=RECORD,
+        run="oci-e5-2-32-1234abcd",
+    )
 
 
 @pytest.fixture
@@ -94,6 +103,13 @@ async def test_the_storage_is_ad_local_in_the_client_zone_at_the_lowest_tier(oci
     storage = mocks.resources[0].inputs["storageDetails"]
     assert storage == {"systemType": "OCI_OPTIMIZED_STORAGE", "isRegionallyDurable": False,
                        "availabilityDomain": "xYzA:EU-FRANKFURT-1-AD-2", "iops": "75000"}  # fmt: skip
+
+
+@pulumi.runtime.test
+async def test_a_client_in_another_region_does_not_pick_the_availability_domain(oci_spec, mocks):
+    await provisioned(dataclasses.replace(oci_spec, client_region="eu-amsterdam-1"))
+    storage = mocks.resources[0].inputs["storageDetails"]
+    assert storage["availabilityDomain"] == "xYzA:EU-FRANKFURT-1-AD-1"
 
 
 @pulumi.runtime.test
