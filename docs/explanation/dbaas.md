@@ -236,3 +236,17 @@ family. The family key comes from the vendor API (Azure ARM Resource SKUs `famil
 never from sc-data `family` or `series`: those are catalogue classifications (workload class and normalized hardware
 line), not quota keys. A family the usages API does not list (Flexible Server lists only some families, none for v6
 SKUs) is not an error: it is logged at info level and only the regional cores quota is checked.
+
+## Vendor notes
+
+### AWS (Amazon RDS for PostgreSQL)
+
+One single-AZ RDS instance (`db.*` class from Keeper's `api_reference`) on gp3, encrypted, not publicly accessible, with
+no automated backups, no final snapshot and no deletion protection. The platform provides, per bench region, a DB subnet
+group over the bench VPC's subnets and a security group that allows 5432 from the bench nodes
+(`networks.<region>`: `subnet_group`, `security_group_id`). The instance goes to the client's availability zone when
+`zone` is a zone name of the region. RDS for PostgreSQL fixes the gp3 I/O of a volume below 400 GiB at 3000 IOPS and
+125 MiB/s; a database whose I/O budget is higher gets a 400 GiB volume (baseline 12000 IOPS and 500 MiB/s), and explicit
+IOPS and throughput only above that. The Jobs use the ServiceAccount `k8s-inspector-dbaas-aws` (web identity, an IAM
+role limited to creating, describing and deleting the run's instance) and the Secret `k8s-inspector-dbaas-aws` with
+`AWS_ROLE_ARN` and `AWS_WEB_IDENTITY_TOKEN_FILE`; `inventory` reads the tags of the instances of every enabled region.

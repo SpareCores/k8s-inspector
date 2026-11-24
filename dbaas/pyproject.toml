@@ -11,7 +11,10 @@ dependencies = [
 [dependency-groups]
 # One provider package per vendor, pinned by `uv.lock` (`uv add --group vendors pulumi-aws`). The vendor module
 # `k8s_inspector_dbaas/vendors/<vendor>.py` imports it; the image installs its Pulumi plugin (`install_plugins.py`).
-vendors = []
+vendors = [
+    "boto3>=1.44.10",
+    "pulumi-aws>=7.55.0",
+]
 dev = [
     "pytest",
     "ruff",
