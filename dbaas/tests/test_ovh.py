@@ -62,7 +62,6 @@ def mocks():
     Mocks.resources.clear()
     pulumi.runtime.set_mocks(Mocks(), "k8s-inspector-dbaas", "test", preview=False)
     yield
-    asyncio.get_event_loop().close()
 
 
 def spy(monkeypatch, module, name):
