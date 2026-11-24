@@ -372,9 +372,15 @@ def request_cancel(kube: Kube, name: str) -> None:
 
 
 def remove_finalizer(kube: Kube, name: str) -> None:
-    """The database is destroyed (or never was created): let the API server delete the run. A merge patch replaces
-    the whole list; the DBaaS finalizer is the only one the controller puts there."""
-    kube.merge_patch("benchmarkrun", name, {"metadata": {"finalizers": None}})
+    """The database is destroyed (or never was created): let the API server delete the run. Only the DBaaS finalizer is
+    removed (a JSON patch that tests the entry it removes), whatever else is in the list."""
+    finalizers = kube.get("benchmarkrun", name)["metadata"].get("finalizers") or []
+    if FINALIZER_DBAAS not in finalizers:
+        return
+    path = f"/metadata/finalizers/{finalizers.index(FINALIZER_DBAAS)}"
+    kube.json_patch(
+        "benchmarkrun", name, [{"op": "test", "path": path, "value": FINALIZER_DBAAS}, {"op": "remove", "path": path}]
+    )
 
 
 def delete_run(kube: Kube, name: str) -> None:

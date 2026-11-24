@@ -549,7 +549,7 @@ def controller(monkeypatch):
         stop.wait()
         stopped.append("dbaas-planner")
 
-    def sweep_loop(kube, cfg_provider, storage, stop, on_stacks):
+    def sweep_loop(kube, cfg_provider, storage, stop, on_stacks, on_inventory):
         started["dbaas-sweeper"].set()
         stop.wait()
         stopped.append("dbaas-sweeper")

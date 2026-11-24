@@ -461,12 +461,33 @@ def test_the_database_status_round_trips_and_the_deletion_timestamp_is_read():
     )
 
 
-def test_removing_the_finalizer_is_a_merge_patch_of_the_metadata():
+def test_removing_the_finalizer_removes_only_its_own_entry_with_a_json_patch():
     seen = []
 
     class Recorder:
-        def merge_patch(self, kind, name, body, subresource_status=False):
-            seen.append((kind, name, body, subresource_status))
+        def get(self, kind, name):
+            return {"metadata": {"finalizers": ["example.com/other", crd.FINALIZER_DBAAS]}}
+
+        def json_patch(self, kind, name, operations):
+            seen.append((kind, name, operations))
 
     crd.remove_finalizer(Recorder(), "aws-x-1")
-    assert seen == [("benchmarkrun", "aws-x-1", {"metadata": {"finalizers": None}}, False)]
+    path = "/metadata/finalizers/1"
+    assert seen == [
+        (
+            "benchmarkrun",
+            "aws-x-1",
+            [{"op": "test", "path": path, "value": crd.FINALIZER_DBAAS}, {"op": "remove", "path": path}],
+        )
+    ]  # the other finalizer stays
+
+
+def test_removing_a_finalizer_that_is_not_there_patches_nothing():
+    class Recorder:
+        def get(self, kind, name):
+            return {"metadata": {}}
+
+        def json_patch(self, *args):
+            raise AssertionError("nothing to remove")
+
+    crd.remove_finalizer(Recorder(), "aws-x-1")

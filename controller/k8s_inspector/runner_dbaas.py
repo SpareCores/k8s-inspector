@@ -9,12 +9,15 @@ The phase is written BEFORE what it stands for is created, so a controller that 
 database to destroy and creates the missing Job again. Creating and Bootstrapping are steps of the run's `Running`
 phase (`_database_up`); Destroying is driven on every pass of every run phase (`_database_teardown`) as soon as the
 benchmark is over, however it ended. The destroy Job is retried until it succeeds; only then is the finalizer removed.
+A stack left by an earlier run of the same name is destroyed first (`Clearing`, then back to `(none)`).
+
+A running `dbaas-up` Job is never deleted: it ends within its own deadline (Pulumi records what it created) and only
+then the destroy starts. Deleting it would risk a database the state never recorded.
 
 The Jobs have no Kubernetes API access: they report through their Pod's termination message, which this module reads.
 """
 
 import base64
-import json
 import logging
 import secrets
 from datetime import timedelta
@@ -42,14 +45,6 @@ RETRY_MIN_SECONDS, RETRY_MAX_SECONDS = 60, 1800  # between destroy attempts: dou
 RUNNING_PHASES = (RunPhase.PENDING, RunPhase.PROVISIONING, RunPhase.RUNNING)
 
 
-def job_state(job: dict) -> str:
-    """`complete`, `failed` or `running`."""
-    for condition in job.get("status", {}).get("conditions") or []:
-        if condition.get("status") == "True" and condition.get("type") in ("Complete", "Failed"):
-            return condition["type"].lower()
-    return "running"
-
-
 def _new_password() -> str:
     """Random, with a letter of each case, a digit and a symbol, which the password policies of the vendors ask for."""
     return f"Sc1-{secrets.token_urlsafe(24)}"
@@ -73,10 +68,7 @@ class DbaasMixin:
     def _set_database(self, run: BenchmarkRun, mutate) -> BenchmarkRun:
         """Update `status.database` (the run may have left `Running` meanwhile: the database does not care)."""
 
-        def apply(status: RunStatus) -> None:
-            mutate(status)
-
-        return crd.update_status(self.kube, run.name, apply)
+        return crd.update_status(self.kube, run.name, mutate)
 
     def _database_up(self, run: BenchmarkRun, cfg: Config, live: dict[str, dict]) -> None:
         """One pass of Creating and Bootstrapping, from `_running` while the database is not Ready. The anchor's hold is
@@ -85,23 +77,21 @@ class DbaasMixin:
         db = run.status.database
         if db is None:
             return self._database_start(run, cfg, live)
+        if db.phase == DbPhase.CLEARING:
+            return self._database_clearing(run, cfg, live)
         if db.phase == DbPhase.CREATING:
             return self._database_creating(run, cfg, live)
         if db.phase == DbPhase.BOOTSTRAPPING:
             return self._database_bootstrapping(run, cfg, live)
         self._database_fail(run, "DBAAS_GONE", "the database is already being destroyed")
 
-    def _database_fail(self, run: BenchmarkRun, reason: str, message: str, *, destroy: bool = False) -> None:
+    def _database_fail(self, run: BenchmarkRun, reason: str, message: str) -> None:
         """The database cannot be used: the run's task ends `-1` (retried by the usual rules). The destroy follows from
-        the run leaving `Running`; with `destroy` (a database may exist although none was created) the phase is set
-        first."""
+        the run leaving `Running`."""
         text = f"{reason}: {message}"[:500]
         log.warning("run %s: %s", run.name, text)
-        now = self._now()
 
         def mutate(status: RunStatus) -> None:
-            if status.database is None and destroy:
-                status.database = DbStatus(DbPhase.CREATING, now, now)
             if status.database is not None:
                 status.database.error = text
 
@@ -118,15 +108,27 @@ class DbaasMixin:
                 run, "DBAAS_NO_NETWORK", f"no network of {db['vendor']} in {db['region']} in the ConfigMap"
             )
         state_key = dbaas_jobs.stack_state_key(run.name)
+        now = self._now()
         if any(key == state_key for key, _ in self.storage.list_objects(state_key)):
             # A stack of this name is left from an earlier run: destroy it before anything new is created.
-            return self._database_fail(run, "DBAAS_STACK_EXISTS", "a Pulumi stack of this run exists", destroy=True)
-        now = self._now()
+            log.warning("run %s: a Pulumi stack of this name exists, destroying it first", run.name)
+            run = self._set_database(
+                run, lambda status: setattr(status, "database", DbStatus(DbPhase.CLEARING, now, now))
+            )
+            return self._database_clearing(run, cfg, live)
         expires = dbaas_jobs.expiry(now, cfg, self._dbaas_task(run))
         run = self._set_database(
             run, lambda status: setattr(status, "database", DbStatus(DbPhase.CREATING, now, expires))
         )
         self._database_creating(run, cfg, live)
+
+    def _database_clearing(self, run: BenchmarkRun, cfg: Config, live: dict[str, dict]) -> None:
+        """Destroy the leftover stack; when that is done the run starts over with a fresh database, without a result
+        for the database."""
+        if not self._drive_destroy(run, cfg, run.status.database):
+            return
+        self._set_database(run, lambda status: setattr(status, "database", None))
+        self._database_start(crd.get_run(self.kube, run.name), cfg, live)
 
     def _password(self, run: BenchmarkRun) -> str:
         """The run's database password: generated once, kept in the run's Secret (so it survives a restart)."""
@@ -146,21 +148,8 @@ class DbaasMixin:
             return self._database_fail(run, "DBAAS_UNKNOWN_DATABASE", f"Keeper does not know {db['vendor']}/{db['id']}")
         self._password(run)
         network = cfg.settings.dbaas.vendors[db["vendor"]].networks[db["region"]]
-        spec = dbaas_jobs.build_spec(run, record, network, run.status.database.expires)
+        spec = dbaas_jobs.build_spec(run, cfg, record, network, run.status.database.expires)
         self._create("job", dbaas_jobs.up_job(run, cfg, spec, self._run_owner(run)))
-
-    def _job_message(self, job_name: str) -> dict:
-        """The JSON in the termination message of the Job's Pod; empty when there is none."""
-        for pod in self.kube.list("pod", labels={dbaas_jobs.LABEL_JOB: job_name}):
-            for status in pod.get("status", {}).get("containerStatuses") or []:
-                text = status.get("state", {}).get("terminated", {}).get("message")
-                if text:
-                    try:
-                        message = json.loads(text)
-                    except ValueError:
-                        return {"error": text[:500]}
-                    return message if isinstance(message, dict) else {}
-        return {}
 
     def _database_creating(self, run: BenchmarkRun, cfg: Config, live: dict[str, dict]) -> None:
         db = run.status.database
@@ -169,9 +158,9 @@ class DbaasMixin:
             job = self.kube.get("job", name)
         except NotFound:
             return self._create_up_job(run, cfg)
-        state = job_state(job)
+        state = dbaas_jobs.job_state(job)
         if state == "failed":
-            message = self._job_message(name).get("error") or "the Job failed"
+            message = dbaas_jobs.job_message(self.kube, name).get("error") or "the Job failed"
             return self._database_fail(run, "DBAAS_CREATE_FAILED", message)
         if state == "running":
             if self._now() - db.since > timedelta(minutes=cfg.settings.dbaas.create_minutes) + TIMEOUT_MARGIN:
@@ -179,7 +168,7 @@ class DbaasMixin:
                     run, "DBAAS_CREATE_TIMEOUT", f"not created within {cfg.settings.dbaas.create_minutes} minutes"
                 )
             return self._enqueue_later(run.name, POLL_SECONDS)
-        outputs = self._job_message(name)
+        outputs = dbaas_jobs.job_message(self.kube, name)
         if "host" not in outputs:
             return self._database_fail(run, "DBAAS_CREATE_FAILED", "the Job reported no connection facts")
         self.kube.apply_secret(dbaas_jobs.connection_secret(run, self._run_owner(run), self._password(run), outputs))
@@ -211,8 +200,10 @@ class DbaasMixin:
         if pod is None:
             return self._start_bootstrap(run, cfg, live)  # first time, or the Pod was lost with an earlier attempt
         phase = pod.get("status", {}).get("phase")
-        if phase == "Failed" or (phase == "Succeeded" and "error" in self._pod_message(pod)):
-            message = self._pod_message(pod).get("error") or pod["status"].get("reason") or "the Pod failed"
+        if phase == "Failed" or (phase == "Succeeded" and "error" in dbaas_jobs.termination_message(pod)):
+            message = (
+                dbaas_jobs.termination_message(pod).get("error") or pod["status"].get("reason") or "the Pod failed"
+            )
             return self._database_fail(run, "DBAAS_BOOTSTRAP_FAILED", message)
         if phase != "Succeeded":
             return self._enqueue_later(run.name, POLL_SECONDS)
@@ -224,18 +215,6 @@ class DbaasMixin:
 
         run = self._set_database(run, mutate)
         self._running(run, cfg, {k: v for k, v in live.items() if k != name})
-
-    @staticmethod
-    def _pod_message(pod: dict) -> dict:
-        for status in pod.get("status", {}).get("containerStatuses") or []:
-            text = status.get("state", {}).get("terminated", {}).get("message")
-            if text:
-                try:
-                    message = json.loads(text)
-                except ValueError:
-                    return {"error": text[:500]}
-                return message if isinstance(message, dict) else {}
-        return {}
 
     # ----------------------------------------------------------------------- destroying
 
@@ -264,29 +243,53 @@ class DbaasMixin:
         self._destroy(run, cfg, db)
 
     def _destroy(self, run: BenchmarkRun, cfg: Config, db: DbStatus) -> None:
+        if not self._drive_destroy(run, cfg, db):
+            return
+        self.kube.delete("secret", pods.db_secret_name(run.name))
+        self._set_database(run, lambda status: setattr(status.database, "phase", DbPhase.DESTROYED))
+        crd.remove_finalizer(self.kube, run.name)
+        log.info("run %s: the database is destroyed", run.name)
+
+    def _drive_destroy(self, run: BenchmarkRun, cfg: Config, db: DbStatus) -> bool:
+        """One pass of the destroy of the run's stack: True when it succeeded and its state is gone. A running up Job is
+        waited for, never deleted: it ends within its deadline and Pulumi records what it created."""
         up = dbaas_jobs.up_job_name(run.name)
-        self.kube.delete("job", up)  # stops a creation that is still going; a finished Job is just removed
+        try:
+            up_job = self.kube.get("job", up)
+        except NotFound:
+            up_job = None
+        if up_job is not None:
+            if dbaas_jobs.job_state(up_job) == "running":
+                self._enqueue_later(run.name, POLL_SECONDS)
+                return False
+            self.kube.delete("job", up)
         if self.kube.list("pod", labels={dbaas_jobs.LABEL_JOB: up}):  # it must be gone before the destroy starts
-            return self._enqueue_later(run.name, WAIT_FOR_POD_SECONDS)
+            self._enqueue_later(run.name, WAIT_FOR_POD_SECONDS)
+            return False
         name = dbaas_jobs.down_job_name(run.name)
         try:
             job = self.kube.get("job", name)
         except NotFound:
             if db.retry_after and self._now() < db.retry_after:
-                return self._enqueue_later(run.name, max(1.0, (db.retry_after - self._now()).total_seconds()))
-            owner = self._run_owner(run)
-            self._create("job", dbaas_jobs.down_job(run.name, run.spec.vendor, cfg, owner))
-            return self._enqueue_later(run.name, POLL_SECONDS)
-        state = job_state(job)
+                self._enqueue_later(run.name, max(1.0, (db.retry_after - self._now()).total_seconds()))
+                return False
+            self._create("job", dbaas_jobs.down_job(run.name, run.spec.vendor, cfg))
+            self._enqueue_later(run.name, POLL_SECONDS)
+            return False
+        state = dbaas_jobs.job_state(job)
         if state == "running":
-            return self._enqueue_later(run.name, POLL_SECONDS)
+            self._enqueue_later(run.name, POLL_SECONDS)
+            return False
         if state == "failed":
-            return self._destroy_failed(run, name, db)
-        self._destroyed(run, name)
+            self._destroy_failed(run, name, db)
+            return False
+        dbaas_jobs.clean_state(self.storage, run.name)
+        self.kube.delete("job", name)
+        return True
 
     def _destroy_failed(self, run: BenchmarkRun, name: str, db: DbStatus) -> None:
         """The destroy failed: try again later, as long as it takes (a database that bills must not stay)."""
-        message = self._job_message(name).get("error") or "the destroy Job failed"
+        message = dbaas_jobs.job_message(self.kube, name).get("error") or "the destroy Job failed"
         failures = db.destroy_failures + 1
         wait = min(RETRY_MIN_SECONDS * 2 ** (failures - 1), RETRY_MAX_SECONDS)
         retry_after = self._now() + timedelta(seconds=wait)
@@ -299,13 +302,3 @@ class DbaasMixin:
         self._set_database(run, mutate)
         self.kube.delete("job", name)
         self._enqueue_later(run.name, wait)
-
-    def _destroyed(self, run: BenchmarkRun, job_name: str) -> None:
-        """The destroy succeeded: what is left of the stack in the bucket goes, then the connection facts, and the run
-        may be deleted. Every step can be repeated."""
-        dbaas_jobs.clean_state(self.storage, run.name)
-        self.kube.delete("secret", pods.db_secret_name(run.name))
-        self._set_database(run, lambda status: setattr(status.database, "phase", DbPhase.DESTROYED))
-        crd.remove_finalizer(self.kube, run.name)
-        self.kube.delete("job", job_name)
-        log.info("run %s: the database is destroyed", run.name)

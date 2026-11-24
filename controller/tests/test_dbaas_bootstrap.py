@@ -74,6 +74,11 @@ class Conn:
         self.close()
         return False
 
+    class pgconn:  # noqa: N801
+        @staticmethod
+        def encrypt_password(password: bytes, user: bytes, algorithm: bytes) -> bytes:
+            return b"SCRAM-SHA-256$4096:salt$" + algorithm + b":" + user  # never contains the password
+
     def cursor(self):
         assert not self.closed, "the connection is closed"
         return Cursor(self)
@@ -160,8 +165,10 @@ def test_a_distinct_workload_user_is_created_granted_and_creates_the_database_it
     assert statements[0] == (
         "postgres",
         "postgres",
-        """CREATE USER "workload" WITH PASSWORD 'pw' CREATEDB CREATEROLE""",
+        """CREATE USER "workload" WITH ENCRYPTED PASSWORD 'SCRAM-SHA-256$4096:salt$scram-sha-256:workload' """
+        "CREATEDB CREATEROLE",
     )
+    assert not [s for s in statements if "'pw'" in s[2]]  # the password itself is in no statement
     assert statements[1] == ("postgres", "postgres", 'GRANT "cloudsqlsuperuser" TO "workload"')
     assert statements[2] == ("workload", "postgres", 'CREATE DATABASE "bench"')  # the admin user cannot give it away
 

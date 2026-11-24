@@ -154,6 +154,28 @@ class FakeKube:
             self._remove(kind, name)
         return result
 
+    def json_patch(self, kind: str, name: str, operations: list[dict]) -> dict:
+        """RFC 6902 for the paths of a list in `metadata` (`test` and `remove`), as far as the controller uses it."""
+        obj = self._store(kind).get(name)
+        if obj is None:
+            raise NotFound(name)
+        for op in operations:
+            *parents, last = op["path"].strip("/").split("/")
+            target = obj
+            for part in parents:
+                target = target[int(part)] if isinstance(target, list) else target[part]
+            index = int(last)
+            if op["op"] == "test":
+                if target[index] != op["value"]:
+                    raise Conflict(name)
+            elif op["op"] == "remove":
+                del target[index]
+        self._bump(obj)
+        released = not obj["metadata"].get("finalizers")
+        if released and obj["metadata"].get("deletionTimestamp"):
+            self._remove(kind, name)
+        return copy.deepcopy(obj)
+
     def apply_secret(self, manifest: dict) -> None:
         secret = copy.deepcopy(manifest)
         import base64

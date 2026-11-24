@@ -14,7 +14,10 @@ on: no lscpu result), `_last_publish_timestamp_seconds`
 and `_launch_blocked{vendor,reason}` (SKUs in the launch ConfigMap, and those of them still waiting for their
 retry). `_dbaas_instances{vendor}` and `_dbaas_oldest_age_seconds{vendor}`: the managed databases (stacks) that exist,
 from the DBaaS
-runs not yet destroyed and the leaked stacks the sweeper sees; alert when the oldest is over 8 h.
+runs not yet destroyed and the leaked stacks the sweeper sees (stacks of a vendor the configuration does not know are
+`vendor="unknown"`); alert when the oldest is over 8 h. `_dbaas_tagged_databases{vendor}` and
+`_dbaas_tagged_oldest_age_seconds{vendor}`: the databases the vendor's inventory Job found by their `sc_inspector_run`
+tag (also the ones no state records), refreshed every 30 minutes; alert when the oldest is over 8 h.
 `/healthz` answers 200 as long as the process serves.
 """
 
@@ -93,13 +96,19 @@ class Metrics:
         self._last_publish = time.time()  # process start until the first cycle: a stuck publisher still ages
         self._counters["unpublishable_tasks_total"][()] = 0
         self._orphans: list[tuple[str, float]] = []  # (vendor, age in seconds) of the stacks without a run
+        self._tagged: dict = {}  # vendor -> `dbaas_sweep.Tagged`: the databases the last inventory found by their tag
 
     def record_dbaas_stacks(self, stacks) -> None:
         """The stacks the sweeper saw (`dbaas_sweep.Stack`); those without a BenchmarkRun are counted here, the others
         come from their runs."""
         now = self._clock()
         with self._lock:
-            self._orphans = [(s.vendor, (now - s.modified).total_seconds()) for s in stacks if s.orphan]
+            self._orphans = [(s.vendor or "unknown", (now - s.modified).total_seconds()) for s in stacks if s.orphan]
+
+    def record_dbaas_inventory(self, tagged: dict) -> None:
+        """The latest inventory of every vendor (`dbaas_sweep.Tagged` by vendor)."""
+        with self._lock:
+            self._tagged = dict(tagged)
 
     def record_publish(self) -> None:
         """A publish cycle finished without error."""
@@ -224,6 +233,17 @@ class Metrics:
         lines += [
             _line("dbaas_oldest_age_seconds", _labels(vendor=v), max(ages, default=0))
             for v, ages in sorted(databases.items())
+        ]
+        lines.append(f"# TYPE {PREFIX}dbaas_tagged_databases gauge")
+        lines += [_line("dbaas_tagged_databases", _labels(vendor=v), t.count) for v, t in sorted(self._tagged.items())]
+        lines.append(f"# TYPE {PREFIX}dbaas_tagged_oldest_age_seconds gauge")
+        lines += [
+            _line(
+                "dbaas_tagged_oldest_age_seconds",
+                _labels(vendor=v),
+                (now - t.oldest_created).total_seconds() if t.oldest_created else 0,
+            )
+            for v, t in sorted(self._tagged.items())
         ]
         lines.append(f"# TYPE {PREFIX}publish_backlog gauge")
         lines.append(_line("publish_backlog", (), backlog))

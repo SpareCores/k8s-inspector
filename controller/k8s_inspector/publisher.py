@@ -410,8 +410,9 @@ class Publisher:
         task = self._get_task(item.key)
         stdout = self._storage.read_bytes(storage_keys.object_key(item.run, item.key, "stdout")) or b""
         if item.database and stdout:  # the bootstrap's PostgreSQL settings belong into the published output
-            document = self._storage.read_json(item.run, item.key, "postgres.json")
-            stdout = dbaas_bench.merge_postgres(stdout, document or {})
+            document = self._storage.read_json(item.run, item.key, "postgres.json") or {}
+            extra = dbaas_bench.repro_extra(task, item.database) | document.get("extra", {})
+            stdout = dbaas_bench.merge_postgres(stdout, {**document, "extra": extra})
         stderr = self._storage.read_bytes(storage_keys.object_key(item.run, item.key, "stderr")) or b""
         if item.run not in cache:
             cache[item.run] = self._read_run_facts(item.run)

@@ -6,10 +6,13 @@ merge_postgres_into_stdout`. The connection variables (`SC_DB_HOST` ...) are not
 
 import json
 
+from k8s_inspector.model import TaskDef
+
 RUN_SECONDS = 300  # 2 min warmup + 5 min measurement is enough to rank databases
 WARMUP_SECONDS = 120
 SETTLE_SECONDS = 60  # after the first warmup, later concurrency levels only settle
 CPU_SCALE = 1
+SCHEMA_GIB = 0.17  # the fixed `ro_cpu_*` dataset of the read-only workload
 
 
 def concurrency_profile(vcpus: int) -> list[int]:
@@ -45,6 +48,27 @@ def pgbench_env(database: dict, client_vcpus: int | None) -> tuple[tuple[str, st
     if client_vcpus:
         env["SC_CLIENT_VCPUS"] = str(client_vcpus)
     return tuple(env.items())
+
+
+def repro_extra(task: TaskDef, database: dict) -> dict:
+    """The top-level `stdout` fields the legacy runner added for reproducing a DBaaS run (`_dbaas_repro_extra`), from
+    the same constants as `pgbench_env`. `client_vcpus` is reported by the benchmark itself (`SC_CLIENT_VCPUS`);
+    `sslmode` and `sync_commit_session_settable` come from the bootstrap."""
+    vcpus = int(database["vcpus"])
+    anchors = concurrency_profile(vcpus)
+    return {
+        "db_vcpus": vcpus,
+        "db_mem_gib": float(database["memoryGib"]),
+        "profile_vus": anchors,
+        "profile_search": False,
+        "profile_max_clients": anchors[-1],
+        "profile_hard_max_clients": anchors[-1],
+        "benchmark_image": task.image,
+        "durability": task.durability or "durable",
+        "workload_kind": "pgbench_ro",
+        "cpu_scale": CPU_SCALE,
+        "schema_gib": SCHEMA_GIB,
+    }
 
 
 def merge_postgres(stdout: bytes, document: dict) -> bytes:

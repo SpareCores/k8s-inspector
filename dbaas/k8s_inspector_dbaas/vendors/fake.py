@@ -5,6 +5,9 @@
 Without one the host is a name that does not resolve, so the bootstrap fails the way an unreachable database does.
 """
 
+import json
+import os
+
 from k8s_inspector_dbaas.spec import DbOutputs, DbSpec
 
 
@@ -17,3 +20,8 @@ def provision(spec: DbSpec) -> DbOutputs:
         admin_db=network.get("admin_db", "postgres"),
         sslmode=network.get("sslmode", "prefer"),
     )
+
+
+def inventory() -> list[dict]:
+    """The tagged databases of the fake cloud: the JSON list in `FAKE_DBAAS_INVENTORY`, none without it."""
+    return json.loads(os.environ.get("FAKE_DBAAS_INVENTORY", "[]"))

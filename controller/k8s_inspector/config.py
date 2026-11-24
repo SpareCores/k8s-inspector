@@ -65,6 +65,7 @@ def load_env(environ: Mapping[str, str]) -> EnvConfig:
         s3_endpoint_url=optional("K8SI_S3_ENDPOINT_URL"),
         key_prefix=optional("K8SI_KEY_PREFIX") or "",
         dbaas_image=optional("K8SI_DBAAS_IMAGE") or "",
+        dbaas_role_arn=optional("K8SI_DBAAS_ROLE_ARN"),
     )
 
 
@@ -175,6 +176,8 @@ _VENDOR = {
     "capacity": ("capacity", _capacity),
     "publish": ("publish", _publish),
     "dbaasAutoPlan": ("dbaas_auto_plan", _bool),
+    "dbaasMaxInFlight": ("dbaas_max_in_flight", _nonneg_int),
+    "dbaasMaxUsdPerHour": ("dbaas_max_usd_per_hour", _optional(_nonneg_float)),
 }
 _DBAAS = {
     "engineVersion": ("engine_version", _version),

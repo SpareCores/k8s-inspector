@@ -30,7 +30,7 @@ dbaas-state/.pulumi/...                                  # Pulumi state of the D
 | Bucket rules | `AbortIncompleteMultipartUpload` after 7 days on `logs/inspect/` (a `K8SI_KEY_PREFIX` needs its own rule); the existing retention otherwise |
 
 Access: the controller's IAM role may create, complete, abort and list multipart uploads, put, get, head and list under
-`logs/inspect/`, and (for DBaaS) read, write, list and delete under `dbaas-state/`, which the provisioner Jobs use with the same role. `dbaas-state/` has no expiry rule: the state of a live stack must not expire. Nothing else, and no write access to the CDN dataset prefix: the pgbench dataset is read from the
+`logs/inspect/`, and (for DBaaS) read, write, list and delete under `dbaas-state/`, which the provisioner Jobs use with their own role (`K8SI_DBAAS_ROLE_ARN`, limited to `dbaas-state/`). `dbaas-state/` has no expiry rule: the state of a live stack must not expire. Nothing else, and no write access to the CDN dataset prefix: the pgbench dataset is read from the
 CDN and never uploaded by benchmark runs (`SC_CDN_UPLOAD=0`).
 
 ## run.json

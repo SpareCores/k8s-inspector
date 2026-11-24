@@ -1,4 +1,4 @@
-"""One module per vendor: `vendors/<vendor>.py` exposes `provision(spec: DbSpec) -> DbOutputs`."""
+"""One module per vendor: `vendors/<vendor>.py` exposes `provision(spec)` and `inventory()` (see `spec.py`)."""
 
 import importlib
 import re

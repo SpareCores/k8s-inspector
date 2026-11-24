@@ -157,6 +157,23 @@ def test_merge_patch_status_subresource_with_resource_version():
     assert sent == body
 
 
+def test_json_patch_sends_the_operations_as_rfc_6902():
+    seen = []
+
+    def handler(request):
+        seen.append((request.method, request.url.path, request.headers["content-type"], json.loads(request.content)))
+        return json_response(
+            200, {"apiVersion": "inspector.sparecores.com/v1alpha1", "kind": "BenchmarkRun", "metadata": {"name": "r"}}
+        )
+
+    operations = [
+        {"op": "test", "path": "/metadata/finalizers/0", "value": "f"},
+        {"op": "remove", "path": "/metadata/finalizers/0"},
+    ]
+    make_kube(handler).json_patch("benchmarkrun", "r", operations)
+    assert seen == [("PATCH", f"{CRD_BASE}/r", "application/json-patch+json", operations)]
+
+
 def test_apply_secret_replaces_when_it_exists():
     seen = []
     manifest = {"apiVersion": "v1", "kind": "Secret", "metadata": {"name": "run-urls"}, "stringData": {"a": "b"}}

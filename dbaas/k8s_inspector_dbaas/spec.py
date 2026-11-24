@@ -1,8 +1,21 @@
 """The vendor contract: what the controller passes in (`DbSpec`) and what a vendor module returns (`DbOutputs`).
 
-A vendor module `vendors/<vendor>.py` exposes one function, `provision(spec: DbSpec) -> DbOutputs`. It runs inside
-a Pulumi program: it declares the resources of one database (and its user and firewall entry) and returns the
-connection facts. Free prerequisites (network, subnets, DNS zones) already exist and are described by `spec.network`.
+A vendor module `vendors/<vendor>.py` exposes two functions:
+
+- `provision(spec: DbSpec) -> DbOutputs` runs inside a Pulumi program: it declares the resources of one database (and
+  its user and firewall entry) and returns the connection facts. Free prerequisites (network, subnets, DNS zones)
+  already exist and are described by `spec.network`.
+- `inventory() -> list[dict]` lists the vendor's databases that carry the `sc_inspector_run` tag or label, outside
+  Pulumi, as `{"id", "run", "expires_at", "created_at"}` (RFC 3339 times): how a database that no state records is
+  found. It reads the vendor's credentials from the environment, like `provision`.
+
+Rules for `provision` that make `down` work from the state alone:
+
+- Create an explicit provider with `region=spec.region`; take its credentials from the environment, never as provider
+  arguments (those are stored in the state and go stale when a key is rotated).
+- Set `ResourceOptions(custom_timeouts=...)` with `spec.create_timeout` and `spec.delete_timeout` on every slow
+  resource, so Pulumi fails by itself before the Job's deadline and records the resource.
+- Name every resource deterministically (from `spec.run`), so a retry finds what an earlier attempt created.
 """
 
 import json
@@ -28,13 +41,25 @@ class DbSpec:
     run_id: str  # `spec.runId` of the run
     expires_at: str  # RFC 3339 UTC: after this the database is a leak (the controller sweeps stacks after 6 h)
     labels: dict[str, str]  # run id and expiry as label-safe strings; apply them as tags/labels where supported
-    network: dict  # opaque infrastructure outputs from the ConfigMap `dbaas.vendors.<vendor>.networks.<region>`
+    create_timeout_minutes: int  # shorter than the up Job's deadline: the `create` custom timeout of slow resources
+    delete_timeout_minutes: int  # shorter than the down Job's deadline: the `delete` custom timeout
+    network: dict  # opaque outputs of the platform from the ConfigMap `dbaas.vendors.<vendor>.networks.<region>`; for a
+    # vendor that needs an allowlist (OVH, UpCloud, Vultr, OCI) the platform puts the client CIDRs in it
     record: dict  # Keeper's record of the database (vcpus, memory_amount, storage_size, api_reference_object ...)
     password: str = field(repr=False, default="")  # admin password, from `DBAAS_PASSWORD`; a Pulumi secret
 
     @property
     def vcpus(self) -> int:
         return int(self.record["vcpus"])
+
+    @property
+    def create_timeout(self) -> str:
+        """For `ResourceOptions(custom_timeouts=pulumi.CustomTimeouts(create=...))`."""
+        return f"{self.create_timeout_minutes}m"
+
+    @property
+    def delete_timeout(self) -> str:
+        return f"{self.delete_timeout_minutes}m"
 
     @property
     def memory_gib(self) -> float:
@@ -91,6 +116,8 @@ def load_spec(environ: dict[str, str] | None = None) -> DbSpec:
         run_id=data["runId"],
         expires_at=data["expiresAt"],
         labels=dict(data["labels"]),
+        create_timeout_minutes=int(data["createTimeoutMinutes"]),
+        delete_timeout_minutes=int(data["deleteTimeoutMinutes"]),
         network=dict(data.get("network") or {}),
         record=dict(data["record"]),
         password=environ.get(PASSWORD_ENV, ""),

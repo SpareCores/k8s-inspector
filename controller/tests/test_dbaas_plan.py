@@ -15,6 +15,7 @@ from k8s_inspector.model import (
     DbStatus,
     EnvConfig,
     RunPhase,
+    RunSpec,
     Settings,
     VendorSettings,
 )
@@ -174,6 +175,8 @@ def test_the_first_database_in_start_order_gets_a_run_in_the_cheapest_region_wit
     (run,) = crd.list_runs(kube)
     assert (run.spec.vendor, run.spec.sku, run.spec.tasks, run.spec.force) == ("oci", "c-cheap", [TASK], False)
     assert run.spec.capacity == CapacityMode.ON_DEMAND  # a lost client would leave the database billing
+    price = run.spec.database.pop("usdPerHour")  # the database in eu-2 and the client, from Keeper
+    assert price == pytest.approx(0.30 + 0.03)
     assert run.spec.database == {
         "vendor": "oci", "id": planned.database_id, "engineVersion": "18", "region": "eu-2", "vcpus": 4,
         "memoryGib": 32.0,
@@ -291,7 +294,8 @@ def test_a_forced_run_needs_no_autoplan_and_picks_region_and_client(kube, world)
 def test_a_forced_run_can_name_the_region_and_the_client(kube, world):
     run = force(kube, world, region="eu-1", client="my-client")
     assert (run.spec.database["region"], run.spec.sku) == ("eu-1", "my-client")
-    assert world.asked == []  # nothing to pick
+    assert world.asked == ["id-eu-1"]
+    assert "usdPerHour" not in run.spec.database  # Keeper does not list that client: its price is unknown
 
 
 @pytest.mark.parametrize(
@@ -315,7 +319,7 @@ def test_a_forced_run_is_refused_without_networks_or_while_another_runs(kube, wo
     with pytest.raises(ValueError, match="no dbaas.vendors.oci.networks"):
         force(kube, world, make_config(networks={}))
     force(kube, world)
-    with pytest.raises(ValueError, match="already has a DBaaS run in flight"):
+    with pytest.raises(ValueError, match="dbaasMaxInFlight limit"):
         dbaas_plan.force_run(kube, make_config(), "oci", "db-b")
 
 
@@ -323,3 +327,64 @@ def test_a_forced_run_of_a_disabled_vendor_is_refused(kube, world):
     cfg = Config(make_config().env, Settings(vendors={"oci": VendorSettings(enabled=False)}))
     with pytest.raises(ValueError, match="not enabled"):
         dbaas_plan.force_run(kube, cfg, "oci", "db-a")
+
+
+# --------------------------------------------------------------------------- the DBaaS limits
+
+
+def test_dbaas_max_in_flight_lets_more_runs_start_one_per_cycle(kube, world):
+    cfg = make_config(dbaas_max_in_flight=2)
+    assert len(plan(kube, cfg, world)) == 1
+    assert len(plan(kube, cfg, world)) == 1  # the next cycle: the limit is not reached yet
+    assert plan(kube, cfg, world) == []  # two DBaaS runs in flight
+    assert len(crd.list_runs(kube)) == 2
+
+
+def test_dbaas_max_in_flight_zero_pauses_the_vendor(kube, world):
+    assert plan(kube, make_config(dbaas_max_in_flight=0), world) == []
+    with pytest.raises(ValueError, match=r"dbaasMaxInFlight limit \(0 of 0"):
+        force(kube, world, make_config(dbaas_max_in_flight=0))
+
+
+def test_server_runs_do_not_use_up_the_dbaas_limits(kube, world):
+    crd.create_run(kube, RunSpec("oci", "some-server", "r1", tasks=["x"]))
+    cfg = make_config(max_in_flight=1, max_usd_per_hour=0.01, dbaas_max_usd_per_hour=1.0)
+    assert len(plan(kube, cfg, world, dry_run=True)) == 1
+
+
+def test_the_dbaas_cap_counts_database_and_client_price_of_the_runs_in_flight(kube, world):
+    cfg = make_config(dbaas_max_in_flight=5, dbaas_max_usd_per_hour=0.50)
+    (first,) = plan(kube, cfg, world)  # eu-2 database 0.30 + c-cheap 0.03
+    assert first.region == "eu-2"
+    assert plan(kube, cfg, world) == []  # 0.33 + 0.33 > 0.50, and eu-1 costs more
+    name = crd.list_runs(kube)[0].name
+    crd.update_status(  # the node is released, the database not yet destroyed
+        kube,
+        name,
+        lambda s: (
+            setattr(s, "phase", RunPhase.PUBLISHING),
+            setattr(s, "database", DbStatus(DbPhase.DESTROYING, NOW, NOW)),
+        ),
+    )
+    assert plan(kube, cfg, world) == []
+    crd.update_status(kube, name, lambda s: setattr(s.database, "phase", DbPhase.DESTROYED))
+    assert len(plan(kube, cfg, world)) == 1  # destroyed: the price is free again
+
+
+def test_a_run_that_alone_passes_the_cap_is_never_planned_and_a_cheaper_database_is_tried(kube, world, monkeypatch):
+    world.records = {"db-a": record("db-a"), "db-b": record("db-b")}
+    prices = {"db-a": {"eu-2": 5.0}, "db-b": {"eu-2": 0.10}}
+    monkeypatch.setattr(dbaas_keeper, "standalone_prices", lambda env, vendor, name: dict(prices[name]))
+    (planned,) = plan(kube, make_config(dbaas_max_usd_per_hour=1.0), world)
+    assert planned.database_id == "db-b"
+    with pytest.raises(ValueError, match="would pass its dbaasMaxUsdPerHour cap"):
+        dbaas_plan.force_run(
+            kube, make_config(auto=False, dbaas_max_in_flight=3, dbaas_max_usd_per_hour=1.0), "oci", "db-a"
+        )
+
+
+def test_an_unknown_price_is_refused_when_a_cap_is_set(kube, world):
+    cfg = make_config(auto=False, dbaas_max_usd_per_hour=1.0)
+    with pytest.raises(ValueError, match="price of the database or client is unknown"):
+        force(kube, world, cfg, region="eu-1", client="my-client")  # Keeper lists no such client
+    assert force(kube, world, make_config(auto=False), region="eu-1", client="my-client")  # no cap: fine

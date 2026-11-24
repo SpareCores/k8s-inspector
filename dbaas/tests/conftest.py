@@ -15,6 +15,8 @@ def spec() -> DbSpec:
         run_id="r20261120t1000-aaaa",
         expires_at="2026-11-20T16:00:00Z",
         labels={"sc_inspector_run": "r20261120t1000-aaaa", "sc_inspector_expires": "20261120t1600z"},
+        create_timeout_minutes=50,
+        delete_timeout_minutes=100,
         network={},
         record={"vcpus": 8, "memory_amount": 65536},
         password="s3cret-pass",

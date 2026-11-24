@@ -40,7 +40,11 @@ database second; on the way out, database destroy and node release in parallel.*
    `k8s-dbaas-<run>`; the password is passed as an environment variable from the Secret and used as a Pulumi secret. The
    Job has no Kubernetes API access: it reports host, port, admin user, admin database and sslmode in its termination
    message, and the controller writes them, with the password, to the Secret `<run>-db` as the `SC_DB_*` variables.
-   Creation has a deadline of 60 minutes (`dbaas.createMinutes`).
+   Creation has a deadline of 60 minutes (`dbaas.createMinutes`), which is the Job's `activeDeadlineSeconds`. The vendor
+   module sets Pulumi `customTimeouts` 10 minutes shorter (`spec.create_timeout`), so Pulumi fails by itself and records
+   the resource. The Job's Pod is annotated `karpenter.sh/do-not-disrupt` and has a 15 minute termination grace period:
+   on SIGTERM the provisioner passes SIGINT to the Pulumi CLI, which finishes the operation in flight and writes it to
+   the state.
 3. **Bootstrap.** The controller starts a Pod on the client node (phase `Bootstrapping`) that runs
    [`dbaas_bootstrap.py`](../../controller/k8s_inspector/dbaas_bootstrap.py) in the benchmark image (it has Python and
    psycopg, so no extra image is pulled; the script comes from the ConfigMap `<run>-boot`). It ports legacy
@@ -56,13 +60,21 @@ database second; on the way out, database destroy and node release in parallel.*
    `sslmode` and `sync_commit_session_settable` fields, as the legacy runner did.
 5. **Removal.** When the benchmark is over for any reason (success, failure, timeout, OOM, lost node, cancel, delete, a
    failed creation), the controller starts `dbaas-down-<run>` and releases the client node in the same reconcile pass.
-   The down Job runs on the `apps` pool and does not need the node. It cancels a stale lock, refreshes the state,
-   destroys the stack and removes it (`pulumi destroy --refresh --remove`). A failed destroy is retried until it
+   The down Job runs on the `apps` pool and does not need the node. **A running `dbaas-up` Job is never deleted**, not
+   by a cancel, a delete, a lost node or a failed run: the destroy waits until the up Job ends within its own deadline
+   and its Pod is gone, because killing Pulumi in the middle of a create could leave a database the state never
+   recorded. Then the down Job cancels a stale lock, refreshes the state, destroys the stack and removes it
+   (`pulumi destroy --refresh --remove`). If the state has pending operations (an `up` that was killed hard), the down
+   Job does not guess: it fails with a termination message that says an operator must look for the resource in the
+   vendor's console and clear the pending creates, and it keeps the state. A failed destroy is retried until it
    succeeds, waiting 1, 2, 4 ... 30 minutes (`status.database.retryAfter`). Only then the controller deletes what
-   Pulumi left in the bucket (backups and history of the stack), the Secret, and the finalizer.
+   Pulumi left in the bucket (backups and history of the stack), the Secret, the down Job and the finalizer. The down
+   Job is labelled with the run, not owned by it, so the run's foreground deletion never waits for it; the controller
+   removes only its own finalizer, with a JSON patch.
 
-`status.database.phase` is the state: `Creating`, `Bootstrapping`, `Ready`, `Destroying`, `Destroyed`; absent means
-nothing was created. The phase is written before what it stands for is created, and the Job names follow from the run
+`status.database.phase` is the state: `Clearing`, `Creating`, `Bootstrapping`, `Ready`, `Destroying`, `Destroyed`; absent
+means nothing was created. `Clearing` is a stack of an earlier run of the same name that is destroyed first; the run
+then starts over, without a result for the database. The phase is written before what it stands for is created, and the Job names follow from the run
 name, so a controller that restarts anywhere continues: it creates a missing Job again and runs the destroy of every
 run that is over.
 
@@ -84,8 +96,7 @@ rules; every input is Keeper's data, nothing is a static table:
   accelerator, with 2-4 vCPUs and 4-8 GiB, dedicated CPUs when there are any (else shared), cheapest after a Tukey price
   fence (Q3 + 1.5 IQR over the region's own candidates), without SKUs SCarpenter does not offer, that wait for a launch
   retry or that already have a run. Same sizing as the legacy `rank_dbaas_client_instances`, so results stay comparable.
-- **In flight**: one DBaaS run per vendor, besides the vendor's server runs (they are not counted against
-  `maxInFlight`, nor the client's node against it).
+- **Limits**: `dbaasMaxInFlight` and `dbaasMaxUsdPerHour` of the vendor ([below](#limits)).
 
 ### The network
 
@@ -94,7 +105,23 @@ region (free prerequisites: networks, subnets, delegated subnets, DNS zones) and
 `k8s-inspector`, `dbaas.vendors.<vendor>.networks.<region>`: an opaque mapping that the controller passes unchanged to the
 vendor module (`spec.network`). A region without an entry is not used. The same section names an optional ServiceAccount
 for workload identity. The Job's cloud credentials come from the optional Secret `k8s-inspector-dbaas-<vendor>`
-(`envFrom`).
+(`envFrom`). `DbSpec` has no client address: for a vendor that needs an allowlist (OVH, UpCloud, Vultr, OCI) the platform
+puts the client CIDRs in the `network` mapping, and the module applies them.
+
+### Limits
+
+DBaaS runs have their own per-vendor limits, next to the server ones and counted only over DBaaS runs (a DBaaS run does
+not count against `maxInFlight` and `maxUsdPerHour`, and a server run does not count against these):
+
+- `dbaasMaxInFlight` (default 1, 0 pauses): DBaaS runs that hold a client node or a database that is not yet destroyed.
+- `dbaasMaxUsdPerHour` (default unset: no cap): the hourly on-demand price of database plus client node, summed over the
+  vendor's DBaaS runs in flight. The price of a run is recorded in its `spec.database.usdPerHour` when it is created: the
+  database's standalone price in the chosen region from Keeper's price data, plus the client's `min_price_ondemand`
+  from Keeper's server data. A new run is refused when the running ones plus its own price would pass the cap, so the
+  planner tries the next database; a forced run is refused with the reason. With a cap set, a price that Keeper does not
+  know (a client it does not list) is refused too.
+
+The planner creates at most one new DBaaS run per vendor and cycle.
 
 ### Pulumi state and leaks
 
@@ -102,7 +129,16 @@ Pulumi state is in the controller's bucket (`K8SI_BUCKET`), below `K8SI_KEY_PREF
 (DIY) backend. One stack per run, named `k8s-dbaas-<run>` in the project `k8s-inspector-dbaas`; its state is
 `dbaas-state/.pulumi/stacks/k8s-inspector-dbaas/k8s-dbaas-<run>.json`. Secrets in the state (the database password) are
 encrypted with the passphrase in the Secret `k8s-inspector-dbaas-state` (key `passphrase`). The prefix has no expiry
-lifecycle rule; a stack's state is deleted only after its destroy succeeded.
+lifecycle rule; a stack's state is deleted only after its destroy succeeded. The bucket and prefix must not be shared
+between clusters: a sweeper that finds a stack it has no run for destroys it.
+
+The Jobs reach the bucket through their own identity, not the controller's: the role `K8SI_DBAAS_ROLE_ARN` (web
+identity, for the ServiceAccount `k8s-inspector-dbaas`) limited to `dbaas-state/`. The backend URL is
+`s3://<bucket>/<prefix>dbaas-state?region=<r>&awssdk=v2&profile=k8si-state`, and the Job writes an AWS config file with
+that one profile (role and token file) and points `AWS_CONFIG_FILE` at it. No `AWS_ROLE_ARN`, `AWS_WEB_IDENTITY_TOKEN_FILE`
+or `AWS_REGION` is set, so the state credentials never reach the vendor's providers. A vendor module creates its own
+provider explicitly and takes its credentials from the environment (the optional Secret), never as provider arguments,
+which Pulumi stores in the state and which would go stale when a key is rotated.
 
 Deadlines: database create 60 min, bootstrap 60 min of waiting, benchmark 120 min (the task timeout), destroy retried
 until it succeeds. The anchor's deadline covers all of them and the controller keeps its hold alive meanwhile.
@@ -111,18 +147,26 @@ Guarantees:
 
 - **Controller restart:** the run phase is in `status.database` and the names follow from the run name, so the
   controller resumes and runs `down`.
-- **Create failure or timeout:** `down` runs anyway; the Pulumi state holds what was already created. The task ends `-1`
-  with `DBAAS_CREATE_FAILED`, `DBAAS_CREATE_TIMEOUT` or `DBAAS_BOOTSTRAP_FAILED` ([exit codes](../reference/exit-codes.md)),
-  which the usual retry rules bound.
+- **Create failure or timeout:** `down` runs anyway, after the up Job has ended; the Pulumi state holds what was already
+  created. The task ends `-1` with `DBAAS_CREATE_FAILED`, `DBAAS_CREATE_TIMEOUT` or `DBAAS_BOOTSTRAP_FAILED`
+  ([exit codes](../reference/exit-codes.md)), which the usual retry rules bound.
 - **`BenchmarkRun` deleted:** a finalizer keeps the object until `down` succeeded; deleting an active run cancels it.
 - **Run gone, stack left:** the sweeper (every 10 minutes) lists the stacks `k8s-dbaas-*` in the bucket; one older than
   `dbaas.sweepAfterHours` (6 h) whose run does not exist is destroyed by a `dbaas-down-<run>` Job that belongs to no run,
-  and retried every cycle until it succeeds. A new run whose stack name already has a state file destroys it first.
-- **Database the state never recorded** (Job killed between the cloud create and the state write): every database is
-  tagged with the run id (`sc_inspector_run`) and an expiry time (`sc_inspector_expires`), passed to the vendor module,
-  which applies them where the vendor supports tags. The metric `k8s_inspector_dbaas_instances` and
-  `k8s_inspector_dbaas_oldest_age_seconds` count the databases that exist, and the monitoring alerts when the oldest is
-  older than 8 h ([monitoring](monitoring.md)). This is alert-only; no tag-driven automatic delete.
+  and retried every cycle until it succeeds. The sweeper lists the bucket whatever the configuration says, also when
+  `dbaas.vendors` is empty or a vendor was removed from it: such a stack is destroyed with the vendor's ServiceAccount
+  and Secret by their names (the default ServiceAccount when `dbaas.vendors.<vendor>` is gone). A stack of a vendor the
+  ConfigMap does not know at all is only reported (the metrics with `vendor="unknown"`, and a log line): the Job would have
+  no credentials. A new run whose stack name already has a state file destroys it first (`Clearing`).
+- **Database the state never recorded** (Job killed between the cloud create and the state write; the up Job is never
+  deleted, but a node can die): every database is tagged with the run id (`sc_inspector_run`) and an expiry time
+  (`sc_inspector_expires`), passed to the vendor module, which applies them where the vendor supports tags. The module's
+  `inventory()` lists the vendor's databases that carry the tag. The sweeper runs it every 30 minutes for each configured
+  vendor in a Job `dbaas-inventory-<vendor>` (same credentials and ServiceAccount as up and down), and the controller
+  exports `k8s_inspector_dbaas_tagged_databases{vendor}` and `k8s_inspector_dbaas_tagged_oldest_age_seconds{vendor}`.
+  The monitoring alerts when the oldest is older than 8 h ([monitoring](monitoring.md)). The metrics
+  `k8s_inspector_dbaas_instances` and `k8s_inspector_dbaas_oldest_age_seconds` count the databases the controller knows
+  about. This is alert-only; no tag-driven automatic delete.
 
 Retries follow the normal `-1`/`-4` backoff with the cap of three, instead of today's retry every 2 h forever.
 

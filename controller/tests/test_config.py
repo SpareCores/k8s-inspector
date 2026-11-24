@@ -234,6 +234,26 @@ def test_dbaas_settings_and_the_vendor_flag():
     assert parsed.dbaas.vendors["aws"].networks == {} and parsed.dbaas.vendors["aws"].service_account is None
 
 
+def test_dbaas_limits_have_their_own_keys_next_to_the_server_limits():
+    parsed = parse_settings(
+        {
+            "vendors": {
+                "gcp": {"maxInFlight": 3, "maxUsdPerHour": 2.0, "dbaasMaxInFlight": 2, "dbaasMaxUsdPerHour": 1.5},
+                "aws": {"dbaasMaxInFlight": 0},
+            }
+        }
+    )
+    gcp, aws = parsed.vendors["gcp"], parsed.vendors["aws"]
+    assert (gcp.max_in_flight, gcp.max_usd_per_hour, gcp.dbaas_max_in_flight, gcp.dbaas_max_usd_per_hour) == (
+        3,
+        2.0,
+        2,
+        1.5,
+    )
+    assert (aws.dbaas_max_in_flight, aws.dbaas_max_usd_per_hour) == (0, None)  # 0 pauses, no cap
+    assert VendorSettings().dbaas_max_in_flight == 1 and VendorSettings().dbaas_max_usd_per_hour is None
+
+
 def test_dbaas_defaults_are_off():
     parsed = parse_settings({})
     assert (parsed.dbaas.engine_version, parsed.dbaas.create_minutes, parsed.dbaas.sweep_after_hours) == ("18", 60, 6)
@@ -248,6 +268,8 @@ def test_dbaas_defaults_are_off():
         {"dbaas": {"vendors": {"gcp": {"networks": {"r": "not a mapping"}}}}},
         {"dbaas": {"vendors": {"gcp": {"serviceAccount": ""}}}},
         {"vendors": {"gcp": {"dbaasAutoPlan": "yes"}}},
+        {"vendors": {"gcp": {"dbaasMaxInFlight": -1}}},
+        {"vendors": {"gcp": {"dbaasMaxUsdPerHour": "cheap"}}},
     ],
 )
 def test_invalid_dbaas_values_name_the_key(data):
@@ -264,3 +286,5 @@ def test_unknown_dbaas_keys_warn_and_are_ignored(caplog):
 def test_the_dbaas_image_is_an_optional_environment_variable():
     assert load_env(MINIMAL_ENV).dbaas_image == ""
     assert load_env({**MINIMAL_ENV, "K8SI_DBAAS_IMAGE": "img@sha256:1"}).dbaas_image == "img@sha256:1"
+    assert load_env(MINIMAL_ENV).dbaas_role_arn is None
+    assert load_env({**MINIMAL_ENV, "K8SI_DBAAS_ROLE_ARN": "arn:r"}).dbaas_role_arn == "arn:r"

@@ -5,8 +5,9 @@ A DBaaS run is a BenchmarkRun with a `database` block; its SKU is the client ser
 versions,
 regions, prices and eligibility are Keeper's (`dbaas_keeper`, fail closed). What is due comes from the
 `dbaas/<vendor>/<id>/postgres/<version>/standalone/<task>/meta.json` files in git with the same rules as servers
-(`planner.due_reason`: a changed hash, `-1` and `-4` retried with their cap, then `-5`). One DBaaS run per vendor is in
-flight, besides the vendor's server runs. See docs/explanation/dbaas.md.
+(`planner.due_reason`: a changed hash, `-1` and `-4` retried with their cap, then `-5`). The DBaaS runs of a vendor have
+their own limits, `dbaasMaxInFlight` and `dbaasMaxUsdPerHour`, besides the vendor's server runs. See
+docs/explanation/dbaas.md.
 """
 
 import logging
@@ -48,18 +49,55 @@ def holds_database(run: BenchmarkRun) -> bool:
     return run.status.phase in planner.ACTIVE_PHASES or (run.status.database is not None and not destroyed)
 
 
+@dataclass(frozen=True)
+class Placement:
+    region: str
+    client: str  # the client server's SKU
+    usd_per_hour: float | None  # database + client node (Keeper's on-demand prices); None: one of them is unknown
+
+
+def holding_runs(runs: list[BenchmarkRun], vendor: str) -> list[BenchmarkRun]:
+    return [run for run in runs if run.spec.vendor == vendor and holds_database(run)]
+
+
 def check_vendor(cfg: Config, vendor: str, runs: list[BenchmarkRun]) -> None:
     """Raise `ValueError` unless one more DBaaS run of `vendor` may start: the vendor is enabled, has networks
-    configured, and has no DBaaS run in flight (the server runs have their own budget)."""
+    configured, and is below its `dbaasMaxInFlight` (0 pauses; server runs have their own limit)."""
     vendor_settings = cfg.settings.vendors.get(vendor)
     if vendor_settings is None or not vendor_settings.enabled:
         raise ValueError(f"vendor {vendor} is not enabled in the ConfigMap")
     vendor_config = cfg.settings.dbaas.vendors.get(vendor)
     if vendor_config is None or not vendor_config.networks:
         raise ValueError(f"no dbaas.vendors.{vendor}.networks in the ConfigMap: the platform provides no DBaaS network")
-    running = [run.name for run in runs if run.spec.vendor == vendor and holds_database(run)]
-    if running:
-        raise ValueError(f"vendor {vendor} already has a DBaaS run in flight: {', '.join(running)}")
+    limit = vendor_settings.dbaas_max_in_flight
+    running = [run.name for run in holding_runs(runs, vendor)]
+    if len(running) >= limit:
+        raise ValueError(
+            f"vendor {vendor} is at its dbaasMaxInFlight limit ({len(running)} of {limit} DBaaS runs in flight"
+            f"{': ' + ', '.join(running) if running else ''})"
+        )
+
+
+def check_spend(cfg: Config, vendor: str, runs: list[BenchmarkRun], price: float | None) -> None:
+    """Raise `ValueError` when `dbaasMaxUsdPerHour` is set and the DBaaS runs of `vendor` that hold a database or client
+    node, plus a new run at `price`, would cost more. Prices are the ones recorded in the runs (`database.usdPerHour`);
+    a run or candidate without a price makes the spend unknown, which is refused."""
+    cap = cfg.settings.vendors[vendor].dbaas_max_usd_per_hour
+    if cap is None:
+        return
+    if price is None:
+        raise ValueError(
+            f"vendor {vendor} has dbaasMaxUsdPerHour {cap}: the price of the database or client is unknown"
+        )
+    holding = holding_runs(runs, vendor)
+    unpriced = [run.name for run in holding if run.spec.database.get("usdPerHour") is None]
+    if unpriced:
+        raise ValueError(f"vendor {vendor} has dbaasMaxUsdPerHour {cap}: the price of {', '.join(unpriced)} is unknown")
+    spend = sum(run.spec.database["usdPerHour"] for run in holding)
+    if spend + price > cap:
+        raise ValueError(
+            f"vendor {vendor} would pass its dbaasMaxUsdPerHour cap ({cap} USD/hour): {spend:.4f} running + {price:.4f}"
+        )
 
 
 def region_order(prices: dict[str, float], networks: dict, last_failed: str | None = None) -> list[str]:
@@ -101,8 +139,7 @@ def _create_run(
     vendor: str,
     record: dict,
     version: str,
-    region: str,
-    client: str,
+    placement: Placement,
     names: list[str],
     *,
     force: bool,
@@ -110,7 +147,7 @@ def _create_run(
 ) -> BenchmarkRun:
     spec = RunSpec(
         vendor=vendor,
-        sku=client,
+        sku=placement.client,
         run_id=crd.new_run_id(datetime.now(UTC)),
         tasks=names,
         force=force,
@@ -120,11 +157,13 @@ def _create_run(
             "vendor": vendor,
             "id": record["api_reference"],
             "engineVersion": version,
-            "region": region,
+            "region": placement.region,
             "vcpus": int(record["vcpus"]),
             "memoryGib": float(record["memory_amount"]) / 1024,
         },
     )
+    if placement.usd_per_hour is not None:
+        spec.database["usdPerHour"] = placement.usd_per_hour
     run = crd.create_run(kube, spec)
     log.info("created DBaaS run", extra={"run": run.name, "vendor": vendor, "database": record["api_reference"]})
     return run
@@ -140,9 +179,9 @@ def _resolve(
     region: str | None,
     client: str | None,
     last_failed: str | None,
-) -> tuple[str, str]:
-    """`(region, client)` for the database: the given ones, else the cheapest region with a network and the client
-    Keeper's data picks there. Raise `ValueError` when there is none."""
+) -> Placement:
+    """The given region and client, else the cheapest region with a network and the client Keeper's data picks there,
+    with the hourly price of database and client from Keeper. Raise `ValueError` when there is none."""
     networks = cfg.settings.dbaas.vendors[vendor].networks
     database_id = record["api_reference"]
     prices = dbaas_keeper.standalone_prices(cfg.env, vendor, database_id)
@@ -155,13 +194,19 @@ def _resolve(
     for candidate in regions:
         if candidate not in ids:
             continue
-        if client:
-            return candidate, client
         servers = dbaas_keeper.client_servers(cfg.env, vendor, ids[candidate])
-        found = pick_client(kube, cfg, vendor, servers, leased)
-        if found:
-            return candidate, found
+        chosen = client or pick_client(kube, cfg, vendor, servers, leased)
+        if chosen:
+            return Placement(candidate, chosen, _hourly(prices.get(candidate), servers, chosen))
     raise ValueError(f"no client server for {vendor}/{database_id} in {', '.join(regions)}")
+
+
+def _hourly(database_price: float | None, servers: list[dict], client: str) -> float | None:
+    """Database price plus the client's `min_price_ondemand` in Keeper's server data; None when either is missing."""
+    client_price = next((s.get("min_price_ondemand") for s in servers if s.get("api_reference") == client), None)
+    if database_price is None or client_price is None:
+        return None
+    return float(database_price) + float(client_price)
 
 
 def force_run(
@@ -203,14 +248,11 @@ def force_run(
         raise ValueError(f"{vendor}/{database_id} has no PostgreSQL version in Keeper")
     try:
         leased = {run.name for run in crd.list_runs(kube)}
-        chosen_region, chosen_client = _resolve(
-            kube, cfg, vendor, record, leased, region=region, client=client, last_failed=None
-        )
+        placement = _resolve(kube, cfg, vendor, record, leased, region=region, client=client, last_failed=None)
     except RuntimeError as e:
         raise ValueError(f"cannot read regions or servers from Keeper: {e}") from e
-    return _create_run(
-        kube, cfg, vendor, record, version, chosen_region, chosen_client, names, force=force, hold_after=hold_after
-    )
+    check_spend(cfg, vendor, crd.list_runs(kube), placement.usd_per_hour)
+    return _create_run(kube, cfg, vendor, record, version, placement, names, force=force, hold_after=hold_after)
 
 
 def plan_cycle(
@@ -283,20 +325,23 @@ def plan_cycle(
             if not due:
                 continue
             try:
-                region, client = _resolve(
+                placement = _resolve(
                     kube, cfg, vendor, record, leased, region=None, client=None, last_failed=last_failed
                 )
+                check_spend(cfg, vendor, crd.list_runs(kube), placement.usd_per_hour)
             except (ValueError, RuntimeError) as e:
                 log.info("DBaaS autoPlan skips %s/%s: %s", vendor, database_id, e)
                 continue
             if not dry_run:
                 try:
-                    _create_run(kube, cfg, vendor, record, version, region, client, list(due), force=False)
+                    _create_run(kube, cfg, vendor, record, version, placement, list(due), force=False)
                 except crd.RunExists:
                     continue
             reason = ", ".join(f"{name}: {why}" for name, why in due.items())
-            planned.append(PlannedDatabase(vendor, database_id, version, region, client, tuple(due), reason))
-            break  # one DBaaS run per vendor in flight
+            planned.append(
+                PlannedDatabase(vendor, database_id, version, placement.region, placement.client, tuple(due), reason)
+            )
+            break  # at most one new DBaaS run per vendor and cycle; the next cycle checks the limits again
     return planned
 
 

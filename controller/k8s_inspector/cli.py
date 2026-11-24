@@ -217,7 +217,12 @@ def serve(kube: Kube, provider: ConfigProvider, stop: threading.Event, metrics_p
         ),
         "dbaas-planner": lambda: dbaas_plan.run_forever(kube, provider, publisher.read_dbaas_metas, stop),
         "dbaas-sweeper": lambda: dbaas_sweep.run_forever(
-            kube, provider, storage, stop, on_stacks=metrics.record_dbaas_stacks
+            kube,
+            provider,
+            storage,
+            stop,
+            on_stacks=metrics.record_dbaas_stacks,
+            on_inventory=metrics.record_dbaas_inventory,
         ),
         "publisher": lambda: publisher.run_forever(lambda: provider().settings, stop),
         "metrics": server.serve_forever,

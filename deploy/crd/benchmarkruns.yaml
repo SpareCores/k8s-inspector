@@ -65,6 +65,7 @@ spec:
                   region: {type: string}
                   vcpus: {type: integer}
                   memoryGib: {type: number}
+                  usdPerHour: {type: number}
           status:
             type: object
             properties:
@@ -160,7 +161,7 @@ spec:
                 properties:
                   phase:
                     type: string
-                    enum: [Creating, Bootstrapping, Ready, Destroying, Destroyed]
+                    enum: [Clearing, Creating, Bootstrapping, Ready, Destroying, Destroyed]
                   since: {type: string, format: date-time}
                   expires: {type: string, format: date-time}
                   error: {type: string, nullable: true}

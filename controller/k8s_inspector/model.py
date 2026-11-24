@@ -47,6 +47,7 @@ class RunPhase(StrEnum):
 class DbPhase(StrEnum):
     """`status.database.phase`: where the managed database of a DBaaS run is. Absent: nothing was created yet."""
 
+    CLEARING = "Clearing"  # a stack of an earlier run of this name is destroyed first; then the run starts over
     CREATING = "Creating"  # the Job `dbaas-up-<run>` is (about to be) running
     BOOTSTRAPPING = "Bootstrapping"  # the database exists; the bootstrap Pod prepares it on the client node
     READY = "Ready"  # the benchmark may run
@@ -456,6 +457,9 @@ class EnvConfig:
     dbaas_image: str = (
         ""  # K8SI_DBAAS_IMAGE: "ghcr.io/sparecores/k8s-inspector-dbaas@sha256:...", only DBaaS runs need it
     )
+    dbaas_role_arn: str | None = (
+        None  # K8SI_DBAAS_ROLE_ARN: the role of the Jobs for `dbaas-state/` (web identity); None: none
+    )
 
 
 @dataclass(frozen=True)
@@ -467,6 +471,10 @@ class VendorSettings:
     capacity: CapacityMode = CapacityMode.SPOT_FIRST  # same default as `RunSpec` and `crd.from_dict`
     publish: bool | tuple[str, ...] = False  # True: every SKU; a tuple: only these SKUs; False: none
     dbaas_auto_plan: bool = False  # autoPlan also creates DBaaS runs for this vendor
+    dbaas_max_in_flight: int = (
+        1  # DBaaS runs holding a database or client node at once; 0 pauses; server runs not counted
+    )
+    dbaas_max_usd_per_hour: float | None = None  # database + client node price of the DBaaS runs; None: no cap
 
 
 @dataclass(frozen=True)

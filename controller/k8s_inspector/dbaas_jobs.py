@@ -5,15 +5,20 @@ The Jobs run the image `k8s-inspector-dbaas` on the `apps` pool with no Kubernet
 their termination message. See docs/explanation/dbaas.md and docs/how-to/add-dbaas-vendor.md.
 """
 
+import hashlib
 import json
 import urllib.parse
+from collections.abc import Iterable
 from datetime import UTC, datetime, timedelta
 from importlib.resources import files
 
 from k8s_inspector import crd, pods, tasks
+from k8s_inspector.kube import Kube
 from k8s_inspector.model import BenchmarkRun, Config, EnvConfig, OwnerRef, PodRole, TaskDef
 
-STACK_PREFIX = "k8s-dbaas-"  # keep equal to `k8s_inspector_dbaas.stack.STACK_PREFIX`
+# The controller and the provisioner image are separate packages that share no code, so the stack prefix is written in
+# both (`k8s_inspector_dbaas.stack.STACK_PREFIX`); a test of this package compares the two.
+STACK_PREFIX = "k8s-dbaas-"
 STATE_PREFIX = "dbaas-state/"  # in the controller's bucket, below `K8SI_KEY_PREFIX`
 STATE_PROJECT = "k8s-inspector-dbaas"  # the Pulumi project: `<prefix>.pulumi/stacks/<project>/<stack>.json`
 PASSPHRASE_SECRET = "k8s-inspector-dbaas-state"  # key `passphrase`: the secrets provider of the stacks
@@ -21,9 +26,15 @@ DEFAULT_SERVICE_ACCOUNT = "k8s-inspector-dbaas"
 LABEL_JOB = "inspector.sparecores.com/dbaas-job"  # on the Pods of a Job: its name
 LABEL_DBAAS = "inspector.sparecores.com/dbaas"  # on Jobs: up | down
 LABEL_SWEEP = "inspector.sparecores.com/dbaas-sweep"  # on a down Job that belongs to no BenchmarkRun
+ANNOTATION_RUN = "inspector.sparecores.com/dbaas-run"  # on up and down Jobs: the full run name (the Job name is short)
 CREDENTIALS_SECRET = "k8s-inspector-dbaas-{vendor}"  # optional: envFrom of the vendor's cloud credentials
 AWS_TOKEN_DIR = "/var/run/secrets/aws"
+STATE_PROFILE = "k8si-state"  # the AWS config profile of the state bucket: the vendor's providers never see its role
 DOWN_DEADLINE_SECONDS = 2 * 3600  # one destroy attempt; the controller retries until it succeeds
+INVENTORY_DEADLINE_SECONDS = 15 * 60
+TERMINATION_GRACE_SECONDS = 15 * 60  # time for Pulumi to record what is in flight after SIGTERM
+JOB_NAME_MAX = 63
+PULUMI_TIMEOUT_MARGIN_MINUTES = 10  # the vendor module's create/delete timeouts end this long before the Job's deadline
 BOOTSTRAP_BUDGET = timedelta(seconds=pods.BOOTSTRAP_SECONDS)
 BOOTSTRAP_SCRIPT = "bootstrap.py"
 DB_KEYS = ("SC_DB_HOST", "SC_DB_PORT", "SC_DB_USER", "SC_DB_PASSWORD", "SC_DB_NAME", "SC_DB_SSLMODE", "PGSSLMODE")
@@ -37,12 +48,27 @@ def stack_name(run: str) -> str:
     return f"{STACK_PREFIX}{run}"
 
 
+def short_name(text: str, limit: int) -> str:
+    """`text`, or when it is longer than `limit` its start and a hash of the whole (deterministic and unique)."""
+    if len(text) <= limit:
+        return text
+    return f"{text[: limit - 9].rstrip('-')}-{hashlib.sha1(text.encode()).hexdigest()[:8]}"
+
+
+def _job_name(prefix: str, text: str) -> str:
+    return f"{prefix}{short_name(text, JOB_NAME_MAX - len(prefix))}"
+
+
 def up_job_name(run: str) -> str:
-    return f"dbaas-up-{run}"
+    return _job_name("dbaas-up-", run)
 
 
 def down_job_name(run: str) -> str:
-    return f"dbaas-down-{run}"
+    return _job_name("dbaas-down-", run)
+
+
+def inventory_job_name(vendor: str) -> str:
+    return _job_name("dbaas-inventory-", vendor)
 
 
 def db_secret_name(run: str) -> str:
@@ -58,9 +84,11 @@ def boot_pod_name(run: str, attempt: int) -> str:
     return f"{pods.anchor_name(run, attempt)}-dbaas-boot"
 
 
-def vendor_of_run(run: str) -> str:
-    """A run name is `<vendor>-<sku slug>-<crc32>`; vendor ids have no dash."""
-    return run.split("-", 1)[0]
+def vendor_of_run(run: str, vendors: Iterable[str]) -> str | None:
+    """The vendor of a run name (`<vendor>-<sku slug>-<crc32>`) among the known vendor ids; the longest match wins, so a
+    vendor id may contain a dash. None for a run of an unknown vendor."""
+    matches = [vendor for vendor in vendors if run.startswith(f"{vendor}-")]
+    return max(matches, key=len, default=None)
 
 
 def stack_state_key(run: str) -> str:
@@ -99,13 +127,31 @@ def clean_state(storage, run: str) -> None:
 
 
 def backend_url(env: EnvConfig) -> str:
-    """The Pulumi DIY backend URL of the state: the controller's bucket, `dbaas-state/` below `K8SI_KEY_PREFIX`."""
+    """The Pulumi DIY backend URL of the state: the controller's bucket, `dbaas-state/` below `K8SI_KEY_PREFIX`. With a
+    role for the Jobs (`K8SI_DBAAS_ROLE_ARN`) the URL names the AWS profile `STATE_PROFILE` (see `state_aws_config`), so
+    the state credentials are not the default ones of the process, which the vendor's providers would pick up."""
     key_prefix = env.key_prefix.strip("/")
     path = f"{key_prefix + '/' if key_prefix else ''}{STATE_PREFIX}".rstrip("/")
-    query = {"region": env.bucket_region}
+    query = {"region": env.bucket_region, "awssdk": "v2"}
+    if env.dbaas_role_arn:
+        query["profile"] = STATE_PROFILE
     if env.s3_endpoint_url:
-        query |= {"endpoint": env.s3_endpoint_url, "s3ForcePathStyle": "true"}
+        query |= {"endpoint": env.s3_endpoint_url, "use_path_style": "true"}
     return f"s3://{env.bucket}/{path}?{urllib.parse.urlencode(query)}"
+
+
+def state_aws_config(env: EnvConfig) -> str | None:
+    """The AWS config file of the Jobs: one profile, the web identity of the state bucket's role. None without a role.
+    The provisioner writes it to a file and points `AWS_CONFIG_FILE` at it; no `AWS_ROLE_ARN`, `AWS_REGION` or the like
+    is set, so a vendor's AWS provider does not get the state credentials."""
+    if not env.dbaas_role_arn:
+        return None
+    return (
+        f"[profile {STATE_PROFILE}]\n"
+        f"role_arn = {env.dbaas_role_arn}\n"
+        f"web_identity_token_file = {AWS_TOKEN_DIR}/token\n"
+        f"region = {env.bucket_region}\n"
+    )
 
 
 # --------------------------------------------------------------------------- the spec
@@ -127,8 +173,9 @@ def labels(run_id: str, expires: datetime) -> dict[str, str]:
     return {"sc_inspector_run": run_id.lower(), "sc_inspector_expires": _stamp(expires)}
 
 
-def build_spec(run: BenchmarkRun, record: dict, network: dict, expires: datetime) -> dict:
-    """`DBAAS_SPEC` of the provisioner (`k8s_inspector_dbaas.spec.DbSpec` without the password)."""
+def build_spec(run: BenchmarkRun, cfg: Config, record: dict, network: dict, expires: datetime) -> dict:
+    """`DBAAS_SPEC` of the provisioner (`k8s_inspector_dbaas.spec.DbSpec` without the password). The Pulumi timeouts
+    the vendor module must set are shorter than the Jobs' deadlines, so Pulumi fails cleanly and records what it did."""
     db = run.spec.database
     return {
         "vendor": db["vendor"],
@@ -140,6 +187,8 @@ def build_spec(run: BenchmarkRun, record: dict, network: dict, expires: datetime
         "runId": run.spec.run_id,
         "expiresAt": expires.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "labels": labels(run.spec.run_id, expires),
+        "createTimeoutMinutes": max(cfg.settings.dbaas.create_minutes - PULUMI_TIMEOUT_MARGIN_MINUTES, 1),
+        "deleteTimeoutMinutes": max(DOWN_DEADLINE_SECONDS // 60 - PULUMI_TIMEOUT_MARGIN_MINUTES, 1),
         "network": network,
         "record": record,
     }
@@ -180,6 +229,50 @@ def connection_secret(run: BenchmarkRun, owner: OwnerRef, password: str, outputs
 # --------------------------------------------------------------------------- Jobs
 
 
+def job_state(job: dict) -> str:
+    """`complete`, `failed` or `running`."""
+    for condition in job.get("status", {}).get("conditions") or []:
+        if condition.get("status") == "True" and condition.get("type") in ("Complete", "Failed"):
+            return condition["type"].lower()
+    return "running"
+
+
+def termination_message(pod: dict) -> dict:
+    """The JSON in the termination message of the Pod's container (how Jobs and the bootstrap report); empty when there
+    is none. A message that is not a JSON object counts as an error text."""
+    for status in pod.get("status", {}).get("containerStatuses") or []:
+        text = status.get("state", {}).get("terminated", {}).get("message")
+        if text:
+            try:
+                message = json.loads(text)
+            except ValueError:
+                return {"error": text[:500]}
+            return message if isinstance(message, dict) else {}
+    return {}
+
+
+def job_message(kube: Kube, job_name: str) -> dict:
+    """`termination_message` of the Pod of the Job."""
+    for pod in kube.list("pod", labels={LABEL_JOB: job_name}):
+        message = termination_message(pod)
+        if message:
+            return message
+    return {}
+
+
+def _state_env(env_cfg: EnvConfig) -> list[dict]:
+    """The Pulumi state backend: bucket URL, secrets passphrase and, with a role, the AWS profile text."""
+    env = [
+        {"name": "PULUMI_BACKEND_URL", "value": backend_url(env_cfg)},
+        {
+            "name": "PULUMI_CONFIG_PASSPHRASE",
+            "valueFrom": {"secretKeyRef": {"name": PASSPHRASE_SECRET, "key": "passphrase"}},
+        },
+    ]
+    aws_config = state_aws_config(env_cfg)
+    return env + ([{"name": "K8SI_STATE_AWS_CONFIG", "value": aws_config}] if aws_config else [])
+
+
 def _job(
     name: str,
     command: str,
@@ -191,32 +284,29 @@ def _job(
     deadline_seconds: int,
     run: str | None,
     owner: OwnerRef | None,
+    state: bool = True,
 ) -> dict:
     """A Job with one Pod of the provisioner image: no retries inside the Job (the controller decides), no Kubernetes
-    API token, the state bucket through the projected web identity token, the vendor's credentials from an optional
-    Secret."""
+    API token, the vendor's credentials from an optional Secret. With `state` it also gets the Pulumi state bucket
+    (through the projected web identity token). The Pod is never disrupted by Karpenter and has time to let Pulumi
+    record what is in flight when it is stopped."""
     env_cfg = cfg.env
     vendor_config = cfg.settings.dbaas.vendors.get(vendor)
     job_labels = {LABEL_DBAAS: kind, crd.LABEL_VENDOR: vendor, pods.LABEL_ROLE: PodRole.DBAAS.value}
     if run:
         job_labels[crd.LABEL_RUN] = run
-    container_env = [
-        {"name": "PULUMI_BACKEND_URL", "value": backend_url(env_cfg)},
-        {
-            "name": "PULUMI_CONFIG_PASSPHRASE",
-            "valueFrom": {"secretKeyRef": {"name": PASSPHRASE_SECRET, "key": "passphrase"}},
-        },
-        *env,
-    ]
-    if env_cfg.role_arn:  # the state bucket, as for the controller
-        container_env += [
-            {"name": "AWS_ROLE_ARN", "value": env_cfg.role_arn},
-            {"name": "AWS_WEB_IDENTITY_TOKEN_FILE", "value": f"{AWS_TOKEN_DIR}/token"},
-            {"name": "AWS_REGION", "value": env_cfg.bucket_region},
-        ]
+    container_env = [*(_state_env(env_cfg) if state else []), *env]
+    mounts = [{"name": "work", "mountPath": "/work"}, {"name": "tmp", "mountPath": "/tmp"}]
+    volumes = [{"name": "work", "emptyDir": {"sizeLimit": "1Gi"}}, {"name": "tmp", "emptyDir": {"sizeLimit": "512Mi"}}]
+    if state and env_cfg.dbaas_role_arn:
+        mounts.append({"name": "aws-token", "mountPath": AWS_TOKEN_DIR, "readOnly": True})
+        token = {"serviceAccountToken": {"audience": "sts.amazonaws.com", "expirationSeconds": 3600, "path": "token"}}
+        volumes.append({"name": "aws-token", "projected": {"sources": [token]}})
     metadata = {"name": name, "namespace": cfg.env.namespace, "labels": job_labels}
     if owner:
         metadata["ownerReferences"] = pods._owner_refs(owner)
+    if run:
+        metadata["annotations"] = {ANNOTATION_RUN: run}
     return {
         "apiVersion": "batch/v1",
         "kind": "Job",
@@ -225,9 +315,13 @@ def _job(
             "backoffLimit": 0,
             "activeDeadlineSeconds": deadline_seconds,
             "template": {
-                "metadata": {"labels": {LABEL_JOB: name, pods.LABEL_ROLE: PodRole.DBAAS.value}},
+                "metadata": {
+                    "labels": {LABEL_JOB: name, pods.LABEL_ROLE: PodRole.DBAAS.value},
+                    "annotations": {"karpenter.sh/do-not-disrupt": "true"},
+                },
                 "spec": {
                     "restartPolicy": "Never",
+                    "terminationGracePeriodSeconds": TERMINATION_GRACE_SECONDS,
                     "serviceAccountName": (vendor_config and vendor_config.service_account) or DEFAULT_SERVICE_ACCOUNT,
                     "automountServiceAccountToken": False,
                     "enableServiceLinks": False,
@@ -252,31 +346,10 @@ def _job(
                             "resources": {"requests": {"cpu": "100m", "memory": "512Mi"}, "limits": {"memory": "2Gi"}},
                             "securityContext": {"allowPrivilegeEscalation": False, "capabilities": {"drop": ["ALL"]}},
                             "terminationMessagePolicy": "File",
-                            "volumeMounts": [
-                                {"name": "work", "mountPath": "/work"},
-                                {"name": "tmp", "mountPath": "/tmp"},
-                                {"name": "aws-token", "mountPath": AWS_TOKEN_DIR, "readOnly": True},
-                            ],
+                            "volumeMounts": mounts,
                         }
                     ],
-                    "volumes": [
-                        {"name": "work", "emptyDir": {"sizeLimit": "1Gi"}},
-                        {"name": "tmp", "emptyDir": {"sizeLimit": "512Mi"}},
-                        {
-                            "name": "aws-token",
-                            "projected": {
-                                "sources": [
-                                    {
-                                        "serviceAccountToken": {
-                                            "audience": "sts.amazonaws.com",
-                                            "expirationSeconds": 3600,
-                                            "path": "token",
-                                        }
-                                    }
-                                ]
-                            },
-                        },
-                    ],
+                    "volumes": volumes,
                 },
             },
         },
@@ -284,7 +357,8 @@ def _job(
 
 
 def up_job(run: BenchmarkRun, cfg: Config, spec: dict, owner: OwnerRef) -> dict:
-    """`dbaas-up-<run>`: create the database. The spec is not secret, the password comes from the run's Secret."""
+    """`dbaas-up-<run>`: create the database. The spec is not secret, the password comes from the run's Secret. The
+    Job's deadline is `dbaas.createMinutes`; the vendor module's Pulumi timeouts are shorter (`build_spec`)."""
     env = [
         {"name": "DBAAS_SPEC", "value": json.dumps(spec, separators=(",", ":"))},
         {
@@ -305,9 +379,10 @@ def up_job(run: BenchmarkRun, cfg: Config, spec: dict, owner: OwnerRef) -> dict:
     )
 
 
-def down_job(run_name: str, vendor: str, cfg: Config, owner: OwnerRef | None) -> dict:
-    """`dbaas-down-<run>`: destroy the stack and remove its state. Without an `owner` (a leaked stack the sweeper found)
-    the Job belongs to no BenchmarkRun and the sweeper deletes it when it is over."""
+def down_job(run_name: str, vendor: str, cfg: Config, *, sweep: bool = False) -> dict:
+    """`dbaas-down-<run>`: destroy the stack and remove its state. It is labelled with the run, not owned by it (the run
+    waits for it under foreground deletion), and the one that finishes it deletes it. A `sweep` Job is for a stack whose
+    run is gone: it carries no run label, and the sweeper deletes it when it is over."""
     job = _job(
         down_job_name(run_name),
         "down",
@@ -316,12 +391,30 @@ def down_job(run_name: str, vendor: str, cfg: Config, owner: OwnerRef | None) ->
         cfg=cfg,
         env=[{"name": "DBAAS_RUN", "value": run_name}],
         deadline_seconds=DOWN_DEADLINE_SECONDS,
-        run=run_name if owner else None,
-        owner=owner,
+        run=None if sweep else run_name,
+        owner=None,
     )
-    if not owner:
+    job["metadata"].setdefault("annotations", {})[ANNOTATION_RUN] = run_name
+    if sweep:
         job["metadata"]["labels"][LABEL_SWEEP] = "true"
     return job
+
+
+def inventory_job(vendor: str, cfg: Config) -> dict:
+    """`dbaas-inventory-<vendor>`: list the vendor's databases that carry the `sc_inspector_run` tag, with the vendor's
+    credentials and ServiceAccount like `up` and `down` (and no state bucket)."""
+    return _job(
+        inventory_job_name(vendor),
+        "inventory",
+        kind="inventory",
+        vendor=vendor,
+        cfg=cfg,
+        env=[{"name": "DBAAS_VENDOR", "value": vendor}],
+        deadline_seconds=INVENTORY_DEADLINE_SECONDS,
+        run=None,
+        owner=None,
+        state=False,
+    )
 
 
 # --------------------------------------------------------------------------- the bootstrap Pod

@@ -763,7 +763,7 @@ def test_rescan_routes_dbaas_runs_by_run_json(tmp_path, origin, cluster):
     git(seed, "push", "origin", "HEAD:main")
     today = datetime.now(UTC).date()
     run = RunKey("hcloud", "cax31", today, "r-db")
-    database = {"vendor": "hcloud", "id": "db1", "engineVersion": 16}
+    database = {"vendor": "hcloud", "id": "db1", "engineVersion": 16, "vcpus": 2, "memoryGib": 8.0}
     storage.put_task("pgbench", {"start": "2026-10-01T10:00:00", "end": "2026-10-01T10:05:00", "exit_code": 0,
                                  "task_hash": "h", "run_id": "r-db"}, b"tps", run=run)  # fmt: skip
     storage.objects[okey(run, "run.json")] = json.dumps({"database": database}).encode()
@@ -1170,7 +1170,7 @@ def test_a_dbaas_result_is_published_with_the_bootstrap_settings_merged_into_std
         }
     ).encode()
     storage.objects[okey(run, "run.json")] = json.dumps(
-        {"database": {"vendor": "gcp", "id": "db1", "engineVersion": 18, "region": "r"}}
+        {"database": {"vendor": "gcp", "id": "db1", "engineVersion": 18, "region": "r", "vcpus": 4, "memoryGib": 16.0}}
     ).encode()
     tasks = {**TASKS, "pgbench": TaskDef("pgbench", "img", None, timedelta(minutes=5))}
     env = EnvConfig(bucket="b", bucket_region="r", git_url=origin.as_uri())
@@ -1187,6 +1187,20 @@ def test_a_dbaas_result_is_published_with_the_bootstrap_settings_merged_into_std
     assert published["score"] == 7 and published["postgres"] == {"version": "PostgreSQL 18.1"}
     assert published["sslmode"] == "require" and published["sync_commit_session_settable"] is True
     assert not (base / "postgres.json").exists()  # merged, not a file of its own
+    assert {k: published[k] for k in published if k not in ("score", "postgres", "sslmode")} == {
+        "sync_commit_session_settable": True,
+        "db_vcpus": 4,
+        "db_mem_gib": 16.0,
+        "profile_vus": [1, 2, 4, 8],
+        "profile_search": False,
+        "profile_max_clients": 8,
+        "profile_hard_max_clients": 8,
+        "benchmark_image": "img",
+        "durability": "durable",
+        "workload_kind": "pgbench_ro",
+        "cpu_scale": 1,
+        "schema_gib": 0.17,
+    }  # the fields the legacy runner added
 
 
 def test_a_dbaas_run_is_published_by_its_database_not_by_its_client_sku():

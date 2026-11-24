@@ -247,6 +247,14 @@ class Kube:
         except ApiError as e:
             raise _translate(e) from e
 
+    def json_patch(self, kind: str, name: str, operations: list[dict]) -> dict:
+        """JSON patch (RFC 6902); a failing `test` operation raises an API error."""
+        resource, ns = self._target(kind)
+        try:
+            return self._client.patch(resource, name, operations, patch_type=PatchType.JSON, **ns).to_dict()
+        except ApiError as e:
+            raise _translate(e) from e
+
     def apply_secret(self, manifest: dict) -> None:
         """Create or replace a Secret (urls Secret, re-signed hourly)."""
         secret = core_v1.Secret.from_dict(manifest)

@@ -10,7 +10,7 @@ The Deployment expects objects that the cluster platform provides (listed at the
 `controller/deployment.yaml`):
 
 - ConfigMap `k8s-inspector-platform`. Required keys: `K8SI_BUCKET`, `K8SI_BUCKET_REGION`, `K8SI_ROLE_ARN`. Optional
-  keys (the controller starts without them): `K8SI_GIT_URL`, `K8SI_GIT_BRANCH`, `KEEPER_API_BASE`, `K8SI_KEY_PREFIX`.
+  keys (the controller starts without them): `K8SI_GIT_URL`, `K8SI_GIT_BRANCH`, `KEEPER_API_BASE`, `K8SI_KEY_PREFIX`, `K8SI_DBAAS_ROLE_ARN` (DBaaS).
 - Secrets `k8s-inspector-git-key` (`ssh-privatekey`) and `k8s-inspector-keeper` (`api-key`): both optional, the
   Pod starts without them.
 - Secret `inspector-secrets` for the benchmark secrets.
@@ -30,10 +30,14 @@ Managed-database benchmarks need, besides the controller, what the cluster platf
   no Role: the Jobs do not call the Kubernetes API);
 - the controller's Role also allows `jobs` (create, get, list, watch, delete) for them;
 - platform: Secret `k8s-inspector-dbaas-state` (key `passphrase`), Secrets `k8s-inspector-dbaas-<vendor>` with the
-  vendors' cloud credentials, `dbaas.vendors.<vendor>.networks.<region>` in the settings ConfigMap, and the bucket role's
-  access to `dbaas-state/` (read, write, list, delete). The Jobs use the controller's role: their ServiceAccount token is
-  projected with the audience `sts.amazonaws.com`, so the role's trust policy must accept the ServiceAccount
-  `k8s-inspector-dbaas` (and any vendor ServiceAccount) as well as `k8s-inspector`.
+  vendors' cloud credentials, and `dbaas.vendors.<vendor>.networks.<region>` in the settings ConfigMap;
+- a separate IAM role for the Jobs, `K8SI_DBAAS_ROLE_ARN` (platform ConfigMap; the Deployment passes it): read, write, list
+  and delete under `dbaas-state/` (below `K8SI_KEY_PREFIX`) and nothing else. The Jobs do not use the controller's
+  bucket role. Their ServiceAccount token is projected with the audience `sts.amazonaws.com`, so this role's trust policy
+  must accept the ServiceAccount `k8s-inspector-dbaas` (and any vendor ServiceAccount), and the controller's role needs
+  the same `dbaas-state/` access for the cleanup after a destroy. The Jobs receive the role in an AWS profile, not in
+  `AWS_*` variables, so a vendor's providers do not get it. The bucket and prefix must not be shared between clusters
+  (the sweeper destroys stacks that have no run).
 
 ## Pin the images
 

@@ -14,6 +14,7 @@ Values are deployment configuration of the cluster platform, not part of this re
 | `K8SI_NAMESPACE` | namespace of runs (default `inspector`) |
 | `K8SI_SC_RUN_IMAGE` | the `sc-run` image of anchors and flush steps, digest-pinned (`ghcr.io/sparecores/k8s-inspector-sc-run@sha256:…`); `serve` and `run` refuse to start without it |
 | `K8SI_DBAAS_IMAGE` | the DBaaS provisioner image of the Jobs, digest-pinned (`ghcr.io/sparecores/k8s-inspector-dbaas@sha256:…`); only DBaaS runs need it (`run --database` refuses without it, a DBaaS run ends `256` without it) |
+| `K8SI_DBAAS_ROLE_ARN` | optional: IAM role of the provisioner Jobs for `dbaas-state/` (web identity of the ServiceAccount `k8s-inspector-dbaas`), limited to that prefix; the Jobs name it in an AWS profile `k8si-state` and set no `AWS_*` variable. Without it the Jobs get no state credentials from the controller |
 | `K8SI_S3_ENDPOINT_URL` | optional S3-compatible endpoint, for object storage that is not AWS S3 (OCI) |
 | `K8SI_KEY_PREFIX` | optional prefix of every object key, default empty (for example `k8s-inspector/spikes/` writes a first run under a scratch prefix); the bucket role must cover it ([output contract](output-contract.md)) |
 
@@ -42,6 +43,8 @@ vendors:
     capacity: SpotFirst          # SpotFirst (the default) | OnDemand
     publish: false               # true, or a list of SKUs: the publisher pushes these results to sc-inspector-data
     dbaasAutoPlan: false         # autoPlan also creates managed-database runs for this vendor (see DBaaS autoPlan)
+    dbaasMaxInFlight: 1          # DBaaS runs in flight; 0 pauses; counted over DBaaS runs only
+    # dbaasMaxUsdPerHour: 3.0   # database + client price of the DBaaS runs in flight; unset (the default): no cap
 defaults:
   maxInFlight: 2                 # conservative default for every vendor without its own maxInFlight
 spot:
@@ -128,7 +131,7 @@ removed from the legacy pipeline ([roadmap](../roadmap.md)); there is no shared 
 ## DBaaS
 
 `dbaas.vendors` holds what the cluster platform provides per vendor ([add a DBaaS vendor](../how-to/add-dbaas-vendor.md#what-the-platform-provides));
-it is empty by default, which leaves DBaaS off (the sweeper does not even list the bucket):
+it is empty by default, which leaves DBaaS off (the sweeper still lists the stacks in the bucket and reports them):
 
 ```yaml
 dbaas:
@@ -210,9 +213,11 @@ create DBaaS runs for the vendor, in their own cycle every `planner.intervalMinu
 It is independent of `planner.autoPlan` and of `autoPlan` of the vendor: server and DBaaS planning are switched
 separately. Per vendor:
 
-1. The vendor must have networks in `dbaas.vendors.<vendor>`, no DBaaS run in flight (running, or with its database not
-   yet destroyed) and must not be launch-paused. Server runs and the client node do not count against `maxInFlight`
-   or `maxUsdPerHour`; one DBaaS run per vendor is the limit.
+1. The vendor must have networks in `dbaas.vendors.<vendor>`, be below `dbaasMaxInFlight` (default 1; the runs that hold
+   a client node or a database not yet destroyed) and must not be launch-paused. A database is skipped when the running
+   DBaaS runs plus its own price (database plus client, from Keeper) would pass `dbaasMaxUsdPerHour` (default: no cap).
+   Server runs and the client node do not count against `maxInFlight` or `maxUsdPerHour`, and server runs do not count
+   against the DBaaS limits. At most one DBaaS run per vendor is created per cycle.
 2. The candidate databases are the ACTIVE PostgreSQL databases Keeper lists for the vendor that Keeper does not block for
    the DBaaS task (`/inspector/databases/task_block_reason_codes`, cached for 30 minutes), whose results may be published
    (`publish` true or listing the database's id), in the order crc32 of `<vendor>/<database>`.

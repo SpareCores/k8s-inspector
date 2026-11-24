@@ -58,18 +58,20 @@ def wait_until_connects(user: str, dbname: str, timeout: float, *, connect_fn=co
 
 def create_workload_user(conn, user: str, grant_role: str | None) -> None:
     """The vendor's admin user is not the workload user (Cloud SQL's `postgres` cannot create databases it can use):
-    create the user with the run's password, or make an existing one capable again."""
+    create the user with the run's password, or make an existing one capable again. DDL takes no bind parameters, so
+    the statement carries the SCRAM-SHA-256 verifier that libpq computes here, never the password: the server's
+    statement log and error messages do not hold it."""
     from psycopg import sql
 
-    password = env("SC_DB_PASSWORD")
+    verifier = conn.pgconn.encrypt_password(env("SC_DB_PASSWORD").encode(), user.encode(), b"scram-sha-256").decode()
     with conn.cursor() as cur:
         cur.execute("SELECT 1 FROM pg_roles WHERE rolname = %s", (user,))
         if cur.fetchone():
             cur.execute(sql.SQL("ALTER USER {} CREATEDB CREATEROLE").format(sql.Identifier(user)))
         else:
             cur.execute(
-                sql.SQL("CREATE USER {} WITH PASSWORD {} CREATEDB CREATEROLE").format(
-                    sql.Identifier(user), sql.Literal(password)
+                sql.SQL("CREATE USER {} WITH ENCRYPTED PASSWORD {} CREATEDB CREATEROLE").format(
+                    sql.Identifier(user), sql.Literal(verifier)
                 )
             )
         if grant_role:
