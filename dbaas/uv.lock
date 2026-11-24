@@ -128,6 +128,7 @@ dev = [
 vendors = [
     { name = "boto3" },
     { name = "pulumi-aws" },
+    { name = "pulumi-upcloud" },
 ]
 
 [package.metadata]
@@ -141,6 +142,7 @@ dev = [
 vendors = [
     { name = "boto3", specifier = ">=1.44.10" },
     { name = "pulumi-aws", specifier = ">=7.55.0" },
+    { name = "pulumi-upcloud", specifier = ">=0.24.1" },
 ]
 
 [[package]]
@@ -277,6 +279,15 @@ wheels = [
 ]
 
 [[package]]
+name = "parver"
+version = "1.0.1.post0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/9a/63/fe1b2d9f19ce47e4a0da6d33ea19a20d7bd1632da432d8e32b20724c741a/parver-1.0.1.post0.tar.gz", hash = "sha256:1bfb9c3f13d5daccaa10eb605679b5dbd4bf2e15b4f5fa1bdf178c5c3f065a2c", size = 105980, upload-time = "2026-07-30T12:32:19.754Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/8b/ad/92776e7199caee67944945fb2c3988443060d318782d8c25d9bb9f8d235d/parver-1.0.1.post0-py3-none-any.whl", hash = "sha256:81f5cbe349da9939749ece40b70ef97b94a346f750750ed49f3ebbf1a40f1195", size = 20853, upload-time = "2026-07-30T12:32:18.289Z" },
+]
+
+[[package]]
 name = "pluggy"
 version = "1.7.0"
 source = { registry = "https://pypi.org/simple" }
@@ -334,6 +345,20 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/0e/29/1877f8fce060f71e21835d272ccd48fe387c40151845ec500df7e7639299/pulumi_aws-7.55.0.tar.gz", hash = "sha256:d283e65b0557cf23293b6868b7d5c4d9cf17b0cbccaae2d4917b040e5f061b10", size = 10236140, upload-time = "2026-11-13T13:03:25.41Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/00/aa/5b81315c11a7173ccbd8a034a2ec6d6d259466d179681c59b1f70f45fcc0/pulumi_aws-7.55.0-py3-none-any.whl", hash = "sha256:db27534aef7e432df22e14226860b20496cb5aacd51baf2387aa1804e624e490", size = 13483395, upload-time = "2026-11-13T13:03:22.461Z" },
+]
+
+[[package]]
+name = "pulumi-upcloud"
+version = "0.24.1"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "parver" },
+    { name = "pulumi" },
+    { name = "semver" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/cb/e3/96ed9bd289e9415b95551fd2af541557c72ebba97940c73f6bef69bdb841/pulumi_upcloud-0.24.1.tar.gz", hash = "sha256:a85fefe913f9c7d1a045ca06988381cb671111fcb0989bcda51ca4accafc8b63", size = 286833, upload-time = "2026-11-10T10:03:40.243Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/cb/0b/6e517e05f3a3f24de0fd9d495102f2bf38ccd7528284edcdf52f53fafb8d/pulumi_upcloud-0.24.1-py3-none-any.whl", hash = "sha256:26ded0b7b1f0e4cc524905fb56b4836e5fcb4779416ffd4a20a40f43aa10c283", size = 368302, upload-time = "2026-11-10T10:03:39.013Z" },
 ]
 
 [[package]]
