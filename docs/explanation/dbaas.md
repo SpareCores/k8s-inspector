@@ -248,5 +248,13 @@ group over the bench VPC's subnets and a security group that allows 5432 from th
 `zone` is a zone name of the region. RDS for PostgreSQL fixes the gp3 I/O of a volume below 400 GiB at 3000 IOPS and
 125 MiB/s; a database whose I/O budget is higher gets a 400 GiB volume (baseline 12000 IOPS and 500 MiB/s), and explicit
 IOPS and throughput only above that. The Jobs use the ServiceAccount `k8s-inspector-dbaas-aws` (web identity, an IAM
-role limited to creating, describing and deleting the run's instance) and the Secret `k8s-inspector-dbaas-aws` with
-`AWS_ROLE_ARN` and `AWS_WEB_IDENTITY_TOKEN_FILE`; `inventory` reads the tags of the instances of every enabled region.
+role limited to creating PostgreSQL single-AZ instances tagged `ManagedBy=k8s-inspector`, describing instances and
+deleting tagged ones, in any region; it covers every tagged `sc-*` instance, not one run's) and the Secret `k8s-inspector-dbaas-aws` with
+`AWS_ROLE_ARN` and `AWS_WEB_IDENTITY_TOKEN_FILE`; `inventory` reads the tags of the instances of every enabled region
+and fails (after logging the region) when one cannot be listed, so the staleness alert fires.
+
+The instance identifier is `sc-<run_id>` (unique per run, stable across its attempts).
+
+Comparability: the storage jumps to 400 GiB (12000 IOPS and 500 MiB/s baseline) once the planned I/O budget exceeds
+3000 IOPS or 125 MiB/s. The legacy AWS setup effectively ran 3000 IOPS and 125 MiB/s, so results of large instances are not
+directly comparable with it.

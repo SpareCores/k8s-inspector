@@ -10,6 +10,7 @@ the region is the provider's `region`.
 """
 
 import hashlib
+import logging
 import re
 from datetime import UTC, datetime
 
@@ -19,6 +20,8 @@ import pulumi_aws as aws
 
 from k8s_inspector_dbaas.spec import DbOutputs, DbSpec
 from k8s_inspector_dbaas.storage_plan import DiskProfile, plan
+
+log = logging.getLogger(__name__)
 
 ADMIN_USER = "scadmin"
 ADMIN_DB = "postgres"
@@ -50,18 +53,20 @@ def rds_storage(spec: DbSpec) -> tuple[int, int | None, int | None]:
     return size, max(iops, LARGE_BASELINE_IOPS), max(mbps, LARGE_BASELINE_MBPS)
 
 
-def identifier(run: str) -> str:
+def identifier(run_id: str) -> str:
     """The DB instance identifier of the run: 1-63 lowercase letters, digits and single hyphens, starting with a
-    letter. A name that does not fit keeps its head and gets a hash of the whole run, so it stays unique."""
-    name = re.sub(r"-+", "-", re.sub(r"[^a-z0-9-]", "-", f"sc-{run}".lower())).strip("-")
+    letter. It derives from `spec.run_id` (unique per run), not from the BenchmarkRun name, which repeats for a client
+    SKU: a run that starts while an earlier delete is still running cannot clash. A name that does not fit keeps its
+    head and gets a hash."""
+    name = re.sub(r"-+", "-", re.sub(r"[^a-z0-9-]", "-", f"sc-{run_id}".lower())).strip("-")
     if len(name) > 63:
-        name = f"{name[:54].rstrip('-')}-{hashlib.sha256(run.encode()).hexdigest()[:8]}"
+        name = f"{name[:54].rstrip('-')}-{hashlib.sha256(run_id.encode()).hexdigest()[:8]}"
     return name
 
 
 def provision(spec: DbSpec) -> DbOutputs:
     provider = aws.Provider("aws", region=spec.region)
-    name = identifier(spec.run)
+    name = identifier(spec.run_id)
     gib, iops, mbps = rds_storage(spec)
     timeouts = pulumi.CustomTimeouts(create=spec.create_timeout, delete=spec.delete_timeout)
     # next to the client when the zone is a zone name of the region (the subnet group has a subnet in every zone)
@@ -98,28 +103,46 @@ def provision(spec: DbSpec) -> DbOutputs:
 
 
 def inventory() -> list[dict]:
-    """The tagged instances of every enabled region. The credentials are the Job's environment."""
+    """The tagged instances of every enabled region. The credentials are the Job's environment. A region that cannot
+    be listed, or an unreadable expiry tag, fails the whole call after logging which, so the staleness alert fires and
+    a partial list does not hide leaks."""
     found = []
     session = boto3.session.Session(region_name="us-east-1")
     for region in session.client("ec2").describe_regions()["Regions"]:
-        rds = session.client("rds", region_name=region["RegionName"])
-        for page in rds.get_paginator("describe_db_instances").paginate():
-            for db in page["DBInstances"]:
-                tags = {tag["Key"]: tag["Value"] for tag in db.get("TagList", [])}
-                if RUN_TAG in tags:
-                    found.append(
-                        {
-                            "id": db["DBInstanceArn"],
-                            "run": tags[RUN_TAG],
-                            "expires_at": _expires_at(tags.get(EXPIRES_TAG)),
-                            "created_at": _rfc3339(db.get("InstanceCreateTime")),
-                        }
-                    )
+        name = region["RegionName"]
+        try:
+            found += _region_instances(session, name)
+        except Exception:
+            log.exception("listing RDS instances failed in region %s", name)
+            raise
     return found
 
 
-def _expires_at(stamp: str | None) -> str | None:
-    return _rfc3339(datetime.strptime(stamp, EXPIRES_FORMAT).replace(tzinfo=UTC)) if stamp else None
+def _region_instances(session: boto3.session.Session, region: str) -> list[dict]:
+    found = []
+    rds = session.client("rds", region_name=region)
+    for page in rds.get_paginator("describe_db_instances").paginate():
+        for db in page["DBInstances"]:
+            tags = {tag["Key"]: tag["Value"] for tag in db.get("TagList", [])}
+            if RUN_TAG in tags:
+                found.append(
+                    {
+                        "id": db["DBInstanceArn"],
+                        "run": tags[RUN_TAG],
+                        "expires_at": _expires_at(tags.get(EXPIRES_TAG), db["DBInstanceArn"]),
+                        "created_at": _rfc3339(db.get("InstanceCreateTime")),
+                    }
+                )
+    return found
+
+
+def _expires_at(stamp: str | None, database: str) -> str | None:
+    if not stamp:
+        return None
+    try:
+        return _rfc3339(datetime.strptime(stamp, EXPIRES_FORMAT).replace(tzinfo=UTC))
+    except ValueError as err:
+        raise ValueError(f"{database}: tag {EXPIRES_TAG}={stamp!r} is not a {EXPIRES_FORMAT} stamp") from err
 
 
 def _rfc3339(when: datetime | None) -> str | None:

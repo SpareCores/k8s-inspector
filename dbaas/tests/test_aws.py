@@ -33,7 +33,7 @@ def make_spec(spec: DbSpec, **changes) -> DbSpec:
     network = {"subnet_group": "sg-bench", "security_group_id": "sg-0123"}
     aws_spec = replace(
         spec, vendor="aws", database_id="db.m6g.large", region="us-east-1", zone="us-east-1b",
-        run="aws-db-m6g-large-1234abcd", network=network,
+        run="aws-db-m6g-large-1234abcd", run_id="r20261120t0930-3f9c", network=network,
     )  # fmt: skip
     return replace(aws_spec, **changes)
 
@@ -63,8 +63,8 @@ def test_the_instance_is_a_private_single_az_postgres_without_leftovers(spec, mo
     assert (i["backupRetentionPeriod"], i["skipFinalSnapshot"], i["deleteAutomatedBackups"]) == (0, True, True)
     assert (i["dbSubnetGroupName"], i["vpcSecurityGroupIds"]) == ("sg-bench", ["sg-0123"])
     assert (i["availabilityZone"], i["storageType"], i["storageEncrypted"]) == ("us-east-1b", "gp3", True)
-    assert i["identifier"] == "sc-aws-db-m6g-large-1234abcd"
-    assert host == "sc-aws-db-m6g-large-1234abcd.abc.rds.amazonaws.com" and port == 5432
+    assert i["identifier"] == "sc-r20261120t0930-3f9c"
+    assert host == "sc-r20261120t0930-3f9c.abc.rds.amazonaws.com" and port == 5432
     assert (out.admin_user, out.admin_db, out.sslmode) == ("scadmin", "postgres", "require")
 
 
@@ -119,6 +119,7 @@ def test_a_database_above_the_large_baseline_provisions_iops_and_throughput(spec
 @pytest.mark.parametrize(
     ("run", "expected"),
     [
+        ("r20261120t0930-3f9c", "sc-r20261120t0930-3f9c"),
         ("aws-db-r6g-large-1", "sc-aws-db-r6g-large-1"),
         ("AWS_x..y--z-", "sc-aws-x-y-z"),
     ],
@@ -132,14 +133,14 @@ def test_a_long_run_name_keeps_a_hash_so_two_runs_do_not_collide():
     assert len(a) <= 63 and len(b) <= 63 and a != b and a == aws.identifier("x" * 80 + "a")
 
 
-def test_inventory_lists_the_tagged_instances_of_every_region(monkeypatch):
+def fake_session(monkeypatch, expires="20261120t1600z", failing_region=None):
     created = datetime(2026, 11, 20, 10, 5, 3, tzinfo=UTC)
     tagged = {
         "DBInstanceArn": "arn:aws:rds:eu-west-1:1:db:sc-x",
         "InstanceCreateTime": created,
         "TagList": [
             {"Key": "sc_inspector_run", "Value": "r1"},
-            {"Key": "sc_inspector_expires", "Value": "20261120t1600z"},
+            {"Key": "sc_inspector_expires", "Value": expires},
         ],
     }
     other = {"DBInstanceArn": "arn:aws:rds:eu-west-1:1:db:other", "TagList": [{"Key": "team", "Value": "x"}]}
@@ -149,6 +150,8 @@ def test_inventory_lists_the_tagged_instances_of_every_region(monkeypatch):
             self.region = region
 
         def paginate(self):
+            if self.region == failing_region:
+                raise RuntimeError("AccessDenied")
             return [{"DBInstances": [tagged, other] if self.region == "eu-west-1" else [other]}]
 
     class Client:
@@ -170,7 +173,24 @@ def test_inventory_lists_the_tagged_instances_of_every_region(monkeypatch):
             return Client(service, region_name)
 
     monkeypatch.setattr(aws.boto3.session, "Session", Session)
+
+
+def test_inventory_lists_the_tagged_instances_of_every_region(monkeypatch):
+    fake_session(monkeypatch)
     assert aws.inventory() == [
         {"id": "arn:aws:rds:eu-west-1:1:db:sc-x", "run": "r1", "expires_at": "2026-11-20T16:00:00Z",
          "created_at": "2026-11-20T10:05:03Z"}
     ]  # fmt: skip
+
+
+def test_a_failing_region_fails_the_inventory_and_is_logged(monkeypatch, caplog):
+    fake_session(monkeypatch, failing_region="us-east-1")
+    with pytest.raises(RuntimeError, match="AccessDenied"):
+        aws.inventory()
+    assert "us-east-1" in caplog.text
+
+
+def test_a_malformed_expiry_tag_fails_naming_the_database(monkeypatch):
+    fake_session(monkeypatch, expires="tomorrow")
+    with pytest.raises(ValueError, match="arn:aws:rds:eu-west-1:1:db:sc-x"):
+        aws.inventory()
