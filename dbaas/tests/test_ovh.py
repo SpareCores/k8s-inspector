@@ -2,6 +2,7 @@ import asyncio
 import dataclasses
 import io
 import json
+import urllib.error
 
 import pulumi
 import pulumi_ovh as ovh
@@ -77,7 +78,9 @@ def spy(monkeypatch, module, name):
 
 
 @pulumi.runtime.test
-def test_the_database_is_standalone_tagged_allowlisted_and_has_the_flavor_of_keeper(ovh_spec):
+def test_a_plan_without_replicas_has_one_node_and_the_database_is_tagged_allowlisted_and_has_the_flavor_of_keeper(
+    ovh_spec,
+):
     outputs = ovh_vendor.provision(ovh_spec)
 
     def check(_):
@@ -127,7 +130,8 @@ def test_the_provider_has_no_credentials_and_the_timeouts_come_from_the_spec(ovh
     assert providers[0][1] == {}  # credentials, endpoint and project come from the environment
     for _, kwargs in (*databases, *users):
         timeouts = kwargs["opts"].custom_timeouts
-        assert (timeouts.create, timeouts.delete) == ("50m", "100m")
+        assert timeouts.delete == "100m"
+        assert timeouts.create == ("5m" if kwargs["opts"] is users[0][1]["opts"] else "45m")  # sum: spec.create_timeout
         assert kwargs["opts"].provider is not None
     assert "service_name" not in databases[0][1]
     assert databases[0][0] == ("ovh-d2-2-1234abcd",)
@@ -140,14 +144,22 @@ def test_a_plan_with_replicas_has_a_node_for_each(ovh_spec, monkeypatch):
     assert databases[0][1]["nodes"] == [{"region": "GRA"}] * 3
 
 
-def test_a_database_without_a_client_address_is_refused(ovh_spec):
-    with pytest.raises(ValueError, match="no client address"):
-        ovh_vendor.provision(dataclasses.replace(ovh_spec, client_addresses=()))
+@pytest.mark.parametrize("addresses", [(), ("2001:db8::1",), ("10.1.0.0/24",)])
+def test_a_database_without_an_ipv4_client_address_is_refused(ovh_spec, addresses):
+    with pytest.raises(ValueError, match="IPv4 client address"):
+        ovh_vendor.provision(dataclasses.replace(ovh_spec, client_addresses=addresses))
 
 
-def test_a_client_range_is_kept_as_it_is(ovh_spec):
-    spec = dataclasses.replace(ovh_spec, client_addresses=("10.1.0.0/24", "198.51.100.4"))
-    assert [r["ip"] for r in ovh_vendor.allowed_ips(spec)] == ["10.1.0.0/24", "198.51.100.4/32"]
+def test_only_ipv4_single_addresses_are_allowed(ovh_spec):
+    spec = dataclasses.replace(
+        ovh_spec, client_addresses=("10.1.0.0/24", "198.51.100.4", "2001:db8::1", "192.0.2.9/32")
+    )
+    assert [r["ip"] for r in ovh_vendor.allowed_ips(spec)] == ["198.51.100.4/32", "192.0.2.9/32"]
+
+
+def test_an_endpoint_without_the_postgresql_component_is_refused():
+    with pytest.raises(ValueError, match="no postgresql endpoint"):
+        ovh_vendor._postgres_endpoint([{"component": "pgbouncer", "domain": "pool.example", "port": 20185}])
 
 
 @pytest.mark.parametrize(
@@ -198,7 +210,10 @@ class FakeApi:
         elif url.endswith("/database/postgresql"):
             body = list(self.clusters)
         else:
-            body = self.clusters[url.rsplit("/", 1)[1]]
+            cluster = self.clusters[url.rsplit("/", 1)[1]]
+            if cluster is None:  # deleted since the list
+                raise urllib.error.HTTPError(url, 404, "Not Found", {}, None)
+            body = cluster
         return io.BytesIO(json.dumps(body).encode())
 
 
@@ -210,6 +225,7 @@ def test_inventory_lists_the_databases_that_carry_the_run_tag(monkeypatch):
                 "createdAt": "2026-11-20T10:00:00Z",
             },
             "c2": {"description": "somebody else's database", "createdAt": "2026-11-01T10:00:00Z"},
+            "gone": None,
             "c3": {"description": None, "createdAt": "2026-11-02T10:00:00Z"},
         }
     )

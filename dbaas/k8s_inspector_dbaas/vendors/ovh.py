@@ -6,7 +6,7 @@ database node's.
 
 The benchmark nodes of OVH have a public address only (SCarpenter attaches nodes to `Ext-Net`, no vRack), so the
 database is reached through its public endpoint, which OVH closes to everyone until an IP restriction allows a client:
-`spec.client_addresses` are the only entries. Connections are TLS-only.
+the IPv4 /32 entries of `spec.client_addresses` (the endpoint is IPv4) are the only ones. Connections are TLS-only.
 
 `spec.region` is the database's region (`GRA`); the client node is in a compute region of the same city (`GRA11`),
 which the controller picks from Keeper's region data.
@@ -18,9 +18,11 @@ The plan and the flavor are `spec.record["api_reference_object"]`. A plan with r
 production, advanced) has `1 + max_read_replicas` nodes, which OVH requires.
 """
 
+import ipaddress
 import json
 import os
 import re
+import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import UTC, datetime
@@ -33,6 +35,7 @@ from k8s_inspector_dbaas.storage_plan import plan
 
 ADMIN_USER = "avnadmin"  # exists from the start; its password is reset to a generated one
 ADMIN_DB = "defaultdb"
+USER_CREATE_MINUTES = 5  # of `spec.create_timeout_minutes`: the admin user is reset right after the database is ready
 DISK_STEP_GIB = 10  # `FlexDiskSizeInvalid` otherwise
 RUN_TAG = "sc_inspector_run"
 EXPIRES_TAG = "sc_inspector_expires"
@@ -60,18 +63,24 @@ def description(labels: dict[str, str]) -> str:
 
 
 def allowed_ips(spec: DbSpec) -> list[dict[str, str]]:
-    if not spec.client_addresses:
-        raise ValueError("OVH denies every client until an IP restriction allows one: the spec has no client address")
-    return [
-        {"ip": ip if "/" in ip else f"{ip}/32", "description": f"{RUN_TAG} {spec.run_id}"[:255]}
-        for ip in spec.client_addresses
-    ]
+    """The IPv4 client addresses (the endpoint is IPv4); OVH denies every client until one is allowed."""
+    addresses = []
+    for address in spec.client_addresses:
+        network = ipaddress.ip_network(address, strict=False)
+        if network.version == 4 and network.prefixlen == 32:
+            addresses.append(str(network.network_address))
+    if not addresses:
+        raise ValueError(f"OVH needs an IPv4 client address: the spec has {list(spec.client_addresses)}")
+    return [{"ip": f"{ip}/32", "description": f"{RUN_TAG} {spec.run_id}"[:255]} for ip in addresses]
 
 
 def provision(spec: DbSpec) -> DbOutputs:
     restrictions = allowed_ips(spec)
     provider = ovh.Provider("ovh")
-    timeouts = pulumi.CustomTimeouts(create=spec.create_timeout, delete=spec.delete_timeout)
+    database_timeouts = pulumi.CustomTimeouts(
+        create=f"{spec.create_timeout_minutes - USER_CREATE_MINUTES}m", delete=spec.delete_timeout
+    )
+    user_timeouts = pulumi.CustomTimeouts(create=f"{USER_CREATE_MINUTES}m", delete=spec.delete_timeout)
     api = spec.record["api_reference_object"]
     nodes = 1 + int(spec.record.get("max_read_replicas") or 0)
     database = ovh.cloudproject.Database(
@@ -85,7 +94,7 @@ def provision(spec: DbSpec) -> DbOutputs:
         deletion_protection=False,
         ip_restrictions=restrictions,
         nodes=[{"region": spec.region}] * nodes,
-        opts=pulumi.ResourceOptions(provider=provider, custom_timeouts=timeouts),
+        opts=pulumi.ResourceOptions(provider=provider, custom_timeouts=database_timeouts),
     )
     admin = ovh.cloudprojectdatabase.PostgresSqlUser(
         f"{spec.run}-admin",
@@ -93,7 +102,7 @@ def provision(spec: DbSpec) -> DbOutputs:
         name=ADMIN_USER,
         password_reset=spec.run_id,
         opts=pulumi.ResourceOptions(
-            provider=provider, custom_timeouts=timeouts, additional_secret_outputs=["password"]
+            provider=provider, custom_timeouts=user_timeouts, additional_secret_outputs=["password"]
         ),
     )
     endpoint = database.endpoints.apply(_postgres_endpoint)
@@ -107,13 +116,11 @@ def provision(spec: DbSpec) -> DbOutputs:
 
 
 def _postgres_endpoint(endpoints) -> dict:
-    """The connection endpoint of the PostgreSQL component (the first one with a domain when none is named so)."""
-    usable = [e for e in endpoints or [] if e.get("domain") and e.get("port")]
-    named = [e for e in usable if e.get("component") == "postgresql"]
-    if not (named or usable):
-        raise ValueError("OVH reports no endpoint with a domain and a port")
-    chosen = (named or usable)[0]
-    return {"domain": chosen["domain"], "port": int(chosen["port"])}
+    """The connection endpoint of the `postgresql` component."""
+    for endpoint in endpoints or []:
+        if endpoint.get("component") == "postgresql" and endpoint.get("domain") and endpoint.get("port"):
+            return {"domain": endpoint["domain"], "port": int(endpoint["port"])}
+    raise ValueError("OVH reports no postgresql endpoint with a domain and a port")
 
 
 def inventory() -> list[dict]:
@@ -123,7 +130,12 @@ def inventory() -> list[dict]:
     token = _access_token(token_url)
     listed = []
     for cluster_id in _get(f"{base}/cloud/project/{project}/database/postgresql", token):
-        cluster = _get(f"{base}/cloud/project/{project}/database/postgresql/{cluster_id}", token)
+        try:
+            cluster = _get(f"{base}/cloud/project/{project}/database/postgresql/{cluster_id}", token)
+        except urllib.error.HTTPError as error:
+            if error.code == 404:  # deleted since the list
+                continue
+            raise
         run = re.search(rf"{RUN_TAG}=(\S+)", cluster.get("description") or "")
         expires = re.search(rf"{EXPIRES_TAG}=(\S+)", cluster.get("description") or "")
         if run and expires:
