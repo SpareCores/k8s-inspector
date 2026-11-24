@@ -25,3 +25,20 @@ Consequences:
   ([DBaaS](../explanation/dbaas.md)).
 - **Keeper**: Keeper serves the OCI SKUs and applies its normal eligibility rules, so autoPlan picks them like any
   vendor's. Forced runs are for operators ([start a forced run](../how-to/run-forced.md)).
+
+## UpCloud DBaaS
+
+`dbaas/k8s_inspector_dbaas/vendors/upcloud.py`. UpCloud calls its regions zones; the database goes to the client's zone.
+
+- **Network**: `dbaas.vendors.upcloud.networks.<zone>` holds `network_id` (the SDN private network that the bench nodes of
+  the zone have an interface on) and `cidr` (its range). The database joins that network with no public access, and its IP
+  filter is `cidr`. The host the benchmark connects to is the service's private endpoint.
+- **Plans**: Keeper's `api_reference`. A flexible plan (`rdb.*`) takes compute, one node, storage and the cheapest backup
+  tier it allows (`mini`, `regular`, `extended`). The storage is the schema-derived size ([DBaaS](../explanation/dbaas.md)),
+  clamped to the plan's bands and snapped to their step, both from `api_reference_object.plan_storage` of Keeper's
+  record. A legacy plan (`1x...`) is passed by name and includes its storage.
+- **Credentials**: the Secret `k8s-inspector-dbaas-upcloud` holds `UPCLOUD_TOKEN` of an API sub-account for the Jobs. The
+  provider and the inventory read it from the environment; UpCloud tokens have no scopes, so the sub-account's permissions
+  are the limit.
+- **Admin user** `scadmin`, database `defaultdb`, `sslmode=require`. Services carry the labels `sc_inspector_run` and
+  `sc_inspector_expires`; `inventory` lists them with `GET /1.3/database`.
