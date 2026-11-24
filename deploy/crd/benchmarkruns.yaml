@@ -55,7 +55,7 @@ spec:
                 type: string
                 default: 0s
               database:
-                description: DBaaS runs only. `vendor` and `id` are Keeper's, `region` is where the client node and the database go.
+                description: DBaaS runs only. `vendor` and `id` are Keeper's, `region` is the database's region and `clientRegion` the client node's (default `region`; another region of the same city when the vendor's database and server regions differ).
                 type: object
                 nullable: true
                 properties:
@@ -63,6 +63,7 @@ spec:
                   id: {type: string}
                   engineVersion: {type: string}
                   region: {type: string}
+                  clientRegion: {type: string}
                   vcpus: {type: integer}
                   memoryGib: {type: number}
                   usdPerHour: {type: number}

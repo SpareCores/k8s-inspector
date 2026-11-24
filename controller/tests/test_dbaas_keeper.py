@@ -43,7 +43,13 @@ def keeper():
             elif path == "/regions":
                 body = [
                     {"vendor_id": "gcp", "region_id": "1000", "api_reference": "us-central1"},
-                    {"vendor_id": "gcp", "region_id": "1100", "api_reference": "europe-west4"},
+                    {
+                        "vendor_id": "gcp",
+                        "region_id": "1100",
+                        "api_reference": "europe-west4",
+                        "country_id": "NL",
+                        "city": "Eemshaven",
+                    },
                     {"vendor_id": "gcp", "region_id": "1200", "api_reference": "asia-east1"},
                     {"vendor_id": "gcp", "region_id": "1300", "api_reference": "asia-east2"},
                 ]
@@ -104,6 +110,11 @@ def test_the_standalone_price_per_region_uses_active_on_demand_rows_of_the_none_
         "us-central1": 0.9,
         "europe-west4": 1.2,
     }  # cheapest row per region; no HA, spot, inactive, unknown
+
+
+def test_regions_with_a_city_are_listed_by_it(keeper):
+    env, _ = keeper
+    assert dbaas_keeper.region_cities(env, "gcp") == {"europe-west4": ("NL", "Eemshaven")}  # the others have no city
 
 
 def test_a_vendor_that_lists_only_zonal_levels_uses_single_zone(keeper):

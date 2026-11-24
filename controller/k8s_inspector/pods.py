@@ -113,6 +113,11 @@ def urls_secret_name(run_name: str) -> str:
     return f"{run_name}-urls"
 
 
+def client_region(database: dict) -> str:
+    """The region of a DBaaS run's client node: `spec.database.clientRegion`, default the database's `region`."""
+    return database.get("clientRegion") or database["region"]
+
+
 def db_secret_name(run_name: str) -> str:
     """Secret `<run>-db` of a DBaaS run: the connection facts (`SC_DB_*`) of its database."""
     return f"{run_name}-db"
@@ -209,8 +214,8 @@ def render_anchor(
                 "karpenter.sh/nodepool": cfg.settings.bench_pool,
                 VENDOR_LABEL: spec.vendor,
                 API_REFERENCE_LABEL: spec.sku,
-                # A DBaaS client sits in the database's region (and its private network).
-                **({REGION_LABEL: spec.database["region"]} if spec.database else {}),
+                # A DBaaS client sits in its own region (the database's, unless `clientRegion` names another).
+                **({REGION_LABEL: client_region(spec.database)} if spec.database else {}),
             },
             "affinity": {
                 "nodeAffinity": {

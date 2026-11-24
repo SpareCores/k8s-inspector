@@ -127,6 +127,21 @@ def test_a_stack_is_as_old_as_its_first_update_whatever_its_state_file_was_last_
     assert jobs(kube) == ["dbaas-down-aws-leak-1"]  # past the 6 h from its creation
 
 
+def test_the_client_addresses_are_the_external_ips_of_the_node_as_host_networks():
+    node = {
+        "status": {
+            "addresses": [
+                {"type": "InternalIP", "address": "10.0.0.4"},
+                {"type": "ExternalIP", "address": "203.0.113.7"},
+                {"type": "ExternalIP", "address": "2001:db8::7"},
+                {"type": "Hostname", "address": "node-1"},
+            ]
+        }
+    }
+    assert dbaas_jobs.client_addresses(node) == ["203.0.113.7/32", "2001:db8::7/128"]
+    assert dbaas_jobs.client_addresses({"status": {}}) == [] and dbaas_jobs.client_addresses({}) == []
+
+
 def test_every_database_is_labelled_with_the_run_and_an_expiry():
     expires = datetime(2026, 11, 21, 9, 5, tzinfo=UTC)
     labels = dbaas_jobs.labels("r20261120T1000-AAAA", expires)
@@ -143,7 +158,7 @@ def test_the_connection_secret_carries_the_password_first_and_the_facts_later():
 
     run = BenchmarkRun("aws-x-1", "inspector", "u", "1", NOW, RunSpec("aws", "x", "r"), RunStatus())
     owner = OwnerRef("v1", "BenchmarkRun", "aws-x-1", "u")
-    assert dbaas_jobs.connection_secret(run, owner, "pw", None)["stringData"] == {"SC_DB_PASSWORD": "pw"}
+    assert dbaas_jobs.connection_secret(run, owner, "pw", None)["stringData"] == {"K8SI_RUN_PASSWORD": "pw"}
     gcp = {
         "host": "h",
         "admin_user": "postgres",

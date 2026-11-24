@@ -682,12 +682,14 @@ def test_run_with_a_database_forces_a_dbaas_run(env, monkeypatch, capsys):
     monkeypatch.setattr(dbaas_plan, "force_run", force_run)
     assert cli.main(["run", "oci", "--database", "db1", "--region", "eu-1", "--force", "--hold", "1h"]) == 0
     assert seen == {
-        "vendor": "oci", "database": "db1", "region": "eu-1", "client": None, "force": True,
+        "vendor": "oci", "database": "db1", "region": "eu-1", "client_region": None, "client": None, "force": True,
         "hold_after": timedelta(hours=1),
     }  # fmt: skip
     assert capsys.readouterr().out == "oci-client\n"
     assert cli.main(["run", "oci", "my-client", "--database", "db1"]) == 0
     assert seen["client"] == "my-client" and seen["region"] is None and seen["force"] is False
+    assert cli.main(["run", "ovh", "--database", "db1", "--region", "GRA", "--client-region", "GRA11"]) == 0
+    assert (seen["region"], seen["client_region"]) == ("GRA", "GRA11")
 
 
 @pytest.mark.parametrize(
@@ -695,6 +697,7 @@ def test_run_with_a_database_forces_a_dbaas_run(env, monkeypatch, capsys):
     [
         (["run", "oci"], "a SKU is required"),
         (["run", "oci", "sku", "--region", "eu-1"], "a SKU is required"),
+        (["run", "oci", "sku", "--client-region", "eu-1"], "a SKU is required"),
         (["run", "oci", "--database", "d", "--tasks", "lscpu"], "--tasks does not apply"),
         (["run", "oci", "--database", "d"], "K8SI_DBAAS_IMAGE is empty"),
     ],

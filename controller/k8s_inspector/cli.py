@@ -74,7 +74,14 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("vendor")
     run.add_argument("sku", nargs="?", help="the SKU; with --database the client server (default: picked)")
     run.add_argument("--database", help="a DBaaS run of this database (Keeper's api_reference) instead of a server run")
-    run.add_argument("--region", help="with --database: the region (default: the cheapest with a DBaaS network)")
+    run.add_argument(
+        "--region", help="with --database: the database's region (default: the cheapest with a client region)"
+    )
+    run.add_argument(
+        "--client-region",
+        help="with --database: the client node's region, an operator override with no city check (default: the "
+        "database's, else one of its Keeper city)",
+    )
     run.add_argument(
         "--tasks", type=lambda s: [t for t in s.split(",") if t], default=[], help="comma-separated task names"
     )
@@ -289,8 +296,10 @@ def cmd_plan(args: argparse.Namespace) -> int:
     for run in planned:
         print(f"{run.vendor} {run.sku} {','.join(run.tasks)} ({run.reason})")
     for db in databases:
+        client_at = f" in {db.client_region}" if db.client_region and db.client_region != db.region else ""
         print(
-            f"{db.vendor} database {db.database_id} in {db.region} with {db.client} {','.join(db.tasks)} ({db.reason})"
+            f"{db.vendor} database {db.database_id} in {db.region} with {db.client}{client_at} "
+            f"{','.join(db.tasks)} ({db.reason})"
         )
     if not planned and not databases:
         print("nothing to plan")
@@ -300,8 +309,8 @@ def cmd_plan(args: argparse.Namespace) -> int:
 def cmd_run(args: argparse.Namespace) -> int:
     """`planner.force_run`; print the run name. Exit 1 on `RunExists` / `ValueError`."""
     kube, provider = _connect(need_run_image=True)
-    if args.database is None and (args.sku is None or args.region):
-        raise CliError("a SKU is required (or --database, with --region)", 2)
+    if args.database is None and (args.sku is None or args.region or args.client_region):
+        raise CliError("a SKU is required (or --database, with --region or --client-region)", 2)
     if args.database is not None and args.tasks:
         raise CliError("--tasks does not apply to --database: a DBaaS run runs the DBaaS tasks", 2)
     try:
@@ -314,6 +323,7 @@ def cmd_run(args: argparse.Namespace) -> int:
                 args.vendor,
                 args.database,
                 region=args.region,
+                client_region=args.client_region,
                 client=args.sku,
                 force=args.force,
                 hold_after=args.hold,

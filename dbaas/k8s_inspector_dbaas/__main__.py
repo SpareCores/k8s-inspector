@@ -2,9 +2,10 @@
 and `dbaas-inventory-<vendor>`.
 
 The Job has no Kubernetes API access and reports through the termination message (`/dev/termination-log`): `up` the
-connection facts as JSON, `inventory` the tagged databases, any command `{"error": "..."}` on failure (the password is
-removed from the text). The exit code is 0 on success. `down` needs only `DBAAS_RUN`, the BenchmarkRun name, and exits 0
-once nothing is left; `inventory` needs `DBAAS_VENDOR`.
+connection facts as JSON (a vendor-generated password in plain text: docs/explanation/dbaas.md), `inventory` the tagged
+databases, any command `{"error": "..."}` on failure (the password is removed from the text). The exit code is 0 on
+success. `down` needs only `DBAAS_RUN`, the BenchmarkRun name, and exits 0 once nothing is left; `inventory` needs
+`DBAAS_VENDOR`.
 
 When the Pod is stopped (SIGTERM) the Pulumi CLI gets SIGINT, which makes it finish the operation in flight and record
 it in the state; the Pod has a long grace period for that.

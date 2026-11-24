@@ -35,7 +35,10 @@ class DbSpec:
     vendor: str
     database_id: str  # Keeper's `api_reference` of the database SKU, the vendor's own name for it
     engine_version: str  # PostgreSQL major version, e.g. "18"
-    region: str  # the region of the client node (Keeper/SCarpenter `api_reference`)
+    region: str  # the region of the database (Keeper `api_reference`)
+    # the region of the client node: `region`, or a region of its city when the vendor's database and server regions
+    # differ (OVH); the key of `network`
+    client_region: str
     zone: str | None  # the zone of the client node, None when unknown; a vendor may place the database in it
     run: str  # BenchmarkRun name
     run_id: str  # `spec.runId` of the run
@@ -43,9 +46,13 @@ class DbSpec:
     labels: dict[str, str]  # run id and expiry as label-safe strings; apply them as tags/labels where supported
     create_timeout_minutes: int  # shorter than the up Job's deadline: the `create` custom timeout of slow resources
     delete_timeout_minutes: int  # shorter than the down Job's deadline: the `delete` custom timeout
-    network: dict  # opaque outputs of the platform from the ConfigMap `dbaas.vendors.<vendor>.networks.<region>`; for a
-    # vendor that needs an allowlist (OVH, UpCloud, Vultr, OCI) the platform puts the client CIDRs in it
+    # opaque outputs of the platform from the ConfigMap `dbaas.vendors.<vendor>.networks.<client region>`; for a vendor
+    # that needs an allowlist on a private network (UpCloud, Vultr, OCI) the platform puts the client CIDRs in it
+    network: dict
     record: dict  # Keeper's record of the database (vcpus, memory_amount, storage_size, api_reference_object ...)
+    # ExternalIP addresses of the client node as /32 or /128, for a vendor whose nodes have no private network (OVH):
+    # the database is on a public endpoint with TLS and allows these. Empty when the node has none.
+    client_addresses: list[str] = field(default_factory=list)
     password: str = field(repr=False, default="")  # admin password, from `DBAAS_PASSWORD`; a Pulumi secret
 
     @property
@@ -77,21 +84,27 @@ class DbOutputs:
     output while the program runs; `export` registers them as stack outputs."""
 
     host: pulumi.Input[str]
-    admin_user: pulumi.Input[str]  # the user the vendor created; the bootstrap connects as this one
-    admin_db: pulumi.Input[
-        str
-    ]  # a database that exists from the start ("postgres", "defaultdb"); the bootstrap uses it
+    # The user the vendor created; the bootstrap connects as this one.
+    admin_user: pulumi.Input[str]
+    # A database that exists from the start ("postgres", "defaultdb"); the bootstrap uses it.
+    admin_db: pulumi.Input[str]
     port: pulumi.Input[int] = 5432
-    sslmode: pulumi.Input[str] = "require"  # libpq sslmode of the client
-    user: pulumi.Input[str] | None = None  # workload user; None: `admin_user`. Otherwise the bootstrap creates it
-    grant_role: pulumi.Input[str] | None = None  # role the bootstrap grants to `user` (Cloud SQL: "cloudsqlsuperuser")
+    # libpq sslmode of the client.
+    sslmode: pulumi.Input[str] = "require"
+    # Workload user; None: `admin_user`. Otherwise the bootstrap creates it.
+    user: pulumi.Input[str] | None = None
+    # Role the bootstrap grants to `user` (Cloud SQL: "cloudsqlsuperuser").
+    grant_role: pulumi.Input[str] | None = None
+    # The admin password when the vendor generates it and cannot be given one (OVH): a Pulumi secret that replaces the
+    # run's. It is reported in plain text (`to_json`).
+    password: pulumi.Input[str] | None = field(default=None, repr=False)
 
     def export(self) -> None:
         """Register every set field as a stack output (inside the Pulumi program)."""
         for f in fields(self):
             value = getattr(self, f.name)
             if value is not None:
-                pulumi.export(f.name, value)
+                pulumi.export(f.name, pulumi.Output.secret(value) if f.name == "password" else value)
 
     @classmethod
     def from_exports(cls, exports: dict) -> DbOutputs:
@@ -99,6 +112,8 @@ class DbOutputs:
         return cls(**{f.name: exports[f.name] for f in fields(cls) if f.name in exports})
 
     def to_json(self) -> str:
+        """The termination message: every set field. A vendor-generated `password` is in it in plain text; the
+        controller deletes the Job right after it has read it (docs/explanation/dbaas.md)."""
         return json.dumps({f.name: getattr(self, f.name) for f in fields(self) if getattr(self, f.name) is not None})
 
 
@@ -111,6 +126,7 @@ def load_spec(environ: dict[str, str] | None = None) -> DbSpec:
         database_id=data["databaseId"],
         engine_version=str(data["engineVersion"]),
         region=data["region"],
+        client_region=data.get("clientRegion") or data["region"],
         zone=data.get("zone"),
         run=data["run"],
         run_id=data["runId"],
@@ -120,5 +136,6 @@ def load_spec(environ: dict[str, str] | None = None) -> DbSpec:
         delete_timeout_minutes=int(data["deleteTimeoutMinutes"]),
         network=dict(data.get("network") or {}),
         record=dict(data["record"]),
+        client_addresses=list(data.get("clientAddresses") or []),
         password=environ.get(PASSWORD_ENV, ""),
     )

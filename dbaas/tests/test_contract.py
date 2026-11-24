@@ -88,6 +88,34 @@ def test_up_reports_the_connection_facts_in_the_termination_message(spec, tmp_pa
     }
 
 
+def test_a_vendor_generated_password_is_reported_in_the_termination_message(spec, tmp_path, monkeypatch):
+    log = tmp_path / "termination"
+    monkeypatch.setenv(entry.TERMINATION_LOG_ENV, str(log))
+    monkeypatch.setenv("DBAAS_SPEC", json.dumps(SPEC_JSON))
+    monkeypatch.setenv("DBAAS_PASSWORD", "run-pw")
+    out = DbOutputs(host="h", admin_user="u", admin_db="d", password="Generated-by-vendor")
+    monkeypatch.setattr(stack, "up", lambda spec: out)
+    assert entry.run("up") == 0
+    assert json.loads(log.read_text())["password"] == "Generated-by-vendor"
+    assert "password" not in repr(out)
+
+
+def test_the_password_is_exported_as_a_secret(monkeypatch):
+    exported = {}
+    monkeypatch.setattr(pulumi, "export", exported.__setitem__)
+    monkeypatch.setattr(pulumi.Output, "secret", staticmethod(lambda value: ("secret", value)))
+    DbOutputs(host="h", admin_user="u", admin_db="d", password="x").export()
+    assert exported["password"] == ("secret", "x") and exported["host"] == "h"
+
+
+def test_the_spec_has_the_client_region_and_addresses():
+    spec = load_spec({"DBAAS_SPEC": json.dumps(SPEC_JSON)})
+    assert spec.client_region == "eu-test-1" and spec.client_addresses == []  # default: the database's region
+    data = {**SPEC_JSON, "clientRegion": "eu-test-2", "clientAddresses": ["203.0.113.7/32"]}
+    spec = load_spec({"DBAAS_SPEC": json.dumps(data)})
+    assert (spec.region, spec.client_region, spec.client_addresses) == ("eu-test-1", "eu-test-2", ["203.0.113.7/32"])
+
+
 def test_a_failed_up_reports_the_error_without_the_password(tmp_path, monkeypatch, capsys):
     log = tmp_path / "termination"
     monkeypatch.setenv(entry.TERMINATION_LOG_ENV, str(log))

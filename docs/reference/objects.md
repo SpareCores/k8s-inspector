@@ -206,7 +206,7 @@ what is left.
 ## DBaaS objects
 
 A DBaaS run ([DBaaS](../explanation/dbaas.md)) is a `BenchmarkRun` with `spec.database`
-(`{vendor, id, engineVersion, region, vcpus, memoryGib, usdPerHour}`; `usdPerHour` is database plus client price, absent when Keeper does not know one of them); its `sku` is the client server, its capacity always
+(`{vendor, id, engineVersion, region, clientRegion, vcpus, memoryGib, usdPerHour}`; `region` is the database's region and `clientRegion` the client node's, absent when it is the same; `usdPerHour` is database plus client price, absent when Keeper does not know one of them); its `sku` is the client server, its capacity always
 `OnDemand`, and `metadata.finalizers` holds `inspector.sparecores.com/dbaas` until the database is destroyed. Its
 `status.database` is the state of the managed database:
 
@@ -226,7 +226,7 @@ status:
 | Job `dbaas-up-<run>` | creates the database (`backoffLimit: 0`, `activeDeadlineSeconds` = `dbaas.createMinutes`, never deleted while it runs); owner: the run; Pods labelled `inspector.sparecores.com/dbaas-job: <job>`, not `…/run`, so the run's own Pod handling never touches them. Both Jobs' Pods have `karpenter.sh/do-not-disrupt: "true"` and a 15 minute termination grace period. The names of the Jobs are `dbaas-up-`/`dbaas-down-` and the run name, shortened with a hash of it when that passes 63 characters; the run name is in the annotation `inspector.sparecores.com/dbaas-run` |
 | Job `dbaas-down-<run>` | destroys the stack and removes its state (deadline 2 h per attempt, created again until it succeeds); labelled with the run, not owned by it (the run's foreground deletion must not wait for it; the controller deletes it after the success), and for a leaked stack labelled `inspector.sparecores.com/dbaas-sweep` and deleted by the sweeper |
 | Job `dbaas-inventory-<vendor>` | the sweeper's, every 30 minutes per configured vendor: lists the vendor's databases that carry the `sc_inspector_run` tag (deadline 15 min, no state bucket) |
-| Secret `<run>-db` (owner: the run) | the password first, then `SC_DB_HOST`, `SC_DB_PORT`, `SC_DB_USER`, `SC_DB_PASSWORD`, `SC_DB_NAME`, `SC_DB_SSLMODE`, `PGSSLMODE`, `SC_DB_BOOTSTRAP_USER`, `SC_DB_BOOTSTRAP_DATABASE`, `SC_DB_GRANT_ROLE`; read by the Job, the bootstrap Pod and the pgbench step (`envFrom`) |
+| Secret `<run>-db` (owner: the run) | the run's own password as `K8SI_RUN_PASSWORD` (never overwritten; the Jobs get it as `DBAAS_PASSWORD`), then `SC_DB_PASSWORD` (the same, or the vendor-generated one once the up Job reported it), `SC_DB_HOST`, `SC_DB_PORT`, `SC_DB_USER`, `SC_DB_PASSWORD`, `SC_DB_NAME`, `SC_DB_SSLMODE`, `PGSSLMODE`, `SC_DB_BOOTSTRAP_USER`, `SC_DB_BOOTSTRAP_DATABASE`, `SC_DB_GRANT_ROLE`; read by the Job, the bootstrap Pod and the pgbench step (`envFrom`) |
 | ConfigMap `<run>-boot` (owner: the run) | the text of the bootstrap script |
 | Pod `<run>-a<n>-dbaas-boot` (role `dbaas`, owner: the anchor) | the bootstrap: `nodeName` of the client node, host network, the pgbench image, `python3 /dbaas/bootstrap.py`, `envFrom` the Secret |
 | Secret `k8s-inspector-dbaas-state` | platform: the passphrase of the Pulumi stacks |

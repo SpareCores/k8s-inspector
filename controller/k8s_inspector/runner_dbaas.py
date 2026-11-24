@@ -49,8 +49,9 @@ RUNNING_PHASES = (RunPhase.PENDING, RunPhase.PROVISIONING, RunPhase.RUNNING)
 
 
 def _new_password() -> str:
-    """Random, with a letter of each case, a digit and a symbol, which the password policies of the vendors ask for."""
-    return f"Sc1-{secrets.token_urlsafe(24)}"
+    """28 characters (vendors cap at 30 or 32), with a letter of each case, a digit and a symbol, which the password
+    policies of the vendors ask for; the only symbol is `-`, and the rest are letters and digits."""
+    return f"Sc1-{secrets.token_hex(12)}"
 
 
 def database_over(run: BenchmarkRun) -> bool:
@@ -104,9 +105,10 @@ class DbaasMixin:
         vendor_config = cfg.settings.dbaas.vendors.get(db["vendor"])
         if not cfg.env.dbaas_image:
             return self._end_run(run, ExitCode.HARNESS_ERROR, "K8SI_DBAAS_IMAGE is empty", AttemptOutcome.HARNESS_ERROR)
-        if not (vendor_config and db["region"] in vendor_config.networks):
+        client_region = pods.client_region(db)
+        if not (vendor_config and client_region in vendor_config.networks):
             return self._database_fail(
-                run, "DBAAS_NO_NETWORK", f"no network of {db['vendor']} in {db['region']} in the ConfigMap"
+                run, "DBAAS_NO_NETWORK", f"no network of {db['vendor']} in {client_region} in the ConfigMap"
             )
         now = self._now()
         expires = dbaas_jobs.expiry(now, cfg, self._dbaas_task(run))
@@ -156,11 +158,11 @@ class DbaasMixin:
         return None
 
     def _password(self, run: BenchmarkRun) -> str:
-        """The run's database password: generated once, kept in the run's Secret (so it survives a restart)."""
+        """The run's own database password: generated once, kept in the run's Secret (so it survives a restart)."""
         name = pods.db_secret_name(run.name)
         try:
             data = self.kube.get("secret", name).get("data") or {}
-            return base64.b64decode(data["SC_DB_PASSWORD"]).decode()
+            return base64.b64decode(data[dbaas_jobs.RUN_PASSWORD_KEY]).decode()
         except NotFound, KeyError:
             password = _new_password()
             self.kube.apply_secret(dbaas_jobs.connection_secret(run, self._run_owner(run), password, None))
@@ -172,8 +174,11 @@ class DbaasMixin:
         if record is None:
             return self._database_fail(run, "DBAAS_UNKNOWN_DATABASE", f"Keeper does not know {db['vendor']}/{db['id']}")
         self._password(run)
-        network = cfg.settings.dbaas.vendors[db["vendor"]].networks[db["region"]]
-        spec = dbaas_jobs.build_spec(run, cfg, record, network, run.status.database.expires)
+        network = cfg.settings.dbaas.vendors[db["vendor"]].networks[pods.client_region(db)]
+        node = self._get_node(self._nodes[run.name].facts.node_name) or {}
+        spec = dbaas_jobs.build_spec(
+            run, cfg, record, network, run.status.database.expires, dbaas_jobs.client_addresses(node)
+        )
         self._create("job", dbaas_jobs.up_job(run, cfg, spec, self._run_owner(run)))
 
     def _database_creating(self, run: BenchmarkRun, cfg: Config, live: dict[str, dict]) -> None:
@@ -203,11 +208,13 @@ class DbaasMixin:
             status.database.phase, status.database.since = DbPhase.BOOTSTRAPPING, now
 
         run = self._set_database(run, mutate)
+        self.kube.delete("job", name)  # a vendor-generated password is in its Pod's termination message
         self._start_bootstrap(run, cfg, live)
 
     # ----------------------------------------------------------------------- bootstrapping
 
     def _start_bootstrap(self, run: BenchmarkRun, cfg: Config, live: dict[str, dict]) -> None:
+        self.kube.delete("job", dbaas_jobs.up_job_name(run.name))  # again: the controller may have restarted before
         nd = self._nodes[run.name]
         owner = self._anchor_owner(run, live)
         self._create("configmap", dbaas_jobs.boot_configmap(run, self._run_owner(run)))

@@ -82,6 +82,17 @@ def region_ids(env: EnvConfig, vendor: str) -> dict[str, str]:
     return {row["api_reference"]: str(row["region_id"]) for row in rows if row.get("vendor_id", vendor) == vendor}
 
 
+def region_cities(env: EnvConfig, vendor: str) -> dict[str, tuple[str, str]]:
+    """`{region api_reference: (Keeper country_id, city)}` of the vendor's regions that have a city. A vendor whose
+    database regions differ from its server regions (OVH) is matched by it."""
+    rows = _list(env, "/regions", [("vendor", vendor)])
+    return {
+        row["api_reference"]: (row.get("country_id"), row["city"])
+        for row in rows
+        if row.get("vendor_id", vendor) == vendor and row.get("city")
+    }
+
+
 def standalone_prices(env: EnvConfig, vendor: str, database_id: str) -> dict[str, float]:
     """`{region api_reference: USD per hour}` of the standalone on-demand price of the database, from its ACTIVE
     price rows. Empty when it has none."""
