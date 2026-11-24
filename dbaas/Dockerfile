@@ -17,6 +17,8 @@ COPY --from=ghcr.io/astral-sh/uv:0.12.7@sha256:95f2aa1fe59274951cfe9b0cbc7972e87
 ENV UV_LINK_MODE=copy UV_COMPILE_BYTECODE=1 UV_PYTHON_DOWNLOADS=never PULUMI_HOME=/opt/pulumi PULUMI_SKIP_UPDATE_CHECK=true
 RUN --mount=from=pulumi,source=/pulumi.tar.gz,target=/pulumi.tar.gz \
     mkdir -p /opt/pulumi-cli && tar -xzf /pulumi.tar.gz -C /opt/pulumi-cli --strip-components=1
+# A C compiler for provider SDKs that have no wheel for this Python yet (oci: crc32c); the final stage does not get it.
+RUN apt-get update && apt-get install -y --no-install-recommends gcc libc6-dev && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 COPY pyproject.toml uv.lock README.md ./
 RUN uv sync --locked --no-dev --group vendors --no-install-project
