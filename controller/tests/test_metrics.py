@@ -226,6 +226,10 @@ def test_launch_gauges_and_failure_counter():
     assert 'k8s_inspector_launch_failures_total{reason="ICE",vendor="oci"} 2' in text
     assert 'k8s_inspector_launch_failures_total{reason="OTHER",vendor="aws"} 1' in text
     assert 'k8s_inspector_launch_paused{vendor="oci"} 0' in text
+    metrics.record_vendor_skipped("oci", "offered_types_unusable")
+    assert 'k8s_inspector_autoplan_vendor_skipped_total{reason="offered_types_unusable",vendor="oci"} 1' in (
+        metrics.render()
+    )
 
 
 def test_a_vendor_paused_by_boot_failures_shows_in_the_gauge():

@@ -123,16 +123,20 @@ def h() -> Harness:
     return Harness()
 
 
+@pytest.fixture
+def keeper_asks() -> list[list[str]]:
+    """The task names of every ask of Keeper's bulk answer."""
+    return []
+
+
 @pytest.fixture(autouse=True)
-def keeper_answer(monkeypatch):
-    """Keeper's bulk answer ({vendor: {sku: {task: reasons}}}); every SKU of these tests is ACTIVE and unblocked.
-    `keeper_calls` counts the asks."""
+def keeper_answer(monkeypatch, keeper_asks):
+    """Keeper's bulk answer ({vendor: {sku: {task: reasons}}}); every SKU of these tests is ACTIVE and unblocked."""
     answer = {"oci": {sku: {} for sku in ("VM.Standard.E5.Flex.2-16", "BM.Standard3.64", "VM.Standard.E5 Flex")}}
-    answer["calls"] = 0
 
     def ask(env, task_names):
-        answer["calls"] += 1
-        return {vendor: skus for vendor, skus in answer.items() if vendor != "calls"}
+        keeper_asks.append(task_names)
+        return answer
 
     monkeypatch.setattr(keeper, "active_servers_block_reasons", ask)
     return answer
@@ -2903,6 +2907,29 @@ def test_a_run_whose_tasks_are_all_blocked_by_keeper_is_deleted(h, keeper_answer
     assert h.kube.list("benchmarkrun") == []
 
 
+def test_a_pending_run_with_done_tasks_whose_sku_left_keeper_ends_and_keeps_its_results(h, keeper_answer):
+    h.start(["membench", "geekbench"])
+    h.drive(stop=in_step("03-membench"))
+    lose_node(h)
+    h.runner.reconcile(h.name)
+    assert h.run.status.phase == RunPhase.PENDING and h.task("geekbench").state == TaskState.DONE
+    del keeper_answer["oci"]["VM.Standard.E5.Flex.2-16"]  # inactive now
+    h.runner = h.new_runner()
+    h.clock.advance(minutes=11)
+    h.runner.reconcile(h.name)
+    run = h.run  # still there, for the publisher
+    assert run.status.phase == RunPhase.FAILED
+    assert h.task("geekbench").state == TaskState.DONE and h.task("geekbench").exit_code == 0
+    assert h.task("membench").exit_code == ExitCode.NO_NODE
+    assert h.kube.list("nodeclaim") == []
+
+
+def test_a_dbaas_run_is_not_checked_against_keeper(h, keeper_answer, keeper_asks):
+    keeper_answer["oci"].clear()
+    _stuck_without_node(h, database={"engine": "postgres"})
+    assert h.run.status.phase == RunPhase.PROVISIONING and not keeper_asks
+
+
 def test_a_run_with_one_task_left_after_keeper_blocks_another_goes_on(h, keeper_answer):
     h.cluster.provision_enabled = False
     h.start(["geekbench", "lscpu"])
@@ -2913,19 +2940,19 @@ def test_a_run_with_one_task_left_after_keeper_blocks_another_goes_on(h, keeper_
     assert h.run.status.phase == RunPhase.PROVISIONING
 
 
-def test_a_forced_run_skips_the_keeper_check(h, keeper_answer):
+def test_a_forced_run_skips_the_keeper_check(h, keeper_answer, keeper_asks):
     keeper_answer["oci"].clear()
     _stuck_without_node(h, force=True)
     h.runner.reconcile(h.name)
-    assert h.run.status.phase == RunPhase.PROVISIONING and keeper_answer["calls"] == 0
+    assert h.run.status.phase == RunPhase.PROVISIONING and not keeper_asks
 
 
-def test_keeper_is_asked_at_most_every_ten_minutes_per_run(h, keeper_answer):
+def test_keeper_is_asked_at_most_every_ten_minutes_per_run(h, keeper_asks):
     _stuck_without_node(h)
-    assert keeper_answer["calls"] == 1
+    assert len(keeper_asks) == 1
     h.clock.advance(minutes=9)
     h.runner.reconcile(h.name)
-    assert keeper_answer["calls"] == 1
+    assert len(keeper_asks) == 1
     h.clock.advance(minutes=2)
     h.runner.reconcile(h.name)  # asked again (the planner's cache may still answer)
     assert h.runner._eligibility_checked[h.name] == h.clock.now

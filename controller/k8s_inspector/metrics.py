@@ -12,7 +12,8 @@ on: no lscpu result), `_last_publish_timestamp_seconds`
 `_spend_usd_per_hour`, `_task_duration_seconds` (summary sum/count), `_launch_failures_total{vendor,reason}`
 (runs that ended because no node could be launched, counted by the runner), `_launch_deferred_skus{vendor,reason}`
 and `_launch_blocked{vendor,reason}` (SKUs in the launch ConfigMap, and those of them still waiting for their
-retry). Not yet: `_dbaas_instances` (P4).
+retry), `_autoplan_vendor_skipped_total{vendor,reason}` (planner cycles that skipped a vendor, counted by the
+planner). Not yet: `_dbaas_instances` (P4).
 `/healthz` answers 200 as long as the process serves.
 """
 
@@ -101,6 +102,11 @@ class Metrics:
         reason = reason if reason in LAUNCH_REASONS else "OTHER"
         with self._lock:
             self._counters["launch_failures_total"][_labels(vendor=vendor, reason=reason)] += 1
+
+    def record_vendor_skipped(self, vendor: str, reason: str) -> None:
+        """A planner cycle skipped the vendor (`planner.OFFERED_UNUSABLE`)."""
+        with self._lock:
+            self._counters["autoplan_vendor_skipped_total"][_labels(vendor=vendor, reason=reason)] += 1
 
     def record_unpublishable(self, count: int) -> None:
         """Tasks the publisher gave up on (finished, but no lscpu result to pick a variant from)."""

@@ -720,6 +720,9 @@ def test_an_unusable_offered_types_listing_skips_the_vendor_with_a_warning(kube,
     assert "offered types of vendor oci unusable" in caplog.text
     assert "autoPlan skips vendor oci: its SCarpenter offered-types listing is unusable" in caplog.text
     assert not_offered_of(kube) is None
+    skipped = []
+    plan(kube, auto_config(), {}, dry_run=True, on_vendor_skipped=lambda *args: skipped.append(args))
+    assert skipped == [("oci", planner.OFFERED_UNUSABLE)]  # the metric's source
     publish_offered(kube, offered_configmap({"s1": OFFERED}))  # a usable listing plans again
     assert planned_skus(kube) == ["s1"]
 

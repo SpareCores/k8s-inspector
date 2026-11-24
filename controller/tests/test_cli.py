@@ -531,7 +531,9 @@ def controller(monkeypatch):
             stop.wait()
             stopped.append("publisher")
 
-    def plan_loop(kube, cfg_provider, schedule_reader, stop, variant_reader, first_seen_reader):
+    def plan_loop(
+        kube, cfg_provider, schedule_reader, stop, variant_reader, first_seen_reader, keeper_cache, on_skipped
+    ):
         assert variant_reader("oci") == {}
         assert first_seen_reader("oci", "s", 0) is None
         assert schedule_reader("oci") == {}

@@ -197,6 +197,7 @@ def _check_keeper(cfg: Config, vendor: str, sku: str, names: list[str]) -> None:
 
 
 KEEPER_CACHE_SECONDS = 30 * 60
+OFFERED_UNUSABLE = "offered_types_unusable"  # `reason` of `on_vendor_skipped`
 
 
 class KeeperCache:
@@ -439,6 +440,7 @@ def plan_cycle(
     keeper_cache: KeeperCache | None = None,
     variant_reader: VariantReader | None = None,
     first_seen_reader: FirstSeenReader | None = None,
+    on_vendor_skipped: Callable[[str, str], None] | None = None,
 ) -> list[PlannedRun]:
     """One autoPlan cycle. For each enabled vendor with autoPlan whose results are published (`publish`; without it
     git would never record them and the SKU would be run again and again) and that is below its caps
@@ -458,7 +460,8 @@ def plan_cycle(
     of `schedule/<task>/meta.json`, else the meta) started before `N`'s `first_seen` (`first_seen_reader`, from
     `variant.json`; none: no fill for the SKU). After an attempt since then only the retry bounds of `due_reason`
     on that attempt apply, wherever it landed. The planner cannot choose the hardware.
-    With `dry_run` nothing is created and the first such SKU of each vendor is returned.
+    With `dry_run` nothing is created and the first such SKU of each vendor is returned. `on_vendor_skipped(vendor,
+    reason)` is called for a vendor skipped for its unusable offered-types listing (`OFFERED_UNUSABLE`; metrics).
 
     Fails closed: when Keeper or git cannot be read the cycle plans nothing (for git: nothing for that vendor)
     and logs why."""
@@ -518,6 +521,8 @@ def plan_cycle(
         skipped = not_offered(kube, cfg, vendor, skus) if skus else {}
         if skipped is None:
             log.warning("autoPlan skips vendor %s: its SCarpenter offered-types listing is unusable", vendor)
+            if on_vendor_skipped:
+                on_vendor_skipped(vendor, OFFERED_UNUSABLE)
             continue
         waiting = launch.deferred(kube, vendor, skus, datetime.now(UTC), prune=not dry_run)
         if skipped:
@@ -590,10 +595,12 @@ def run_forever(
     stop: threading.Event,
     variant_reader: VariantReader | None = None,
     first_seen_reader: FirstSeenReader | None = None,
+    keeper_cache: KeeperCache | None = None,
+    on_vendor_skipped: Callable[[str, str], None] | None = None,
 ) -> None:
     """Every `planner.interval_minutes`: `plan_cycle`; exceptions are logged, never fatal. `cfg_provider` is a
-    zero-argument callable returning the current `Config`."""
-    keeper_cache = KeeperCache()
+    zero-argument callable returning the current `Config`. `keeper_cache` is shared with the runner."""
+    keeper_cache = keeper_cache or KeeperCache()
     while not stop.is_set():
         interval_minutes = 5
         try:
@@ -606,6 +613,7 @@ def run_forever(
                 keeper_cache=keeper_cache,
                 variant_reader=variant_reader,
                 first_seen_reader=first_seen_reader,
+                on_vendor_skipped=on_vendor_skipped,
             ):
                 log.info("planned run", extra={"vendor": planned.vendor, "sku": planned.sku, "reason": planned.reason})
         except Exception:

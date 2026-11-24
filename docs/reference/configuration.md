@@ -116,10 +116,12 @@ failure, no claim is pending and `noOfferingMinutes` have passed, a run ends wit
 SCarpenter's offered-types listing is readable and does not offer the SKU ([Offered types](#offered-types)); with an
 unreadable or stale listing it keeps waiting for the pre-launch budget.
 
-A run in Pending or Provisioning also ends when its SKU is no longer eligible in Keeper: not ACTIVE any more, or every
-server task of the run blocked. The controller asks Keeper (the planner's cached bulk answer) at most every 10 minutes per run,
-deletes the run's NodeClaims and the run itself, and records nothing (the run had no node and no result). A forced run is never checked, and an
-unreachable Keeper changes nothing.
+A run in Pending or Provisioning also stops when its SKU is no longer eligible in Keeper: not ACTIVE any more, or every
+unfinished server task of the run blocked. The controller asks Keeper (the planner's cached answer, one instance shared
+by both) at most every 10 minutes per run and deletes the run's NodeClaims. A run that never reached a node and has no
+finished task is deleted and records nothing. A run with a finished task or a node (a spot-interrupted run back in
+Pending) ends Failed instead: its unfinished tasks end `-1`, and the finished ones are published. A DBaaS run and a
+forced run are never checked, and an unreachable Keeper changes nothing.
 
 Only vendors listed with `enabled: true` are touched, and their results reach sc-inspector-data only with
 `publish: true` or a list of SKUs (default `false`: runs and outputs happen, git stays untouched, and the runs of

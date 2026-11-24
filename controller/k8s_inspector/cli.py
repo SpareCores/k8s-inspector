@@ -178,7 +178,15 @@ def serve(kube: Kube, provider: ConfigProvider, stop: threading.Event, metrics_p
     env = cfg.env
     storage = Storage(env, cfg.settings.uploads)
     metrics = Metrics(kube, lambda: provider().settings)
-    runner = Runner(kube, storage, provider, env.namespace, on_launch_failure=metrics.record_launch_failure)
+    keeper_cache = planner.KeeperCache()  # one Keeper answer for the planner and the runner
+    runner = Runner(
+        kube,
+        storage,
+        provider,
+        env.namespace,
+        on_launch_failure=metrics.record_launch_failure,
+        keeper_cache=keeper_cache,
+    )
     publisher = _MeteredPublisher(
         kube,
         storage,
@@ -212,6 +220,8 @@ def serve(kube: Kube, provider: ConfigProvider, stop: threading.Event, metrics_p
             stop,
             publisher.read_newest_variants,
             publisher.read_first_seen,
+            keeper_cache,
+            metrics.record_vendor_skipped,
         ),
         "publisher": lambda: publisher.run_forever(lambda: provider().settings, stop),
         "metrics": server.serve_forever,

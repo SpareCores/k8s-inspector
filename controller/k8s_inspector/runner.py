@@ -108,6 +108,7 @@ SKU_NOT_SELECTABLE = "SKU name is not a valid label value; SCarpenter cannot sel
 ACTIVE = (RunPhase.PENDING, RunPhase.PROVISIONING, RunPhase.RUNNING, RunPhase.RELEASING)
 MAX_PROVISION_RETRIES = 3  # attempts lost before a node was usable (stale node, anchor deleted)
 EXTRA_ATTEMPTS = 2  # attempts beyond `max_spot_attempts` (the on-demand one plus one spare)
+NOT_ELIGIBLE = "SKU is no longer eligible in Keeper"
 ELIGIBILITY_CHECK_INTERVAL = timedelta(minutes=10)  # per run without a node: how often Keeper is asked again
 MAX_LAUNCH_FAILURES = 2  # distinct NodeClaims that failed to launch in one attempt before the run gives up; ICE
 # ones go on while SCarpenter still offers the SKU (`_launch_failures_exhausted`)
@@ -401,11 +402,13 @@ class Runner:
         *,
         clock: Callable[[], datetime] | None = None,
         on_launch_failure: Callable[[str, str], None] | None = None,
+        keeper_cache: planner.KeeperCache | None = None,
     ) -> None:
         """`cfg_provider`: zero-argument callable returning the current `Config` (settings are re-read from the
         ConfigMap every cycle, so a callable is passed instead of a snapshot). `clock` (tests) returns the
         current UTC time. `on_launch_failure(vendor, reason)` is called
-        for each run that ends because no node could be launched (metrics)."""
+        for each run that ends because no node could be launched (metrics). `keeper_cache` is the planner's, so both
+        see the same Keeper answer (`_drop_if_ineligible`)."""
         self.kube = kube
         self.storage = storage
         self.namespace = namespace
@@ -421,7 +424,7 @@ class Runner:
         self._signed_at: dict[str, datetime] = {}  # when the urls Secret was last signed, per run
         # run -> since when its node has had DiskPressure. In memory: a controller restart restarts the wait.
         self._disk_wait: dict[str, datetime] = {}
-        self._keeper_cache = planner.KeeperCache()  # the planner's bulk Keeper answer, for `_drop_if_ineligible`
+        self._keeper_cache = keeper_cache or planner.KeeperCache()  # shared with the planner: `_drop_if_ineligible`
         self._eligibility_checked: dict[str, datetime] = {}  # run -> when Keeper was last asked about its SKU
 
     def check_config(self) -> None:
@@ -969,7 +972,6 @@ class Runner:
         failures = self._record_launch_failures(run, claims, events)
         if error is None and self._launch_failures_exhausted(run, cfg, anchor, failures):
             error = self._launch_error(failures[-1].message)
-        on_demand_retry = bool(error) and error.startswith(SPOT_FALLBACK_ERRORS)
         reclaims = run.status.spot_reclaims
         if error is None and not bound:
             error, reclaims = self._boot_error(run, cfg, claims)
@@ -1017,7 +1019,7 @@ class Runner:
                 error = launch.error_message("ICE", f"no node launched after {minutes} minutes")
         if error is None:
             return
-        if on_demand_retry and pods.allows_spot(anchor):
+        if error.startswith(SPOT_FALLBACK_ERRORS) and pods.allows_spot(anchor):
             # The next attempt (`spot.capacity_for_next_attempt`) is on-demand only.
             return self._retry_on_demand(run, live, error)
         self._fail_run(run, live, error)
@@ -1028,7 +1030,8 @@ class Runner:
         """`MAX_LAUNCH_FAILURES` claims failed to launch. When all of them name the class InsufficientCapacity or
         ZoneUnusable the run goes on while SCarpenter's offered listing has an available offering for the SKU in a
         capacity type the anchor allows (it tries other regions and zones itself), up to `MAX_ICE_LAUNCH_FAILURES`;
-        the provisioning budget still ends it. An unreadable listing counts as none."""
+        the provisioning budget still ends it. An unreadable listing counts as none (not offered), unlike
+        `_not_offered`, where no answer means keep waiting."""
         if len(failures) < MAX_LAUNCH_FAILURES:
             return False
         if not all(launch.is_capacity_class(f.message) for f in failures):
@@ -1045,16 +1048,20 @@ class Runner:
         return bool(skipped)
 
     def _drop_if_ineligible(self, run: BenchmarkRun, live: dict[str, dict]) -> bool:
-        """A run without a node whose SKU Keeper no longer lists as ACTIVE, or blocks for all of the run's server
-        tasks, is deleted: no result is recorded and no NodeClaim stays (`_delete_run_claims`). Asked at most every
-        `ELIGIBILITY_CHECK_INTERVAL` per run; a forced run skips Keeper by design, and an unreachable Keeper is not
-        an answer. True when the run was deleted."""
+        """A run whose SKU Keeper no longer lists as ACTIVE, or blocks for all of its unfinished server tasks, does
+        not go on: no node is launched for it and its NodeClaims are deleted (`_delete_run_claims`). A run with no
+        finished task that never reached a node is deleted without a record. A run with a finished task or a node
+        (a spot-interrupted run back in Pending) ends through `_end_run` instead: its done tasks stay and are
+        published, the unfinished ones end `-1`. A DBaaS run is never checked (its teardown has its own path). Asked
+        at most every `ELIGIBILITY_CHECK_INTERVAL` per run; a forced run skips Keeper by design, and an unreachable
+        Keeper is not an answer. True when the run was ended or deleted."""
         now = self._now()
         last = self._eligibility_checked.get(run.name)
-        if run.spec.force or (last and now - last < ELIGIBILITY_CHECK_INTERVAL):
+        if run.spec.database is not None or run.spec.force or (last and now - last < ELIGIBILITY_CHECK_INTERVAL):
             return False
         self._eligibility_checked[run.name] = now
-        names = [t.name for t in self._selected(run) if not t.dbaas]
+        done = {t.name for t in run.status.tasks if t.state == TaskState.DONE}
+        names = [t.name for t in self._selected(run) if not t.dbaas and t.name not in done]
         if not names:
             return False
         try:
@@ -1065,10 +1072,13 @@ class Runner:
         reasons = blocked.get(run.spec.vendor, {}).get(run.spec.sku)  # None: not ACTIVE
         if reasons is not None and not all(name in reasons for name in names):
             return False
+        self._delete_run_claims(run, live)
+        if done or any(a.node for a in run.status.attempts):
+            self._end_run(run, ExitCode.NO_NODE, NOT_ELIGIBLE, AttemptOutcome.PROVISIONING_FAILED)
+            return True
         log.warning(
             "run %s: %s/%s is no longer eligible in Keeper, deleting the run", run.name, run.spec.vendor, run.spec.sku
         )
-        self._delete_run_claims(run, live)
         self._delete_secret(run)
         crd.delete_run(self.kube, run.name)
         self._forget(run.name)  # deletes the anchor with the Pods
