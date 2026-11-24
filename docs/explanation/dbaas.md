@@ -247,10 +247,10 @@ group over the bench VPC's subnets and a security group that allows 5432 from th
 (`networks.<region>`: `subnet_group`, `security_group_id`). The instance goes to the client's availability zone when
 `zone` is a zone name of the region. RDS for PostgreSQL fixes the gp3 I/O of a volume below 400 GiB at 3000 IOPS and
 125 MiB/s; a database whose I/O budget is higher gets a 400 GiB volume (baseline 12000 IOPS and 500 MiB/s), and explicit
-IOPS and throughput only above that. The Jobs use the ServiceAccount `k8s-inspector-dbaas-aws` (web identity, an IAM
-role limited to creating PostgreSQL single-AZ instances tagged `ManagedBy=k8s-inspector`, describing instances and
-deleting tagged ones, in any region; it covers every tagged `sc-*` instance, not one run's) and the Secret `k8s-inspector-dbaas-aws` with
-`AWS_ROLE_ARN` and `AWS_WEB_IDENTITY_TOKEN_FILE`; `inventory` reads the tags of the instances of every enabled region
+IOPS and throughput only above that. The Jobs use the ServiceAccount `k8s-inspector-dbaas-aws` (web identity) and the
+Secret `k8s-inspector-dbaas-aws` with `AWS_ROLE_ARN` and `AWS_WEB_IDENTITY_TOKEN_FILE`. The IAM role is limited to
+creating PostgreSQL single-AZ instances tagged `ManagedBy=k8s-inspector`, describing instances and deleting tagged
+ones, in any region, so it can delete any tagged `sc-*` instance, not only the current run's; `inventory` reads the tags of the instances of every enabled region
 and fails (after logging the region) when one cannot be listed, so the staleness alert fires.
 
 The instance identifier is `sc-<run_id>` (unique per run, stable across its attempts).
