@@ -18,7 +18,7 @@ import json
 import os
 from collections.abc import Sequence
 from dataclasses import replace
-from datetime import date
+from datetime import date, datetime
 
 import boto3
 from botocore.config import Config
@@ -399,6 +399,21 @@ class Storage:
         )
         keys = (o["Key"].removeprefix(self._prefix) for page in pages for o in page.get("Contents", []))
         return [k for k in keys if k.endswith("/status.json") and "/tasks/" in k]
+
+    # ---- Pulumi state of the DBaaS stacks (`dbaas-state/`, written by the provisioner Jobs)
+
+    def list_objects(self, prefix: str) -> list[tuple[str, datetime]]:
+        """`(logical key, last modified)` of every object under a logical prefix."""
+        pages = self.s3.get_paginator("list_objects_v2").paginate(Bucket=self.bucket, Prefix=self._k(prefix))
+        return [
+            (o["Key"].removeprefix(self._prefix), o["LastModified"]) for page in pages for o in page.get("Contents", [])
+        ]
+
+    def delete_objects(self, keys: Sequence[str]) -> None:
+        """Delete logical keys (missing ones are fine)."""
+        for start in range(0, len(keys), 1000):
+            batch = [{"Key": self._k(k)} for k in keys[start : start + 1000]]
+            self.s3.delete_objects(Bucket=self.bucket, Delete={"Objects": batch, "Quiet": True})
 
 
 # --------------------------------------------------------------------------- urls.json

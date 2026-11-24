@@ -10,6 +10,8 @@ from k8s_inspector.model import (
     AttemptOutcome,
     AttemptStatus,
     CapacityType,
+    DbPhase,
+    DbStatus,
     LaunchFailure,
     RunPhase,
     RunSpec,
@@ -90,15 +92,18 @@ def test_every_status_key_the_controller_writes_is_in_the_crd_schema():
         ],
         launch_failures=[LaunchFailure(node_claim="nc", message="m", time=NOW)],
         conditions=[{"type": "Published", "status": "True"}],
+        database=DbStatus(DbPhase.DESTROYING, NOW, NOW, error="e", destroy_failures=1, retry_after=NOW),
     )
     emitted = crd.status_to_dict(status)
     assert unknown_keys(emitted, schema()["status"], "status") == []
     assert emitted["tasks"][0].keys() >= {"errorMsg", "gpuFallback"}  # the sample really sets every optional key
     assert "node" in emitted["attempts"][0]
+    assert emitted["database"].keys() == {"phase", "since", "expires", "error", "destroyFailures", "retryAfter"}
 
 
 def test_every_spec_key_the_controller_writes_is_in_the_crd_schema():
-    spec = RunSpec(vendor="v", sku="s", run_id="r", database={"vendor": "v", "id": "i", "engineVersion": "1"})
+    database = {"vendor": "v", "id": "i", "engineVersion": "1", "region": "r", "vcpus": 4, "memoryGib": 16.0}
+    spec = RunSpec(vendor="v", sku="s", run_id="r", database=database)
     manifest = crd.to_manifest(spec, "inspector")
     assert unknown_keys(manifest["spec"], schema()["spec"], "spec") == []
 
@@ -127,7 +132,8 @@ def test_rbac_is_least_privilege_for_what_the_controller_calls():
     assert cluster[("", "pods")] == {"list"}  # the Pods on the benchmark node (cpu requests), any namespace
     assert cluster[("", "nodes")] == {"get"}
     assert granted[("", "events")] == {"list"}  # Karpenter FailedScheduling event of the anchor
-    assert ("batch", "jobs") not in granted
+    assert granted[("batch", "jobs")] == {"create", "get", "list", "watch", "delete"}  # the DBaaS provisioner Jobs
+    assert granted[("inspector.sparecores.com", "benchmarkruns")] >= {"patch"}  # also removes the DBaaS finalizer
 
 
 def test_rbac_reads_scarpenter_offered_types_in_its_namespace():
@@ -142,3 +148,12 @@ def test_rbac_reads_scarpenter_offered_types_in_its_namespace():
     (binding,) = [d for d in docs if d["kind"] == "RoleBinding" and d["metadata"]["namespace"] == "scarpenter-system"]
     assert binding["roleRef"]["name"] == role["metadata"]["name"]
     assert binding["subjects"] == [{"kind": "ServiceAccount", "name": "k8s-inspector", "namespace": "inspector"}]
+
+
+def test_the_dbaas_provisioner_runs_with_a_serviceaccount_that_has_no_role():
+    base = CRD_PATH.parents[1]
+    docs = list(yaml.safe_load_all((base / "controller" / "dbaas-serviceaccount.yaml").read_text()))
+    assert [(d["kind"], d["metadata"]["name"]) for d in docs] == [("ServiceAccount", "k8s-inspector-dbaas")]
+    rbac = (base / "controller" / "rbac.yaml").read_text()
+    assert "k8s-inspector-dbaas" not in rbac  # no Role or binding: the Jobs do not call the Kubernetes API
+    assert "controller/dbaas-serviceaccount.yaml" in (base / "kustomization.yaml").read_text()

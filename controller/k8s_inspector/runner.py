@@ -56,6 +56,10 @@ A reconcile that keeps failing for `MAX_FAILING` ends the run: unfinished tasks 
 uploads aborted, phase Failed (attempt outcome `HarnessError`). Nothing is deleted there: the Failed phase
 removes the anchor (and with it the step Pods) on the next pass; the Secret is deleted at once.
 
+DBaaS runs (`spec.database`, `runner_dbaas.py`): while Running, the database is created and bootstrapped before the
+first step (`status.database`); no probe step is run; and `reconcile` ends by driving the destroy of the database,
+which starts as soon as the run leaves the node phases (or is cancelled or deleted), in the pass that releases the node.
+
 Cancel: the CLI sets the annotation `inspector.sparecores.com/cancel: "true"` (`crd.request_cancel`); the runner
 sees it and `_cancel` records `-4 CANCELLED` for every unfinished task, deletes the Pods and sets phase
 Cancelled. The BenchmarkRun is kept for the publisher: the CRD has no finalizer, so a plain `kubectl delete`
@@ -97,6 +101,7 @@ from k8s_inspector.model import (
     UninitializedClaim,
     Verification,
 )
+from k8s_inspector.runner_dbaas import DbaasMixin
 from k8s_inspector.storage import Storage, UrlsTooLarge, object_key, render_urls_json, run_json_key, split_urls_key
 
 log = logging.getLogger(__name__)
@@ -106,6 +111,7 @@ RESYNC_SECONDS = 300
 MAX_FAILING = timedelta(minutes=30)  # reconciles of a run failing for this long end the run
 SKU_NOT_SELECTABLE = "SKU name is not a valid label value; SCarpenter cannot select it by api-reference"
 ACTIVE = (RunPhase.PENDING, RunPhase.PROVISIONING, RunPhase.RUNNING, RunPhase.RELEASING)
+NO_NODE_YET = (RunPhase.PENDING, RunPhase.PROVISIONING)  # a DBaaS run in these phases has created nothing that bills
 MAX_PROVISION_RETRIES = 3  # attempts lost before a node was usable (stale node, anchor deleted)
 EXTRA_ATTEMPTS = 2  # attempts beyond `max_spot_attempts` (the on-demand one plus one spare)
 MAX_LAUNCH_FAILURES = 2  # distinct NodeClaims that failed to launch in one attempt before the run gives up; ICE
@@ -390,7 +396,7 @@ def _step_index(name: str | None) -> int:
     return int(name[:2]) if name else 0
 
 
-class Runner:
+class Runner(DbaasMixin):
     def __init__(
         self,
         kube: Kube,
@@ -400,17 +406,20 @@ class Runner:
         *,
         clock: Callable[[], datetime] | None = None,
         on_launch_failure: Callable[[str, str], None] | None = None,
+        on_leftover_stack_failure: Callable[[str], None] | None = None,
     ) -> None:
         """`cfg_provider`: zero-argument callable returning the current `Config` (settings are re-read from the
         ConfigMap every cycle, so a callable is passed instead of a snapshot). `clock` (tests) returns the
         current UTC time. `on_launch_failure(vendor, reason)` is called
-        for each run that ends because no node could be launched (metrics)."""
+        for each run that ends because no node could be launched, `on_leftover_stack_failure(vendor)` for each that gave
+        up destroying a stack an earlier run left (metrics)."""
         self.kube = kube
         self.storage = storage
         self.namespace = namespace
         self._cfg = cfg_provider
         self._clock = clock or (lambda: datetime.now(UTC))
         self._on_launch_failure = on_launch_failure
+        self._on_leftover_stack_failure = on_leftover_stack_failure
         self._queue: queue.Queue[str] = queue.Queue()
         self._lock = threading.Lock()
         self._queued: set[str] = set()
@@ -457,7 +466,17 @@ class Runner:
             RunPhase.RELEASING: self._releasing,
         }
         try:
-            if run.cancel_requested and run.status.phase in ACTIVE:
+            if (
+                run.deleting
+                and run.spec.database is not None
+                and (run.status.database is None or self._clearing(run))
+                and run.status.phase in NO_NODE_YET
+            ):
+                # A DBaaS run deleted before it created anything (its finalizer is only there for the database, or
+                # for the leftover stack it clears): drop it like a deleted server run, leaving no record.
+                self._delete_anchors(live)
+                self._delete_secret(run)
+            elif (run.cancel_requested or run.deleting) and run.status.phase in ACTIVE:
                 self._cancel(run, cfg, live)
             elif run.status.phase in handlers:
                 handlers[run.status.phase](run, cfg, live)
@@ -465,12 +484,17 @@ class Runner:
                 self._delete_anchors(live)  # finished: nothing may be left holding a node
         except _Stale:
             log.info("run %s changed under the reconcile, dropping the pass", run.name)
+        if run.spec.database is not None:  # after the handler: the node is released and the database destroyed together
+            try:
+                self._database_teardown(crd.get_run(self.kube, run_name), cfg)
+            except NotFound:
+                self._forget(run_name)
 
     def run_forever(self, stop: threading.Event) -> None:
         """Start the watch threads (BenchmarkRuns, labelled Pods), the resync timer and the worker loop in this
         thread until `stop` is set. On start and after every watch end: LIST, enqueue all runs."""
         self.check_config()
-        watches = [("benchmarkrun", None), ("pod", {LABEL_RUN: None})]  # None: label exists
+        watches = [("benchmarkrun", None), ("pod", {LABEL_RUN: None}), ("job", {LABEL_RUN: None})]  # None: label exists
         for kind, labels in watches:
             threading.Thread(target=self._watch, args=(kind, labels, stop), daemon=True, name=f"watch-{kind}").start()
         threading.Thread(target=self._resync_loop, args=(stop,), daemon=True, name="resync").start()
@@ -902,6 +926,10 @@ class Runner:
 
     def _pending(self, run: BenchmarkRun, cfg: Config, live: dict[str, dict]) -> None:
         self.check_config()
+        if run.spec.database is not None:
+            run = self._clear_leftover_stack(run, cfg)
+            if run is None:
+                return
         settings = cfg.settings
         selected = self._selected(run)
         attempt = run.status.attempt + 1
@@ -915,7 +943,9 @@ class Runner:
             attempt,
             cfg,
             capacity=capacity,
-            deadline_seconds=pods.anchor_deadline_seconds(selected, cfg, run.spec.hold_after),
+            deadline_seconds=pods.anchor_deadline_seconds(
+                selected, cfg, run.spec.hold_after, database=run.spec.database is not None
+            ),
             owner=self._run_owner(run),
         )
         self._delete_anchors(live, keep=_meta(anchor)["name"])  # leftovers of earlier attempts
@@ -1367,6 +1397,10 @@ class Runner:
         nd, draining = self._node_state(run, anchor)
         if nd is None:
             return self._attempt_lost(run, cfg, live, self._nodes.get(run.name))
+        if run.spec.database is not None and not self._database_ready(run):
+            if draining:
+                return self._attempt_lost(run, cfg, live, nd)
+            return self._database_up(run, cfg, live)
         if any(t.state == TaskState.RUNNING for t in run.status.tasks):
             return self._watch_step(run, cfg, live, nd, draining)
         if draining:
@@ -1413,6 +1447,8 @@ class Runner:
     def _probe_tasks(self, run: BenchmarkRun, nd: _Node) -> list[TaskDef]:
         """The probe step's tasks: the selected parallel tasks plus `lscpu` (always: the variant comes from it)
         and `gpu_facts` on GPU nodes, minus what the precheck refuses."""
+        if run.spec.database is not None:  # the client node is not what is benchmarked
+            return []
         selected = {t.name: t for t in self._selected(run)}
         wanted = {"lscpu": selected.get("lscpu") or tasks.get_task("lscpu")}
         if nd.facts.has_nvidia_gpu:
@@ -1434,7 +1470,7 @@ class Runner:
                 return step
         finished = self._finished(run)
         remaining = [t for t in self._selected(run) if not t.parallel and t.name not in finished]
-        return steps.next_step(remaining, finished, nd.facts, index=index)
+        return steps.next_step(remaining, finished, nd.facts, index=index, database=run.spec.database)
 
     def _precheck(self, run: BenchmarkRun, nd: _Node) -> BenchmarkRun:
         """Tasks the node contradicts (GPU task, no GPU) end `-3`."""
@@ -1860,6 +1896,7 @@ class Runner:
         results = [
             _Result(steps.task_of(t.name), t.name, ExitCode.NEVER_FINISHED, Reason.CANCELLED.value)
             for t in self._unfinished(run)
+            if not self._clearing(run)  # no database was created: nothing to record
         ]
         run = self._record(run, nd, results)
 

@@ -35,6 +35,21 @@ jobs:
       - run: uv run ruff format --check .
       - run: uv run pytest
 
+  dbaas:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: dbaas
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          python-version: "3.15"
+      - run: uv sync --locked
+      - run: uv run ruff check .
+      - run: uv run ruff format --check .
+      - run: uv run pytest
+
   image:
     needs: test
     runs-on: ubuntu-latest
@@ -84,3 +99,28 @@ jobs:
           tags: |
             ghcr.io/sparecores/k8s-inspector:main
             ghcr.io/sparecores/k8s-inspector:${{ github.sha }}
+
+  dbaas-image:
+    needs: dbaas
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - if: github.event_name == 'push'
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: dbaas
+          platforms: linux/amd64,linux/arm64
+          push: ${{ github.event_name == 'push' }}  # pull requests and dispatches only build
+          tags: |
+            ghcr.io/sparecores/k8s-inspector-dbaas:main
+            ghcr.io/sparecores/k8s-inspector-dbaas:${{ github.sha }}

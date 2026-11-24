@@ -8,6 +8,7 @@ All namespaced objects live in namespace `inspector`. API group of the custom re
 |---|---|---|
 | `inspector.sparecores.com/run` | BenchmarkRun, anchor, steps, Secrets, Jobs | run name |
 | `inspector.sparecores.com/role` | Pods, Jobs | `anchor`, `step`, `flush`, `dbaas` |
+| `inspector.sparecores.com/dbaas` | DBaaS Jobs | `up` or `down` |
 | `inspector.sparecores.com/vendor` | BenchmarkRun, Pods | vendor id |
 | `inspector.sparecores.com/attempt` | anchor, steps | attempt number |
 | `inspector.sparecores.com/task` | steps | task name (`probe` for the probe step) |
@@ -34,7 +35,7 @@ spec:
   force: false              # skip Keeper's eligibility check; launch failures end as -1 results
   capacity: SpotFirst       # SpotFirst | OnDemand (default from the vendor setting)
   holdAfter: 0s             # keep the node after the last step (debugging)
-  database: null            # DBaaS runs: {vendor, id, engineVersion}
+  database: null            # DBaaS runs: {vendor, id, engineVersion, region, vcpus, memoryGib}
 status:
   phase: Running            # Pending | Provisioning | Running | Releasing | Publishing | Done | Failed | Cancelled
   progress: "7/19"          # tasks finished / planned
@@ -60,7 +61,7 @@ status:
   conditions: []
 ```
 
-Printer columns (all `.spec`/`.status` paths): Vendor, SKU, Phase, Progress, Step, Capacity, Attempt, Node, Age.
+Printer columns (all `.spec`/`.status` paths): Vendor, SKU, Phase, Database (`status.database.phase` of a DBaaS run), Progress, Step, Capacity, Attempt, Node, Age.
 
 Lifecycle: created by the planner or the CLI; deleted by the controller 24 h after every task is published; deleting it
 earlier cancels the run (owner references remove the anchor, steps and Secrets).
@@ -198,6 +199,36 @@ what is left.
 | ConfigMap `k8s-inspector-spot` | per-SKU interruption counts ([spot](../explanation/spot.md)) |
 | ConfigMap `k8s-inspector-launch-<vendor>` | launch failures per SKU, `skus` = JSON `{sku: {reason, since, count, next}}` ([launch retries](../explanation/launch-retries.md)) |
 | Secret `inspector-secrets` | benchmark secrets (External Secrets) |
-| Jobs `dbaas-up-<run>`, `dbaas-down-<run>` | DBaaS provisioning ([DBaaS](../explanation/dbaas.md)) |
+| Jobs `dbaas-up-<run>`, `dbaas-down-<run>` | DBaaS provisioning ([DBaaS objects](#dbaas-objects)) |
 | PriorityClass `benchmark` | value `-10`, `preemptionPolicy: Never`, not the global default; shipped in `deploy/` |
 | ResourceQuota `benchmark-pods` | `pods: 60` in `inspector`; shipped in `deploy/` |
+
+## DBaaS objects
+
+A DBaaS run ([DBaaS](../explanation/dbaas.md)) is a `BenchmarkRun` with `spec.database`
+(`{vendor, id, engineVersion, region, vcpus, memoryGib, usdPerHour}`; `usdPerHour` is database plus client price, absent when Keeper does not know one of them); its `sku` is the client server, its capacity always
+`OnDemand`, and `metadata.finalizers` holds `inspector.sparecores.com/dbaas` until the database is destroyed. Its
+`status.database` is the state of the managed database:
+
+```yaml
+status:
+  database:
+    phase: Ready            # Clearing | Creating | Bootstrapping | Ready | Destroying | Destroyed; absent: nothing was created
+    since: …                # the phase began
+    expires: …              # the database is a leak after this (also tagged on it)
+    error: "DBAAS_CREATE_FAILED: …"   # why it could not be created or used; or the last destroy failure
+    destroyFailures: 0      # failed destroy Jobs so far
+    retryAfter: null        # the next destroy Job is created at this time
+```
+
+| Object | Purpose |
+|---|---|
+| Job `dbaas-up-<run>` | creates the database (`backoffLimit: 0`, `activeDeadlineSeconds` = `dbaas.createMinutes`, never deleted while it runs); owner: the run; Pods labelled `inspector.sparecores.com/dbaas-job: <job>`, not `…/run`, so the run's own Pod handling never touches them. Both Jobs' Pods have `karpenter.sh/do-not-disrupt: "true"` and a 15 minute termination grace period. The names of the Jobs are `dbaas-up-`/`dbaas-down-` and the run name, shortened with a hash of it when that passes 63 characters; the run name is in the annotation `inspector.sparecores.com/dbaas-run` |
+| Job `dbaas-down-<run>` | destroys the stack and removes its state (deadline 2 h per attempt, created again until it succeeds); labelled with the run, not owned by it (the run's foreground deletion must not wait for it; the controller deletes it after the success), and for a leaked stack labelled `inspector.sparecores.com/dbaas-sweep` and deleted by the sweeper |
+| Job `dbaas-inventory-<vendor>` | the sweeper's, every 30 minutes per configured vendor: lists the vendor's databases that carry the `sc_inspector_run` tag (deadline 15 min, no state bucket) |
+| Secret `<run>-db` (owner: the run) | the password first, then `SC_DB_HOST`, `SC_DB_PORT`, `SC_DB_USER`, `SC_DB_PASSWORD`, `SC_DB_NAME`, `SC_DB_SSLMODE`, `PGSSLMODE`, `SC_DB_BOOTSTRAP_USER`, `SC_DB_BOOTSTRAP_DATABASE`, `SC_DB_GRANT_ROLE`; read by the Job, the bootstrap Pod and the pgbench step (`envFrom`) |
+| ConfigMap `<run>-boot` (owner: the run) | the text of the bootstrap script |
+| Pod `<run>-a<n>-dbaas-boot` (role `dbaas`, owner: the anchor) | the bootstrap: `nodeName` of the client node, host network, the pgbench image, `python3 /dbaas/bootstrap.py`, `envFrom` the Secret |
+| Secret `k8s-inspector-dbaas-state` | platform: the passphrase of the Pulumi stacks |
+| Secret `k8s-inspector-dbaas-<vendor>` | platform, optional: the vendor's cloud credentials as environment of its Jobs |
+| ServiceAccount `k8s-inspector-dbaas` | shipped in `deploy/`: the Jobs' identity (no Role); a vendor may name its own in `dbaas.vendors.<vendor>.serviceAccount` |

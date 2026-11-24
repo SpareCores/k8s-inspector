@@ -45,9 +45,15 @@ Transient API errors (429, 5xx, connection errors, timeouts, a 404 on the `Bench
 | `k8s_inspector_publish_lag_seconds` | (age of the oldest done, unpublished task; 0 when none) |
 | `k8s_inspector_last_publish_timestamp_seconds` | (last publish cycle without error; the process start until the first one) |
 | `k8s_inspector_spend_usd_per_hour` | vendor (sum of running node prices) |
+| `k8s_inspector_dbaas_instances` | vendor: managed databases that exist: DBaaS runs whose database is not yet destroyed, plus leaked stacks the sweeper sees (0 for a vendor without any) |
+| `k8s_inspector_dbaas_oldest_age_seconds` | vendor: age of the oldest of them (a stack's age since its first update, whatever retries or runs of the same name came after). Stacks of a vendor the ConfigMap does not know are `vendor="unknown"` |
+| `k8s_inspector_dbaas_leftover_stack_failures_total` | vendor: runs that ended `-1 DBAAS_LEFTOVER_STACK` because the stack of an earlier run of the same name could not be destroyed in 3 attempts (operator action needed) |
+| `k8s_inspector_dbaas_tagged_databases` | vendor: databases the vendor's inventory Job (every 30 minutes) found by their `sc_inspector_run` tag, also those no state records |
+| `k8s_inspector_dbaas_inventory_last_success_timestamp_seconds` | vendor: when its inventory Job last succeeded (the controller's start time until the first success: a vendor that never succeeds alerts 2 h after the start); the tagged metrics are missing while the latest one failed |
+| `k8s_inspector_dbaas_tagged_oldest_age_seconds` | vendor: age of the oldest of them since its creation in the cloud |
 | `k8s_inspector_task_duration_seconds_sum`, `_count` | vendor, task |
 
-`k8s_inspector_dbaas_instances` (vendor, age bucket) arrives with the DBaaS phase. The `*_total` and `_sum`/`_count`
+The `*_total` and `_sum`/`_count`
 series count what the current process has seen and restart from zero with it.
 
 Logs are structured JSON lines with `run`, `vendor`, `sku`, `task` fields.
@@ -57,6 +63,8 @@ Logs are structured JSON lines with `run`, `vendor`, `sku`, `task` fields.
 | Alert | Condition | Independent of the controller? |
 |---|---|---|
 | **Bench node running too long** | a node in a bench pool older than its run's expected duration + 2 h, or older than 50 h regardless (past `expireAfter` plus grace) (from kube-state-metrics node creation time and pool label) | yes |
+| **DBaaS database running too long** | `k8s_inspector_dbaas_tagged_oldest_age_seconds` or `k8s_inspector_dbaas_oldest_age_seconds` above 8 h (the databases are tagged with run id and expiry: look for `sc_inspector_run` in the cloud console). Alert only, nothing is deleted from the tag | no: also alert on the metrics being absent |
+| **DBaaS inventory stale** | `time() - k8s_inspector_dbaas_inventory_last_success_timestamp_seconds` above 2 h for a vendor: the tagged-database check is blind for it | no |
 | Bench NodeClaim without a run | NodeClaim in a bench pool with no anchor for 30 min | yes |
 | Controller down | no `/metrics` scrape for 10 min | yes |
 | Publish stalled | backlog > 0 and no successful publish for 1 h | no |

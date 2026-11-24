@@ -35,6 +35,7 @@ from k8s_inspector.steps import VLLM_PROBE_TIMEOUT
 NODEPOOL_LABEL = "karpenter.sh/nodepool"
 VENDOR_LABEL = "scarpenter.sparecores.com/vendor"
 API_REFERENCE_LABEL = "scarpenter.sparecores.com/api-reference"
+REGION_LABEL = "topology.kubernetes.io/region"
 _LABEL_VALUE = re.compile(r"(?:[A-Za-z0-9](?:[-_.A-Za-z0-9]{0,61}[A-Za-z0-9])?)?")
 
 NODE_DIR = "/var/lib/k8s-inspector"  # hostPath on the node; mounted at /k8si in every Pod
@@ -57,6 +58,8 @@ STEP_SLACK = timedelta(minutes=5)
 STEP_VERSION = timedelta(minutes=1)
 STEP_UPLOAD = timedelta(minutes=10)
 ANCHOR_EXTRA = timedelta(hours=1)
+BOOTSTRAP_WAIT_SECONDS = 3600  # the bootstrap of a DBaaS run waits this long for the database to accept connections
+BOOTSTRAP_SECONDS = BOOTSTRAP_WAIT_SECONDS + 900  # ... and its Pod has 15 more minutes
 DB_RLIMITS = ("nofile=1048576", "memlock=unlimited")  # docker era: nofile 1048576, memlock -1
 CPU_FLOOR_M = (
     10  # smallest CPU request of a whole Pod in millicores: the lowest cgroup weight, and the flush/fallback request
@@ -108,6 +111,11 @@ def flush_pod_name(run_name: str, attempt: int, step: Step, n: int) -> str:
 def urls_secret_name(run_name: str) -> str:
     """`<run name>-urls`."""
     return f"{run_name}-urls"
+
+
+def db_secret_name(run_name: str) -> str:
+    """Secret `<run>-db` of a DBaaS run: the connection facts (`SC_DB_*`) of its database."""
+    return f"{run_name}-db"
 
 
 def container_name(key: str) -> str:
@@ -201,6 +209,8 @@ def render_anchor(
                 "karpenter.sh/nodepool": cfg.settings.bench_pool,
                 VENDOR_LABEL: spec.vendor,
                 API_REFERENCE_LABEL: spec.sku,
+                # A DBaaS client sits in the database's region (and its private network).
+                **({REGION_LABEL: spec.database["region"]} if spec.database else {}),
             },
             "affinity": {
                 "nodeAffinity": {
@@ -259,15 +269,19 @@ def step_deadline_seconds(step: Step, cfg: Config) -> int:
     return int(_step_budget(longest, cfg).total_seconds())
 
 
-def anchor_deadline_seconds(selected: Sequence[TaskDef], cfg: Config, hold_after: timedelta = timedelta(0)) -> int:
+def anchor_deadline_seconds(
+    selected: Sequence[TaskDef], cfg: Config, hold_after: timedelta = timedelta(0), *, database: bool = False
+) -> int:
     """The anchor's `activeDeadlineSeconds`: the budgets of the probe step and of every serial task (one probe
-    step per vLLM image besides), two flush Pods for each of them, `hold_after` and 1 h (objects.md)."""
-    longest = [max((t.timeout for t in selected if t.parallel), default=STEP_SLACK)]
+    step per vLLM image besides), two flush Pods for each of them, `hold_after` and 1 h (objects.md). A DBaaS run
+    (`database`) has no probe step; the anchor also waits for the database to be created and bootstrapped."""
+    longest = [] if database else [max((t.timeout for t in selected if t.parallel), default=STEP_SLACK)]
     for task in selected:
         if not task.parallel:
             longest += [task.timeout, *[VLLM_PROBE_TIMEOUT for _ in task.images]]
     flushes = timedelta(seconds=FLUSH_DEADLINE_SECONDS * FLUSH_STEPS)
-    total = sum((_step_budget(t, cfg) + flushes for t in longest), hold_after + ANCHOR_EXTRA)
+    wait = timedelta(minutes=cfg.settings.dbaas.create_minutes, seconds=BOOTSTRAP_SECONDS) if database else timedelta(0)
+    total = sum((_step_budget(t, cfg) + flushes for t in longest), hold_after + ANCHOR_EXTRA + wait)
     return int(total.total_seconds())
 
 
@@ -335,6 +349,7 @@ def _step_container(
     single: bool,
     allocatable: int,
     cpu_millicores: int,
+    db_secret: str | None,
 ) -> dict:
     task = container.task
     spool = f"{HEARTBEAT_ROOT}/{run_id}/{container.key}"
@@ -386,6 +401,8 @@ def _step_container(
         "image": container.image,
         "command": command,
         "env": _env(container, run_id, gpu_runtime=gpu_runtime),
+        # A DBaaS task connects with the facts of its database, which the run's Secret holds as `SC_DB_*`.
+        **({"envFrom": [{"secretRef": {"name": db_secret}}]} if db_secret else {}),
         "securityContext": {"privileged": True, "seccompProfile": {"type": "Unconfined"}},
         "resources": resources,
         "terminationMessagePolicy": "File",
@@ -474,6 +491,7 @@ def render_step(
                     single=single,
                     allocatable=node_allocatable_memory_bytes,
                     cpu_millicores=max(CONTAINER_FLOOR_M, max(CPU_FLOOR_M, cpu_millicores) // len(step.containers)),
+                    db_secret=db_secret_name(run.name) if c.task.dbaas else None,
                 )
                 for c in step.containers
             ],

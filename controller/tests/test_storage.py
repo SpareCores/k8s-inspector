@@ -300,3 +300,27 @@ def test_clear_task_removes_only_the_attempt_files_of_that_task(store):
     assert store.read_bytes(storage.object_key(RUN, "membench", "stdout")) == b"x"
     assert store.read_bytes(storage.object_key(RUN, "geekbench", "manifest.json")) == b"x"
     store.clear_task(RUN, "membench")  # nothing left: not an error
+
+
+def test_pulumi_state_is_listed_and_deleted_below_the_key_prefix(monkeypatch):
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "test")
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "test")
+    with mock_aws():
+        s3 = boto3.client("s3", region_name="eu-west-1")
+        s3.create_bucket(Bucket=BUCKET, CreateBucketConfiguration={"LocationConstraint": "eu-west-1"})
+        prefixed = Storage(EnvConfig(bucket=BUCKET, bucket_region="eu-west-1", key_prefix="scratch/"), UploadSettings())
+        for key in (
+            "scratch/dbaas-state/.pulumi/stacks/p/a.json",
+            "scratch/dbaas-state/.pulumi/stacks/p/a.json.bak",
+            "dbaas-state/other",
+        ):
+            s3.put_object(Bucket=BUCKET, Key=key, Body=b"{}")
+        listed = prefixed.list_objects("dbaas-state/.pulumi/stacks/")
+        assert [(key, modified.tzinfo is not None) for key, modified in listed] == [
+            ("dbaas-state/.pulumi/stacks/p/a.json", True),
+            ("dbaas-state/.pulumi/stacks/p/a.json.bak", True),
+        ]  # logical keys, the prefix is Storage's business, and `dbaas-state/other` at the root is not under it
+        prefixed.delete_objects([key for key, _ in listed] + ["dbaas-state/missing"])
+        assert prefixed.list_objects("dbaas-state/") == []
+        assert [o["Key"] for o in s3.list_objects_v2(Bucket=BUCKET)["Contents"]] == ["dbaas-state/other"]
+        prefixed.delete_objects([])  # nothing to do

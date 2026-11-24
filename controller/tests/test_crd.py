@@ -420,3 +420,74 @@ def test_attempt_without_a_node_omits_the_capacity_type():
     assert "capacityType" not in omitted and crd._attempt_from_dict(omitted).capacity_type is None
     kept = crd._attempt_to_dict(AttemptStatus(n=1, capacity_type=CapacityType.SPOT))
     assert kept["capacityType"] == "spot"
+
+
+# --------------------------------------------------------------------------- DBaaS
+
+
+def test_a_dbaas_run_carries_the_finalizer_and_a_server_run_does_not():
+    database = {
+        "vendor": "aws",
+        "id": "rds",
+        "engineVersion": "16",
+        "region": "eu-central-1",
+        "vcpus": 4,
+        "memoryGib": 16.0,
+    }
+    assert crd.to_manifest(spec(database=database), "inspector")["metadata"]["finalizers"] == [crd.FINALIZER_DBAAS]
+    assert "finalizers" not in crd.to_manifest(spec(), "inspector")["metadata"]
+
+
+def test_the_database_status_round_trips_and_the_deletion_timestamp_is_read():
+    from k8s_inspector.model import DbPhase, DbStatus
+
+    status = RunStatus(
+        database=DbStatus(DbPhase.DESTROYING, T0, T0 + timedelta(hours=5), "DBAAS_X: y", 2, T0 + timedelta(minutes=3))
+    )
+    body = crd.status_to_dict(status)
+    assert body["database"] == {
+        "phase": "Destroying", "since": "2026-11-20T09:30:00Z", "expires": "2026-11-20T14:30:00Z",
+        "error": "DBAAS_X: y",
+        "destroyFailures": 2, "retryAfter": "2026-11-20T09:33:00Z",
+    }  # fmt: skip
+    manifest = crd.to_manifest(spec(), "inspector")
+    manifest["metadata"].update(creationTimestamp="2026-11-20T09:30:00Z", deletionTimestamp="2026-11-20T10:00:00Z")
+    manifest["status"] = crd.status_to_dict(status)
+    run = crd.from_dict(manifest)
+    assert run.status.database == status.database and run.deleting is True
+    assert crd.status_to_dict(RunStatus())["database"] is None  # a merge patch removes it
+    assert (
+        crd.from_dict({**manifest, "metadata": {**manifest["metadata"], "deletionTimestamp": None}}).deleting is False
+    )
+
+
+def test_removing_the_finalizer_removes_only_its_own_entry_with_a_json_patch():
+    seen = []
+
+    class Recorder:
+        def get(self, kind, name):
+            return {"metadata": {"finalizers": ["example.com/other", crd.FINALIZER_DBAAS]}}
+
+        def json_patch(self, kind, name, operations):
+            seen.append((kind, name, operations))
+
+    crd.remove_finalizer(Recorder(), "aws-x-1")
+    path = "/metadata/finalizers/1"
+    assert seen == [
+        (
+            "benchmarkrun",
+            "aws-x-1",
+            [{"op": "test", "path": path, "value": crd.FINALIZER_DBAAS}, {"op": "remove", "path": path}],
+        )
+    ]  # the other finalizer stays
+
+
+def test_removing_a_finalizer_that_is_not_there_patches_nothing():
+    class Recorder:
+        def get(self, kind, name):
+            return {"metadata": {}}
+
+        def json_patch(self, *args):
+            raise AssertionError("nothing to remove")
+
+    crd.remove_finalizer(Recorder(), "aws-x-1")

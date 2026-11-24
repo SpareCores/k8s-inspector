@@ -20,9 +20,12 @@ rules:
 - apiGroups: [""]
   resources: [configmaps]
   verbs: [get, create, patch]
+- apiGroups: [batch]
+  resources: [jobs]
+  verbs: [create, get, list, watch, delete]    # DBaaS: dbaas-up-<run> and dbaas-down-<run> (the sweeper's too)
 - apiGroups: [inspector.sparecores.com]
   resources: [benchmarkruns]
-  verbs: [create, get, list, watch, patch, delete]
+  verbs: [create, get, list, watch, patch, delete]    # patch also removes the DBaaS finalizer
 - apiGroups: [inspector.sparecores.com]
   resources: [benchmarkruns/status]
   verbs: [patch]

@@ -13,6 +13,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import replace
 from datetime import timedelta
 
+from k8s_inspector.dbaas_bench import pgbench_env
 from k8s_inspector.model import ExitCode, NodeFacts, Reason, Step, StepContainer, TaskDef, TaskOutcome
 from k8s_inspector.tasks import all_tasks, image_ref
 
@@ -124,6 +125,7 @@ def next_step(
     facts: NodeFacts,
     *,
     index: int,
+    database: dict | None = None,
 ) -> Step | None:
     """The next step Pod, or None when nothing is left.
 
@@ -136,6 +138,7 @@ def next_step(
     - nvbandwidth: command with `-b <MiB>` derived from `facts.gpu_vram_mib`.
     - GPU types: `gpu_runtime=True` for every step; `GPU_VRAM_MIB`/`GPU_COMPUTE_CAP` env where the legacy
       passed them.
+    - a DBaaS task (`database` is `RunSpec.database`): the benchmark's variables for that database (`dbaas_bench`).
     `storage` (priority inf) is always last. `index` numbers the Pod (`NN-<task>`).
 
     A vLLM task whose ladder failed is skipped (not a reason to stop the run); the runner asks
@@ -149,7 +152,8 @@ def next_step(
                 continue
             return step
         command = nvbandwidth_command(facts.gpu_vram_mib) if task.name == "nvbandwidth" else None
-        container = replace(_container(task), command=command)
+        env = pgbench_env(database, facts.vcpus) if task.dbaas and database else ()  # DBaaS: what and how hard to drive
+        container = replace(_container(task), command=command, env=env)
         name = f"{index:02d}-{task.name.replace('_', '-')}"
         return Step(index=index, name=name, containers=(container,), gpu_runtime=facts.has_nvidia_gpu)
     return None
