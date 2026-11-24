@@ -366,6 +366,7 @@ vendors = [
     { name = "ediri-vultr" },
     { name = "oci" },
     { name = "pulumi-aws" },
+    { name = "pulumi-azure-native" },
     { name = "pulumi-oci" },
     { name = "pulumi-upcloud" },
 ]
@@ -383,6 +384,7 @@ vendors = [
     { name = "ediri-vultr", specifier = ">=2.27.1" },
     { name = "oci", specifier = ">=2.193.0" },
     { name = "pulumi-aws", specifier = ">=7.55.0" },
+    { name = "pulumi-azure-native", specifier = "==3.32.0" },
     { name = "pulumi-oci", specifier = ">=5.8.0" },
     { name = "pulumi-upcloud", specifier = ">=0.24.1" },
 ]
@@ -704,6 +706,20 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/0e/29/1877f8fce060f71e21835d272ccd48fe387c40151845ec500df7e7639299/pulumi_aws-7.55.0.tar.gz", hash = "sha256:d283e65b0557cf23293b6868b7d5c4d9cf17b0cbccaae2d4917b040e5f061b10", size = 10236140, upload-time = "2026-11-13T13:03:25.41Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/00/aa/5b81315c11a7173ccbd8a034a2ec6d6d259466d179681c59b1f70f45fcc0/pulumi_aws-7.55.0-py3-none-any.whl", hash = "sha256:db27534aef7e432df22e14226860b20496cb5aacd51baf2387aa1804e624e490", size = 13483395, upload-time = "2026-11-13T13:03:22.461Z" },
+]
+
+[[package]]
+name = "pulumi-azure-native"
+version = "3.32.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "parver" },
+    { name = "pulumi" },
+    { name = "semver" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/e0/f8/8dbc2b8c33ef71e2ff131b6906af304edae32534637d69e2576614330d84/pulumi_azure_native-3.32.0.tar.gz", hash = "sha256:a64ce846f9ffa09d3148a6d13c10dd7626a0da622083bdf7de1c5269019c6d63", size = 12871094, upload-time = "2026-11-19T13:36:56.689Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/2b/15/a2d719b3a00a943a555ddca06d7b392a9c5055544afca631e67b255e5d31/pulumi_azure_native-3.32.0-py3-none-any.whl", hash = "sha256:ddaf376141e27a2c1425368e22548e2882c57efbf327408a1921b281b52fc9b8", size = 21642288, upload-time = "2026-11-19T13:36:53.222Z" },
 ]
 
 [[package]]

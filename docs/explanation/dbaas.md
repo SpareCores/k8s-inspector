@@ -237,6 +237,13 @@ never from sc-data `family` or `series`: those are catalogue classifications (wo
 line), not quota keys. A family the usages API does not list (Flexible Server lists only some families, none for v6
 SKUs) is not an error: it is logged at info level and only the regional cores quota is checked.
 
+The pre-flight runs in the `azure` vendor module before the first resource (`azure_preflight.py`), with the Job's workload
+identity. It refuses, with a message that names the cause, when the subscription is restricted for the offer in the
+region, the region does not list the SKU (or lists it as disabled), the region lacks the storage the plan needs, or the
+regional cores or the family quota are short. The up Job then fails at once and the run ends `-1` with
+`DBAAS_CREATE_FAILED`, like any other create failure; the retry rules go to the next region. A check that cannot be made
+(ARM unreachable) is logged and does not stop the create.
+
 ## Vendor notes
 
 ### AWS (Amazon RDS for PostgreSQL)
@@ -258,3 +265,22 @@ The instance identifier is `sc-<run_id>` (unique per run, stable across its atte
 Comparability: the storage jumps to 400 GiB (12000 IOPS and 500 MiB/s baseline) once the planned I/O budget exceeds
 3000 IOPS or 125 MiB/s. The legacy AWS setup effectively ran 3000 IOPS and 125 MiB/s, so results of large instances are not
 directly comparable with it.
+
+### Azure (Flexible Server for PostgreSQL)
+
+- **Network**: Flexible Server with private access (VNet integration). In every bench region the platform creates a
+  subnet delegated to `Microsoft.DBforPostgreSQL/flexibleServers` in the bench VNet and the private DNS zone
+  `privatelink.postgres.database.azure.com`, linked to it. `networks.<region>` holds `resource_group`, `subnet_id` and
+  `private_dns_zone_id`. The server is created in that resource group (the Job's identity may write only there), named
+  from the run, and has no public access, so no allowlist is needed.
+- **Identity**: Azure workload identity. The federated credential of an Entra application trusts the Job's
+  ServiceAccount `k8s-inspector-dbaas-azure`; the Job's projected token (audience `sts.amazonaws.com`, the one the state
+  profile uses) is the client assertion. The Secret `k8s-inspector-dbaas-azure` holds the application, tenant and
+  subscription ids and `ARM_USE_OIDC` / `ARM_OIDC_TOKEN_FILE_PATH` for the provider.
+- **Sizing**: the tier comes from the `GP_`, `MO_` or `B_` prefix of Keeper's `api_reference_object.sku_name`, the compute
+  size is Keeper's `api_reference`. Premium SSD v2 when Keeper's `compatible_storage_ids` has `ManagedDiskV2`, with the
+  plan's IOPS and throughput raised to the free baseline (3000 IOPS, 125 MB/s); else Premium SSD (Burstable) at the P30
+  tier. The disk size is the plan's, within Keeper's `storage_extra_min`/`storage_extra_max`.
+- **Admin**: `scadmin` on `postgres`; it may create the database `bench`, so there is no separate workload user.
+  `sslmode=require`.
+- **Zone**: the client node's zone when the SKU is offered there, else Azure chooses.
