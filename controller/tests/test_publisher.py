@@ -1234,7 +1234,7 @@ def test_dbaas_timing_is_published_and_the_destroy_files_follow_later(tmp_path, 
     assert {p.name: p.read_text() for p in timing.iterdir()} == {
         "api_start": "2026-11-24T21:50:00Z\n",
         "api_end": "2026-11-24T21:58:00Z\n",
-        "inspector_start": "2026-11-24T21:58:00Z\n",
+        "inspector_start": "2026-11-24T22:00:00Z\n",
         "inspector_end": "2026-11-24T22:20:00Z\n",
     }  # no destroy files while the destroy has not run
 
@@ -1246,3 +1246,23 @@ def test_dbaas_timing_is_published_and_the_destroy_files_follow_later(tmp_path, 
     timing = clone(origin, tmp_path, "check2") / "dbaas/gcp/db1/postgres/18/standalone/timing/r-db"
     assert (timing / "api_destroy_start").read_text() == "2026-11-24T22:21:00Z\n"
     assert (timing / "api_destroy_end").read_text() == "2026-11-24T22:25:00Z\n"
+
+
+def test_dbaas_timing_skips_runs_without_recorded_timing_and_prunes_what_is_gone(tmp_path, origin):
+    t = datetime(2026, 11, 24, 21, 50, 0, tzinfo=UTC)
+    database = {"vendor": "gcp", "id": "db1", "engineVersion": "18"}
+    task = TaskStatus("pgbench", state=TaskState.DONE, start=t, end=t + timedelta(minutes=30))
+    task.published = True
+    run = BenchmarkRun("gcp-x-1", "inspector", "u", "1", t, RunSpec("gcp", "client-sku", "r-old", database=database))
+    run.status.tasks = [task]
+    run.status.database = DbStatus(DbPhase.READY, t, t)  # no timing recorded
+    settings = Settings(vendors={"gcp": VendorSettings(enabled=True, publish=True)})
+    env = EnvConfig(bucket="b", bucket_region="r", git_url=origin.as_uri())
+    pub = publisher.Publisher(None, FakeStorage(), env, tmp_path / "work")
+
+    pub._publish_dbaas_timing([run], settings)
+    assert not (clone(origin, tmp_path, "check") / "dbaas/gcp/db1/postgres/18/standalone/timing").exists()
+
+    pub._timing_rendered["gone"] = {"api_start": "x"}
+    pub._publish_dbaas_timing([run], settings)
+    assert pub._timing_rendered == {}

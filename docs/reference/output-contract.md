@@ -74,10 +74,11 @@ NodeClaim launched, `machine_start` = kernel boot time from `sc-run`, plus `node
 `inspector_start`/`inspector_end` (first task start and last task end).
 
 DBaaS timing files (from `status.database.timing` and the task ends): `api_start` = the create Job is about to start,
-`api_end` = the create Job succeeded, `inspector_start` = the same moment (the bootstrap starts), `inspector_end` = the
-last task ended, `api_destroy_start`/`api_destroy_end` = the destroy Job is about to start / succeeded. The first four
-are published with the results; the destroy files come in a later publish when the destroy succeeds (a run whose destroy
-never finishes has none). `meta.json` `version` of a DBaaS task is the image tag (no version command runs against a
+`api_end` = the create Job succeeded, `inspector_start` = the first task started, `inspector_end` = the last task
+ended, `api_destroy_start`/`api_destroy_end` = the destroy Job is about to start / succeeded (the Jobs' completion
+times). A run without `api_start` and `api_end` has no timing files. The first four are published with the results; the
+destroy files come in a later publish when the destroy succeeds (a run whose destroy never finishes has none, and a run
+being deleted loses its object with the finalizer before `api_destroy_end` can be published). `meta.json` `version` of a DBaaS task is the image tag (no version command runs against a
 managed database).
 
 Variant dirs `<N>` are integers; the publisher picks the variant of a task from the `lscpu` output of its attempt with

@@ -22,7 +22,7 @@ The Jobs have no Kubernetes API access: they report through their Pod's terminat
 import base64
 import logging
 import secrets
-from datetime import timedelta
+from datetime import datetime, timedelta
 
 from k8s_inspector import crd, dbaas_jobs, dbaas_keeper, pods
 from k8s_inspector.kube import NotFound
@@ -206,10 +206,11 @@ class DbaasMixin:
             return self._database_fail(run, "DBAAS_CREATE_FAILED", "the Job reported no connection facts")
         self.kube.apply_secret(dbaas_jobs.connection_secret(run, self._run_owner(run), self._password(run), outputs))
         now = self._now()
+        created = dbaas_jobs.job_completed_at(job, now)
 
         def mutate(status: RunStatus) -> None:
             status.database.phase, status.database.since = DbPhase.BOOTSTRAPPING, now
-            status.database.timing["api_end"] = now
+            status.database.timing["api_end"] = created
 
         run = self._set_database(run, mutate)
         self.kube.delete("job", name)  # a vendor-generated password is in its Pod's termination message
@@ -280,23 +281,23 @@ class DbaasMixin:
         self._destroy(run, cfg, db)
 
     def _destroy(self, run: BenchmarkRun, cfg: Config, db: DbStatus) -> None:
-        if not self._drive_destroy(run, cfg, db)[0]:
+        destroyed_at, run = self._drive_destroy(run, cfg, db)
+        if not destroyed_at:
             return
         self.kube.delete("secret", pods.db_secret_name(run.name))
-        now = self._now()
 
         def mutate(status: RunStatus) -> None:
             status.database.phase = DbPhase.DESTROYED
-            status.database.timing["api_destroy_end"] = now
+            status.database.timing["api_destroy_end"] = destroyed_at
 
         self._set_database(run, mutate)
         crd.remove_finalizer(self.kube, run.name)
         log.info("run %s: the database is destroyed", run.name)
 
-    def _drive_destroy(self, run: BenchmarkRun, cfg: Config, db: DbStatus) -> tuple[bool, BenchmarkRun]:
-        """One pass of the destroy of the run's stack: True when it succeeded and its state is gone, with the run as
-        it is now (a failed destroy updated it). A running up Job is waited for, never deleted: it ends within its
-        deadline and Pulumi records what it created."""
+    def _drive_destroy(self, run: BenchmarkRun, cfg: Config, db: DbStatus) -> tuple[datetime | None, BenchmarkRun]:
+        """One pass of the destroy of the run's stack: when it succeeded and its state is gone, the time the destroy
+        Job completed (else None), with the run as it is now (a failed destroy updated it). A running up Job is
+        waited for, never deleted: it ends within its deadline and Pulumi records what it created."""
         up = dbaas_jobs.up_job_name(run.name)
         try:
             up_job = self.kube.get("job", up)
@@ -305,30 +306,30 @@ class DbaasMixin:
         if up_job is not None:
             if dbaas_jobs.job_state(up_job) == "running":
                 self._enqueue_later(run.name, POLL_SECONDS)
-                return False, run
+                return None, run
             self.kube.delete("job", up)
         if self.kube.list("pod", labels={dbaas_jobs.LABEL_JOB: up}):  # it must be gone before the destroy starts
             self._enqueue_later(run.name, WAIT_FOR_POD_SECONDS)
-            return False, run
+            return None, run
         name = dbaas_jobs.down_job_name(run.name)
         try:
             job = self.kube.get("job", name)
         except NotFound:
             if db.retry_after and self._now() < db.retry_after:
                 self._enqueue_later(run.name, max(1.0, (db.retry_after - self._now()).total_seconds()))
-                return False, run
+                return None, run
             self._create("job", dbaas_jobs.down_job(run.name, run.spec.vendor, cfg))
             self._enqueue_later(run.name, POLL_SECONDS)
-            return False, run
+            return None, run
         state = dbaas_jobs.job_state(job)
         if state == "running":
             self._enqueue_later(run.name, POLL_SECONDS)
-            return False, run
+            return None, run
         if state == "failed":
-            return False, self._destroy_failed(run, name, db)
+            return None, self._destroy_failed(run, name, db)
         dbaas_jobs.clean_state(self.storage, run.name)
         self.kube.delete("job", name)
-        return True, run
+        return dbaas_jobs.job_completed_at(job, self._now()), run
 
     def _destroy_failed(self, run: BenchmarkRun, name: str, db: DbStatus) -> BenchmarkRun:
         """The destroy failed: try again later, as long as it takes (a database that bills must not stay)."""

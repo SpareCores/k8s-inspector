@@ -388,37 +388,56 @@ class Publisher:
         published, so a run is rendered again when its timing grew (a run whose destroy never finishes has no destroy
         files). Idempotent: a restarted controller renders each run once more and commits nothing new."""
         todo = []
+        names = set()
         for run in runs:
             db = run.status.database
             if not (run.spec.database and db and _all_published(run) and _publishable(settings, run)):
                 continue
-            timings = self._dbaas_timings(run)
+            names.add(run.name)
+            try:
+                for part in (*(run.spec.database[k] for k in ("vendor", "id", "engineVersion")), run.spec.run_id):
+                    _safe_part(str(part))
+                timings = self._dbaas_timings(run)
+            except Exception:
+                log.exception("cannot render the timing of %s, skipping", run.name)
+                continue
             if timings and self._timing_rendered.get(run.name) != timings:
                 todo.append((run, timings))
+        self._timing_rendered = {n: t for n, t in self._timing_rendered.items() if n in names}
         if not todo:
             return
+        rendered = []
         for attempt in range(1, MAX_PUSH_ATTEMPTS + 1):
-            self._sync(sorted({f"dbaas/{_safe_part(r.spec.database['vendor'])}/{_safe_part(r.spec.database['id'])}"
-                               for r, _ in todo}))  # fmt: skip
+            self._sync(sorted({f"dbaas/{r.spec.database['vendor']}/{r.spec.database['id']}" for r, _ in todo}))
+            rendered = []
             for run, timings in todo:
-                render.render_dbaas_timing(self._repo, run.spec.database, run.spec.run_id, timings)
-            if self._commit([], f"k8s-inspector: DBaaS timing ({', '.join(r.spec.run_id for r, _ in todo)})") is None:
+                try:
+                    render.render_dbaas_timing(self._repo, run.spec.database, run.spec.run_id, timings)
+                    rendered.append((run, timings))
+                except Exception:
+                    log.exception("cannot render the timing of %s, skipping", run.name)
+            run_ids = ", ".join(r.spec.run_id for r, _ in rendered)
+            if self._commit([], f"k8s-inspector: DBaaS timing ({run_ids})") is None:
                 break
             if self._push():
                 break
             log.warning("push rejected (attempt %d), starting again from a fresh fetch", attempt)
         else:
             raise RuntimeError(f"push rejected {MAX_PUSH_ATTEMPTS} times")
-        for run, timings in todo:
+        for run, timings in rendered:
             self._timing_rendered[run.name] = timings
 
     @staticmethod
     def _dbaas_timings(run: BenchmarkRun) -> dict[str, str]:
-        """The database's timing plus `inspector_start` (the bootstrap starts = the database is created) and
-        `inspector_end` (the last task ended)."""
+        """The database's timing plus `inspector_start` (the first task start) and `inspector_end` (the last task
+        end). A run without `api_start` and `api_end` (an old run, or one from before the CRD kept `timing`) has
+        none."""
         timing = dict(run.status.database.timing)
-        if "api_end" in timing:
-            timing["inspector_start"] = timing["api_end"]
+        if "api_start" not in timing or "api_end" not in timing:
+            return {}
+        starts = [t.start for t in run.status.tasks if t.start]
+        if starts:
+            timing["inspector_start"] = min(starts)
         ends = [t.end for t in run.status.tasks if t.end]
         if ends:
             timing["inspector_end"] = max(ends)
