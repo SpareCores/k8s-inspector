@@ -87,13 +87,20 @@ def plan_args(spec: DbSpec) -> dict:
     return {"plan": spec.database_id}  # a legacy plan includes its storage
 
 
-def _connection(components: list) -> tuple[str, int]:
-    """Host and port of the private endpoint of the service. No private `pg` component is an error: the
-    service's own host is the public one, which the filters keep closed, so a fallback would be unreachable."""
-    for component in components or []:
-        if component["component"] == "pg" and component["route"] == "private":
-            return component["host"], int(component["port"])
-    raise RuntimeError("the UpCloud database has no private pg component: it is not attached to the SDN network")
+def _connection(components: list, networks: list) -> tuple[str, int]:
+    """Host and port of the service's `pg` endpoint that the SDN network reaches.
+
+    UpCloud lists each component per route: `dynamic` (the service hostname, which resolves to the private address
+    on an attached SDN network), `public` (the `public-` hostname) and, where it exists, `private`. A `private` route
+    wins; otherwise `dynamic` is the private endpoint. `public` is never used: the filters keep it closed. A service
+    without an attached network is an error, as its `dynamic` host would be the public address."""
+    if not networks:
+        raise RuntimeError("the UpCloud database is not attached to the SDN network")
+    pg = {c["route"]: c for c in components or [] if c["component"] == "pg"}
+    for route in ("private", "dynamic"):
+        if route in pg:
+            return pg[route]["host"], int(pg[route]["port"])
+    raise RuntimeError(f"the UpCloud database has no private or dynamic pg component: {sorted(pg)}")
 
 
 def provision(spec: DbSpec) -> DbOutputs:
@@ -122,7 +129,7 @@ def provision(spec: DbSpec) -> DbOutputs:
         opts=pulumi.ResourceOptions(provider=provider, custom_timeouts=timeouts),
         **plan_args(spec),
     )
-    connection = db.components.apply(_connection)
+    connection = pulumi.Output.all(db.components, db.networks).apply(lambda v: _connection(*v))
     return DbOutputs(
         host=connection.apply(lambda c: c[0]),
         port=connection.apply(lambda c: c[1]),
