@@ -154,9 +154,23 @@ def test_the_client_addresses_fall_back_to_the_external_ips():
     assert dbaas_jobs.client_addresses({"status": {}}) == [] and dbaas_jobs.client_addresses({}) == []
 
 
-def test_the_client_addresses_prefer_the_annotations_over_the_external_ips():
+def test_the_client_addresses_are_the_union_of_the_annotations_and_the_external_ips():
     node = _node({"scarpenter.sparecores.com/public-ipv4": "198.51.100.9"}, external=("203.0.113.7", "2001:db8::7"))
-    assert dbaas_jobs.client_addresses(node) == ["198.51.100.9/32"]
+    assert dbaas_jobs.client_addresses(node) == ["198.51.100.9/32", "203.0.113.7/32", "2001:db8::7/128"]
+
+
+def test_the_client_addresses_include_the_claim_annotations_of_a_fresh_node_without_duplicates():
+    claim = {"metadata": {"annotations": {"scarpenter.sparecores.com/public-ipv4": "203.0.113.7"}}}
+    node = _node(external=("203.0.113.7",))
+    assert dbaas_jobs.client_addresses(_node(), claim) == ["203.0.113.7/32"]
+    assert dbaas_jobs.client_addresses(node, claim) == ["203.0.113.7/32"]
+
+
+def test_a_malformed_annotation_is_skipped_not_raised():
+    node = _node(
+        {"scarpenter.sparecores.com/public-ipv4": "not-an-ip", "scarpenter.sparecores.com/public-ipv6": " 2001:db8::7 "}
+    )
+    assert dbaas_jobs.client_addresses(node) == ["2001:db8::7/128"]
 
 
 def test_the_client_addresses_of_an_ipv6_only_node():

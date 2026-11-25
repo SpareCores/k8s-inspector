@@ -8,6 +8,7 @@ their termination message. See docs/explanation/dbaas.md and docs/how-to/add-dba
 import hashlib
 import ipaddress
 import json
+import logging
 import urllib.parse
 from collections.abc import Iterable
 from datetime import UTC, datetime, timedelta
@@ -184,19 +185,32 @@ def labels(run_id: str, expires: datetime) -> dict[str, str]:
     return {"sc_inspector_run": run_id.lower(), "sc_inspector_expires": _stamp(expires)}
 
 
+log = logging.getLogger(__name__)
+
 PUBLIC_IP_ANNOTATIONS = ("scarpenter.sparecores.com/public-ipv4", "scarpenter.sparecores.com/public-ipv6")
 
 
-def client_addresses(node: dict) -> list[str]:
-    """The public addresses of the client Node as `/32` and `/128` networks, for the allowlist of a vendor whose
-    database is on a public endpoint. SCarpenter's public-ipv4/public-ipv6 annotations come first (the only source on
-    OVH, whose Nodes have no ExternalIP); the ExternalIP addresses are the fallback when there are none. Empty when
-    the Node has neither."""
-    annotations = node.get("metadata", {}).get("annotations") or {}
-    found = [annotations[key] for key in PUBLIC_IP_ANNOTATIONS if annotations.get(key)]
-    if not found:
-        found = [a["address"] for a in node.get("status", {}).get("addresses") or [] if a.get("type") == "ExternalIP"]
-    return [ipaddress.ip_network(address).with_prefixlen for address in found]
+def client_addresses(node: dict, claim: dict | None = None) -> list[str]:
+    """The public addresses of the client as `/32` and `/128` networks, for the allowlist of a vendor whose database
+    is on a public endpoint: the union of SCarpenter's public-ipv4/public-ipv6 annotations on the NodeClaim (set at
+    create, so there before the Node has them) and on the Node, and the Node's ExternalIP addresses (OVH Nodes have
+    none), without duplicates. A malformed value is skipped with a warning. Empty when there are none."""
+    values = []
+    for obj in (claim or {}, node):
+        annotations = obj.get("metadata", {}).get("annotations") or {}
+        values += [annotations[key] for key in PUBLIC_IP_ANNOTATIONS if annotations.get(key)]
+    values += [a["address"] for a in node.get("status", {}).get("addresses") or [] if a.get("type") == "ExternalIP"]
+    found: list[str] = []
+    for value in values:
+        try:
+            ip = ipaddress.ip_address(str(value).strip())
+        except ValueError:
+            log.warning("ignoring malformed client public address %r", value)
+            continue
+        network = f"{ip}/{ip.max_prefixlen}"
+        if network not in found:
+            found.append(network)
+    return found
 
 
 def build_spec(
