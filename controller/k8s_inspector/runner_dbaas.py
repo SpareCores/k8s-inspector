@@ -185,10 +185,10 @@ class DbaasMixin:
             return self._database_fail(run, "DBAAS_UNKNOWN_DATABASE", f"Keeper does not know {db['vendor']}/{db['id']}")
         self._password(run)
         network = cfg.settings.dbaas.vendors[db["vendor"]].networks[pods.client_region(db)]
-        node = self._get_node(self._nodes[run.name].facts.node_name) or {}
-        spec = dbaas_jobs.build_spec(
-            run, cfg, record, network, run.status.database.expires, dbaas_jobs.client_addresses(node)
-        )
+        nd = self._nodes[run.name]
+        node = self._get_node(nd.facts.node_name) or {}
+        addresses = dbaas_jobs.client_addresses(node, nd.claim)
+        spec = dbaas_jobs.build_spec(run, cfg, record, network, run.status.database.expires, addresses)
         self._create("job", dbaas_jobs.up_job(run, cfg, spec, self._run_owner(run)))
 
     def _database_creating(self, run: BenchmarkRun, cfg: Config, live: dict[str, dict]) -> None:

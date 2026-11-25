@@ -134,8 +134,9 @@ for workload identity. The Job's cloud credentials come from the optional Secret
 The rule: **private network first.** Where the vendor's databases can join a private network that the client node is on,
 the database goes there, and an allowlist the vendor needs (UpCloud, Vultr) is the platform's client CIDRs in the
 `network` mapping. **Only where the vendor's nodes have no private network (OVH today)** the database gets a public
-endpoint with TLS and an IP allowlist of the client node's public addresses. The controller reads them from the client
-Node's `ExternalIP` addresses when it creates the up Job and passes them as `DbSpec.client_addresses` (`/32` for IPv4,
+endpoint with TLS and an IP allowlist of the client node's public addresses. The controller reads them from the client's
+SCarpenter annotations (`scarpenter.sparecores.com/public-ipv4`, `public-ipv6`) on the NodeClaim and the Node, and the Node's
+`ExternalIP` addresses, when it creates the up Job and passes them as `DbSpec.client_addresses` (`/32` for IPv4,
 `/128` for IPv6; an empty list when the Node has none, and a vendor that needs them fails with a clear error).
 
 ### The admin password
