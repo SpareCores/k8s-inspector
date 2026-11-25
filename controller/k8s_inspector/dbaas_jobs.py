@@ -28,6 +28,10 @@ LABEL_JOB = "inspector.sparecores.com/dbaas-job"  # on the Pods of a Job: its na
 LABEL_DBAAS = "inspector.sparecores.com/dbaas"  # on Jobs: up | down
 LABEL_SWEEP = "inspector.sparecores.com/dbaas-sweep"  # on a down Job that belongs to no BenchmarkRun
 ANNOTATION_RUN = "inspector.sparecores.com/dbaas-run"  # on up and down Jobs: the full run name (the Job name is short)
+# on down Jobs: the failed destroys before this Job
+ANNOTATION_DESTROY_FAILURES = "inspector.sparecores.com/dbaas-destroy-failures"
+# a finished Job and its Pod stay this long: a failed one is kept for `kubectl logs`
+FINISHED_JOB_TTL_SECONDS = 24 * 3600
 CREDENTIALS_SECRET = "k8s-inspector-dbaas-{vendor}"  # optional: envFrom of the vendor's cloud credentials
 AWS_TOKEN_DIR = "/var/run/secrets/aws"
 STATE_PROFILE = "k8si-state"  # the AWS config profile of the state bucket: the vendor's providers never see its role
@@ -341,6 +345,7 @@ def _job(
         "metadata": metadata,
         "spec": {
             "backoffLimit": 0,
+            "ttlSecondsAfterFinished": FINISHED_JOB_TTL_SECONDS,
             "activeDeadlineSeconds": deadline_seconds,
             "template": {
                 "metadata": {
@@ -409,12 +414,21 @@ def up_job(run: BenchmarkRun, cfg: Config, spec: dict, owner: OwnerRef) -> dict:
     )
 
 
-def down_job(run_name: str, vendor: str, cfg: Config, *, sweep: bool = False) -> dict:
+def failure_counted(job: dict, db) -> bool:
+    """The failure of a failed down Job is already in `db.destroy_failures`: the Job was created after that many
+    failures, so it counts once a failure is recorded after it. A Job without the annotation is never counted."""
+    created_after = (job["metadata"].get("annotations") or {}).get(ANNOTATION_DESTROY_FAILURES)
+    return created_after is not None and created_after != str(db.destroy_failures)
+
+
+def down_job(run_name: str, vendor: str, cfg: Config, *, sweep: bool = False, failures: int = 0) -> dict:
     """`dbaas-down-<run>`: destroy the stack and remove its state. It is labelled with the run, not owned by it (the run
-    waits for it under foreground deletion), and the one that finishes it deletes it. A `sweep` Job is for a stack whose
-    run is gone: it carries no run label, and the sweeper deletes it when it is over. The run's password is optional
-    here: `down` only uses it to mask error text, and the Secret or its key may be missing (a leftover stack, a lost
-    Secret, a run from before the key); a required reference would stall the Pod and never destroy the database."""
+    waits for it under foreground deletion). A successful one is deleted by the one that finishes it; a failed one
+    stays for its logs until its retry replaces it (or the TTL). `failures` is the number of failed destroys so far. A
+    `sweep` Job is for a stack whose run is gone: it carries no run label, and the sweeper deletes it when it is over.
+    The run's password is optional here: `down` only uses it to mask error text, and the Secret or its key may be
+    missing (a leftover stack, a lost Secret, a run from before the key); a required reference would stall the Pod and
+    never destroy the database."""
     job = _job(
         down_job_name(run_name),
         "down",
@@ -428,6 +442,7 @@ def down_job(run_name: str, vendor: str, cfg: Config, *, sweep: bool = False) ->
         owner=None,
     )
     job["metadata"].setdefault("annotations", {})[ANNOTATION_RUN] = run_name
+    job["metadata"]["annotations"][ANNOTATION_DESTROY_FAILURES] = str(failures)
     if sweep:
         job["metadata"]["labels"][LABEL_SWEEP] = "true"
     return job

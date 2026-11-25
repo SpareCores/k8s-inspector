@@ -8,9 +8,10 @@ from dataclasses import replace
 from datetime import timedelta
 
 import pytest
+from fakes import iso
 from test_runner import START, Harness, in_step
 
-from k8s_inspector import crd, dbaas_jobs, dbaas_keeper, pods, runner_dbaas
+from k8s_inspector import crd, dbaas_jobs, dbaas_keeper, launch, pods, runner_dbaas
 from k8s_inspector import keeper as sc_keeper
 from k8s_inspector.model import (
     CapacityMode,
@@ -216,6 +217,39 @@ def test_a_failed_create_ends_the_task_minus_one_and_destroys_the_database(h):
     assert not h.kube.get("benchmarkrun", h.name)["metadata"].get("finalizers")
 
 
+def test_a_forced_run_without_an_offering_ends_with_its_result_and_makes_the_next_pick_skip_the_client(h):
+    h.cluster.provision_enabled = False
+    h.start_db(force=True)
+    h.runner.reconcile(h.name)
+    condition = {"type": "PodScheduled", "status": "False", "reason": "Unschedulable", "message": "no node matches"}
+    h.kube.merge_patch("pod", f"{h.name}-a1", {"status": {"conditions": [condition]}})
+    h.clock.advance(minutes=11)
+    h.runner.reconcile(h.name)
+    assert h.run.status.phase == RunPhase.FAILED  # the forced run is the operator's: its result is recorded
+    assert h.codes()[TASK][1].startswith("SCARPENTER_NO_OFFERING")
+    assert launch.read(h.kube, "oci")[CLIENT]["reason"] == "NO_OFFERING"
+    assert CLIENT in launch.deferred(h.kube, "oci", [CLIENT], h.clock.now)
+
+
+def test_a_failed_up_job_and_its_pod_stay_for_their_logs_through_the_destroy(h):
+    h.cluster.jobs["up"] = ["fail"]
+    h.start_db()
+    h.until_phase(DbPhase.DESTROYED)
+    up = f"dbaas-up-{h.name}"
+    assert up in h.jobs() and f"{up}-pod" in h.pod_names() and ("job", up) not in h.kube.deleted
+    assert h.kube.get("job", up)["spec"]["ttlSecondsAfterFinished"] == dbaas_jobs.FINISHED_JOB_TTL_SECONDS
+
+
+def test_a_long_job_error_is_kept_in_the_status_and_the_result(h, monkeypatch):
+    cause = "creating (0s) error: " + "y" * 1400 + " the end"
+    monkeypatch.setattr(dbaas_jobs, "job_message", lambda kube, name: {"error": cause})
+    h.cluster.jobs["up"] = ["fail"]
+    h.start_db()
+    h.drive(stop=lambda run: run.status.phase == RunPhase.FAILED)
+    assert h.db.error == f"DBAAS_CREATE_FAILED: {cause}"
+    assert h.codes()[TASK][1].endswith("the end")
+
+
 def test_a_create_that_takes_too_long_ends_the_task_but_the_up_job_is_never_killed(h):
     h.cluster.jobs["up"] = ["hang"]
     h.start_db()
@@ -232,6 +266,60 @@ def test_a_create_that_takes_too_long_ends_the_task_but_the_up_job_is_never_kill
     h.cluster.finish_job(f"dbaas-up-{h.name}", "fail")  # the Job's deadline passed and Pulumi recorded what it did
     h.runner.reconcile(h.name)
     h.until_phase(DbPhase.DESTROYED)
+
+
+def test_a_failed_up_job_whose_pod_still_runs_holds_back_the_destroy(h):
+    h.cluster.jobs["up"] = ["hang"]
+    h.start_db()
+    h.until_phase(DbPhase.CREATING)
+    h.cluster.react()
+    h.runner.reconcile(h.name)
+    h.clock.advance(minutes=66)
+    h.runner.reconcile(h.name)
+    up = f"dbaas-up-{h.name}"
+    h.kube.set_status("job", up, {"conditions": [{"type": "Failed", "status": "True"}]})  # the deadline passed
+    for _ in range(3):
+        h.runner.reconcile(h.name)  # the Pod is Running through its grace period: Pulumi finishes the create
+    assert h.jobs() == [up] and h.db.phase == DbPhase.DESTROYING
+    h.cluster.finish_job(up, "fail")
+    h.runner.reconcile(h.name)
+    assert f"dbaas-down-{h.name}" in h.jobs() and f"{up}-pod" in h.pod_names()  # the Pod stays for its logs
+
+
+def hold_up_pod_of_failed_job(h) -> str:
+    """A failed up Job whose Pod is still there (the creation hung past its deadline)."""
+    h.cluster.jobs["up"] = ["hang"]
+    h.start_db()
+    h.until_phase(DbPhase.CREATING)
+    h.cluster.react()
+    h.runner.reconcile(h.name)
+    h.clock.advance(minutes=66)
+    h.runner.reconcile(h.name)
+    up = f"dbaas-up-{h.name}"
+    h.kube.set_status("job", up, {"conditions": [{"type": "Failed", "status": "True"}]})
+    return f"{up}-pod"
+
+
+def test_a_failed_up_jobs_pod_in_phase_unknown_holds_back_the_destroy(h):
+    pod = hold_up_pod_of_failed_job(h)
+    h.kube.set_status("pod", pod, {"phase": "Unknown"})  # its node is unreachable: Pulumi may still run
+    h.clock.advance(minutes=5)
+    for _ in range(3):
+        h.runner.reconcile(h.name)
+    assert h.jobs() == [f"dbaas-up-{h.name}"] and h.db.phase == DbPhase.DESTROYING
+
+
+def test_a_pod_terminating_far_past_its_grace_period_no_longer_holds_back_the_destroy(h):
+    pod = hold_up_pod_of_failed_job(h)
+    h.kube.patch_obj("pod", pod, {"metadata": {"deletionTimestamp": iso(h.clock.now)}})  # the node is gone
+    h.kube.patch_obj("pod", pod, {"spec": {"terminationGracePeriodSeconds": 900}})
+    h.clock.advance(minutes=24)  # within grace (15 min) plus the margin (10 min)
+    h.runner.reconcile(h.name)
+    assert h.jobs() == [f"dbaas-up-{h.name}"] and "UP_POD_STUCK" not in h.db.error  # not yet
+    h.clock.advance(minutes=2)
+    h.runner.reconcile(h.name)
+    assert f"dbaas-down-{h.name}" in h.jobs()
+    assert h.db.error.startswith("DBAAS_UP_POD_STUCK: ") and pod in h.db.error
 
 
 @pytest.mark.parametrize("how", ["cancel", "delete"])
@@ -344,7 +432,8 @@ def test_a_destroy_of_the_leftover_stack_that_fails_is_retried(h):
     h.until_phase(DbPhase.CLEARING)
     h.cluster.react()
     h.runner.reconcile(h.name)
-    assert h.db.phase == DbPhase.CLEARING and h.db.destroy_failures == 1 and h.jobs() == []
+    assert h.db.phase == DbPhase.CLEARING and h.db.destroy_failures == 1
+    assert h.jobs() == [f"dbaas-down-{h.name}"]  # the failed Job stays for its logs until the retry replaces it
     h.clock.advance(minutes=2)
     h.storage.objects.pop(STATE_KEY)
     h.drive(stop=lambda run: run.status.phase == RunPhase.PUBLISHING)
@@ -368,7 +457,7 @@ def test_a_leftover_stack_that_cannot_be_destroyed_ends_the_run_with_a_result_an
     code, message = h.codes()[TASK]
     assert code == ExitCode.NO_NODE and message.startswith("DBAAS_LEFTOVER_STACK: k8s-dbaas-")
     assert "operator action needed" in message and failures == ["oci"]
-    assert STATE_KEY in h.storage.objects and h.pod_names() == []  # the sweeper and the operator take it from here
+    assert STATE_KEY in h.storage.objects and h.run_pods() == []  # the sweeper and the operator take it from here
 
 
 @pytest.mark.parametrize("how", ["cancel", "delete"])
@@ -442,11 +531,14 @@ def test_the_destroy_is_retried_with_a_growing_wait_until_it_succeeds(h):
     h.cluster.react()
     h.runner.reconcile(h.name)  # the first destroy failed
     assert h.db.destroy_failures == 1 and h.db.phase == DbPhase.DESTROYING and "quota exceeded" in h.db.error
-    assert h.jobs() == [] and h.db.retry_after == START + timedelta(minutes=1)
+    failed = f"dbaas-down-{h.name}"
+    assert h.jobs() == [failed] and h.db.retry_after == START + timedelta(minutes=1)
     h.runner.reconcile(h.name)
-    assert h.jobs() == []  # not before the wait is over
+    assert h.jobs() == [failed] and ("job", failed) not in h.kube.deleted  # kept, not counted twice
+    assert h.db.destroy_failures == 1
     h.clock.advance(minutes=1, seconds=1)
     h.runner.reconcile(h.name)
+    assert ("job", failed) in h.kube.deleted  # the retry replaces it
     h.cluster.react()
     h.runner.reconcile(h.name)
     assert h.db.destroy_failures == 2 and h.db.retry_after == h.clock.now + timedelta(minutes=2)
@@ -455,6 +547,23 @@ def test_the_destroy_is_retried_with_a_growing_wait_until_it_succeeds(h):
     h.cluster.react()
     h.runner.reconcile(h.name)
     assert h.db.phase == DbPhase.DESTROYED
+
+
+def test_a_failed_destroy_job_from_before_the_failure_annotation_is_counted_once_and_retried(h):
+    h.cluster.jobs["down"] = ["fail"]
+    h.start_db()
+    h.drive(stop=lambda run: run.status.phase == RunPhase.PUBLISHING)
+    h.runner.reconcile(h.name)
+    h.cluster.react()
+    down = f"dbaas-down-{h.name}"
+    del h.kube.objects["job"][down]["metadata"]["annotations"][dbaas_jobs.ANNOTATION_DESTROY_FAILURES]
+    h.runner.reconcile(h.name)
+    assert h.db.destroy_failures == 1 and ("job", down) in h.kube.deleted  # counted once, the Job is replaced
+    h.clock.advance(minutes=1, seconds=1)
+    h.runner.reconcile(h.name)
+    h.cluster.react()
+    h.runner.reconcile(h.name)
+    assert h.db.phase == DbPhase.DESTROYED and h.db.destroy_failures == 1
 
 
 def test_a_restarted_controller_continues_creating_and_runs_the_destroy(h):

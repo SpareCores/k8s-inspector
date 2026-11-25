@@ -856,12 +856,17 @@ class Runner(DbaasMixin):
         if reason in launch.PERMANENT and reason != "BOOT_FAILURE":
             launch.clear(self.kube, vendor, [sku])
             return False
-        if reason not in launch.REASONS or run.spec.force:  # a forced run is the operator's: it records its result
+        if reason not in launch.REASONS:
             return False
+        if run.spec.force and (run.spec.database is None or reason != "NO_OFFERING"):
+            return False  # a forced run is the operator's: it records its result (a DBaaS one also defers NO_OFFERING)
         until = (
             planner.offered_until(self.kube, self._cfg(), vendor, sku, self._now()) if reason == "DAILY_LIMIT" else None
         )
         count = launch.record_failure(self.kube, vendor, sku, reason, self._now(), until)
+        # a forced DBaaS run still ends with its result; the entry makes the next pick skip the client
+        if run.spec.force:
+            return False
         if reason == "BOOT_FAILURE" and count >= launch.BOOT_FAILURE_LIMIT:
             return False  # the entry stays: it counts for the vendor's breaker until a node comes up
         if any(t.state == TaskState.DONE for t in run.status.tasks):

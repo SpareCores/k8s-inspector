@@ -23,13 +23,32 @@ from k8s_inspector_dbaas import stack, vendors
 from k8s_inspector_dbaas.spec import load_spec
 
 TERMINATION_LOG_ENV = "TERMINATION_LOG"
-MAX_MESSAGE = 3000  # the kubelet keeps 4 KiB
+MAX_MESSAGE = 3500  # the kubelet keeps 4 KiB
+TAIL_CHARS = 1000  # the end of the output: the exception line of a traceback is the last one
+ERROR_LINE_CHARS = 300
 INVENTORY_LISTED = 10  # databases named in the inventory message besides their number: the oldest
 
 
 def _report(message: str) -> None:
     with open(os.environ.get(TERMINATION_LOG_ENV, "/dev/termination-log"), "w") as f:
         f.write(message[:MAX_MESSAGE])
+
+
+def error_message(text: str) -> str:
+    """The JSON error message for the termination log: the lines before the tail that mention an error (Pulumi prints
+    the cause in a line like `... creating (0s) error: ...`, far from the end) and the tail of the output. It always
+    fits `MAX_MESSAGE` as valid JSON (escaping makes the text longer, so the text shrinks until the JSON fits)."""
+    budget = MAX_MESSAGE
+    while True:  # ends: a budget of a few characters always fits
+        tail = text[-TAIL_CHARS:]
+        lines = text[: len(text) - len(tail)].splitlines()
+        errors = list(dict.fromkeys(line.strip()[:ERROR_LINE_CHARS] for line in lines if "error" in line.lower()))
+        head = "\n".join(errors)[: max(budget - TAIL_CHARS, 0)]
+        condensed = f"{head}\n[...]\n{tail}" if head else tail
+        message = json.dumps({"error": condensed[-budget:]})
+        if len(message) <= MAX_MESSAGE:
+            return message
+        budget = budget * 3 // 4
 
 
 def use_state_credentials() -> None:
@@ -67,7 +86,7 @@ def run(command: str) -> int:
     except Exception as e:
         message = str(e).replace(password, "***") if password else str(e)
         print(f"{command} failed: {message}", file=sys.stderr)
-        _report(json.dumps({"error": message[-2000:]}))
+        _report(error_message(message))
         return 1
     return 0
 
