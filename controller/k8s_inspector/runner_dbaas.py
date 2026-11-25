@@ -45,7 +45,8 @@ TIMEOUT_MARGIN = timedelta(minutes=5)  # the controller judges the create deadli
 POLL_SECONDS = 60  # while waiting for a Job: the Job and Pod watches wake the run, this bounds the wait for a deadline
 WAIT_FOR_POD_SECONDS = 10  # the up Job's Pod is still going away; the down Job must not start before it is gone
 RETRY_MIN_SECONDS, RETRY_MAX_SECONDS = 60, 1800  # between destroy attempts: doubles from a minute to half an hour
-PULUMI_PHASES = ("Pending", "Running")  # Pod phases in which the Pulumi process may still run
+ENDED_PHASES = ("Succeeded", "Failed")  # any other Pod phase (even Unknown) may still run the Pulumi process
+STUCK_POD_MARGIN = timedelta(minutes=10)  # a deleted Pod this long past its grace period is on a lost node
 CLEAR_ATTEMPTS = 3  # failed destroys of a leftover stack after which the run ends -1 and leaves it to the sweeper
 RUNNING_PHASES = (RunPhase.PENDING, RunPhase.PROVISIONING, RunPhase.RUNNING)
 
@@ -60,6 +61,10 @@ def database_over(run: BenchmarkRun) -> bool:
     """The benchmark is over and the database may go: the run is releasing or finished in any way, cancelled or
     deleted. Between attempts of a running run (`Pending`) the database stays."""
     return run.cancel_requested or run.deleting or run.status.phase not in RUNNING_PHASES
+
+
+def pod_ended(pod: dict) -> bool:
+    return (pod.get("status") or {}).get("phase") in ENDED_PHASES
 
 
 class DbaasMixin:
@@ -313,14 +318,19 @@ class DbaasMixin:
             self.kube.delete("job", up)
         pods_left = self.kube.list("pod", labels={dbaas_jobs.LABEL_JOB: up})
         if keep_up:  # the kept Pod stays: only one that may still run Pulumi (even in its grace period) is waited for
-            pods_left = [
-                pod
-                for pod in pods_left
-                if pod["metadata"].get("deletionTimestamp") or (pod.get("status") or {}).get("phase") in PULUMI_PHASES
-            ]
+            pods_left = [pod for pod in pods_left if not pod_ended(pod)]
+        stuck = [pod for pod in pods_left if self._pod_stuck(pod)]
+        pods_left = [pod for pod in pods_left if pod not in stuck]
         if pods_left:  # the destroy starts when the up Pulumi process cannot run any more
             self._enqueue_later(run.name, WAIT_FOR_POD_SECONDS)
             return None, run
+        if stuck:  # a Pod past its grace on a lost node runs no Pulumi any more: the database must not bill on
+            pod_name = stuck[0]["metadata"]["name"]
+            text = (
+                f"DBAAS_UP_POD_STUCK: Pod {pod_name} is terminating long past its grace period, proceeding with destroy"
+            )
+            log.error("run %s: %s", run.name, text)
+            run = self._set_database(run, lambda status: setattr(status.database, "error", text))
         name = dbaas_jobs.down_job_name(run.name)
         try:
             job = self.kube.get("job", name)
@@ -348,6 +358,14 @@ class DbaasMixin:
         dbaas_jobs.clean_state(self.storage, run.name)
         self.kube.delete("job", name)
         return dbaas_jobs.job_completed_at(job, self._now()), run
+
+    def _pod_stuck(self, pod: dict) -> bool:
+        """Deleted, and now is past its `deletionTimestamp` plus its grace period plus `STUCK_POD_MARGIN`."""
+        deleted = pod["metadata"].get("deletionTimestamp")
+        if not deleted:
+            return False
+        grace = pod.get("spec", {}).get("terminationGracePeriodSeconds", pods.DEFAULT_GRACE_SECONDS)
+        return self._now() > datetime.fromisoformat(deleted) + timedelta(seconds=grace) + STUCK_POD_MARGIN
 
     def _destroy_failed(self, run: BenchmarkRun, job: dict, db: DbStatus) -> BenchmarkRun:
         """The destroy failed: try again later, as long as it takes (a database that bills must not stay). A Job

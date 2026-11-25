@@ -8,6 +8,7 @@ from dataclasses import replace
 from datetime import timedelta
 
 import pytest
+from fakes import iso
 from test_runner import START, Harness, in_step
 
 from k8s_inspector import crd, dbaas_jobs, dbaas_keeper, launch, pods, runner_dbaas
@@ -283,6 +284,42 @@ def test_a_failed_up_job_whose_pod_still_runs_holds_back_the_destroy(h):
     h.cluster.finish_job(up, "fail")
     h.runner.reconcile(h.name)
     assert f"dbaas-down-{h.name}" in h.jobs() and f"{up}-pod" in h.pod_names()  # the Pod stays for its logs
+
+
+def hold_up_pod_of_failed_job(h) -> str:
+    """A failed up Job whose Pod is still there (the creation hung past its deadline)."""
+    h.cluster.jobs["up"] = ["hang"]
+    h.start_db()
+    h.until_phase(DbPhase.CREATING)
+    h.cluster.react()
+    h.runner.reconcile(h.name)
+    h.clock.advance(minutes=66)
+    h.runner.reconcile(h.name)
+    up = f"dbaas-up-{h.name}"
+    h.kube.set_status("job", up, {"conditions": [{"type": "Failed", "status": "True"}]})
+    return f"{up}-pod"
+
+
+def test_a_failed_up_jobs_pod_in_phase_unknown_holds_back_the_destroy(h):
+    pod = hold_up_pod_of_failed_job(h)
+    h.kube.set_status("pod", pod, {"phase": "Unknown"})  # its node is unreachable: Pulumi may still run
+    h.clock.advance(minutes=5)
+    for _ in range(3):
+        h.runner.reconcile(h.name)
+    assert h.jobs() == [f"dbaas-up-{h.name}"] and h.db.phase == DbPhase.DESTROYING
+
+
+def test_a_pod_terminating_far_past_its_grace_period_no_longer_holds_back_the_destroy(h):
+    pod = hold_up_pod_of_failed_job(h)
+    h.kube.patch_obj("pod", pod, {"metadata": {"deletionTimestamp": iso(h.clock.now)}})  # the node is gone
+    h.kube.patch_obj("pod", pod, {"spec": {"terminationGracePeriodSeconds": 900}})
+    h.clock.advance(minutes=24)  # within grace (15 min) plus the margin (10 min)
+    h.runner.reconcile(h.name)
+    assert h.jobs() == [f"dbaas-up-{h.name}"] and "UP_POD_STUCK" not in h.db.error  # not yet
+    h.clock.advance(minutes=2)
+    h.runner.reconcile(h.name)
+    assert f"dbaas-down-{h.name}" in h.jobs()
+    assert h.db.error.startswith("DBAAS_UP_POD_STUCK: ") and pod in h.db.error
 
 
 @pytest.mark.parametrize("how", ["cancel", "delete"])
