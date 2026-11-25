@@ -348,6 +348,31 @@ def test_a_job_that_cannot_work_in_the_region_ends_with_its_own_reason_and_the_c
     assert h.run.status.region == "eu-test-1"  # published with the meta: the next plan tries another region first
 
 
+def test_a_vendor_wide_region_failure_blocks_the_region_for_the_vendor(h):
+    h.cluster.jobs["up"] = ["fail"]
+    h.cluster.up_error = "DBAAS_REGION_UNAVAILABLE: [vendor-wide] azure pre-flight: restricted in eu-test-1"
+    h.start_db()
+    h.drive(stop=lambda run: run.status.phase == RunPhase.FAILED)
+    assert h.codes()[TASK][1].startswith("DBAAS_REGION_UNAVAILABLE: [vendor-wide] azure pre-flight")  # as before
+    assert launch.blocked_regions(h.kube, "oci", h.clock.now) == {"eu-test-1"}  # the database's region
+
+
+def test_a_database_created_in_a_blocked_region_lifts_the_block(h):
+    launch.block_region(h.kube, "oci", "eu-test-1", h.clock.now, "restricted")
+    launch.block_region(h.kube, "oci", "other-region", h.clock.now, "restricted")
+    h.start_db()
+    h.until_phase(DbPhase.BOOTSTRAPPING)  # the up Job succeeded: a forced re-test of the region worked
+    assert launch.blocked_regions(h.kube, "oci", h.clock.now) == {"other-region"}
+
+
+def test_a_region_failure_of_one_database_blocks_nothing_for_the_vendor(h):
+    h.cluster.jobs["up"] = ["fail"]
+    h.cluster.up_error = "DBAAS_REGION_UNAVAILABLE: azure pre-flight: the SKU is not offered"
+    h.start_db()
+    h.drive(stop=lambda run: run.status.phase == RunPhase.FAILED)
+    assert launch.blocked_regions(h.kube, "oci", h.clock.now) == set()
+
+
 def test_a_region_unavailable_marker_without_a_cause_still_ends_the_run(h):
     h.cluster.jobs["up"] = ["fail"]
     h.cluster.up_error = "DBAAS_REGION_UNAVAILABLE:"

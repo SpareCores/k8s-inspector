@@ -25,7 +25,7 @@ import urllib.request
 from collections.abc import Iterator
 from pathlib import Path
 
-from k8s_inspector_dbaas.errors import RegionUnavailable
+from k8s_inspector_dbaas.errors import RegionUnavailable, VendorRegionUnavailable
 
 ARM = "https://management.azure.com"
 API_VERSION = "2025-08-01"  # Microsoft.DBforPostgreSQL; the version of the pulumi-azure-native Server resource
@@ -43,6 +43,10 @@ class PreflightError(RuntimeError):
 class RegionPreflightError(PreflightError, RegionUnavailable):
     """... and never will: the offer is restricted, the SKU or storage is not there, or the quota limit is too low. A
     shortfall of the quota that running servers use up is a plain `PreflightError`: it may be gone later."""
+
+
+class OfferRestrictedError(RegionPreflightError, VendorRegionUnavailable):
+    """The subscription is restricted for the offer in the region: no database of it can be created there."""
 
 
 def subscription_id() -> str:
@@ -153,7 +157,7 @@ def _check(region: str, sku: str, vcpus: int, storage_edition: str) -> list[str]
     }
     family = _sku_family(arm_token, region, sku)
     if offer_restricted(capabilities):
-        raise RegionPreflightError(
+        raise OfferRestrictedError(
             f"azure pre-flight: PostgreSQL Flexible Server is restricted for this subscription in {region}"
         )
     found = sku_capability(capabilities, sku)

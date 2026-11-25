@@ -7,7 +7,7 @@ from datetime import UTC, datetime, timedelta
 import pytest
 from fakes import Clock, FakeKube
 
-from k8s_inspector import crd, dbaas_client, dbaas_keeper, dbaas_plan, planner
+from k8s_inspector import crd, dbaas_client, dbaas_keeper, dbaas_plan, launch, planner
 from k8s_inspector.model import (
     CapacityMode,
     Config,
@@ -257,6 +257,31 @@ def test_a_region_unavailable_result_sends_the_next_plan_to_another_region(kube,
     assert dbaas_plan._failed_regions(meta) == {"eu-2"}
     world.metas = {"db-a": {"18": {TASK: meta}}}
     assert plan(kube, make_config(), world, dry_run=True)[0].region == "eu-1"
+
+
+def block(kube, *regions):
+    for region in regions:
+        launch.block_region(kube, "oci", region, datetime.now(UTC), "restricted")
+
+
+def test_a_region_blocked_for_the_vendor_is_not_used_for_any_database(kube, world):
+    block(kube, "eu-2")  # the cheapest
+    planned = plan(kube, make_config(), world, dry_run=True)
+    assert [p.region for p in planned] == ["eu-1"]
+
+
+def test_a_database_with_only_blocked_regions_is_skipped_and_logged(kube, world, caplog):
+    caplog.set_level(logging.INFO)
+    block(kube, "eu-1", "eu-2")
+    assert plan(kube, make_config(), world, dry_run=True) == []
+    assert "3 databases, 3 regions blocked for the vendor" in caplog.text
+
+
+def test_a_forced_run_ignores_the_block_with_a_region_but_not_without(kube, world):
+    block(kube, "eu-2")
+    cfg = make_config(auto=False, dbaas_max_in_flight=5)
+    assert force(kube, world, cfg, region="eu-2").spec.database["region"] == "eu-2"  # an operator re-testing it
+    assert force(kube, world, cfg, database="db-b").spec.database["region"] == "eu-1"
 
 
 def test_the_regions_of_all_the_failures_in_a_row_go_last(kube, world):

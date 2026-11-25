@@ -144,6 +144,20 @@ def test_a_client_zone_the_sku_does_not_offer_is_not_requested(mocks, checked):
     return registered(mocks, make_spec(zone="westeurope-3")).apply(check)
 
 
+def test_only_a_restricted_offer_is_vendor_wide(arm):
+    for change, wide in (
+        ({"capabilities": capabilities(features=("OfferRestricted",))}, True),
+        ({"capabilities": []}, False),  # the SKU is not offered: other databases may be
+        ({"capabilities": capabilities(status="Disabled")}, False),
+        ({"usages": usages(cores=(0, 2))}, False),  # a quota limit below the need
+    ):
+        arm.update(change)
+        with pytest.raises(RegionUnavailable) as caught:
+            azure_preflight.check("westeurope", "Standard_D4ds_v5", 4, "ManagedDiskV2")
+        assert str(caught.value).startswith("DBAAS_REGION_UNAVAILABLE: ")  # the per-database handling keeps working
+        assert ("[vendor-wide]" in str(caught.value)) is wide
+
+
 def test_a_pre_flight_refusal_is_marked_as_region_unavailable_for_the_controller():
     error = RegionPreflightError("azure pre-flight: restricted in eastus")
     assert isinstance(error, RegionUnavailable)

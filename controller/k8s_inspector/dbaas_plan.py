@@ -178,6 +178,10 @@ def _create_run(
     return run
 
 
+class RegionsBlocked(ValueError):
+    """Every database region that would do is blocked for the vendor (`launch.block_region`)."""
+
+
 def _resolve(
     cfg: Config,
     vendor: str,
@@ -186,11 +190,14 @@ def _resolve(
     region: str | None,
     client: str | None,
     failed_regions: Collection[str],
+    blocked_regions: Collection[str] = (),
     client_region: str | None = None,
 ) -> Placement:
     """The given database region, client region and client, else the cheapest database region that has a client region
     (its own or one of its city, with a network) and a client type in Keeper's data there, with the hourly price of
-    database and client (the dearest type that may be launched) from Keeper. Raise `ValueError` when there is none."""
+    database and client (the dearest type that may be launched) from Keeper, without the vendor's `blocked_regions`
+    (a given `region` is never refused for that). Raise `ValueError` when there is none, `RegionsBlocked` when only
+    blocked regions are left."""
     vendor_config = cfg.settings.dbaas.vendors[vendor]
     networks = vendor_config.networks
     database_id = record["api_reference"]
@@ -213,6 +220,10 @@ def _resolve(
         regions = [region]
     else:
         reachable = {r: price for r, price in prices.items() if clients_of(r)}
+        left = {r: price for r, price in reachable.items() if r not in blocked_regions}
+        if reachable and not left:
+            raise RegionsBlocked(f"{vendor}/{database_id}: its regions are blocked for the vendor")
+        reachable = left
         # a run records the region of its node, which is the client's
         failed = {r for r in reachable if failed_regions and set(failed_regions) & {r, *clients_of(r)}}
         regions = region_order(reachable, reachable, failed)
@@ -292,6 +303,7 @@ def force_run(
             region=region,
             client=client,
             failed_regions=(),
+            blocked_regions=() if region else launch.blocked_regions(kube, vendor, datetime.now(UTC)),
             client_region=client_region,
         )
     except RuntimeError as e:
@@ -345,6 +357,7 @@ def plan_cycle(
             log.exception("DBaaS autoPlan skips vendor %s: cannot read Keeper or the sc-inspector-data state", vendor)
             continue
         runs = crd.list_runs(kube)
+        blocked_regions = launch.blocked_regions(kube, vendor, datetime.now(UTC))
         skipped: Counter[str] = Counter()  # why the databases got no run, for the line logged when none did
         block_codes: Counter[str] = Counter()
         for database_id in sorted(blocked.get(vendor, {}), key=lambda d: planner.start_order(vendor, d)):
@@ -390,8 +403,19 @@ def plan_cycle(
                 skipped["nothing due"] += 1
                 continue
             try:
-                placement = _resolve(cfg, vendor, record, region=None, client=None, failed_regions=failed_regions)
+                placement = _resolve(
+                    cfg,
+                    vendor,
+                    record,
+                    region=None,
+                    client=None,
+                    failed_regions=failed_regions,
+                    blocked_regions=blocked_regions,
+                )
                 check_spend(cfg, vendor, crd.list_runs(kube), placement.usd_per_hour)
+            except RegionsBlocked:
+                skipped["regions blocked for the vendor"] += 1
+                continue
             except (ValueError, RuntimeError) as e:
                 log.info("DBaaS autoPlan skips %s/%s: %s", vendor, database_id, e)
                 skipped["no region, client or budget"] += 1

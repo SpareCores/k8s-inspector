@@ -89,7 +89,8 @@ like `ICE` (1 h, doubling, up to 6 h), never permanent, and not counted by the v
 
 Nothing is written to sc-inspector-data. The BenchmarkRun is deleted at once (no 24 h lease; a run that already has
 finished tasks is kept, they must be published). The SKU goes into the per-vendor ConfigMap
-`k8s-inspector-launch-<vendor>`, key `skus`, JSON `{sku: {reason, since, count, next}}`. The planner skips a SKU
+`k8s-inspector-launch-<vendor>`, key `skus`, JSON `{sku: {reason, since, count, next}}` (the key `regions` holds the
+DBaaS regions blocked for the vendor, see [DBaaS](dbaas.md)). The planner skips a SKU
 until `next`. The count is of failures in a row with the same reason (another reason starts again at 1). The wait is
 1 h, doubling with each failure up to a cap:
 
