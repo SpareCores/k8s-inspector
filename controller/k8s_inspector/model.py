@@ -46,6 +46,7 @@ class RunPhase(StrEnum):
 
 # In the error of an up Job that cannot create the database in its region, whatever else happens (the provisioner's
 # `RegionUnavailable`): the run ends with this reason and the next plan tries other regions first.
+VENDOR_WIDE = "[vendor-wide]"  # after it: no database of the vendor can be created in the region
 REGION_UNAVAILABLE = "DBAAS_REGION_UNAVAILABLE:"
 
 

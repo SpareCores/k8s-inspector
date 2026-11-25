@@ -299,6 +299,14 @@ regions. Like every failure, this is published only while no older good result o
 replaces a good result): then there is no cap and no rotation, only the usual retry wait. A vendor module raises
 `RegionUnavailable` for what is region-fatal.
 
+A restricted offer is the same for every database of the vendor in that region, unlike a missing SKU or a quota limit.
+Its message carries `[vendor-wide]` after the marker (`DBAAS_REGION_UNAVAILABLE: [vendor-wide] ...`, the per-database
+handling above applies unchanged). The controller then also records the database region as blocked for the vendor for
+24 hours, in the vendor's launch ConfigMap under the key `regions` (`{region: {until, reason}}`). Until it expires no
+plan uses the region for any database of the vendor, so dozens of databases do not each burn a client node on it; a
+database whose regions are all blocked is skipped (the "nothing to plan" log says "regions blocked for the vendor").
+`run --database <id> --region <region>` ignores the block, so an operator can test the region again.
+
 A check that cannot be made
 (ARM unreachable, an unexpected answer) is logged and does not stop the create; the client node's zone is then requested
 as is.

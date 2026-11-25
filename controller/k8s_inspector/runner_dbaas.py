@@ -24,10 +24,11 @@ import logging
 import secrets
 from datetime import datetime, timedelta
 
-from k8s_inspector import crd, dbaas_jobs, dbaas_keeper, pods
+from k8s_inspector import crd, dbaas_jobs, dbaas_keeper, launch, pods
 from k8s_inspector.kube import NotFound
 from k8s_inspector.model import (
     REGION_UNAVAILABLE,
+    VENDOR_WIDE,
     AttemptOutcome,
     BenchmarkRun,
     Config,
@@ -226,6 +227,12 @@ class DbaasMixin:
             if REGION_UNAVAILABLE in message:  # not in this region, whatever happens: the next plan moves on
                 rest = message.split(REGION_UNAVAILABLE, 1)[1]
                 cause = next(iter(rest.strip().splitlines()), "no cause given")
+                if cause.startswith(VENDOR_WIDE):  # e.g. an offer restricted for the account: no database fits there
+                    region = run.spec.database["region"]
+                    log.warning(
+                        "run %s: %s is blocked for vendor %s for a while: %s", run.name, region, run.spec.vendor, cause
+                    )
+                    launch.block_region(self.kube, run.spec.vendor, region, self._now(), cause)
                 return self._database_fail(run, REGION_UNAVAILABLE.removesuffix(":"), cause)
             return self._database_fail(run, "DBAAS_CREATE_FAILED", message)
         if state == "running":

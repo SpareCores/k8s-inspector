@@ -9,7 +9,8 @@ launch condition; `reason_of_class` maps the class to a reason (no keyword guess
   meta, final until the task hash changes and re-checked after 30 days (`planner.due_reason`).
 
 The ConfigMap holds `{sku: {reason, since, last, count, next}}` as JSON under the key `skus`. Losing it only means an
-earlier retry. Entries go when the SKU gets a node or is no longer in Keeper's ACTIVE list.
+earlier retry. Entries go when the SKU gets a node or is no longer in Keeper's ACTIVE list. The key `regions` holds
+`{region: {until, reason}}`: the DBaaS regions a vendor is blocked in for every database (`block_region`).
 
 A vendor with `BREAKER_LIMIT` BOOT_FAILURE entries whose `last` is within `BREAKER_WINDOW` is paused for autoPlan
 (`paused`): its nodes do not come up, whatever the SKU. A node of the vendor becoming ready drops every `last`
@@ -65,6 +66,7 @@ FLAT_WAIT = {
     "BOOT_FAILURE": timedelta(hours=24),
 }
 RETRY_AFTER_PERMANENT = timedelta(days=30)
+REGION_BLOCK_TTL = timedelta(hours=24)  # a region the vendor's offer is restricted in is not tried for this long
 PATCH_RETRIES = 3
 
 # The class may be wrapped (`launching X: Retryable (RequestLimitExceeded): ...`): search for the token.
@@ -123,17 +125,18 @@ def configmap_name(vendor: str) -> str:
     return f"k8s-inspector-launch-{vendor}"
 
 
-def _entries(configmap: dict) -> dict:
-    """The entries of a ConfigMap's JSON `skus`: only the object ones, none when it is not a JSON object."""
-    found = json.loads(configmap["data"]["skus"])
+def _entries(configmap: dict, key: str = "skus") -> dict:
+    """The entries of a ConfigMap's JSON `key` (`skus`, or `regions`): only the object ones, none when it is not a JSON
+    object."""
+    found = json.loads(configmap["data"][key])
     return {sku: entry for sku, entry in found.items() if isinstance(entry, dict)} if isinstance(found, dict) else {}
 
 
-def read(kube: Kube, vendor: str) -> dict[str, dict]:
+def read(kube: Kube, vendor: str, key: str = "skus") -> dict[str, dict]:
     """The vendor's entries. A missing, damaged or unreadable ConfigMap has none, a damaged entry is dropped: the
     SKUs are launched as if they had not failed."""
     try:
-        return _entries(kube.get("configmap", configmap_name(vendor)))
+        return _entries(kube.get("configmap", configmap_name(vendor)), key)
     except NotFound, KeyError, TypeError, ValueError:
         return {}
     except Exception:
@@ -141,8 +144,8 @@ def read(kube: Kube, vendor: str) -> dict[str, dict]:
         return {}
 
 
-def _change(kube: Kube, vendor: str, mutate) -> None:
-    """Apply `mutate(entries)` to the vendor's entries (create the ConfigMap when missing). Best
+def _change(kube: Kube, vendor: str, mutate, key: str = "skus") -> None:
+    """Apply `mutate(entries)` to the vendor's entries under `key` (create the ConfigMap when missing). Best
     effort: never raises."""
     name = configmap_name(vendor)
     try:
@@ -155,10 +158,10 @@ def _change(kube: Kube, vendor: str, mutate) -> None:
                 if not entries:
                     return
                 body = {"apiVersion": "v1", "kind": "ConfigMap", "metadata": {"name": name}}
-                kube.create("configmap", {**body, "data": {"skus": json.dumps(entries)}})
+                kube.create("configmap", {**body, "data": {key: json.dumps(entries)}})
                 return
             try:
-                entries = _entries(configmap)
+                entries = _entries(configmap, key)
             except KeyError, TypeError, ValueError:
                 entries = {}
             before = json.dumps(entries)
@@ -167,7 +170,7 @@ def _change(kube: Kube, vendor: str, mutate) -> None:
                 return
             patch = {
                 "metadata": {"resourceVersion": configmap["metadata"]["resourceVersion"]},
-                "data": {"skus": json.dumps(entries)},
+                "data": {key: json.dumps(entries)},
             }
             try:
                 kube.merge_patch("configmap", name, patch)
@@ -202,6 +205,24 @@ def record_failure(kube: Kube, vendor: str, sku: str, reason: str, now: datetime
 
     _change(kube, vendor, mutate)
     return count
+
+
+def block_region(kube: Kube, vendor: str, region: str, now: datetime, reason: str) -> None:
+    """The vendor cannot create a database in `region` for any database (an offer restricted for the account): no plan
+    uses the region for `REGION_BLOCK_TTL`. Kept in the same ConfigMap as the SKU entries, under its own key (the
+    pruning of SKU entries does not touch it). Expired entries go with the write."""
+
+    def mutate(entries: dict[str, dict]) -> None:
+        for name in [r for r, e in entries.items() if not is_waiting({"next": e.get("until")}, now)]:
+            del entries[name]
+        entries[region] = {"until": (now + REGION_BLOCK_TTL).isoformat(), "reason": reason[:200]}
+
+    _change(kube, vendor, mutate, "regions")
+
+
+def blocked_regions(kube: Kube, vendor: str, now: datetime) -> set[str]:
+    """The regions the vendor is blocked in for every database (`block_region`) and not yet expired."""
+    return {r for r, e in read(kube, vendor, "regions").items() if is_waiting({"next": e.get("until")}, now)}
 
 
 def clear(kube: Kube, vendor: str, skus: list[str]) -> None:

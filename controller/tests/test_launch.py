@@ -95,6 +95,20 @@ def test_failures_are_counted_per_sku_and_set_next():
     assert launch.read(kube, "aws") == {}  # per vendor
 
 
+def test_blocked_regions_last_a_day_beside_the_sku_entries():
+    kube = FakeKube(Clock(NOW))
+    launch.record_failure(kube, "azure", "sku", "ICE", NOW)
+    launch.block_region(kube, "azure", "eastus", NOW, "restricted")
+    assert launch.blocked_regions(kube, "azure", NOW + timedelta(hours=23)) == {"eastus"}
+    assert launch.blocked_regions(kube, "azure", NOW + timedelta(hours=25)) == set()
+    assert launch.blocked_regions(kube, "aws", NOW) == set()  # per vendor
+    assert launch.deferred(kube, "azure", [], NOW + timedelta(minutes=1)) == {"sku"}  # SKU pruning leaves it alone
+    launch.deferred(kube, "azure", ["other"], NOW + timedelta(minutes=1))
+    assert launch.blocked_regions(kube, "azure", NOW) == {"eastus"}
+    launch.block_region(kube, "azure", "westus", NOW + timedelta(days=2), "restricted")  # drops the expired entry
+    assert set(launch.read(kube, "azure", "regions")) == {"westus"}
+
+
 def test_deferred_lists_waiting_skus_and_prunes_the_ones_not_active():
     kube = FakeKube(Clock(NOW))
     for sku in ("a", "b", "gone"):
