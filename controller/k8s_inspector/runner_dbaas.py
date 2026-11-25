@@ -42,7 +42,9 @@ log = logging.getLogger(__name__)
 
 ERROR_CHARS = 2000  # of a Job's error in `status.database.error`: the provisioner condenses it to fit (`__main__`)
 TIMEOUT_MARGIN = timedelta(minutes=5)  # the controller judges the create deadline a little after the Job's own
+ADDRESS_POLL_SECONDS = 15  # while waiting for the client node's public address
 POLL_SECONDS = 60  # while waiting for a Job: the Job and Pod watches wake the run, this bounds the wait for a deadline
+CLIENT_ADDRESS_WAIT = timedelta(minutes=5)  # how long the up Job waits for the client node's public address
 WAIT_FOR_POD_SECONDS = 10  # the up Job's Pod is still going away; the down Job must not start before it is gone
 RETRY_MIN_SECONDS, RETRY_MAX_SECONDS = 60, 1800  # between destroy attempts: doubles from a minute to half an hour
 ENDED_PHASES = ("Succeeded", "Failed")  # any other Pod phase (even Unknown) may still run the Pulumi process
@@ -188,6 +190,11 @@ class DbaasMixin:
         nd = self._nodes[run.name]
         node = self._get_node(nd.facts.node_name) or {}
         addresses = dbaas_jobs.client_addresses(node, nd.claim)
+        if not addresses and self._now() - run.status.database.since < CLIENT_ADDRESS_WAIT:
+            # SCarpenter writes the address at create when the vendor returns it, else with its next sweep (~2 minutes).
+            # A vendor that needs none is not held up for long; one that does fails loudly after the wait.
+            log.info("run %s: waiting for the public address of the client node %s", run.name, nd.facts.node_name)
+            return self._enqueue_later(run.name, ADDRESS_POLL_SECONDS)
         spec = dbaas_jobs.build_spec(run, cfg, record, network, run.status.database.expires, addresses)
         self._create("job", dbaas_jobs.up_job(run, cfg, spec, self._run_owner(run)))
 

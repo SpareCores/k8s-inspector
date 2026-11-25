@@ -315,7 +315,8 @@ class Cluster:
             "scarpenter.sparecores.com/nodeclass-hash": "h1",
         }
         self.nodes = 0
-        self.node_addresses: list[dict] = []  # `status.addresses` of the nodes (InternalIP, ExternalIP ...)
+        # `status.addresses` of the nodes (InternalIP, ExternalIP ...): bench nodes have a public IPv4
+        self.node_addresses: list[dict] = [{"type": "ExternalIP", "address": "203.0.113.50"}]
         self.claim_conditions: list[dict] | None = None  # override: claim with these conditions, no node
         self.provision_enabled = True
         # DBaaS: what the next Jobs `up` / `down` and the bootstrap Pod do, in order (default "ok"):

@@ -3,6 +3,7 @@ parallel with the node release, retries, restarts, the finalizer. Jobs and Pods 
 
 import base64
 import json
+import logging
 import re
 from dataclasses import replace
 from datetime import timedelta
@@ -838,12 +839,41 @@ def test_the_up_job_gets_the_public_addresses_of_the_client_node(h):
     assert json.loads(env["DBAAS_SPEC"])["clientAddresses"] == ["203.0.113.7/32", "2001:db8::7/128"]
 
 
-def test_a_node_without_public_addresses_gives_an_empty_list(h):
-    h.start_db()
-    h.until_phase(DbPhase.CREATING)
+def _spec_of_up_job(h) -> dict:
     (job,) = h.kube.list("job")
     env = {e["name"]: e.get("value") for e in job["spec"]["template"]["spec"]["containers"][0]["env"]}
-    assert json.loads(env["DBAAS_SPEC"])["clientAddresses"] == []
+    return json.loads(env["DBAAS_SPEC"])
+
+
+def _client_node_without_address(h):
+    h.cluster.node_addresses = []
+    h.start_db()
+    h.drive(stop=lambda run: run.status.database is not None)  # Creating, the node is up
+    h.runner.reconcile(h.name)
+
+
+def test_the_up_job_waits_for_the_public_address_of_the_client_node(h, caplog):
+    caplog.set_level(logging.INFO)
+    _client_node_without_address(h)
+    assert h.kube.list("job") == [] and h.run.status.database.phase == DbPhase.CREATING
+    assert "waiting for the public address" in caplog.text
+    node = h.kube.list("node")[0]["metadata"]["name"]
+    h.clock.advance(minutes=2)  # SCarpenter's sweep writes the annotation
+    h.kube.merge_patch(
+        "node", node, {"metadata": {"annotations": {"scarpenter.sparecores.com/public-ipv4": "203.0.113.9"}}}
+    )
+    h.runner.reconcile(h.name)
+    assert _spec_of_up_job(h)["clientAddresses"] == ["203.0.113.9/32"]
+
+
+def test_the_up_job_starts_without_an_address_once_the_wait_is_over(h):
+    _client_node_without_address(h)
+    h.clock.advance(minutes=4)
+    h.runner.reconcile(h.name)
+    assert h.kube.list("job") == []
+    h.clock.advance(minutes=2)  # a vendor that needs no address is not blocked
+    h.runner.reconcile(h.name)
+    assert _spec_of_up_job(h)["clientAddresses"] == []
 
 
 def test_a_vendor_generated_password_replaces_the_one_the_benchmark_uses_and_the_up_job_is_deleted(h):
