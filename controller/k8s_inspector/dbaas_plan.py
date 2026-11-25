@@ -1,7 +1,8 @@
 """DBaaS planning: which database gets a BenchmarkRun, in which region and with which client (autoPlan and forced).
 
-A DBaaS run is a BenchmarkRun with a `database` block; its SKU is the client server that is put next to the database
-(`dbaas_client`), in the cheapest region of the database that the cluster platform has a network for. Databases,
+A DBaaS run is a BenchmarkRun with a `database` block; it is named after the database. Its client node is any small
+x86_64 type (`dbaas_client`) that the cluster launches next to the database, in the cheapest region of the database that
+the cluster platform has a network for; only the price bound comes from Keeper's server data. Databases,
 versions,
 regions, prices and eligibility are Keeper's (`dbaas_keeper`, fail closed). What is due comes from the
 `dbaas/<vendor>/<id>/postgres/<version>/standalone/<task>/meta.json` files in git with the same rules as servers
@@ -32,7 +33,7 @@ class PlannedDatabase:
     database_id: str
     engine_version: str
     region: str  # the database's region
-    client: str  # the client server's SKU: the run's SKU
+    client: str | None  # the operator's choice of client SKU; None: any small x86_64 type
     tasks: tuple[str, ...]
     reason: str  # for logs and `plan --dry-run`
     client_region: str | None = None  # where the client runs when it is not `region`
@@ -54,8 +55,14 @@ def holds_database(run: BenchmarkRun) -> bool:
 class Placement:
     region: str  # the database's region
     client_region: str  # the client node's region: `region`, or one of its city
-    client: str  # the client server's SKU
-    usd_per_hour: float | None  # database + client node (Keeper's on-demand prices); None: one of them is unknown
+    client: str | None  # the operator's choice of client SKU; None: any small x86_64 type
+    usd_per_hour: float | None  # database + client node (Keeper's on-demand prices, the dearest type); None: unknown
+
+
+def database_run(runs: list[BenchmarkRun], vendor: str, database_id: str) -> BenchmarkRun | None:
+    """The run of the database, whatever its name: a run made before runs were named after their database is named
+    after its client SKU."""
+    return next((r for r in runs if r.spec.vendor == vendor and (r.spec.database or {}).get("id") == database_id), None)
 
 
 def holding_runs(runs: list[BenchmarkRun], vendor: str) -> list[BenchmarkRun]:
@@ -127,26 +134,6 @@ def _failed_region(meta: dict | None) -> str | None:
     return attempt.get("region") if attempt.get("exit_code") in (ExitCode.NO_NODE, ExitCode.NEVER_FINISHED) else None
 
 
-def pick_client(kube: Kube, cfg: Config, vendor: str, servers: list[dict], leased: set[str]) -> str | None:
-    """The client server for a database: `dbaas_client.rank` over Keeper's servers in its region, without SKUs that
-    SCarpenter does not offer, that wait for a launch retry or that already have a run (`leased`: run names). None when
-    there is none or SCarpenter's offered-types listing is unusable."""
-    ranked = dbaas_client.rank(servers)
-    skipped = planner.not_offered(kube, cfg, vendor, ranked)
-    if skipped is None:  # no usable offered-types listing: nothing is known about the SKUs
-        return None
-    waiting = launch.deferred(kube, vendor, ranked, datetime.now(UTC), prune=False)
-    for sku in ranked:
-        if (
-            sku not in skipped
-            and sku not in waiting
-            and pods.is_label_value(sku)
-            and crd.run_name(vendor, sku) not in leased
-        ):
-            return sku
-    return None
-
-
 def _create_run(
     kube: Kube,
     cfg: Config,
@@ -161,7 +148,7 @@ def _create_run(
 ) -> BenchmarkRun:
     spec = RunSpec(
         vendor=vendor,
-        sku=placement.client,
+        sku=record["api_reference"],
         run_id=crd.new_run_id(datetime.now(UTC)),
         tasks=names,
         force=force,
@@ -172,6 +159,7 @@ def _create_run(
             "id": record["api_reference"],
             "engineVersion": version,
             "region": placement.region,
+            **({"client": placement.client} if placement.client else {}),
             **({"clientRegion": placement.client_region} if placement.client_region != placement.region else {}),
             "vcpus": int(record["vcpus"]),
             "memoryGib": float(record["memory_amount"]) / 1024,
@@ -185,11 +173,9 @@ def _create_run(
 
 
 def _resolve(
-    kube: Kube,
     cfg: Config,
     vendor: str,
     record: dict,
-    leased: set[str],
     *,
     region: str | None,
     client: str | None,
@@ -197,8 +183,8 @@ def _resolve(
     client_region: str | None = None,
 ) -> Placement:
     """The given database region, client region and client, else the cheapest database region that has a client region
-    (its own or one of its city, with a network) and the client Keeper's data picks there, with the hourly price of
-    database and client from Keeper. Raise `ValueError` when there is none."""
+    (its own or one of its city, with a network) and a client type in Keeper's data there, with the hourly price of
+    database and client (the dearest type that may be launched) from Keeper. Raise `ValueError` when there is none."""
     vendor_config = cfg.settings.dbaas.vendors[vendor]
     networks = vendor_config.networks
     database_id = record["api_reference"]
@@ -232,15 +218,18 @@ def _resolve(
             if client_at not in ids:
                 continue
             servers = dbaas_keeper.client_servers(cfg.env, vendor, ids[client_at])
-            chosen = client or pick_client(kube, cfg, vendor, servers, leased)
-            if chosen:
-                return Placement(candidate, client_at, chosen, _hourly(prices.get(candidate), servers, chosen))
+            if client or dbaas_client.most_expensive(servers) is not None:
+                return Placement(candidate, client_at, client, _hourly(prices.get(candidate), servers, client))
     raise ValueError(f"no client server for {vendor}/{database_id} in {', '.join(regions)}")
 
 
-def _hourly(database_price: float | None, servers: list[dict], client: str) -> float | None:
-    """Database price plus the client's `min_price_ondemand` in Keeper's server data; None when either is missing."""
-    client_price = next((s.get("min_price_ondemand") for s in servers if s.get("api_reference") == client), None)
+def _hourly(database_price: float | None, servers: list[dict], client: str | None) -> float | None:
+    """Database price plus the client's `min_price_ondemand` in Keeper's server data: the named client's, else the
+    dearest type that may be launched; None when either is missing."""
+    if client:
+        client_price = next((s.get("min_price_ondemand") for s in servers if s.get("api_reference") == client), None)
+    else:
+        client_price = dbaas_client.most_expensive(servers)
     if database_price is None or client_price is None:
         return None
     return float(database_price) + float(client_price)
@@ -259,11 +248,16 @@ def force_run(
     hold_after: timedelta = timedelta(0),
 ) -> BenchmarkRun:
     """`k8s-inspector run <vendor> --database <id>`: a DBaaS run of one database now. Raise `ValueError` for validation
-    errors and `crd.RunExists` when the client server already has a run. Without `force` Keeper must find the database
+    errors and `crd.RunExists` when the database already has a run. Without `force` Keeper must find the database
     eligible (unreachable Keeper: refused); with it only Keeper's record must exist. `region` is the database's;
     `region`, `client_region` and `client` default to the cheapest database region with a client region (its own or
-    one of its city, with a network) and the client the picker chooses."""
-    check_vendor(cfg, vendor, crd.list_runs(kube))
+    one of its city, with a network) and any small x86_64 client type."""
+    if client and not pods.is_label_value(client):
+        raise ValueError(f"{client} is not a valid label value: SCarpenter cannot select it by api-reference")
+    runs = crd.list_runs(kube)
+    check_vendor(cfg, vendor, runs)
+    if existing := database_run(runs, vendor, database_id):
+        raise crd.RunExists(existing.name)
     try:
         record = dbaas_keeper.database(cfg.env, vendor, database_id)
     except RuntimeError as e:
@@ -285,13 +279,10 @@ def force_run(
     if version is None:
         raise ValueError(f"{vendor}/{database_id} has no PostgreSQL version in Keeper")
     try:
-        leased = {run.name for run in crd.list_runs(kube)}
         placement = _resolve(
-            kube,
             cfg,
             vendor,
             record,
-            leased,
             region=region,
             client=client,
             last_failed=None,
@@ -347,9 +338,11 @@ def plan_cycle(
         except Exception:
             log.exception("DBaaS autoPlan skips vendor %s: cannot read Keeper or the sc-inspector-data state", vendor)
             continue
-        leased = {run.name for run in crd.list_runs(kube)}
+        runs = crd.list_runs(kube)
         for database_id in sorted(blocked.get(vendor, {}), key=lambda d: planner.start_order(vendor, d)):
             record = records.get(database_id)
+            if database_run(runs, vendor, database_id):
+                continue
             if record is None or not publisher.publish_allowed(cfg.settings, vendor, database_id):
                 continue
             version = dbaas_keeper.engine_version(record, cfg.settings.dbaas.engine_version)
@@ -373,9 +366,7 @@ def plan_cycle(
             if not due:
                 continue
             try:
-                placement = _resolve(
-                    kube, cfg, vendor, record, leased, region=None, client=None, last_failed=last_failed
-                )
+                placement = _resolve(cfg, vendor, record, region=None, client=None, last_failed=last_failed)
                 check_spend(cfg, vendor, crd.list_runs(kube), placement.usd_per_hour)
             except (ValueError, RuntimeError) as e:
                 log.info("DBaaS autoPlan skips %s/%s: %s", vendor, database_id, e)

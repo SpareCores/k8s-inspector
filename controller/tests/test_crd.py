@@ -262,6 +262,18 @@ def test_status_round_trip():
     assert crd.from_dict(obj).status == status
 
 
+def test_the_client_sku_of_a_dbaas_run_round_trips_and_is_its_node_sku():
+    d = crd.status_to_dict(RunStatus(client_sku="c1"))
+    assert d["clientSku"] == "c1"
+    manifest = crd.to_manifest(spec(sku="db1", database={"id": "db1"}), "i")
+    manifest["metadata"]["creationTimestamp"] = "2026-11-20T09:30:00Z"
+    manifest["status"] = d
+    run = crd.from_dict(manifest)
+    assert run.node_sku == "c1"  # the client the cluster launched, not the `sku`
+    server = crd.from_dict(crd.to_manifest(spec(sku="s1"), "i") | {"metadata": manifest["metadata"]})
+    assert server.node_sku == "s1"
+
+
 def test_uninitialized_claims_round_trip():
     status = RunStatus(
         spot_reclaims=2, uninitialized_claims=[UninitializedClaim("nc-1", T0, "spot"), UninitializedClaim("nc-2", T0)]

@@ -55,7 +55,7 @@ spec:
                 type: string
                 default: 0s
               database:
-                description: DBaaS runs only. `vendor` and `id` are Keeper's, `region` is the database's region and `clientRegion` the client node's (default `region`; another region of the same city when the vendor's database and server regions differ).
+                description: DBaaS runs only (their `sku` is the database id). `vendor` and `id` are Keeper's, `region` is the database's region and `clientRegion` the client node's (default `region`; another region of the same city when the vendor's database and server regions differ).
                 type: object
                 nullable: true
                 properties:
@@ -67,6 +67,9 @@ spec:
                   vcpus: {type: integer}
                   memoryGib: {type: number}
                   usdPerHour: {type: number}
+                  client:
+                    description: An operator's choice of the client SKU (`run --database <id> <sku>`). Without it the client is any small x86_64 type (2-4 vCPUs, 4-8 GiB), the cheapest offered one.
+                    type: string
           status:
             type: object
             properties:
@@ -99,6 +102,7 @@ spec:
               attempt: {type: integer}
               capacityType: {type: string}
               node: {type: string}
+              clientSku: {type: string}
               region: {type: string}
               zone: {type: string}
               pricePerHour: {type: string}

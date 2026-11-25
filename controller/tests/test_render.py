@@ -533,6 +533,18 @@ def test_dbaas_layout(tmp_path):
     assert sorted(p.name for p in written) == ["meta.json", "stdout"] and (base / "stdout").read_bytes() == b"out"
 
 
+def test_dbaas_client_failures_count_as_start_retries_and_end_as_minus_five(tmp_path):
+    db = {"vendor": "ovh", "id": "pg", "engineVersion": "18"}
+    task = "pgbench_postgres_dbaas_ro_durable"
+    meta = tmp_path / "dbaas/ovh/pg/postgres/18/standalone" / task / "meta.json"
+    for n in (1, 2, 3):
+        error = "DBAAS_CLIENT_FAILED: SCARPENTER_ICE: x"
+        inp = plain_input(task, -1, f"2026-10-0{n}T10:00:00", f"r{n}", b"", error_msg=error)
+        render.render_dbaas_task(tmp_path, db, inp)
+    written = json.loads(meta.read_text())
+    assert (written["start_retries"], written["exit_code"]) == (3, -5)
+
+
 def test_dbaas_version_is_the_image_tag_unless_the_status_has_one(tmp_path):
     db = {"vendor": "ovh", "id": "pg", "engineVersion": "18"}
     task = "pgbench_postgres_dbaas_ro_durable"

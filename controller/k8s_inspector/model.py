@@ -207,13 +207,13 @@ class OwnerRef:
 @dataclass
 class RunSpec:
     vendor: str
-    sku: str
+    sku: str  # a DBaaS run has no server of its own: its `sku` is the database id
     run_id: str
     tasks: list[str] = field(default_factory=list)  # empty = every due task
     force: bool = False
     capacity: CapacityMode = CapacityMode.SPOT_FIRST
     hold_after: timedelta = timedelta(0)
-    database: dict | None = None  # DBaaS: {vendor, id, engineVersion, region}
+    database: dict | None = None  # DBaaS: {vendor, id, engineVersion, region, client}
 
 
 @dataclass
@@ -291,6 +291,7 @@ class RunStatus:
     attempt: int = 0
     capacity_type: CapacityType | None = None
     node: str | None = None
+    client_sku: str | None = None  # DBaaS: the SKU of the client node the cluster launched
     region: str | None = None
     zone: str | None = None
     price_per_hour: str | None = None
@@ -322,6 +323,11 @@ class BenchmarkRun:
     deleting: bool = (
         False  # `metadata.deletionTimestamp` is set: the DBaaS finalizer keeps the object until `down` succeeded
     )
+
+    @property
+    def node_sku(self) -> str | None:
+        """The SKU of the run's node: a server run's own, a DBaaS run's client once it has a node (else None)."""
+        return self.status.client_sku if self.spec.database else self.spec.sku
 
 
 # --------------------------------------------------------------------------- node, outcomes

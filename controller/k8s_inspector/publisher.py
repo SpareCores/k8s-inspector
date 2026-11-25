@@ -157,7 +157,7 @@ def publish_allowed(settings: Settings, vendor: str, sku: str) -> bool:
 
 
 def _publishable(settings: Settings, run: BenchmarkRun) -> bool:
-    """The run's SKU may be published; for a DBaaS run (whose SKU is only its client) its database."""
+    """The run's SKU may be published; for a DBaaS run (which has no SKU of its own) its database."""
     database = run.spec.database
     if database:
         return publish_allowed(settings, database["vendor"], database["id"])
@@ -862,10 +862,11 @@ class Publisher:
         dirs = set()
         for one in loaded:
             run = one.item.run
-            dirs.add(f"data/{run.vendor}/{run.sku}")
             if one.item.database:
                 db = one.item.database
                 dirs.add(f"dbaas/{_safe_part(db['vendor'])}/{_safe_part(db['id'])}")
+            else:
+                dirs.add(f"data/{run.vendor}/{run.sku}")
         return sorted(dirs)
 
     def _commit(self, rendered: list[tuple[_Loaded, int | None]], message: str | None = None) -> str | None:

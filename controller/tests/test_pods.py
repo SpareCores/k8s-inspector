@@ -3,7 +3,7 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
-from k8s_inspector import pods
+from k8s_inspector import dbaas_client, pods
 from k8s_inspector.model import (
     BenchmarkRun,
     CapacityType,
@@ -78,6 +78,24 @@ def test_names_and_labels(run):
     }
 
 
+def test_a_dbaas_anchor_names_the_band_or_the_operators_client(run, cfg):
+    run.spec.database = {"vendor": "oci", "id": "db1", "region": "eu-1", "clientRegion": "eu-2"}
+
+    owner = OwnerRef("inspector.sparecores.com/v1alpha1", "BenchmarkRun", run.name, "u")
+
+    def anchor():
+        pod = pods.render_anchor(run, 1, cfg, capacity=[CapacityType.ON_DEMAND], deadline_seconds=100, owner=owner)
+        terms = pod["spec"]["affinity"]["nodeAffinity"]["requiredDuringSchedulingIgnoredDuringExecution"]
+        return pod["spec"]["nodeSelector"], terms["nodeSelectorTerms"][0]["matchExpressions"]
+
+    selector, expressions = anchor()
+    assert selector["topology.kubernetes.io/region"] == "eu-2" and selector["inspector.sparecores.com/run"] == run.name
+    assert "scarpenter.sparecores.com/api-reference" not in selector
+    assert expressions[0]["key"] == "karpenter.sh/capacity-type" and expressions[1:] == dbaas_client.requirements()
+    run.spec.database["client"] = "c1"
+    assert anchor()[1][1:] == dbaas_client.requirements("c1")
+
+
 def test_anchor(run, cfg):
     owner = OwnerRef("inspector.sparecores.com/v1alpha1", "BenchmarkRun", run.name, "u")
     pod = pods.render_anchor(
@@ -94,10 +112,12 @@ def test_anchor(run, cfg):
     assert spec["nodeSelector"] == {
         "karpenter.sh/nodepool": "bench",
         "scarpenter.sparecores.com/vendor": "oci",
+        "inspector.sparecores.com/run": "oci-vm-1-3f9c1a7e",  # a node of its own
         "scarpenter.sparecores.com/api-reference": "VM.Standard.E5.Flex.2-16",
     }
     expr = spec["affinity"]["nodeAffinity"]["requiredDuringSchedulingIgnoredDuringExecution"]["nodeSelectorTerms"][0]
     assert expr["matchExpressions"][0]["values"] == ["spot", "on-demand"]
+    assert len(expr["matchExpressions"]) == 1  # a server run: the SKU is in the nodeSelector
     # no toleration for SCarpenter's `gpu-pending` taint: the anchor waits until the driver check removes it
     assert spec["tolerations"] == [{"key": "frankenscube/bench", "operator": "Exists"}]
     assert spec["activeDeadlineSeconds"] == 100

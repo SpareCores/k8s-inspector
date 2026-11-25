@@ -9,9 +9,9 @@ from datetime import timedelta
 
 import pytest
 from fakes import iso
-from test_runner import START, Harness, in_step
+from test_runner import START, Harness, _launch_failed, _unlaunched_claim, in_step
 
-from k8s_inspector import crd, dbaas_jobs, dbaas_keeper, launch, pods, runner_dbaas
+from k8s_inspector import crd, dbaas_client, dbaas_jobs, dbaas_keeper, launch, pods, runner_dbaas
 from k8s_inspector import keeper as sc_keeper
 from k8s_inspector.model import (
     CapacityMode,
@@ -26,6 +26,7 @@ from k8s_inspector.model import (
     Settings,
     VendorSettings,
 )
+from k8s_inspector.storage import run_json_key
 
 TASK = "pgbench_postgres_dbaas_ro_durable"
 STEP = "pgbench-postgres-dbaas-ro-durable"
@@ -33,7 +34,7 @@ DATABASE = {"vendor": "oci", "id": "PostgreSQL.VM.E5.2", "engineVersion": "18", 
 DATABASE |= {"vcpus": 4, "memoryGib": 32.0}
 RECORD = {"api_reference": "PostgreSQL.VM.E5.2", "vcpus": 4, "memory_amount": 32768}
 CLIENT = "VM.Standard.E5.Flex.2-8"
-STATE_KEY = f"dbaas-state/.pulumi/stacks/k8s-inspector-dbaas/k8s-dbaas-{crd.run_name('oci', CLIENT)}.json"
+STATE_KEY = f"dbaas-state/.pulumi/stacks/k8s-inspector-dbaas/k8s-dbaas-{crd.run_name('oci', DATABASE['id'])}.json"
 
 
 def make_dbaas_config(**dbaas) -> Config:
@@ -55,7 +56,7 @@ class DbHarness(Harness):
     def start_db(self, **spec) -> None:
         spec = RunSpec(
             vendor="oci",
-            sku=CLIENT,
+            sku=DATABASE["id"],
             run_id="r20261120t1000-aaaa",
             tasks=[TASK],
             capacity=CapacityMode.ON_DEMAND,
@@ -115,6 +116,10 @@ def test_the_client_node_comes_first_and_the_database_is_created_when_the_anchor
     anchor = h.kube.get("pod", f"{h.name}-a1")
     assert anchor["spec"]["nodeSelector"]["topology.kubernetes.io/region"] == "eu-test-1"  # the database's region
     assert h.jobs() == [] and h.db is None  # no node, nothing that bills by the hour
+    assert anchor["spec"]["nodeSelector"]["inspector.sparecores.com/run"] == h.name  # a node of its own
+    assert "scarpenter.sparecores.com/api-reference" not in anchor["spec"]["nodeSelector"]
+    terms = anchor["spec"]["affinity"]["nodeAffinity"]["requiredDuringSchedulingIgnoredDuringExecution"]
+    assert terms["nodeSelectorTerms"][0]["matchExpressions"][1:] == dbaas_client.requirements()  # any small x86_64
 
     h.until_phase(DbPhase.CREATING)
     assert h.jobs() == [f"dbaas-up-{h.name}"]
@@ -217,18 +222,114 @@ def test_a_failed_create_ends_the_task_minus_one_and_destroys_the_database(h):
     assert not h.kube.get("benchmarkrun", h.name)["metadata"].get("finalizers")
 
 
-def test_a_forced_run_without_an_offering_ends_with_its_result_and_makes_the_next_pick_skip_the_client(h):
+def test_the_run_records_which_client_the_cluster_launched_and_run_json_names_it(h):
+    h.cluster.sku = "VM.Standard.E4.Flex.2-8"  # whatever the cluster found cheapest
+    h.start_db()
+    h.until_phase(DbPhase.BOOTSTRAPPING)
+    assert h.run.name == crd.run_name("oci", DATABASE["id"]) and h.run.status.client_sku == "VM.Standard.E4.Flex.2-8"
+    assert h.run.node_sku == "VM.Standard.E4.Flex.2-8"
+    run_json = json.loads(h.storage.read_bytes(run_json_key(crd.run_key(h.run))))
+    assert run_json["sku"] == "VM.Standard.E4.Flex.2-8" and run_json["database"]["id"] == DATABASE["id"]
+
+
+def test_an_unlaunched_claim_of_the_run_is_found_by_its_run_requirement(h):
     h.cluster.provision_enabled = False
-    h.start_db(force=True)
+    h.start_db()
+    h.runner.reconcile(h.name)
+    _unlaunched_claim(h, h.kube.get("pod", f"{h.name}-a1"), "claim-1")  # requirements: the run, no SKU
+    _unlaunched_claim(h, h.kube.get("pod", f"{h.name}-a1"), "other")
+    h.kube.merge_patch(
+        "nodeclaim",
+        "other",
+        {
+            "spec": {
+                "requirements": [{"key": "inspector.sparecores.com/run", "operator": "In", "values": ["another-run"]}]
+            }
+        },
+    )
+    crd.request_cancel(h.kube, h.name)
+    h.runner.reconcile(h.name)
+    assert [c["metadata"]["name"] for c in h.kube.list("nodeclaim")] == ["other"]
+
+
+def test_an_anchor_made_before_the_run_label_finds_its_claims_by_vendor_and_sku(h):
+    h.cluster.provision_enabled = False
+    h.start_db()
+    h.runner.reconcile(h.name)
+    anchor = f"{h.name}-a1"  # as the previous controller made it: the client SKU in the nodeSelector, no run label
+    selector = {"inspector.sparecores.com/run": None, "scarpenter.sparecores.com/api-reference": CLIENT}
+    h.kube.merge_patch("pod", anchor, {"spec": {"nodeSelector": selector}})
+    _unlaunched_claim(h, h.kube.get("pod", anchor), "claim-1")
+    _unlaunched_claim(h, h.kube.get("pod", anchor), "of-a-run-with-its-own-node")  # the same SKU, but another run's
+    run_requirement = {"key": "inspector.sparecores.com/run", "operator": "In", "values": ["another-run"]}
+    claim = h.kube.get("nodeclaim", "of-a-run-with-its-own-node")
+    h.kube.merge_patch(
+        "nodeclaim", "of-a-run-with-its-own-node",
+        {"spec": {"requirements": [*claim["spec"]["requirements"][:-1], run_requirement]}},
+    )  # fmt: skip
+    _unlaunched_claim(h, h.kube.get("pod", anchor), "stamped")  # the NodePool's `Exists` gave it a generated label
+    stamped = h.kube.get("nodeclaim", "stamped")
+    exists = {"key": "inspector.sparecores.com/run", "operator": "Exists"}
+    h.kube.merge_patch("nodeclaim", "stamped", {
+        "metadata": {"labels": {"inspector.sparecores.com/run": "4711"}},
+        "spec": {"requirements": [*stamped["spec"]["requirements"], exists]},
+    })  # fmt: skip
+    crd.request_cancel(h.kube, h.name)
+    h.runner.reconcile(h.name)
+    assert [c["metadata"]["name"] for c in h.kube.list("nodeclaim")] == ["of-a-run-with-its-own-node"]
+
+
+@pytest.mark.parametrize("reason", ["NO_OFFERING", "ICE", "QUOTA", "DAILY_LIMIT", "BOOT_FAILURE", "LAUNCH_REJECTED"])
+def test_a_dbaas_launch_failure_writes_no_per_sku_entry(h, reason):
+    h.start_db()
+    h.runner._fail_run(h.run, {}, launch.error_message(reason, "x"))
+    assert h.run.status.phase == RunPhase.FAILED and h.codes()[TASK][1].startswith("DBAAS_CLIENT_FAILED: SCARPENTER_")
+    assert launch.read(h.kube, "oci") == {}  # one entry per candidate would hold back server runs, or pause the vendor
+
+
+def test_a_dbaas_client_gives_up_after_three_failed_claims(h):
+    h.cluster.provision_enabled = False
+    h.start_db()
+    h.runner.reconcile(h.name)
+    for n, claim in enumerate(("bench-aaaaa", "bench-bbbbb", "bench-ccccc"), 1):
+        _launch_failed(h, claim, "Fatal (InvalidParameter): x")
+        h.runner.reconcile(h.name)
+        assert h.run.status.phase == (RunPhase.FAILED if n == 3 else RunPhase.PROVISIONING)  # a server run ends at 2
+        h.kube.delete("nodeclaim", claim)
+        h.clock.advance(minutes=5)
+
+
+def test_a_dbaas_run_in_flight_without_a_client_sku_gets_it_from_its_node(h):
+    h.start_db()
+    h.until_phase(DbPhase.BOOTSTRAPPING)
+    crd.update_status(h.kube, h.name, lambda s: setattr(s, "client_sku", None))
+    h.runner._nodes.pop(h.name)  # as after a restart of the controller
+    h.runner.reconcile(h.name)
+    assert h.run.status.client_sku == "client-x"
+
+
+def test_a_new_attempt_forgets_the_client_of_the_last_one(h):
+    h.cluster.provision_enabled = False
+    h.start_db()
+    h.runner.reconcile(h.name)
+    crd.update_status(h.kube, h.name, lambda s: (setattr(s, "phase", RunPhase.PENDING), setattr(s, "client_sku", "c1")))
+    h.runner.reconcile(h.name)
+    assert h.run.status.attempt == 2 and h.run.status.client_sku is None
+
+
+def test_a_dbaas_run_without_an_offering_ends_with_its_result_and_defers_no_sku(h):
+    h.cluster.provision_enabled = False
+    h.start_db()
     h.runner.reconcile(h.name)
     condition = {"type": "PodScheduled", "status": "False", "reason": "Unschedulable", "message": "no node matches"}
     h.kube.merge_patch("pod", f"{h.name}-a1", {"status": {"conditions": [condition]}})
     h.clock.advance(minutes=11)
     h.runner.reconcile(h.name)
-    assert h.run.status.phase == RunPhase.FAILED  # the forced run is the operator's: its result is recorded
-    assert h.codes()[TASK][1].startswith("SCARPENTER_NO_OFFERING")
-    assert launch.read(h.kube, "oci")[CLIENT]["reason"] == "NO_OFFERING"
-    assert CLIENT in launch.deferred(h.kube, "oci", [CLIENT], h.clock.now)
+    assert h.run.status.phase == RunPhase.FAILED  # recorded, so that the cap bounds the retries
+    code, message = h.codes()[TASK]
+    assert code == ExitCode.NO_NODE and message.startswith("DBAAS_CLIENT_FAILED: SCARPENTER_NO_OFFERING")
+    assert h.run.status.region == "eu-test-1"  # the next plan tries another region first
+    assert launch.read(h.kube, "oci") == {}  # server runs of these SKUs are not held back by a DBaaS run
 
 
 def test_a_failed_up_job_and_its_pod_stay_for_their_logs_through_the_destroy(h):
@@ -709,7 +810,7 @@ def test_the_client_goes_to_its_own_region_when_the_database_is_in_another(h):
     h.cfg.settings.dbaas.vendors["oci"].networks.clear()
     h.cfg.settings.dbaas.vendors["oci"].networks["eu-test-1"] = {"vpc": "client-side"}  # keyed by the client's region
     spec = RunSpec(
-        vendor="oci", sku=CLIENT, run_id="r20261120t1000-aaaa", tasks=[TASK], capacity=CapacityMode.ON_DEMAND,
+        vendor="oci", sku=DATABASE["id"], run_id="r20261120t1000-aaaa", tasks=[TASK], capacity=CapacityMode.ON_DEMAND,
         database={**DATABASE, "region": "db-test-1", "clientRegion": "eu-test-1"},
     )  # fmt: skip
     h.name = crd.create_run(h.kube, spec).name

@@ -72,7 +72,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     run = sub.add_parser("run", help="start a forced run of one SKU, or of one managed database (--database)")
     run.add_argument("vendor")
-    run.add_argument("sku", nargs="?", help="the SKU; with --database the client server (default: picked)")
+    run.add_argument(
+        "sku", nargs="?", help="the SKU; with --database the client server (default: any small x86_64 type)"
+    )
     run.add_argument("--database", help="a DBaaS run of this database (Keeper's api_reference) instead of a server run")
     run.add_argument(
         "--region", help="with --database: the database's region (default: the cheapest with a client region)"
@@ -298,7 +300,7 @@ def cmd_plan(args: argparse.Namespace) -> int:
     for db in databases:
         client_at = f" in {db.client_region}" if db.client_region and db.client_region != db.region else ""
         print(
-            f"{db.vendor} database {db.database_id} in {db.region} with {db.client}{client_at} "
+            f"{db.vendor} database {db.database_id} in {db.region} with {db.client or 'any small client'}{client_at} "
             f"{','.join(db.tasks)} ({db.reason})"
         )
     if not planned and not databases:
@@ -339,10 +341,10 @@ def cmd_run(args: argparse.Namespace) -> int:
                 capacity=CapacityMode.ON_DEMAND if args.on_demand else None,
                 hold_after=args.hold,
             )
-    except crd.RunExists:
-        name = crd.run_name(args.vendor, args.sku or "")
+    except crd.RunExists as e:
+        name = str(e) if args.database else crd.run_name(args.vendor, args.sku)
         raise CliError(
-            f"a run for {args.vendor}/{args.sku or args.database} exists: {name} "
+            f"a run for {args.vendor}/{args.database or args.sku} exists: {name} "
             f"(follow it with kubectl, or cancel it with "
             f"`k8s-inspector cancel {name}`)"
         ) from None
