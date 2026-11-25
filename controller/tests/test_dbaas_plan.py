@@ -1,5 +1,6 @@
 """DBaaS planning: the client picker, region choice, what is due and the forced path. Keeper is faked."""
 
+import logging
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -266,6 +267,36 @@ def test_a_database_keeper_blocks_is_not_planned(kube, world):
     world.blocked = {first: {TASK: ["Cloud credit/budget exhausted."]}}
     (planned,) = plan(kube, make_config(), world, dry_run=True)
     assert planned.database_id != first
+
+
+def test_a_vendor_that_gets_no_run_is_logged_with_the_reasons_and_counts(kube, world, caplog):
+    caplog.set_level(logging.INFO)
+    world.blocked = {
+        "db-a": {TASK: ["Cloud credit/budget exhausted."]},
+        "db-b": {TASK: ["Cloud credit/budget exhausted."]},
+    }
+    world.metas = {"db-c": {"18": {TASK: good_meta()}}}  # a current result: nothing due
+    world.records["db-d"] = record("db-d")
+    world.metas["db-d"] = {}
+    crd.create_run(kube, RunSpec("oci", "db-d", "r0", database={"vendor": "oci", "id": "db-d", "engineVersion": "18"}))
+    assert plan(kube, make_config(dbaas_max_in_flight=5), world, dry_run=True) == []
+    (line,) = [m for m in caplog.messages if m.startswith("DBaaS autoPlan: nothing to plan")]
+    assert line.startswith("DBaaS autoPlan: nothing to plan for vendor oci: 4 databases, ")
+    for part in ("2 blocked by Keeper (e.g. Cloud credit/budget exhausted.)", "1 nothing due", "1 already has a run"):
+        assert part in line
+
+
+def test_a_vendor_keeper_lists_no_database_for_is_logged_too(kube, world, caplog):
+    caplog.set_level(logging.INFO)
+    world.records = {}
+    assert plan(kube, make_config(), world, dry_run=True) == []
+    assert "DBaaS autoPlan: nothing to plan for vendor oci: 0 databases" in caplog.messages
+
+
+def test_a_vendor_with_a_planned_run_logs_no_skip_line(kube, world, caplog):
+    caplog.set_level(logging.INFO)
+    assert len(plan(kube, make_config(), world, dry_run=True)) == 1
+    assert not [m for m in caplog.messages if "nothing to plan" in m]
 
 
 def test_one_dbaas_run_is_in_flight_per_vendor(kube, world):

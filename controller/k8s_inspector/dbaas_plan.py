@@ -13,6 +13,7 @@ docs/explanation/dbaas.md.
 
 import logging
 import threading
+from collections import Counter
 from collections.abc import Callable, Collection
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -344,14 +345,26 @@ def plan_cycle(
             log.exception("DBaaS autoPlan skips vendor %s: cannot read Keeper or the sc-inspector-data state", vendor)
             continue
         runs = crd.list_runs(kube)
+        skipped: Counter[str] = Counter()  # why the databases got no run, for the line logged when none did
+        block_codes: Counter[str] = Counter()
         for database_id in sorted(blocked.get(vendor, {}), key=lambda d: planner.start_order(vendor, d)):
             record = records.get(database_id)
             if database_run(runs, vendor, database_id):
+                skipped["already has a run"] += 1
                 continue
-            if record is None or not publisher.publish_allowed(cfg.settings, vendor, database_id):
+            if record is None:
+                skipped["no Keeper record"] += 1
+                continue
+            if not publisher.publish_allowed(cfg.settings, vendor, database_id):
+                skipped["publish not allowed"] += 1
                 continue
             version = dbaas_keeper.engine_version(record, cfg.settings.dbaas.engine_version)
             if version is None:
+                skipped["no PostgreSQL version"] += 1
+                continue
+            if all(name in blocked[vendor][database_id] for name in names):
+                skipped["blocked by Keeper"] += 1
+                block_codes.update(code for codes in blocked[vendor][database_id].values() for code in codes)
                 continue
             due, failed_regions = {}, set()
             for task in dbaas_tasks():
@@ -369,12 +382,14 @@ def plan_cycle(
                     due[task.name] = reason
                     failed_regions |= _failed_regions(meta)
             if not due:
+                skipped["nothing due"] += 1
                 continue
             try:
                 placement = _resolve(cfg, vendor, record, region=None, client=None, failed_regions=failed_regions)
                 check_spend(cfg, vendor, crd.list_runs(kube), placement.usd_per_hour)
             except (ValueError, RuntimeError) as e:
                 log.info("DBaaS autoPlan skips %s/%s: %s", vendor, database_id, e)
+                skipped["no region, client or budget"] += 1
                 continue
             if not dry_run:
                 try:
@@ -395,7 +410,18 @@ def plan_cycle(
                 )
             )
             break  # at most one new DBaaS run per vendor and cycle; the next cycle checks the limits again
+        else:
+            log.info(_nothing_planned(vendor, len(blocked.get(vendor, {})), skipped, block_codes))
     return planned
+
+
+def _nothing_planned(vendor: str, total: int, skipped: Counter[str], block_codes: Counter[str]) -> str:
+    """The line of a vendor that got no run in a cycle: the databases Keeper lists and how many were skipped why."""
+    parts = []
+    for reason, count in skipped.items():
+        example = f" (e.g. {block_codes.most_common(1)[0][0]})" if reason == "blocked by Keeper" and block_codes else ""
+        parts.append(f"{count} {reason}{example}")
+    return f"DBaaS autoPlan: nothing to plan for vendor {vendor}: {total} databases" + "".join(f", {p}" for p in parts)
 
 
 def run_forever(
