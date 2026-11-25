@@ -864,6 +864,47 @@ def test_the_up_job_waits_for_the_public_address_of_the_client_node(h, caplog):
     )
     h.runner.reconcile(h.name)
     assert _spec_of_up_job(h)["clientAddresses"] == ["203.0.113.9/32"]
+    timing = h.run.status.database.timing
+    assert timing["api_start"] == h.clock.now and h.run.status.database.since < timing["api_start"]  # the Job's start
+
+
+def test_the_wait_logs_once_and_makes_no_keeper_or_secret_call(h, caplog, monkeypatch):
+    caplog.set_level(logging.INFO)
+    _client_node_without_address(h)
+    asked = []
+    monkeypatch.setattr(dbaas_keeper, "database", lambda *a: asked.append(a) or dict(RECORD))
+    for _ in range(3):
+        h.clock.advance(seconds=15)
+        h.runner.reconcile(h.name)
+    assert asked == [] and f"{h.name}-db" not in h.kube.objects.get("secret", {})
+    assert caplog.text.count("waiting for the public address") == 1
+
+
+def test_an_address_only_on_the_nodeclaim_is_enough(h):
+    _client_node_without_address(h)
+    (claim,) = h.kube.list("nodeclaim")
+    h.kube.merge_patch(
+        "nodeclaim", claim["metadata"]["name"],
+        {"metadata": {"annotations": {"scarpenter.sparecores.com/public-ipv4": "203.0.113.8"}}},
+    )  # fmt: skip
+    h.runner.reconcile(h.name)
+    assert _spec_of_up_job(h)["clientAddresses"] == ["203.0.113.8/32"]
+
+
+def test_a_new_attempt_waits_for_the_address_of_its_new_node(h):
+    _client_node_without_address(h)
+    h.clock.advance(minutes=4)
+    h.runner.reconcile(h.name)
+    assert h.kube.list("job") == []
+    (node,) = h.kube.list("node")
+    h.kube.delete("node", node["metadata"]["name"])  # the node is lost during the wait
+    h.drive(stop=lambda run: run.status.attempt == 2 and run.status.phase == RunPhase.RUNNING)
+    h.clock.advance(minutes=2)  # 6 minutes since the first node, 2 since the second
+    h.runner.reconcile(h.name)
+    assert h.kube.list("job") == []
+    h.clock.advance(minutes=4)
+    h.runner.reconcile(h.name)
+    assert _spec_of_up_job(h)["clientAddresses"] == []
 
 
 def test_the_up_job_starts_without_an_address_once_the_wait_is_over(h):

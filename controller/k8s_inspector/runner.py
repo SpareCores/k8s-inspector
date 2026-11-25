@@ -85,6 +85,7 @@ from k8s_inspector.model import (
     BenchmarkRun,
     CapacityType,
     Config,
+    DbPhase,
     ExitCode,
     LaunchFailure,
     NodeFacts,
@@ -431,6 +432,7 @@ class Runner(DbaasMixin):
         self._known: set[str] = set()  # run names seen, to notice deletions between LISTs
         self._failing: dict[str, tuple[int, datetime]] = {}  # run -> (reconciles failed in a row, since when)
         self._nodes: dict[str, _Node] = {}  # cache per run
+        self._address_wait_logged: set[tuple[str, int]] = set()  # (run, attempt) waiting for the client's address
         self._signed_at: dict[str, datetime] = {}  # when the urls Secret was last signed, per run
         # run -> since when its node has had DiskPressure. In memory: a controller restart restarts the wait.
         self._disk_wait: dict[str, datetime] = {}
@@ -1366,6 +1368,9 @@ class Runner(DbaasMixin):
 
         def mutate(status: RunStatus) -> None:
             status.phase = RunPhase.RUNNING
+            db = status.database
+            if db is not None and db.phase == DbPhase.CREATING and "api_start" not in db.timing:
+                db.since = self._now()  # a new attempt's node: the wait for its address starts over
             status.node, status.region, status.zone = facts.node_name, facts.region, facts.zone
             if run.spec.database:
                 status.client_sku = sku

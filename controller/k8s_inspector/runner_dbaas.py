@@ -123,9 +123,7 @@ class DbaasMixin:
         expires = dbaas_jobs.expiry(now, cfg, self._dbaas_task(run))
         run = self._set_database(
             run,
-            lambda status: setattr(
-                status, "database", DbStatus(DbPhase.CREATING, now, expires, timing={"api_start": now})
-            ),
+            lambda status: setattr(status, "database", DbStatus(DbPhase.CREATING, now, expires)),
         )
         self._database_creating(run, cfg, live)
 
@@ -182,21 +180,36 @@ class DbaasMixin:
 
     def _create_up_job(self, run: BenchmarkRun, cfg: Config) -> None:
         db = run.spec.database
+        nd = self._nodes[run.name]
+        node = self._get_node(nd.facts.node_name) or {}
+        addresses = dbaas_jobs.client_addresses(node, nd.claim)
+        if not addresses:
+            # SCarpenter writes the address at create when the vendor returns it, else with its next sweep (~2 minutes).
+            # A vendor that needs none is not held up for long; one that does fails loudly after the wait. The wait
+            # starts with the node (`status.database.since`, reset by a new attempt's node).
+            if self._now() - run.status.database.since < CLIENT_ADDRESS_WAIT:
+                if (run.name, run.status.attempt) not in self._address_wait_logged:
+                    self._address_wait_logged.add((run.name, run.status.attempt))
+                    log.info(
+                        "run %s: waiting for the public address of the client node %s", run.name, nd.facts.node_name
+                    )
+                return self._enqueue_later(run.name, ADDRESS_POLL_SECONDS)
+            log.warning(
+                "run %s: no public address of the client node %s after %s",
+                run.name,
+                nd.facts.node_name,
+                CLIENT_ADDRESS_WAIT,
+            )
         record = dbaas_keeper.database(cfg.env, db["vendor"], db["id"])
         if record is None:
             return self._database_fail(run, "DBAAS_UNKNOWN_DATABASE", f"Keeper does not know {db['vendor']}/{db['id']}")
         self._password(run)
         network = cfg.settings.dbaas.vendors[db["vendor"]].networks[pods.client_region(db)]
-        nd = self._nodes[run.name]
-        node = self._get_node(nd.facts.node_name) or {}
-        addresses = dbaas_jobs.client_addresses(node, nd.claim)
-        if not addresses and self._now() - run.status.database.since < CLIENT_ADDRESS_WAIT:
-            # SCarpenter writes the address at create when the vendor returns it, else with its next sweep (~2 minutes).
-            # A vendor that needs none is not held up for long; one that does fails loudly after the wait.
-            log.info("run %s: waiting for the public address of the client node %s", run.name, nd.facts.node_name)
-            return self._enqueue_later(run.name, ADDRESS_POLL_SECONDS)
         spec = dbaas_jobs.build_spec(run, cfg, record, network, run.status.database.expires, addresses)
+        now = self._now()
         self._create("job", dbaas_jobs.up_job(run, cfg, spec, self._run_owner(run)))
+        # the create time starts with the Job, not with the wait for the address
+        self._set_database(run, lambda status: status.database.timing.__setitem__("api_start", now))
 
     def _database_creating(self, run: BenchmarkRun, cfg: Config, live: dict[str, dict]) -> None:
         db = run.status.database
@@ -210,7 +223,8 @@ class DbaasMixin:
             message = dbaas_jobs.job_message(self.kube, name).get("error") or "the Job failed"
             return self._database_fail(run, "DBAAS_CREATE_FAILED", message)
         if state == "running":
-            if self._now() - db.since > timedelta(minutes=cfg.settings.dbaas.create_minutes) + TIMEOUT_MARGIN:
+            started = db.timing.get("api_start") or db.since
+            if self._now() - started > timedelta(minutes=cfg.settings.dbaas.create_minutes) + TIMEOUT_MARGIN:
                 return self._database_fail(
                     run, "DBAAS_CREATE_TIMEOUT", f"not created within {cfg.settings.dbaas.create_minutes} minutes"
                 )
