@@ -899,7 +899,7 @@ def claim_api_reference(claim: dict) -> str | None:
     return labels.get(API_REFERENCE_LABEL) or _claim_requirement(claim, API_REFERENCE_LABEL)
 
 
-def node_sku(node: dict) -> str | None:
+def node_api_reference(node: dict) -> str | None:
     """The SKU a Node was launched as."""
     return (node.get("metadata", {}).get("labels") or {}).get(API_REFERENCE_LABEL)
 

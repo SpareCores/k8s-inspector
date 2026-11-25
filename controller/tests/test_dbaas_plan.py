@@ -310,6 +310,11 @@ def test_a_forced_run_needs_no_autoplan_and_picks_region_and_client(kube, world)
     assert run.spec.force is True and run.spec.tasks == [TASK]
 
 
+def test_a_forced_client_must_be_a_label_value(kube, world):
+    with pytest.raises(ValueError, match="not a valid label value"):
+        force(kube, world, client="a name with spaces")
+
+
 def test_a_forced_run_can_name_the_region_and_the_client(kube, world):
     run = force(kube, world, region="eu-1", client="my-client")
     assert (run.spec.database["region"], run.spec.database["client"]) == ("eu-1", "my-client")

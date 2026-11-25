@@ -17,7 +17,7 @@ from collections.abc import Callable, Collection
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
-from k8s_inspector import crd, dbaas_client, dbaas_keeper, launch, planner, publisher, tasks
+from k8s_inspector import crd, dbaas_client, dbaas_keeper, launch, planner, pods, publisher, tasks
 from k8s_inspector.kube import Kube
 from k8s_inspector.model import BenchmarkRun, CapacityMode, Config, DbPhase, ExitCode, RunSpec, TaskDef
 
@@ -252,6 +252,8 @@ def force_run(
     eligible (unreachable Keeper: refused); with it only Keeper's record must exist. `region` is the database's;
     `region`, `client_region` and `client` default to the cheapest database region with a client region (its own or
     one of its city, with a network) and any small x86_64 client type."""
+    if client and not pods.is_label_value(client):
+        raise ValueError(f"{client} is not a valid label value: SCarpenter cannot select it by api-reference")
     runs = crd.list_runs(kube)
     check_vendor(cfg, vendor, runs)
     if existing := database_run(runs, vendor, database_id):

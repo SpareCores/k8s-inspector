@@ -115,7 +115,7 @@ def standalone_prices(env: EnvConfig, vendor: str, database_id: str) -> dict[str
 def client_servers(env: EnvConfig, vendor: str, region_id: str) -> list[dict]:
     """Candidate client servers of the vendor in the region (`/servers`): ACTIVE, x86_64, no accelerator, 2-4 vCPUs,
     with the on-demand price in that region as `min_price_ondemand`. Memory and CPU allocation are judged by
-    `dbaas_client.rank`."""
+    `dbaas_client.most_expensive`, which bounds the price of a run."""
     params = [
         ("vendor", vendor),
         ("regions", region_id),

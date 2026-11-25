@@ -54,7 +54,7 @@ from k8s_inspector.model import (
 NOT_FINAL_CODES = (ExitCode.NEVER_FINISHED, ExitCode.RETRIES_EXHAUSTED)  # never finished: no variant dir, no outputs
 MAX_START_RETRIES = 3  # three `-4` in a row become `-5` (exit-codes.md)
 START_FAILURE_PREFIX = "cannot start command:"  # sc-run's error_msg when the task's command does not start
-START_FAILURE_PREFIXES = (START_FAILURE_PREFIX, "DBAAS_CLIENT_FAILED:", "DBAAS_LEFTOVER_STACK")
+START_FAILURE_PREFIXES = (START_FAILURE_PREFIX, "DBAAS_CLIENT_FAILED:", "DBAAS_LEFTOVER_STACK:")
 ERROR_MSG_MAX = 200  # published error_msg length; a longer one keeps its start and end
 
 LEGACY_META_FIELDS = (

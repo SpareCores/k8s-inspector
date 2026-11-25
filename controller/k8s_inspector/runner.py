@@ -116,9 +116,7 @@ MAX_PROVISION_RETRIES = 3  # attempts lost before a node was usable (stale node,
 EXTRA_ATTEMPTS = 2  # attempts beyond `max_spot_attempts` (the on-demand one plus one spare)
 NOT_ELIGIBLE = "SKU is no longer eligible in Keeper"
 ELIGIBILITY_CHECK_INTERVAL = timedelta(minutes=10)  # per run without a node: how often Keeper is asked again
-MAX_DBAAS_LAUNCH_FAILURES = (
-    3  # NodeClaims of a DBaaS client that failed to launch in one attempt before the run gives up
-)
+MAX_DBAAS_LAUNCH_FAILURES = 3  # failed NodeClaims of a DBaaS client in one attempt before the run gives up
 MAX_LAUNCH_FAILURES = 2  # distinct NodeClaims that failed to launch in one attempt before the run gives up; ICE
 # ones go on while SCarpenter still offers the SKU (`_launch_failures_exhausted`)
 SPOT_FALLBACK_ERRORS = (
@@ -1012,6 +1010,9 @@ class Runner(DbaasMixin):
 
         claims = self._pending_claims(anchor)
         bound = bool(anchor["spec"].get("nodeName")) or any(_is_true(c, "Initialized") for c in claims)
+        if not bound and pods.RUN_NODE_LABEL not in anchor["spec"]["nodeSelector"]:
+            # made before runs had a node of their own: it could land on another run's node, so it gets the new shape
+            return self._retry_provisioning(run, cfg, live, "the anchor does not select its run's node")
         if bound:  # the anchor has its node: Karpenter cleans up any other claim
             claims = [c for c in claims if _is_true(c, "Initialized")]
         error = _claim_error(claims)
@@ -1299,8 +1300,9 @@ class Runner(DbaasMixin):
         def mine(claim: dict) -> bool:
             if run_name:
                 return pods.claim_run(claim) == run_name
-            return (
-                pods.claim_vendor(claim) == selector[pods.VENDOR_LABEL]
+            return (  # not a claim of a run with a node of its own that happens to have the SKU
+                pods.claim_run(claim) is None
+                and pods.claim_vendor(claim) == selector[pods.VENDOR_LABEL]
                 and pods.claim_api_reference(claim) == selector[pods.API_REFERENCE_LABEL]
             )
 
@@ -1353,7 +1355,7 @@ class Runner(DbaasMixin):
             return self._retry_provisioning(run, cfg, live, "the node is older than the anchor")
         nd = self._build_node(run, node, anchor)
         self._nodes[run.name] = nd
-        sku = pods.node_sku(node)  # a DBaaS client is whatever type was cheapest: the label says which
+        sku = pods.node_api_reference(node)  # a DBaaS client is whatever type was cheapest: the label says which
         launch.node_ready(self.kube, run.spec.vendor, sku or run.spec.sku)  # launched: forget earlier failures
         facts = nd.facts
         if not facts.price_per_hour:
@@ -1478,6 +1480,9 @@ class Runner(DbaasMixin):
         if nd is None or nd.attempt != run.status.attempt or nd.facts.node_name != _meta(node)["name"]:
             nd = self._build_node(run, node, anchor)
             self._nodes[run.name] = nd
+            if run.spec.database and run.status.client_sku is None:  # a run in flight when the field was introduced
+                sku = pods.node_api_reference(node)
+                self._update(run, lambda status: setattr(status, "client_sku", sku))
         nd.claim = self._get_claim(nd.facts.node_claim) or self._claim_of(node, anchor)
         nd.gpu_count = _quantity(
             node.get("status", {}).get("allocatable", {}).get(GPU_RESOURCE, 0)

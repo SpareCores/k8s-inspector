@@ -260,9 +260,16 @@ def test_an_anchor_made_before_the_run_label_finds_its_claims_by_vendor_and_sku(
     selector = {"inspector.sparecores.com/run": None, "scarpenter.sparecores.com/api-reference": CLIENT}
     h.kube.merge_patch("pod", anchor, {"spec": {"nodeSelector": selector}})
     _unlaunched_claim(h, h.kube.get("pod", anchor), "claim-1")
+    _unlaunched_claim(h, h.kube.get("pod", anchor), "of-a-run-with-its-own-node")  # the same SKU, but another run's
+    run_requirement = {"key": "inspector.sparecores.com/run", "operator": "In", "values": ["another-run"]}
+    claim = h.kube.get("nodeclaim", "of-a-run-with-its-own-node")
+    h.kube.merge_patch(
+        "nodeclaim", "of-a-run-with-its-own-node",
+        {"spec": {"requirements": [*claim["spec"]["requirements"][:-1], run_requirement]}},
+    )  # fmt: skip
     crd.request_cancel(h.kube, h.name)
     h.runner.reconcile(h.name)
-    assert h.kube.list("nodeclaim") == []
+    assert [c["metadata"]["name"] for c in h.kube.list("nodeclaim")] == ["of-a-run-with-its-own-node"]
 
 
 @pytest.mark.parametrize("reason", ["NO_OFFERING", "ICE", "QUOTA", "DAILY_LIMIT", "BOOT_FAILURE", "LAUNCH_REJECTED"])
@@ -283,6 +290,15 @@ def test_a_dbaas_client_gives_up_after_three_failed_claims(h):
         assert h.run.status.phase == (RunPhase.FAILED if n == 3 else RunPhase.PROVISIONING)  # a server run ends at 2
         h.kube.delete("nodeclaim", claim)
         h.clock.advance(minutes=5)
+
+
+def test_a_dbaas_run_in_flight_without_a_client_sku_gets_it_from_its_node(h):
+    h.start_db()
+    h.until_phase(DbPhase.BOOTSTRAPPING)
+    crd.update_status(h.kube, h.name, lambda s: setattr(s, "client_sku", None))
+    h.runner._nodes.pop(h.name)  # as after a restart of the controller
+    h.runner.reconcile(h.name)
+    assert h.run.status.client_sku == "client-x"
 
 
 def test_a_new_attempt_forgets_the_client_of_the_last_one(h):
