@@ -20,6 +20,7 @@ import time
 OUTPUT = "/k8si/dbaas/postgres.json"
 TERMINATION_LOG = "/dev/termination-log"
 RETRY_SECONDS = 10
+LOG_SECONDS = 60
 
 
 def env(name: str, default: str = "") -> str:
@@ -43,8 +44,10 @@ def connect(user: str, dbname: str, timeout: int = 10):
 
 
 def wait_until_connects(user: str, dbname: str, timeout: float, *, connect_fn=connect, sleep=time.sleep) -> None:
-    """Retry every `RETRY_SECONDS` until a connection works. Raise `TimeoutError` with the last error."""
+    """Retry every `RETRY_SECONDS` until a connection works, logging the error once per `LOG_SECONDS` so a network
+    failure is visible while waiting. Raise `TimeoutError` with the last error."""
     deadline = time.monotonic() + timeout
+    next_log = time.monotonic()
     last = None
     while time.monotonic() < deadline:
         try:
@@ -52,6 +55,9 @@ def wait_until_connects(user: str, dbname: str, timeout: float, *, connect_fn=co
             return
         except Exception as e:
             last = e
+            if time.monotonic() >= next_log:
+                print(f"waiting for {env('SC_DB_HOST')} as {user}: {e}", file=sys.stderr, flush=True)
+                next_log = time.monotonic() + LOG_SECONDS
             sleep(RETRY_SECONDS)
     raise TimeoutError(f"{env('SC_DB_HOST')} did not accept connections as {user} within {timeout:.0f}s: {last}")
 

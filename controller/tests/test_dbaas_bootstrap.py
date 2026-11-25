@@ -202,6 +202,21 @@ def test_a_database_that_never_accepts_connections_times_out_with_the_last_error
         run(pg)
 
 
+def test_the_connect_error_is_logged_once_a_minute_while_waiting(pg, monkeypatch, capsys):
+    pg.refuse.add("scadmin")
+    clock = [0.0]
+    monkeypatch.setattr(boot.time, "monotonic", lambda: clock[0])
+
+    def sleep(seconds):
+        clock[0] += seconds
+
+    with pytest.raises(TimeoutError):
+        boot.wait_until_connects("scadmin", "postgres", 150, connect_fn=pg.connect_fn, sleep=sleep)
+    lines = capsys.readouterr().err.splitlines()
+    assert len(lines) == 3  # at 0 s, 60 s and 120 s, not at every 10 s retry
+    assert all("no login for scadmin" in line for line in lines)
+
+
 def test_the_result_goes_to_the_termination_message_without_the_password(pg, monkeypatch, tmp_path):
     real_run = boot.run
     monkeypatch.setattr(boot, "run", lambda: real_run(connect_fn=pg.connect_fn, sleep=lambda s: None))
