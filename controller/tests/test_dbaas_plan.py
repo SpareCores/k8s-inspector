@@ -1,5 +1,6 @@
 """DBaaS planning: the client picker, region choice, what is due and the forced path. Keeper is faked."""
 
+import dataclasses
 import logging
 from datetime import UTC, datetime, timedelta
 
@@ -230,6 +231,17 @@ def test_failures_are_retried_with_the_usual_bounds(kube, world):
     assert plan(kube, make_config(), world, dry_run=True) == []
 
 
+def test_a_damaged_meta_skips_the_database_even_when_an_earlier_task_is_due(kube, world, monkeypatch, caplog):
+    caplog.set_level(logging.INFO)
+    first = get_task(TASK)
+    second = dataclasses.replace(first, name="second_dbaas_task")
+    monkeypatch.setattr(dbaas_plan, "dbaas_tasks", lambda: [first, second])
+    world.records = {"db-a": world.records["db-a"]}
+    world.metas = {"db-a": {"18": {second.name: None}}}  # the first task never ran (due), the second's meta is damaged
+    assert plan(kube, make_config(), world, dry_run=True) == []
+    assert "nothing to plan for vendor oci: 1 databases, 1 damaged meta.json" in caplog.text
+
+
 def test_the_retry_goes_to_another_region_than_the_failed_one(kube, world):
     world.records = {"db-a": world.records["db-a"]}
     old = (NOW - timedelta(hours=3)).replace(tzinfo=None).isoformat()
@@ -281,9 +293,20 @@ def test_a_vendor_that_gets_no_run_is_logged_with_the_reasons_and_counts(kube, w
     crd.create_run(kube, RunSpec("oci", "db-d", "r0", database={"vendor": "oci", "id": "db-d", "engineVersion": "18"}))
     assert plan(kube, make_config(dbaas_max_in_flight=5), world, dry_run=True) == []
     (line,) = [m for m in caplog.messages if m.startswith("DBaaS autoPlan: nothing to plan")]
-    assert line.startswith("DBaaS autoPlan: nothing to plan for vendor oci: 4 databases, ")
+    assert line.startswith("DBaaS autoPlan: nothing to plan for vendor oci: 4 databases, 2 blocked by Keeper (e.g. ")
     for part in ("2 blocked by Keeper (e.g. Cloud credit/budget exhausted.)", "1 nothing due", "1 already has a run"):
         assert part in line
+
+
+def test_a_run_created_meanwhile_counts_as_already_having_one(kube, world, caplog, monkeypatch):
+    caplog.set_level(logging.INFO)
+
+    def taken(*args, **kwargs):
+        raise crd.RunExists("x")
+
+    monkeypatch.setattr(dbaas_plan, "_create_run", taken)
+    assert plan(kube, make_config(), world) == []
+    assert "nothing to plan for vendor oci: 3 databases, 3 already has a run" in caplog.text
 
 
 def test_a_vendor_keeper_lists_no_database_for_is_logged_too(kube, world, caplog):

@@ -366,21 +366,26 @@ def plan_cycle(
                 skipped["blocked by Keeper"] += 1
                 block_codes.update(code for codes in blocked[vendor][database_id].values() for code in codes)
                 continue
-            due, failed_regions = {}, set()
+            due, failed_regions, damaged = {}, set(), False
             for task in dbaas_tasks():
                 if task.name in blocked[vendor][database_id]:
                     continue
                 meta = metas.get(database_id, {}).get(version, {}).get(task.name)
                 if meta is None and task.name in metas.get(database_id, {}).get(version, {}):
-                    break  # damaged meta.json: skip the database
+                    damaged = True
+                    break
                 try:
                     reason = planner.due_reason(task, meta, now)
                 except AttributeError, TypeError, ValueError:
                     log.warning("DBaaS autoPlan skips %s/%s: damaged meta.json of %s", vendor, database_id, task.name)
+                    damaged = True
                     break
                 if reason:
                     due[task.name] = reason
                     failed_regions |= _failed_regions(meta)
+            if damaged:  # the whole database is skipped, whatever an earlier task found due
+                skipped["damaged meta.json"] += 1
+                continue
             if not due:
                 skipped["nothing due"] += 1
                 continue
@@ -395,6 +400,7 @@ def plan_cycle(
                 try:
                     _create_run(kube, cfg, vendor, record, version, placement, list(due), force=False)
                 except crd.RunExists:
+                    skipped["already has a run"] += 1
                     continue
             reason = ", ".join(f"{name}: {why}" for name, why in due.items())
             planned.append(
@@ -418,7 +424,7 @@ def plan_cycle(
 def _nothing_planned(vendor: str, total: int, skipped: Counter[str], block_codes: Counter[str]) -> str:
     """The line of a vendor that got no run in a cycle: the databases Keeper lists and how many were skipped why."""
     parts = []
-    for reason, count in skipped.items():
+    for reason, count in skipped.most_common():
         example = f" (e.g. {block_codes.most_common(1)[0][0]})" if reason == "blocked by Keeper" and block_codes else ""
         parts.append(f"{count} {reason}{example}")
     return f"DBaaS autoPlan: nothing to plan for vendor {vendor}: {total} databases" + "".join(f", {p}" for p in parts)
