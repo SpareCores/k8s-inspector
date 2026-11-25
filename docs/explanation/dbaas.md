@@ -290,9 +290,10 @@ regional cores or the family quota are short. These refusals mean the database c
 whatever happens, so they are a `RegionUnavailable` error: its message starts with `DBAAS_REGION_UNAVAILABLE:`, which
 survives Pulumi's wrapping of the exception. The up Job fails at once and the run ends `-1` with
 `DBAAS_REGION_UNAVAILABLE: <cause>` (any other create failure is `DBAAS_CREATE_FAILED`), with the client region
-recorded. The next plan puts that region last, and the result counts as a start retry like `DBAAS_CLIENT_FAILED`, so the
-third in a row ends as `-5`. Only the last failed region is remembered, so with two unavailable regions the plan
-alternates between them until the cap ends it. A vendor module raises `RegionUnavailable` for what is region-fatal. A check that cannot be made
+recorded. The result counts as a start retry like `DBAAS_CLIENT_FAILED`, so the third in a row ends as `-5`. The
+published `meta.json` carries `failed_regions`, the regions of the start failures in a row (carried like
+`start_retries`, gone with any other result), and the next plan puts all of them last: with the cap of three, the run
+tries up to three different regions. A vendor module raises `RegionUnavailable` for what is region-fatal. A check that cannot be made
 (ARM unreachable, an unexpected answer) is logged and does not stop the create; the client node's zone is then requested
 as is.
 

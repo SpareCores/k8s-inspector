@@ -110,8 +110,8 @@ def check_spend(cfg: Config, vendor: str, runs: list[BenchmarkRun], price: float
 
 
 def region_order(prices: dict[str, float], networks: dict, failed: Collection[str] = ()) -> list[str]:
-    """The database's regions that have a network, cheapest first; the regions where the last attempt failed go last,
-    so a retry tries another one."""
+    """The database's regions that have a network, cheapest first; the regions where the failed attempts in a row
+    were go last, so a retry tries another one."""
     return sorted((r for r in prices if r in networks), key=lambda r: (r in failed, prices[r], r))
 
 
@@ -129,9 +129,14 @@ def client_regions(
     return [r for r in sorted(networks) if city and cities.get(r) == city]
 
 
-def _failed_region(meta: dict | None) -> str | None:
+def _failed_regions(meta: dict | None) -> set[str]:
+    """The regions of the attempts that failed without a result in a row: the published `failed_regions` (start
+    failures counted for the retry cap), else the last attempt's region when it failed without one."""
     attempt = meta.get("last_attempt") or meta if meta else {}
-    return attempt.get("region") if attempt.get("exit_code") in (ExitCode.NO_NODE, ExitCode.NEVER_FINISHED) else None
+    regions = set(attempt.get("failed_regions") or [])
+    if attempt.get("region") and attempt.get("exit_code") in (ExitCode.NO_NODE, ExitCode.NEVER_FINISHED):
+        regions.add(attempt["region"])
+    return regions
 
 
 def _create_run(
@@ -179,7 +184,7 @@ def _resolve(
     *,
     region: str | None,
     client: str | None,
-    last_failed: str | None,
+    failed_regions: Collection[str],
     client_region: str | None = None,
 ) -> Placement:
     """The given database region, client region and client, else the cheapest database region that has a client region
@@ -208,7 +213,7 @@ def _resolve(
     else:
         reachable = {r: price for r, price in prices.items() if clients_of(r)}
         # a run records the region of its node, which is the client's
-        failed = {r for r in reachable if last_failed in (r, *clients_of(r))}
+        failed = {r for r in reachable if failed_regions and set(failed_regions) & {r, *clients_of(r)}}
         regions = region_order(reachable, reachable, failed)
     if not regions:
         raise ValueError(f"{vendor}/{database_id} has no standalone price in a region that has a DBaaS network")
@@ -285,7 +290,7 @@ def force_run(
             record,
             region=region,
             client=client,
-            last_failed=None,
+            failed_regions=(),
             client_region=client_region,
         )
     except RuntimeError as e:
@@ -348,7 +353,7 @@ def plan_cycle(
             version = dbaas_keeper.engine_version(record, cfg.settings.dbaas.engine_version)
             if version is None:
                 continue
-            due, last_failed = {}, None
+            due, failed_regions = {}, set()
             for task in dbaas_tasks():
                 if task.name in blocked[vendor][database_id]:
                     continue
@@ -362,11 +367,11 @@ def plan_cycle(
                     break
                 if reason:
                     due[task.name] = reason
-                    last_failed = _failed_region(meta)
+                    failed_regions |= _failed_regions(meta)
             if not due:
                 continue
             try:
-                placement = _resolve(cfg, vendor, record, region=None, client=None, last_failed=last_failed)
+                placement = _resolve(cfg, vendor, record, region=None, client=None, failed_regions=failed_regions)
                 check_spend(cfg, vendor, crd.list_runs(kube), placement.usd_per_hour)
             except (ValueError, RuntimeError) as e:
                 log.info("DBaaS autoPlan skips %s/%s: %s", vendor, database_id, e)

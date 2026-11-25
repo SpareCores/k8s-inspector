@@ -277,6 +277,8 @@ def dump_meta(meta: dict) -> str:
     out = _canonical_meta(meta, with_added=False)
     if "last_attempt" in meta:  # schedule metas only
         out["last_attempt"] = meta["last_attempt"]
+    if meta.get("failed_regions"):  # DBaaS metas only: the regions of the start failures in a row
+        out["failed_regions"] = meta["failed_regions"]
     return json.dumps(out, separators=(",", ":"), ensure_ascii=False)
 
 
@@ -899,6 +901,19 @@ def render_task(tree: Path, vendor: str, sku: str, variant: int | None, inp: Ren
     return written + ([schedule] if schedule else [])
 
 
+def _apply_failed_regions(meta: dict, prior: dict | None) -> None:
+    """`failed_regions`: the regions of the consecutive start failures, carried like `start_retries` (which says
+    whether this one continues the chain, or is a re-render of the same run) and gone with any other result. The next
+    plan tries a region not in it first."""
+    if not meta["start_retries"]:
+        return
+    chained = meta["start_retries"] > 1 or (prior and prior.get("run_id") == meta["run_id"])
+    regions = list(prior.get("failed_regions") or []) if prior and chained else []
+    if meta.get("region") and meta["region"] not in regions:
+        regions.append(meta["region"])
+    meta["failed_regions"] = regions
+
+
 def render_dbaas_task(tree: Path, database: dict, inp: RenderInput) -> list[Path]:
     """DBaaS result: `dbaas/<vendor>/<id>/postgres/<engineVersion>/standalone/<task>/{meta.json,stdout}`
     (`database` is `RunSpec.database`). No variant, no schedule."""
@@ -913,6 +928,7 @@ def render_dbaas_task(tree: Path, database: dict, inp: RenderInput) -> list[Path
     if meta["exit_code"] != ExitCode.OK and previous and previous.get("exit_code") == ExitCode.OK:
         return []  # a failure never replaces a good result (sc-crawler reads the stdout without the exit code)
     _apply_start_retries(meta, previous)
+    _apply_failed_regions(meta, previous)
     if meta["version"] is None:  # no version command runs against a managed database: the legacy wrote the image tag
         meta["version"] = inp.task.image.rsplit(":", 1)[-1]
     stdout = inp.stdout if inp.stdout and meta["exit_code"] not in NOT_FINAL_CODES else b""

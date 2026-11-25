@@ -241,9 +241,24 @@ def test_a_region_unavailable_result_sends_the_next_plan_to_another_region(kube,
     old = (NOW - timedelta(hours=3)).replace(tzinfo=None).isoformat()
     error = "DBAAS_REGION_UNAVAILABLE: azure pre-flight: restricted in eu-2"
     meta = good_meta(exit_code=-1, end=old, region="eu-2", error_msg=error)
-    assert dbaas_plan._failed_region(meta) == "eu-2"
+    assert dbaas_plan._failed_regions(meta) == {"eu-2"}
     world.metas = {"db-a": {"18": {TASK: meta}}}
     assert plan(kube, make_config(), world, dry_run=True)[0].region == "eu-1"
+
+
+def test_the_regions_of_all_the_failures_in_a_row_go_last(kube, world):
+    world.records = {"db-a": world.records["db-a"]}
+    world.prices = {"eu-1": 0.40, "eu-2": 0.30, "eu-3": 0.50}
+    networks = {r: {"vpc": r} for r in world.prices}
+    old = (NOW - timedelta(hours=3)).replace(tzinfo=None).isoformat()
+    error = "DBAAS_REGION_UNAVAILABLE: x"
+    meta = good_meta(
+        exit_code=-1, end=old, region="eu-1", error_msg=error, start_retries=2, failed_regions=["eu-2", "eu-1"]
+    )
+    world.metas = {"db-a": {"18": {TASK: meta}}}
+    assert dbaas_plan._failed_regions(meta) == {"eu-1", "eu-2"}
+    # the dearest region is the only one left that has not failed
+    assert plan(kube, make_config(networks=networks), world, dry_run=True)[0].region == "eu-3"
 
 
 def test_a_database_keeper_blocks_is_not_planned(kube, world):
