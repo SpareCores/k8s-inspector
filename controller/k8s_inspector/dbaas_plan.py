@@ -13,6 +13,7 @@ docs/explanation/dbaas.md.
 
 import logging
 import threading
+from collections import Counter
 from collections.abc import Callable, Collection
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -344,42 +345,62 @@ def plan_cycle(
             log.exception("DBaaS autoPlan skips vendor %s: cannot read Keeper or the sc-inspector-data state", vendor)
             continue
         runs = crd.list_runs(kube)
+        skipped: Counter[str] = Counter()  # why the databases got no run, for the line logged when none did
+        block_codes: Counter[str] = Counter()
         for database_id in sorted(blocked.get(vendor, {}), key=lambda d: planner.start_order(vendor, d)):
             record = records.get(database_id)
             if database_run(runs, vendor, database_id):
+                skipped["already has a run"] += 1
                 continue
-            if record is None or not publisher.publish_allowed(cfg.settings, vendor, database_id):
+            if record is None:
+                skipped["no Keeper record"] += 1
+                continue
+            if not publisher.publish_allowed(cfg.settings, vendor, database_id):
+                skipped["publish not allowed"] += 1
                 continue
             version = dbaas_keeper.engine_version(record, cfg.settings.dbaas.engine_version)
             if version is None:
+                skipped["no PostgreSQL version"] += 1
                 continue
-            due, failed_regions = {}, set()
+            if all(name in blocked[vendor][database_id] for name in names):
+                skipped["blocked by Keeper"] += 1
+                block_codes.update(code for codes in blocked[vendor][database_id].values() for code in codes)
+                continue
+            due, failed_regions, damaged = {}, set(), False
             for task in dbaas_tasks():
                 if task.name in blocked[vendor][database_id]:
                     continue
                 meta = metas.get(database_id, {}).get(version, {}).get(task.name)
                 if meta is None and task.name in metas.get(database_id, {}).get(version, {}):
-                    break  # damaged meta.json: skip the database
+                    damaged = True
+                    break
                 try:
                     reason = planner.due_reason(task, meta, now)
                 except AttributeError, TypeError, ValueError:
                     log.warning("DBaaS autoPlan skips %s/%s: damaged meta.json of %s", vendor, database_id, task.name)
+                    damaged = True
                     break
                 if reason:
                     due[task.name] = reason
                     failed_regions |= _failed_regions(meta)
+            if damaged:  # the whole database is skipped, whatever an earlier task found due
+                skipped["damaged meta.json"] += 1
+                continue
             if not due:
+                skipped["nothing due"] += 1
                 continue
             try:
                 placement = _resolve(cfg, vendor, record, region=None, client=None, failed_regions=failed_regions)
                 check_spend(cfg, vendor, crd.list_runs(kube), placement.usd_per_hour)
             except (ValueError, RuntimeError) as e:
                 log.info("DBaaS autoPlan skips %s/%s: %s", vendor, database_id, e)
+                skipped["no region, client or budget"] += 1
                 continue
             if not dry_run:
                 try:
                     _create_run(kube, cfg, vendor, record, version, placement, list(due), force=False)
                 except crd.RunExists:
+                    skipped["already has a run"] += 1
                     continue
             reason = ", ".join(f"{name}: {why}" for name, why in due.items())
             planned.append(
@@ -395,7 +416,18 @@ def plan_cycle(
                 )
             )
             break  # at most one new DBaaS run per vendor and cycle; the next cycle checks the limits again
+        else:
+            log.info(_nothing_planned(vendor, len(blocked.get(vendor, {})), skipped, block_codes))
     return planned
+
+
+def _nothing_planned(vendor: str, total: int, skipped: Counter[str], block_codes: Counter[str]) -> str:
+    """The line of a vendor that got no run in a cycle: the databases Keeper lists and how many were skipped why."""
+    parts = []
+    for reason, count in skipped.most_common():
+        example = f" (e.g. {block_codes.most_common(1)[0][0]})" if reason == "blocked by Keeper" and block_codes else ""
+        parts.append(f"{count} {reason}{example}")
+    return f"DBaaS autoPlan: nothing to plan for vendor {vendor}: {total} databases" + "".join(f", {p}" for p in parts)
 
 
 def run_forever(
