@@ -246,6 +246,7 @@ class DbaasMixin:
         if "host" not in outputs:
             return self._database_fail(run, "DBAAS_CREATE_FAILED", "the Job reported no connection facts")
         self.kube.apply_secret(dbaas_jobs.connection_secret(run, self._run_owner(run), self._password(run), outputs))
+        launch.unblock_region(self.kube, run.spec.vendor, run.spec.database["region"])  # it works there
         now = self._now()
         created = dbaas_jobs.job_completed_at(job, now)
 

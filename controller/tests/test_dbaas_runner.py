@@ -357,6 +357,14 @@ def test_a_vendor_wide_region_failure_blocks_the_region_for_the_vendor(h):
     assert launch.blocked_regions(h.kube, "oci", h.clock.now) == {"eu-test-1"}  # the database's region
 
 
+def test_a_database_created_in_a_blocked_region_lifts_the_block(h):
+    launch.block_region(h.kube, "oci", "eu-test-1", h.clock.now, "restricted")
+    launch.block_region(h.kube, "oci", "other-region", h.clock.now, "restricted")
+    h.start_db()
+    h.until_phase(DbPhase.BOOTSTRAPPING)  # the up Job succeeded: a forced re-test of the region worked
+    assert launch.blocked_regions(h.kube, "oci", h.clock.now) == {"other-region"}
+
+
 def test_a_region_failure_of_one_database_blocks_nothing_for_the_vendor(h):
     h.cluster.jobs["up"] = ["fail"]
     h.cluster.up_error = "DBAAS_REGION_UNAVAILABLE: azure pre-flight: the SKU is not offered"

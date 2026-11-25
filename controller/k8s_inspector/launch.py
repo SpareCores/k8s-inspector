@@ -213,16 +213,21 @@ def block_region(kube: Kube, vendor: str, region: str, now: datetime, reason: st
     pruning of SKU entries does not touch it). Expired entries go with the write."""
 
     def mutate(entries: dict[str, dict]) -> None:
-        for name in [r for r, e in entries.items() if not is_waiting({"next": e.get("until")}, now)]:
+        for name in [r for r, e in entries.items() if _time(e.get("until")) <= now]:
             del entries[name]
         entries[region] = {"until": (now + REGION_BLOCK_TTL).isoformat(), "reason": reason[:200]}
 
     _change(kube, vendor, mutate, "regions")
 
 
+def unblock_region(kube: Kube, vendor: str, region: str) -> None:
+    """A database was created in `region`: the block (if any) was wrong or is over."""
+    _change(kube, vendor, lambda entries: entries.pop(region, None), "regions")
+
+
 def blocked_regions(kube: Kube, vendor: str, now: datetime) -> set[str]:
     """The regions the vendor is blocked in for every database (`block_region`) and not yet expired."""
-    return {r for r, e in read(kube, vendor, "regions").items() if is_waiting({"next": e.get("until")}, now)}
+    return {r for r, e in read(kube, vendor, "regions").items() if _time(e.get("until")) > now}
 
 
 def clear(kube: Kube, vendor: str, skus: list[str]) -> None:

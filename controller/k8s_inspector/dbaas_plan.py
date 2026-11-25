@@ -220,9 +220,10 @@ def _resolve(
         regions = [region]
     else:
         reachable = {r: price for r, price in prices.items() if clients_of(r)}
-        if reachable and set(reachable) <= set(blocked_regions):
+        left = {r: price for r, price in reachable.items() if r not in blocked_regions}
+        if reachable and not left:
             raise RegionsBlocked(f"{vendor}/{database_id}: its regions are blocked for the vendor")
-        reachable = {r: price for r, price in reachable.items() if r not in blocked_regions}
+        reachable = left
         # a run records the region of its node, which is the client's
         failed = {r for r in reachable if failed_regions and set(failed_regions) & {r, *clients_of(r)}}
         regions = region_order(reachable, reachable, failed)
