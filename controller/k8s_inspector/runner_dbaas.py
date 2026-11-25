@@ -187,9 +187,9 @@ class DbaasMixin:
             # SCarpenter writes the address at create when the vendor returns it, else with its next sweep (~2 minutes).
             # A vendor that needs none is not held up for long; one that does fails loudly after the wait. The wait
             # starts with the node (`status.database.since`, reset by a new attempt's node).
-            if self._now() - run.status.database.since < CLIENT_ADDRESS_WAIT:
-                if (run.name, run.status.attempt) not in self._address_wait_logged:
-                    self._address_wait_logged.add((run.name, run.status.attempt))
+            waited = self._now() - run.status.database.since
+            if waited < CLIENT_ADDRESS_WAIT:
+                if waited < timedelta(seconds=ADDRESS_POLL_SECONDS):  # the first poll only
                     log.info(
                         "run %s: waiting for the public address of the client node %s", run.name, nd.facts.node_name
                     )
@@ -207,9 +207,10 @@ class DbaasMixin:
         network = cfg.settings.dbaas.vendors[db["vendor"]].networks[pods.client_region(db)]
         spec = dbaas_jobs.build_spec(run, cfg, record, network, run.status.database.expires, addresses)
         now = self._now()
-        self._create("job", dbaas_jobs.up_job(run, cfg, spec, self._run_owner(run)))
-        # the create time starts with the Job, not with the wait for the address
+        # the create time starts with the Job, not with the wait for the address; stamped first, so that a restart
+        # between the two calls cannot lose it
         self._set_database(run, lambda status: status.database.timing.__setitem__("api_start", now))
+        self._create("job", dbaas_jobs.up_job(run, cfg, spec, self._run_owner(run)))
 
     def _database_creating(self, run: BenchmarkRun, cfg: Config, live: dict[str, dict]) -> None:
         db = run.status.database

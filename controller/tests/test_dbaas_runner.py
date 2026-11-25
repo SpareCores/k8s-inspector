@@ -868,16 +868,18 @@ def test_the_up_job_waits_for_the_public_address_of_the_client_node(h, caplog):
     assert timing["api_start"] == h.clock.now and h.run.status.database.since < timing["api_start"]  # the Job's start
 
 
-def test_the_wait_logs_once_and_makes_no_keeper_or_secret_call(h, caplog, monkeypatch):
+def test_the_wait_logs_only_at_the_start_and_makes_no_keeper_or_secret_call(h, caplog, monkeypatch):
     caplog.set_level(logging.INFO)
     _client_node_without_address(h)
+    logged = caplog.text.count("waiting for the public address")  # the first poll(s), right at the start
+    assert logged >= 1
     asked = []
     monkeypatch.setattr(dbaas_keeper, "database", lambda *a: asked.append(a) or dict(RECORD))
     for _ in range(3):
         h.clock.advance(seconds=15)
         h.runner.reconcile(h.name)
     assert asked == [] and f"{h.name}-db" not in h.kube.objects.get("secret", {})
-    assert caplog.text.count("waiting for the public address") == 1
+    assert caplog.text.count("waiting for the public address") == logged  # none after the first poll
 
 
 def test_an_address_only_on_the_nodeclaim_is_enough(h):

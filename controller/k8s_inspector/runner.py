@@ -432,7 +432,6 @@ class Runner(DbaasMixin):
         self._known: set[str] = set()  # run names seen, to notice deletions between LISTs
         self._failing: dict[str, tuple[int, datetime]] = {}  # run -> (reconciles failed in a row, since when)
         self._nodes: dict[str, _Node] = {}  # cache per run
-        self._address_wait_logged: set[tuple[str, int]] = set()  # (run, attempt) waiting for the client's address
         self._signed_at: dict[str, datetime] = {}  # when the urls Secret was last signed, per run
         # run -> since when its node has had DiskPressure. In memory: a controller restart restarts the wait.
         self._disk_wait: dict[str, datetime] = {}
