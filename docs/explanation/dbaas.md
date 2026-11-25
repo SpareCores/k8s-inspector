@@ -286,8 +286,13 @@ SKUs) is not an error: it is logged at info level and only the regional cores qu
 The pre-flight runs in the `azure` vendor module before the first resource (`azure_preflight.py`), with the Job's workload
 identity. It refuses, with a message that names the cause, when the subscription is restricted for the offer in the
 region, the region does not list the SKU (or lists it as disabled), the region lacks the storage the plan needs, or the
-regional cores or the family quota are short. The up Job then fails at once and the run ends `-1` with
-`DBAAS_CREATE_FAILED`, like any other create failure; the retry rules go to the next region. A check that cannot be made
+regional cores or the family quota are short. These refusals mean the database cannot be created in this region
+whatever happens, so they are a `RegionUnavailable` error: its message starts with `DBAAS_REGION_UNAVAILABLE:`, which
+survives Pulumi's wrapping of the exception. The up Job fails at once and the run ends `-1` with
+`DBAAS_REGION_UNAVAILABLE: <cause>` (any other create failure is `DBAAS_CREATE_FAILED`), with the client region
+recorded. The next plan puts that region last, and the result counts as a start retry like `DBAAS_CLIENT_FAILED`, so the
+third in a row ends as `-5`. Only the last failed region is remembered, so with two unavailable regions the plan
+alternates between them until the cap ends it. A vendor module raises `RegionUnavailable` for what is region-fatal. A check that cannot be made
 (ARM unreachable, an unexpected answer) is logged and does not stop the create; the client node's zone is then requested
 as is.
 

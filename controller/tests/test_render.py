@@ -533,12 +533,19 @@ def test_dbaas_layout(tmp_path):
     assert sorted(p.name for p in written) == ["meta.json", "stdout"] and (base / "stdout").read_bytes() == b"out"
 
 
-def test_dbaas_client_failures_count_as_start_retries_and_end_as_minus_five(tmp_path):
+@pytest.mark.parametrize(
+    "error",
+    [
+        "DBAAS_CLIENT_FAILED: SCARPENTER_ICE: x",
+        "DBAAS_LEFTOVER_STACK: a stack could not be destroyed",
+        "DBAAS_REGION_UNAVAILABLE: azure pre-flight: restricted in eastus",
+    ],
+)
+def test_dbaas_start_failures_count_as_start_retries_and_end_as_minus_five(tmp_path, error):
     db = {"vendor": "ovh", "id": "pg", "engineVersion": "18"}
     task = "pgbench_postgres_dbaas_ro_durable"
     meta = tmp_path / "dbaas/ovh/pg/postgres/18/standalone" / task / "meta.json"
     for n in (1, 2, 3):
-        error = "DBAAS_CLIENT_FAILED: SCARPENTER_ICE: x"
         inp = plain_input(task, -1, f"2026-10-0{n}T10:00:00", f"r{n}", b"", error_msg=error)
         render.render_dbaas_task(tmp_path, db, inp)
     written = json.loads(meta.read_text())

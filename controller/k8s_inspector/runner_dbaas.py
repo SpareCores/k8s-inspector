@@ -222,6 +222,9 @@ class DbaasMixin:
         state = dbaas_jobs.job_state(job)
         if state == "failed":
             message = dbaas_jobs.job_message(self.kube, name).get("error") or "the Job failed"
+            if dbaas_jobs.REGION_UNAVAILABLE in message:  # not in this region, whatever happens: the next plan moves on
+                cause = message.split(dbaas_jobs.REGION_UNAVAILABLE, 1)[1].strip().splitlines()[0]
+                return self._database_fail(run, "DBAAS_REGION_UNAVAILABLE", cause)
             return self._database_fail(run, "DBAAS_CREATE_FAILED", message)
         if state == "running":
             started = db.timing.get("api_start") or db.since

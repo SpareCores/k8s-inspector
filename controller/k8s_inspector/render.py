@@ -54,7 +54,12 @@ from k8s_inspector.model import (
 NOT_FINAL_CODES = (ExitCode.NEVER_FINISHED, ExitCode.RETRIES_EXHAUSTED)  # never finished: no variant dir, no outputs
 MAX_START_RETRIES = 3  # three `-4` in a row become `-5` (exit-codes.md)
 START_FAILURE_PREFIX = "cannot start command:"  # sc-run's error_msg when the task's command does not start
-START_FAILURE_PREFIXES = (START_FAILURE_PREFIX, "DBAAS_CLIENT_FAILED:", "DBAAS_LEFTOVER_STACK:")
+START_FAILURE_PREFIXES = (
+    START_FAILURE_PREFIX,
+    "DBAAS_CLIENT_FAILED:",
+    "DBAAS_LEFTOVER_STACK:",
+    "DBAAS_REGION_UNAVAILABLE:",
+)
 ERROR_MSG_MAX = 200  # published error_msg length; a longer one keeps its start and end
 
 LEGACY_META_FIELDS = (
@@ -781,7 +786,8 @@ def refresh_schedule_meta(instance_root: Path, task: str, attempt: dict, extra: 
 
 def _is_start_failure(meta: dict) -> bool:
     """A `-1` published for a command that did not start (see `published_meta`) or for a DBaaS run that got no client
-    node or no clean slate: the same failure again and again ends as `-5`."""
+    node, no clean slate or no way to create the database in the region: the same failure again and again ends as
+    `-5`."""
     return meta.get("exit_code") == ExitCode.NO_NODE and str(meta.get("error_msg")).startswith(START_FAILURE_PREFIXES)
 
 

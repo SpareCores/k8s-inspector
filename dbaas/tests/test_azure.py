@@ -6,6 +6,7 @@ import pytest
 
 from k8s_inspector_dbaas import azure_preflight
 from k8s_inspector_dbaas.azure_preflight import PreflightError
+from k8s_inspector_dbaas.errors import RegionUnavailable
 from k8s_inspector_dbaas.spec import DbSpec
 from k8s_inspector_dbaas.vendors import azure
 
@@ -141,6 +142,12 @@ def test_a_client_zone_the_sku_does_not_offer_is_not_requested(mocks, checked):
         assert not found[2].inputs.get("availabilityZone")
 
     return registered(mocks, make_spec(zone="westeurope-3")).apply(check)
+
+
+def test_a_pre_flight_refusal_is_marked_as_region_unavailable_for_the_controller():
+    error = PreflightError("azure pre-flight: restricted in eastus")
+    assert isinstance(error, RegionUnavailable)
+    assert str(error) == "DBAAS_REGION_UNAVAILABLE: azure pre-flight: restricted in eastus"
 
 
 def test_a_failed_pre_flight_creates_nothing(mocks, monkeypatch):

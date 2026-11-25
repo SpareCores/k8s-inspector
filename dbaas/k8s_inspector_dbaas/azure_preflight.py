@@ -25,6 +25,8 @@ import urllib.request
 from collections.abc import Iterator
 from pathlib import Path
 
+from k8s_inspector_dbaas.errors import RegionUnavailable
+
 ARM = "https://management.azure.com"
 API_VERSION = "2025-08-01"  # Microsoft.DBforPostgreSQL; the version of the pulumi-azure-native Server resource
 COMPUTE_API_VERSION = "2021-07-01"  # Microsoft.Compute/skus
@@ -34,7 +36,7 @@ ASSERTION_TYPE = "urn:ietf:params:oauth:client-assertion-type:jwt-bearer"
 log = logging.getLogger(__name__)
 
 
-class PreflightError(RuntimeError):
+class PreflightError(RegionUnavailable):
     """The subscription cannot create this database in this region."""
 
 
