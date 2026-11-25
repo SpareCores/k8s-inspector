@@ -379,7 +379,12 @@ def _unlaunched_claim(h, anchor, name):
             "spec": {
                 "requirements": [
                     {"key": key, "operator": "In", "values": [selector[key]]}
-                    for key in ("scarpenter.sparecores.com/vendor", "scarpenter.sparecores.com/api-reference")
+                    for key in (
+                        "scarpenter.sparecores.com/vendor",
+                        "scarpenter.sparecores.com/api-reference",
+                        "inspector.sparecores.com/run",
+                    )
+                    if key in selector
                 ]
             },
         },
@@ -1607,16 +1612,16 @@ def test_cancel_deletes_a_claim_the_run_has_not_recorded_yet(h):
 def test_cancel_deletes_only_the_claims_of_its_own_anchor(h):
     _boot_run(h)
     anchor = h.kube.get("pod", f"{h.name}-a1")
-    vendor, api = "scarpenter.sparecores.com/vendor", "scarpenter.sparecores.com/api-reference"
-    for name, labels in (("other-sku", {api: "other"}), ("other-vendor", {vendor: "other"}), ("old", {})):
+    for name in ("other-run", "old"):
         _launched_claim(h, anchor, name)
-        h.kube.merge_patch("nodeclaim", name, {"metadata": {"labels": labels}})
+    run_label = "inspector.sparecores.com/run"
+    h.kube.merge_patch("nodeclaim", "other-run", {"metadata": {"labels": {run_label: "another-run"}}})
     h.kube.merge_patch("nodeclaim", "old", {"metadata": {"creationTimestamp": iso(START - timedelta(hours=1))}})
     crd.request_cancel(h.kube, h.name)
     h.runner.reconcile(h.name)
     assert h.run.status.phase == RunPhase.CANCELLED
     assert _claim_deletes(h) == ["claim-1"]
-    assert sorted(c["metadata"]["name"] for c in h.kube.list("nodeclaim")) == ["old", "other-sku", "other-vendor"]
+    assert sorted(c["metadata"]["name"] for c in h.kube.list("nodeclaim")) == ["old", "other-run"]
 
 
 def test_a_failing_claim_delete_does_not_change_how_the_run_is_cancelled(h, monkeypatch):

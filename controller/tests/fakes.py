@@ -307,6 +307,7 @@ class Cluster:
         self.kube, self.clock = kube, clock
         self.behaviour: dict[str, list[dict]] = {}
         self.capacity = "spot"
+        self.sku = "client-x"  # the SKU of the nodes of anchors that do not name one (DBaaS clients)
         self.node_labels: dict[str, str] = {}
         self.node_allocatable: dict[str, str] = {"memory": "15Gi", "cpu": "2"}
         self.claim_annotations: dict[str, str] = {
@@ -325,12 +326,15 @@ class Cluster:
     def node_name(self, anchor: dict) -> str:
         return f"node-{anchor['metadata']['name']}"
 
-    def provision(self, anchor: dict, *, node_created: datetime | None = None) -> None:
+    def provision(self, anchor: dict, *, node_created: datetime | None = None, sku: str | None = None) -> None:
+        """The node of the anchor. Its SKU is the anchor's, or (a DBaaS client) `sku`, else `self.sku`."""
         name = self.node_name(anchor)
         when = node_created or self.clock.now + timedelta(seconds=30)
         selector = anchor["spec"]["nodeSelector"]
-        vendor, sku = selector["scarpenter.sparecores.com/vendor"], selector["scarpenter.sparecores.com/api-reference"]
+        vendor = selector["scarpenter.sparecores.com/vendor"]
+        sku = selector.get("scarpenter.sparecores.com/api-reference") or sku or self.sku
         labels = {
+            **({RUN_LABEL: selector[RUN_LABEL]} if RUN_LABEL in selector else {}),
             "node.kubernetes.io/instance-type": f"{vendor}.{sku}",
             "scarpenter.sparecores.com/vendor": vendor,
             "scarpenter.sparecores.com/api-reference": sku,
@@ -401,7 +405,9 @@ class Cluster:
                             "karpenter.sh/nodepool",
                             "scarpenter.sparecores.com/vendor",
                             "scarpenter.sparecores.com/api-reference",
+                            RUN_LABEL,
                         )
+                        if k in selector
                     },
                     "creationTimestamp": iso(self.clock.now + timedelta(seconds=1)),
                 },
@@ -558,6 +564,9 @@ class Cluster:
             elif role in ("step", "flush"):
                 changed |= self.finish(pod)
         return changed
+
+
+RUN_LABEL = "inspector.sparecores.com/run"
 
 
 def anchor_name(run_name: str, attempt: int) -> str:

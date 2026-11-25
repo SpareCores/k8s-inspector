@@ -17,12 +17,14 @@ launch failure of an attempt ends the run; a temporary one leaves no record, a f
 The anchor is the only Pod the scheduler and SCarpenter ever see for a run.
 
 - `nodeSelector`: `karpenter.sh/nodepool: <benchPool>` (`bench`),
-  `scarpenter.sparecores.com/vendor: <vendor>` and `scarpenter.sparecores.com/api-reference: <sku>` (the raw SKU name
+  `scarpenter.sparecores.com/vendor: <vendor>`, `inspector.sparecores.com/run: <run name>` (a node of its own: no
+  other run's Pod can schedule there; the NodePool allows the key) and `scarpenter.sparecores.com/api-reference: <sku>` (the raw SKU name
   SCarpenter keeps unsanitised, unlike `node.kubernetes.io/instance-type`; with the vendor selector the pair is unique and
   keeps the per-vendor NodeClaim count clear), plus a `karpenter.sh/capacity-type` requirement set by the
   [spot strategy](spot.md). A SKU name that is not a valid label value (over 63 characters, odd characters) cannot be selected
   this way: the run ends `256 HARNESS_ERROR` ("SKU name is not a valid label value; SCarpenter cannot select it by
-  api-reference") before any anchor is created. The node's `node.kubernetes.io/instance-type` label is only recorded as a node fact.
+  api-reference") before any anchor is created. A DBaaS client has no SKU: its anchor requires the labels of
+  [the client band](dbaas.md#which-database-where-with-which-client) instead. The node's `node.kubernetes.io/instance-type` label is only recorded as a node fact.
 - It holds the node: a Running Pod keeps the node non-empty, and `karpenter.sh/do-not-disrupt: "true"` blocks
   consolidation and drift. It does **not** block spot reclaim, `expireAfter` or a manual delete.
 - Its container is `sc-run hold`: it first installs the `sc-run` binary into a hostPath directory that the steps

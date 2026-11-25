@@ -116,6 +116,9 @@ MAX_PROVISION_RETRIES = 3  # attempts lost before a node was usable (stale node,
 EXTRA_ATTEMPTS = 2  # attempts beyond `max_spot_attempts` (the on-demand one plus one spare)
 NOT_ELIGIBLE = "SKU is no longer eligible in Keeper"
 ELIGIBILITY_CHECK_INTERVAL = timedelta(minutes=10)  # per run without a node: how often Keeper is asked again
+MAX_DBAAS_LAUNCH_FAILURES = (
+    3  # NodeClaims of a DBaaS client that failed to launch in one attempt before the run gives up
+)
 MAX_LAUNCH_FAILURES = 2  # distinct NodeClaims that failed to launch in one attempt before the run gives up; ICE
 # ones go on while SCarpenter still offers the SKU (`_launch_failures_exhausted`)
 SPOT_FALLBACK_ERRORS = (
@@ -839,8 +842,18 @@ class Runner(DbaasMixin):
         """No usable node: its claims are deleted, unfinished tasks end `-1`, unless the failure is temporary
         (`_defer_launch`)."""
         self._delete_run_claims(run, live)
-        if not self._defer_launch(run, message):
-            self._end_run(run, ExitCode.NO_NODE, message, AttemptOutcome.PROVISIONING_FAILED)
+        if run.spec.database:
+            # A DBaaS client has several candidate SKUs, so no per-SKU backoff: the failure is the run's result (not a
+            # temporary reason, which is never recorded) and names the client region, which the next plan tries last.
+            reason = launch.reason_of_error(message)
+            if reason and self._on_launch_failure:
+                self._on_launch_failure(run.spec.vendor, reason)
+            region = pods.client_region(run.spec.database)
+            run = self._update(run, lambda status: setattr(status, "region", region))
+            message = f"DBAAS_CLIENT_FAILED: {message}"
+        elif self._defer_launch(run, message):
+            return
+        self._end_run(run, ExitCode.NO_NODE, message, AttemptOutcome.PROVISIONING_FAILED)
 
     def _defer_launch(self, run: BenchmarkRun, message: str) -> bool:
         """Count a launch failure and remember when the SKU may be launched again (`launch`). A temporary one
@@ -858,15 +871,12 @@ class Runner(DbaasMixin):
             return False
         if reason not in launch.REASONS:
             return False
-        if run.spec.force and (run.spec.database is None or reason != "NO_OFFERING"):
-            return False  # a forced run is the operator's: it records its result (a DBaaS one also defers NO_OFFERING)
+        if run.spec.force:
+            return False  # a forced run is the operator's: it records its result
         until = (
             planner.offered_until(self.kube, self._cfg(), vendor, sku, self._now()) if reason == "DAILY_LIMIT" else None
         )
         count = launch.record_failure(self.kube, vendor, sku, reason, self._now(), until)
-        # a forced DBaaS run still ends with its result; the entry makes the next pick skip the client
-        if run.spec.force:
-            return False
         if reason == "BOOT_FAILURE" and count >= launch.BOOT_FAILURE_LIMIT:
             return False  # the entry stays: it counts for the vendor's breaker until a node comes up
         if any(t.state == TaskState.DONE for t in run.status.tasks):
@@ -924,7 +934,7 @@ class Runner(DbaasMixin):
         }
         doc = {
             "vendor": run.spec.vendor,
-            "sku": run.spec.sku,
+            "sku": run.node_sku,
             "run_id": run.spec.run_id,
             "plan": [t.name for t in run.status.tasks],
             "attempts": attempts,
@@ -948,9 +958,10 @@ class Runner(DbaasMixin):
         selected = self._selected(run)
         attempt = run.status.attempt + 1
         now = self._now()
-        quarantined = spot.is_quarantined(self.kube, run.spec.vendor, run.spec.sku, settings, now)
+        server = run.spec.database is None  # a DBaaS client has no SKU of its own
+        quarantined = server and spot.is_quarantined(self.kube, run.spec.vendor, run.spec.sku, settings, now)
         capacity = spot.capacity_for_next_attempt(run, selected, settings, quarantined)
-        if not pods.is_label_value(run.spec.sku):
+        if server and not pods.is_label_value(run.spec.sku):
             return self._end_run(run, ExitCode.HARNESS_ERROR, SKU_NOT_SELECTABLE, AttemptOutcome.HARNESS_ERROR)
         anchor = pods.render_anchor(
             run,
@@ -975,6 +986,7 @@ class Runner(DbaasMixin):
             status.spot_reclaims = 0
             status.phase = RunPhase.PROVISIONING
             status.capacity_type = None  # the node's, once the attempt has one
+            status.client_sku = None
             status.current_step = status.step = status.node = None
             if not any(a.n == attempt for a in status.attempts):
                 status.attempts.append(AttemptStatus(n=attempt, start=now))
@@ -1067,6 +1079,8 @@ class Runner(DbaasMixin):
         capacity type the anchor allows (it tries other regions and zones itself), up to `MAX_ICE_LAUNCH_FAILURES`;
         the provisioning budget still ends it. An unreadable listing counts as none (not offered), unlike
         `_not_offered`, where no answer means keep waiting."""
+        if run.spec.database:  # no SKU to ask SCarpenter about: Karpenter tries other types itself, up to a small limit
+            return len(failures) >= MAX_DBAAS_LAUNCH_FAILURES
         if len(failures) < MAX_LAUNCH_FAILURES:
             return False
         if not all(launch.is_capacity_class(f.message) for f in failures):
@@ -1078,7 +1092,10 @@ class Runner(DbaasMixin):
 
     def _not_offered(self, run: BenchmarkRun, cfg: Config) -> bool:
         """SCarpenter's offered-types listing is readable and does not offer the SKU. An unreadable or stale
-        listing is not an answer (False): the run keeps waiting."""
+        listing is not an answer (False): the run keeps waiting. A DBaaS client has no SKU: Karpenter's own event
+        says when no type fits."""
+        if run.spec.database:
+            return False
         skipped = planner.not_offered(self.kube, cfg, run.spec.vendor, [run.spec.sku], self._now())
         return bool(skipped)
 
@@ -1133,7 +1150,7 @@ class Runner(DbaasMixin):
         failure, and is forgotten. The NodeClaim is deleted once a limit has passed. While a limit is running, the
         run is queued again for the moment it expires."""
         deadlines = cfg.settings.deadlines
-        bare_metal = bool(BARE_METAL_SKU.search(run.spec.sku))
+        bare_metal = run.spec.database is None and bool(BARE_METAL_SKU.search(run.spec.sku))
         gpu = self._is_gpu(run, claims)
         registration = timedelta(
             minutes=deadlines.registration_minutes_bare_metal if bare_metal or gpu else deadlines.registration_minutes
@@ -1273,17 +1290,26 @@ class Runner(DbaasMixin):
         return failures
 
     def _pending_claims(self, anchor: dict) -> list[dict]:
-        """NodeClaims created for this anchor's pool, vendor and SKU since the anchor exists."""
+        """NodeClaims created for this anchor since it exists: those of its run (a node of its own, see
+        `pods.RUN_NODE_LABEL`); for an anchor made before that label, those of its pool, vendor and SKU."""
         selector = anchor["spec"]["nodeSelector"]
         created = _time(_meta(anchor).get("creationTimestamp"))
-        # Before launch a NodeClaim has only the pool label; its vendor and SKU are in `spec.requirements`.
+        run_name = selector.get(pods.RUN_NODE_LABEL)
+
+        def mine(claim: dict) -> bool:
+            if run_name:
+                return pods.claim_run(claim) == run_name
+            return (
+                pods.claim_vendor(claim) == selector[pods.VENDOR_LABEL]
+                and pods.claim_api_reference(claim) == selector[pods.API_REFERENCE_LABEL]
+            )
+
+        # Before launch a NodeClaim has only the pool label; its run, vendor and SKU are in `spec.requirements`.
         claims = self.kube.list("nodeclaim", labels={NODEPOOL_LABEL: selector[NODEPOOL_LABEL]})
         return [
             c
             for c in claims
-            if pods.claim_vendor(c) == selector[pods.VENDOR_LABEL]
-            and pods.claim_api_reference(c) == selector[pods.API_REFERENCE_LABEL]
-            and (created is None or (_time(_meta(c).get("creationTimestamp")) or created) >= created)
+            if mine(c) and (created is None or (_time(_meta(c).get("creationTimestamp")) or created) >= created)
         ]
 
     def _retry_on_demand(self, run: BenchmarkRun, live: dict[str, dict], error: str) -> None:
@@ -1327,7 +1353,8 @@ class Runner(DbaasMixin):
             return self._retry_provisioning(run, cfg, live, "the node is older than the anchor")
         nd = self._build_node(run, node, anchor)
         self._nodes[run.name] = nd
-        launch.node_ready(self.kube, run.spec.vendor, run.spec.sku)  # launched: forget earlier failures
+        sku = pods.node_sku(node)  # a DBaaS client is whatever type was cheapest: the label says which
+        launch.node_ready(self.kube, run.spec.vendor, sku or run.spec.sku)  # launched: forget earlier failures
         facts = nd.facts
         if not facts.price_per_hour:
             log.warning(
@@ -1338,6 +1365,8 @@ class Runner(DbaasMixin):
         def mutate(status: RunStatus) -> None:
             status.phase = RunPhase.RUNNING
             status.node, status.region, status.zone = facts.node_name, facts.region, facts.zone
+            if run.spec.database:
+                status.client_sku = sku
             status.price_per_hour = facts.price_per_hour
             status.price_incomplete = facts.price_incomplete
             if facts.capacity_type:
@@ -1865,7 +1894,7 @@ class Runner(DbaasMixin):
             log.warning("run %s attempt %d lost its node: %s", run.name, run.status.attempt, outcome.value)
             run = self._update(run, lambda status: self._close_attempt(status, outcome))
             if outcome == AttemptOutcome.SPOT_INTERRUPTED:
-                spot.record_interruption(self.kube, run.spec.vendor, run.spec.sku, self._now())
+                spot.record_interruption(self.kube, run.spec.vendor, run.node_sku, self._now())
         interrupted = outcome == AttemptOutcome.SPOT_INTERRUPTED
         reason = Reason.SPOT_INTERRUPTED if interrupted else Reason.NODE_LOST
 

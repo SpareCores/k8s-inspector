@@ -28,13 +28,13 @@ the cluster platform. The benchmark creates only the database (and its user/fire
 ## The flow (decision K11)
 
 A DBaaS run is a `BenchmarkRun` with a `database` block (`vendor`, `id`, `engineVersion`, `region`, optionally
-`clientRegion`, and the database's `vcpus` and `memoryGib`). `region` is the database's region; `clientRegion` is the
+`clientRegion`, `client`, and the database's `vcpus` and `memoryGib`). `region` is the database's region; `clientRegion` is the
 client node's and defaults to `region` (they differ where a vendor's database regions are not its server regions, see
-[Which database, where, with which client](#which-database-where-with-which-client)). Its SKU is the client server, so the run's lease is the client's. Order: **client node first,
+[Which database, where, with which client](#which-database-where-with-which-client)). The run is named after the database (its `spec.sku` is the database id), so there is one run per database; `status.clientSku` records the SKU of the client node the cluster launched. Order: **client node first,
 database second; on the way out, database destroy and node release in parallel.**
 
 1. **Client node.** The anchor is created in the client's region (`topology.kubernetes.io/region`) with a cheap
-   client type picked from Keeper's server data (below), always on demand: a lost client would leave a database billing
+   small x86_64 type that the cluster picks (below), always on demand: a lost client would leave a database billing
    with nobody to use it. If no node comes up, nothing was created that bills by the hour and no database is created.
 2. **Database.** When the anchor is Running, the controller writes `status.database.phase: Creating`, creates the
    Secret `<run>-db` with a generated password and the Job `dbaas-up-<run>` (image `k8s-inspector-dbaas`, `apps` pool).
@@ -115,10 +115,26 @@ rules; every input is Keeper's data, nothing is a static table:
   (databases in `GRA`, servers in `GRA7`, `GRA9`, `GRA11`), and the city ties them, so OVH sets it. The run records `database.region`
   and, when it differs, `database.clientRegion`. An operator may name both (`run --region`, `--client-region`); an
   explicit client region is an override with no city check, with or without `--region`.
-- **Client**: Keeper's servers in the client region that are x86_64 (the benchmark image is amd64 only), without
-  accelerator, with 2-4 vCPUs and 4-8 GiB, dedicated CPUs when there are any (else shared), cheapest after a Tukey price
-  fence (Q3 + 1.5 IQR over the region's own candidates), without SKUs SCarpenter does not offer, that wait for a launch
-  retry or that already have a run. Same sizing as the legacy `rank_dbaas_client_instances`, so results stay comparable.
+- **Client**: the anchor requires SCarpenter's labels, not a SKU: this vendor and the client region, on-demand,
+  `kubernetes.io/arch` amd64 (the benchmark image is amd64 only), `vcpus` 2 to 4, `memory-mib` 4096 to 8192,
+  `accelerator-count` `DoesNotExist` (SCarpenter leaves it undefined on types without an accelerator) and `cpu-allocation`
+  Dedicated or Shared (the bounds are constants in `dbaas_client.py`). Karpenter launches the cheapest offered type that
+  fits: the pgbench client is not what is benchmarked and the workload is server heavy, so its speed does not matter,
+  and a type that is blocked only in that region (no vCPU quota of its family, say) is passed over without a wait. An
+  operator's `run --database <id> <sku>` replaces the labels with `api-reference In [<sku>]` (`database.client`).
+  A launch failure (no type fits, ICE, quota, boot failure) of a DBaaS client writes no per-SKU backoff, which would
+  hold back server runs of the same SKU: the run ends `-1` (`DBAAS_CLIENT_FAILED: <reason>`) with the client region
+  recorded, so the next plan tries another database region first. After three failed NodeClaims of an attempt the run
+  gives up (a server run after two). Like a command that does not start, `DBAAS_CLIENT_FAILED` (and
+  `DBAAS_LEFTOVER_STACK`) counts as a start retry: the third in a row ends as `-5`. This needs the failure to be
+  published, which it is not while an older good result of the database exists (a failure never replaces a good
+  result): then the planner retries after the usual wait, without region rotation and without the cap.
+- **One node per run**: every anchor, of server and DBaaS runs, requires the node label `inspector.sparecores.com/run`
+  with the run's name (the bench NodePool allows the key with an `Exists` requirement, so Karpenter stamps it on the
+  node), so no other run's Pod schedules on the node and a run's NodeClaims and Nodes are recognised by the label. An
+  anchor made before the label existed has none: its NodeClaims are matched by vendor and SKU, and an anchor that
+  finds no node ends with the usual provisioning deadline. A database has one run, found by `spec.database.id`,
+  whatever the run is named.
 - **Limits**: `dbaasMaxInFlight` and `dbaasMaxUsdPerHour` of the vendor ([below](#limits)).
 
 ### The network
@@ -168,8 +184,8 @@ not count against `maxInFlight` and `maxUsdPerHour`, and a server run does not c
 - `dbaasMaxInFlight` (default 1, 0 pauses): DBaaS runs that hold a client node or a database that is not yet destroyed.
 - `dbaasMaxUsdPerHour` (default unset: no cap): the hourly on-demand price of database plus client node, summed over the
   vendor's DBaaS runs in flight. The price of a run is recorded in its `spec.database.usdPerHour` when it is created: the
-  database's standalone price in the chosen region from Keeper's price data, plus the client's `min_price_ondemand`
-  from Keeper's server data. A new run is refused when the running ones plus its own price would pass the cap, so the
+  database's standalone price in the chosen region from Keeper's price data, plus the `min_price_ondemand` of the dearest Keeper server in the client region that matches the same labels
+  (the most the cluster may launch). A new run is refused when the running ones plus its own price would pass the cap, so the
   planner tries the next database; a forced run is refused with the reason. With a cap set, a price that Keeper does not
   know (a client it does not list) is refused too.
 
@@ -252,7 +268,7 @@ The module is `vendors/ovh.py`; its credentials are the OAuth2 service account o
 
 ### Operators
 
-`k8s-inspector run <vendor> --database <id> [--region <region>] [--client-region <region>] [<client sku>] [--force]` starts a DBaaS run of one
+`k8s-inspector run <vendor> --database <id> [--region <region>] [--client-region <region>] [<client sku>] [--force]` (one client SKU instead of the labels) starts a DBaaS run of one
 database now ([forced run](../how-to/run-forced.md#managed-database)); `k8s-inspector plan --dry-run` also prints the
 database it would start.
 

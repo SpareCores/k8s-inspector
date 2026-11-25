@@ -82,7 +82,7 @@ spec:
   enableServiceLinks: false
   hostNetwork: true                      # false for tasks with `host_network: false` (redis, static_web), see node-profile.md#loopback-tasks
   dnsPolicy: Default
-  nodeSelector: {karpenter.sh/nodepool: bench, scarpenter.sparecores.com/vendor: oci, scarpenter.sparecores.com/api-reference: VM.Standard.E5.Flex.2-16}
+  nodeSelector: {karpenter.sh/nodepool: bench, scarpenter.sparecores.com/vendor: oci, inspector.sparecores.com/run: oci-vm-standard-e5-flex-2-16-3f9c1a7e, scarpenter.sparecores.com/api-reference: VM.Standard.E5.Flex.2-16}
   affinity: {nodeAffinity: {requiredDuringSchedulingIgnoredDuringExecution: {nodeSelectorTerms: [{matchExpressions:
     [{key: karpenter.sh/capacity-type, operator: In, values: [spot, on-demand]}]}]}}}
   tolerations: [{key: frankenscube/bench, operator: Exists}]
@@ -207,7 +207,7 @@ what is left.
 ## DBaaS objects
 
 A DBaaS run ([DBaaS](../explanation/dbaas.md)) is a `BenchmarkRun` with `spec.database`
-(`{vendor, id, engineVersion, region, clientRegion, vcpus, memoryGib, usdPerHour}`; `region` is the database's region and `clientRegion` the client node's, absent when it is the same; `usdPerHour` is database plus client price, absent when Keeper does not know one of them); its `sku` is the client server, its capacity always
+(`{vendor, id, engineVersion, region, clientRegion, client, vcpus, memoryGib, usdPerHour}`; `region` is the database's region and `clientRegion` the client node's, absent when it is the same; `client` is an operator's choice of client SKU, absent: any small x86_64 type, and `status.clientSku` the SKU of the node it got; `usdPerHour` is database plus the dearest matching client price, absent when Keeper does not know one); its `sku` is the database id (the run is named after it), its capacity always
 `OnDemand`, and `metadata.finalizers` holds `inspector.sparecores.com/dbaas` until the database is destroyed. Its
 `status.database` is the state of the managed database:
 

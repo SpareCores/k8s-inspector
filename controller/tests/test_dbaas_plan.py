@@ -118,31 +118,29 @@ def first_by_start_order(ids):
 # --------------------------------------------------------------------------- the client picker
 
 
-def test_the_picker_takes_the_cheapest_dedicated_x86_client_in_the_size_band():
+def test_the_client_requirements_are_scarpenter_labels_of_a_small_x86_type():
+    assert dbaas_client.requirements() == [
+        {"key": "kubernetes.io/arch", "operator": "In", "values": ["amd64"]},
+        {"key": "scarpenter.sparecores.com/vcpus", "operator": "Gt", "values": ["1"]},
+        {"key": "scarpenter.sparecores.com/vcpus", "operator": "Lt", "values": ["5"]},
+        {"key": "scarpenter.sparecores.com/memory-mib", "operator": "Gt", "values": ["4095"]},
+        {"key": "scarpenter.sparecores.com/memory-mib", "operator": "Lt", "values": ["8193"]},
+        {"key": "scarpenter.sparecores.com/accelerator-count", "operator": "DoesNotExist"},
+        {"key": "scarpenter.sparecores.com/cpu-allocation", "operator": "In", "values": ["Dedicated", "Shared"]},
+    ]
+    assert dbaas_client.requirements("c1") == [  # an explicit client replaces the band
+        {"key": "scarpenter.sparecores.com/api-reference", "operator": "In", "values": ["c1"]}
+    ]
+
+
+def test_the_price_bound_is_the_dearest_server_the_requirements_accept():
     servers = [
-        server("arm", 0.01, arch="arm64"), server("gpu", 0.01, gpu=1), server("tiny", 0.01, vcpus=1, memory=2048),
-        server("big-ram", 0.01, memory=16384), server("burst", 0.01, allocation="Burstable"),
-        server("shared", 0.02, allocation="Shared"), server("b", 0.05), server("a", 0.05), server("c", 0.04),
+        server("arm", 9.0, arch="arm64"), server("gpu", 9.0, gpu=1), server("tiny", 9.0, vcpus=1, memory=2048),
+        server("big-ram", 9.0, memory=16384), server("burst", 9.0, allocation="Burstable"), server("none", None),
+        server("shared", 0.02, allocation="Shared"), server("b", 0.05), server("edge", 0.07, vcpus=4, memory=8192),
     ]  # fmt: skip
-    assert dbaas_client.rank(servers) == ["c", "a", "b"]  # dedicated only, cheapest first, ties by name
-
-
-def test_the_picker_falls_back_to_shared_cpus_when_no_dedicated_one_is_in_the_band():
-    servers = [server("s2", 0.02, allocation="Shared"), server("s1", 0.01, allocation="Shared"),
-               server("burst", 0.001, allocation="Burstable")]  # fmt: skip
-    assert dbaas_client.rank(servers) == ["s1", "s2"]
-
-
-def test_the_picker_drops_price_outliers_with_the_tukey_fence():
-    prices = [0.04, 0.045, 0.05, 0.05, 0.055, 0.06, 0.06, 0.065, 0.07, 0.9]  # the fence is about 0.092
-    ranked = dbaas_client.rank([server(f"s{i}", p) for i, p in enumerate(prices)])
-    assert "s9" not in ranked and len(ranked) == 9
-    few = dbaas_client.rank([server("x", 0.04), server("y", 5.0)])  # fewer than four prices: no fence
-    assert few == ["x", "y"]
-
-
-def test_a_server_without_a_price_is_not_a_client():
-    assert dbaas_client.rank([server("x", None)]) == []
+    assert dbaas_client.most_expensive(servers) == 0.07
+    assert dbaas_client.most_expensive([server("x", None)]) is None
 
 
 def test_the_engine_version_is_the_preferred_one_when_offered_else_the_newest():
@@ -178,18 +176,27 @@ def test_a_vendor_without_the_flag_or_without_networks_is_not_planned(kube, worl
 def test_the_first_database_in_start_order_gets_a_run_in_the_cheapest_region_with_the_cheapest_client(kube, world):
     (planned,) = plan(kube, make_config(), world)
     assert planned.database_id == first_by_start_order(world.records) and planned.region == "eu-2"
-    assert planned.client == "c-cheap" and planned.engine_version == "18" and planned.tasks == (TASK,)
+    assert (
+        planned.client is None  # any small x86_64 type: the cluster launches the cheapest one
+        and planned.engine_version == "18"
+        and planned.tasks == (TASK,)
+    )
     assert world.asked == ["id-eu-2"]
     (run,) = crd.list_runs(kube)
-    assert (run.spec.vendor, run.spec.sku, run.spec.tasks, run.spec.force) == ("oci", "c-cheap", [TASK], False)
+    assert (run.spec.vendor, run.spec.sku, run.spec.tasks, run.spec.force) == (
+        "oci",
+        planned.database_id,
+        [TASK],
+        False,
+    )
     assert run.spec.capacity == CapacityMode.ON_DEMAND  # a lost client would leave the database billing
-    price = run.spec.database.pop("usdPerHour")  # the database in eu-2 and the client, from Keeper
-    assert price == pytest.approx(0.30 + 0.03)
+    price = run.spec.database.pop("usdPerHour")  # the database in eu-2 and the dearest client, from Keeper
+    assert price == pytest.approx(0.30 + 0.09)
     assert run.spec.database == {
         "vendor": "oci", "id": planned.database_id, "engineVersion": "18", "region": "eu-2", "vcpus": 4,
         "memoryGib": 32.0,
     }  # fmt: skip
-    assert run.name == crd.run_name("oci", "c-cheap")
+    assert run.name == crd.run_name("oci", planned.database_id)  # not the client's: one run per database
     assert kube.get("benchmarkrun", run.name)["metadata"]["finalizers"] == ["inspector.sparecores.com/dbaas"]
 
 
@@ -251,8 +258,8 @@ def test_one_dbaas_run_is_in_flight_per_vendor(kube, world):
         )
         assert plan(kube, make_config(), world, dry_run=True) == [], phase
     crd.update_status(kube, run.name, lambda s: setattr(s.database, "phase", DbPhase.DESTROYED))
-    (next_run,) = plan(kube, make_config(), world, dry_run=True)  # destroyed: the next one may start ...
-    assert planned.client == "c-cheap" and next_run.client == "c-small"  # ... with a client that has no run
+    (next_run,) = plan(kube, make_config(), world, dry_run=True)  # destroyed: the next one may start
+    assert next_run.database_id != planned.database_id  # the first database has a run
 
 
 def test_dbaas_runs_do_not_count_against_the_server_budget(kube, world):
@@ -262,9 +269,12 @@ def test_dbaas_runs_do_not_count_against_the_server_budget(kube, world):
     planner.check_vendor_budget(kube, make_config(max_in_flight=1), "oci", runs)
 
 
-def test_a_client_that_waits_for_a_launch_retry_is_skipped(kube, world, monkeypatch):
-    monkeypatch.setattr(dbaas_plan.launch, "deferred", lambda kube, vendor, skus, now, prune: {"c-cheap": object()})
-    assert plan(kube, make_config(), world, dry_run=True)[0].client == "c-small"
+def test_a_database_with_a_run_is_not_planned_again_whatever_the_run_is_named(kube, world):
+    old = RunSpec("oci", "c-cheap", "r0", database={"vendor": "oci", "id": "db-a", "engineVersion": "18"})
+    crd.create_run(kube, old)  # made before runs were named after their database: named after its client
+    assert "db-a" not in [p.database_id for p in plan(kube, make_config(dbaas_max_in_flight=5), world, dry_run=True)]
+    with pytest.raises(crd.RunExists, match=crd.run_name("oci", "c-cheap")):
+        force(kube, world, make_config(auto=False, dbaas_max_in_flight=5))
 
 
 def test_a_database_without_a_usable_region_or_client_is_skipped(kube, world):
@@ -289,19 +299,20 @@ def test_dry_run_creates_nothing(kube, world):
 # --------------------------------------------------------------------------- the forced path
 
 
-def force(kube, world, cfg=None, **kw):
-    return dbaas_plan.force_run(kube, cfg or make_config(auto=False), "oci", "db-a", **kw)
+def force(kube, world, cfg=None, database="db-a", **kw):
+    return dbaas_plan.force_run(kube, cfg or make_config(auto=False), "oci", database, **kw)
 
 
 def test_a_forced_run_needs_no_autoplan_and_picks_region_and_client(kube, world):
     run = force(kube, world)
-    assert run.spec.database["id"] == "db-a" and run.spec.database["region"] == "eu-2" and run.spec.sku == "c-cheap"
+    assert run.spec.database["id"] == "db-a" and run.spec.database["region"] == "eu-2" and run.spec.sku == "db-a"
+    assert "client" not in run.spec.database
     assert run.spec.force is True and run.spec.tasks == [TASK]
 
 
 def test_a_forced_run_can_name_the_region_and_the_client(kube, world):
     run = force(kube, world, region="eu-1", client="my-client")
-    assert (run.spec.database["region"], run.spec.sku) == ("eu-1", "my-client")
+    assert (run.spec.database["region"], run.spec.database["client"]) == ("eu-1", "my-client")
     assert world.asked == ["id-eu-1"]
     assert "usdPerHour" not in run.spec.database  # Keeper does not list that client: its price is unknown
 
@@ -362,9 +373,9 @@ def test_server_runs_do_not_use_up_the_dbaas_limits(kube, world):
 
 def test_the_dbaas_cap_counts_database_and_client_price_of_the_runs_in_flight(kube, world):
     cfg = make_config(dbaas_max_in_flight=5, dbaas_max_usd_per_hour=0.50)
-    (first,) = plan(kube, cfg, world)  # eu-2 database 0.30 + c-cheap 0.03
+    (first,) = plan(kube, cfg, world)  # eu-2 database 0.30 + the dearest client 0.09
     assert first.region == "eu-2"
-    assert plan(kube, cfg, world) == []  # 0.33 + 0.33 > 0.50, and eu-1 costs more
+    assert plan(kube, cfg, world) == []  # 0.39 + 0.39 > 0.50, and eu-1 costs more
     name = crd.list_runs(kube)[0].name
     crd.update_status(  # the node is released, the database not yet destroyed
         kube,
@@ -433,24 +444,28 @@ def test_the_client_goes_to_a_region_of_the_databases_city(kube, split):
 def test_a_forced_database_region_finds_its_client_region_by_city(kube, split):
     run = force(kube, split, split_config(SPLIT_NETWORKS), region="db-a")
     assert (run.spec.database["region"], run.spec.database["clientRegion"]) == ("db-a", "srv-a")
-    assert run.spec.database["usdPerHour"] == pytest.approx(0.30 + 0.03)  # database price of db-a plus the client's
+    assert run.spec.database["usdPerHour"] == pytest.approx(
+        0.30 + 0.09
+    )  # database price of db-a plus the dearest client's
 
 
 def test_the_explicit_client_region_overrides_the_city_but_must_have_a_network(kube, split):
     cfg = split_config(SPLIT_NETWORKS)
     run = force(kube, split, cfg, region="db-a", client_region="srv-b")
     assert (run.spec.database["region"], run.spec.database["clientRegion"]) == ("db-a", "srv-b")
-    run = force(kube, split, cfg, client_region="srv-a")  # no --region: no city check either, the cheapest database
+    run = force(
+        kube, split, cfg, "db-b", client_region="srv-a"
+    )  # no --region: no city check either, the cheapest database
     assert (run.spec.database["region"], run.spec.database["clientRegion"]) == ("db-b", "srv-a")
     with pytest.raises(ValueError, match="no DBaaS network of oci in srv-a2"):
-        force(kube, split, cfg, client_region="srv-a2")
+        force(kube, split, cfg, "db-c", client_region="srv-a2")
 
 
 def test_a_database_region_without_a_network_in_its_city_is_not_used(kube, split):
     cfg = split_config({"srv-a": {}})
     assert force(kube, split, cfg).spec.database["region"] == "db-a"  # db-b is cheaper but its city has no network
     with pytest.raises(ValueError, match="no DBaaS network of oci in db-b or in a region of its city"):
-        force(kube, split, cfg, region="db-b")
+        force(kube, split, cfg, "db-b", region="db-b")
 
 
 def test_a_region_that_is_its_own_client_region_is_tried_first_and_leaves_no_client_region(kube, split):

@@ -17,6 +17,7 @@ from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
 
 from lightkube.utils.quantity import parse_quantity
 
+from k8s_inspector import dbaas_client
 from k8s_inspector.model import (
     BenchmarkRun,
     CapacityType,
@@ -36,6 +37,7 @@ NODEPOOL_LABEL = "karpenter.sh/nodepool"
 VENDOR_LABEL = "scarpenter.sparecores.com/vendor"
 API_REFERENCE_LABEL = "scarpenter.sparecores.com/api-reference"
 REGION_LABEL = "topology.kubernetes.io/region"
+RUN_NODE_LABEL = "inspector.sparecores.com/run"  # on a node: the one run that may use it (the NodePool allows the key)
 _LABEL_VALUE = re.compile(r"(?:[A-Za-z0-9](?:[-_.A-Za-z0-9]{0,61}[A-Za-z0-9])?)?")
 
 NODE_DIR = "/var/lib/k8s-inspector"  # hostPath on the node; mounted at /k8si in every Pod
@@ -183,8 +185,9 @@ def render_anchor(
     owner: OwnerRef,
 ) -> dict:
     """The anchor Pod (objects.md "Anchor Pod"): nodeSelector (`karpenter.sh/nodepool: <benchPool>`,
-    `scarpenter.sparecores.com/vendor: <vendor>`, `scarpenter.sparecores.com/api-reference: <sku>`),
-    capacity-type node affinity from `capacity` (`[spot, on-demand]` or `[on-demand]`),
+    `scarpenter.sparecores.com/vendor: <vendor>`, `inspector.sparecores.com/run: <run>`, and for a server run
+    `scarpenter.sparecores.com/api-reference: <sku>`), capacity-type node affinity from `capacity` (`[spot,
+    on-demand]` or `[on-demand]`) and, for a DBaaS client, the labels of `dbaas_client.requirements`,
     `do-not-disrupt`, toleration `frankenscube/bench`, container
     `hold` with `cfg.env.sc_run_image` and args `hold --install /k8si/bin --heartbeat-dir
     /k8si/runs/<run_id> --idle-timeout <deadlines.hold_idle_minutes>m`, readiness probe `/sc-run ready
@@ -213,9 +216,9 @@ def render_anchor(
             "nodeSelector": {
                 "karpenter.sh/nodepool": cfg.settings.bench_pool,
                 VENDOR_LABEL: spec.vendor,
-                API_REFERENCE_LABEL: spec.sku,
+                RUN_NODE_LABEL: run.name,  # a node of its own: no other run's Pod schedules there
                 # A DBaaS client sits in its own region (the database's, unless `clientRegion` names another).
-                **({REGION_LABEL: client_region(spec.database)} if spec.database else {}),
+                **({REGION_LABEL: client_region(spec.database)} if spec.database else {API_REFERENCE_LABEL: spec.sku}),
             },
             "affinity": {
                 "nodeAffinity": {
@@ -227,7 +230,9 @@ def render_anchor(
                                         "key": "karpenter.sh/capacity-type",
                                         "operator": "In",
                                         "values": [c.value for c in capacity],
-                                    }
+                                    },
+                                    # a DBaaS client: any small x86_64 type, the cheapest offered one is launched
+                                    *(dbaas_client.requirements(spec.database.get("client")) if spec.database else []),
                                 ]
                             }
                         ]
@@ -892,6 +897,17 @@ def claim_api_reference(claim: dict) -> str | None:
     """A NodeClaim's raw SKU name: the label (after launch), else the `spec.requirements` entry (from creation)."""
     labels = claim.get("metadata", {}).get("labels") or {}
     return labels.get(API_REFERENCE_LABEL) or _claim_requirement(claim, API_REFERENCE_LABEL)
+
+
+def node_sku(node: dict) -> str | None:
+    """The SKU a Node was launched as."""
+    return (node.get("metadata", {}).get("labels") or {}).get(API_REFERENCE_LABEL)
+
+
+def claim_run(claim: dict) -> str | None:
+    """The run a NodeClaim is for: the label (after launch), else the requirement (from creation)."""
+    labels = claim.get("metadata", {}).get("labels") or {}
+    return labels.get(RUN_NODE_LABEL) or _claim_requirement(claim, RUN_NODE_LABEL)
 
 
 def claim_vendor(claim: dict) -> str | None:
