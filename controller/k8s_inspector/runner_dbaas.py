@@ -27,6 +27,7 @@ from datetime import datetime, timedelta
 from k8s_inspector import crd, dbaas_jobs, dbaas_keeper, pods
 from k8s_inspector.kube import NotFound
 from k8s_inspector.model import (
+    REGION_UNAVAILABLE,
     AttemptOutcome,
     BenchmarkRun,
     Config,
@@ -222,6 +223,10 @@ class DbaasMixin:
         state = dbaas_jobs.job_state(job)
         if state == "failed":
             message = dbaas_jobs.job_message(self.kube, name).get("error") or "the Job failed"
+            if REGION_UNAVAILABLE in message:  # not in this region, whatever happens: the next plan moves on
+                rest = message.split(REGION_UNAVAILABLE, 1)[1]
+                cause = next(iter(rest.strip().splitlines()), "no cause given")
+                return self._database_fail(run, REGION_UNAVAILABLE.removesuffix(":"), cause)
             return self._database_fail(run, "DBAAS_CREATE_FAILED", message)
         if state == "running":
             started = db.timing.get("api_start") or db.since

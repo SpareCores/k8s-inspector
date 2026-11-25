@@ -25,6 +25,8 @@ import urllib.request
 from collections.abc import Iterator
 from pathlib import Path
 
+from k8s_inspector_dbaas.errors import RegionUnavailable
+
 ARM = "https://management.azure.com"
 API_VERSION = "2025-08-01"  # Microsoft.DBforPostgreSQL; the version of the pulumi-azure-native Server resource
 COMPUTE_API_VERSION = "2021-07-01"  # Microsoft.Compute/skus
@@ -35,7 +37,12 @@ log = logging.getLogger(__name__)
 
 
 class PreflightError(RuntimeError):
-    """The subscription cannot create this database in this region."""
+    """The subscription cannot create this database in this region now."""
+
+
+class RegionPreflightError(PreflightError, RegionUnavailable):
+    """... and never will: the offer is restricted, the SKU or storage is not there, or the quota limit is too low. A
+    shortfall of the quota that running servers use up is a plain `PreflightError`: it may be gone later."""
 
 
 def subscription_id() -> str:
@@ -100,8 +107,9 @@ def offer_restricted(capabilities: list[dict]) -> bool:
     return False
 
 
-def headroom(usages: dict[str, dict], family: str | None, vcpus: int) -> str | None:
-    """Why the quota does not fit `vcpus` more vCPUs (None: it fits). `usages` maps lowercase quota name -> item."""
+def headroom(usages: dict[str, dict], family: str | None, vcpus: int) -> tuple[str, bool] | None:
+    """Why the quota does not fit `vcpus` more vCPUs, and whether its limit is below `vcpus` (so it never will: not
+    just used up by running servers); None: it fits. `usages` maps lowercase quota name -> item."""
 
     def left(item: dict) -> str:
         return f"{item['limit'] - item['currentValue']} of {item['limit']} left"
@@ -111,7 +119,7 @@ def headroom(usages: dict[str, dict], family: str | None, vcpus: int) -> str | N
         log.warning("the regional cores quota is not listed, the vCPU headroom is not checked")
         return None
     if cores["limit"] - cores["currentValue"] < vcpus:
-        return f"{vcpus} vCPUs needed, the regional cores quota has {left(cores)}"
+        return f"{vcpus} vCPUs needed, the regional cores quota has {left(cores)}", cores["limit"] < vcpus
     if family is None:
         log.info("no quota family known for the SKU, only the regional cores are checked")
     elif family.lower() not in usages:
@@ -119,7 +127,7 @@ def headroom(usages: dict[str, dict], family: str | None, vcpus: int) -> str | N
             "the usages do not list the quota family %s (normal for some), only the regional cores are checked", family
         )
     elif (item := usages[family.lower()])["limit"] - item["currentValue"] < vcpus:
-        return f"{vcpus} vCPUs needed, quota {family} has {left(item)}"
+        return f"{vcpus} vCPUs needed, quota {family} has {left(item)}", item["limit"] < vcpus
     return None
 
 
@@ -145,20 +153,23 @@ def _check(region: str, sku: str, vcpus: int, storage_edition: str) -> list[str]
     }
     family = _sku_family(arm_token, region, sku)
     if offer_restricted(capabilities):
-        raise PreflightError(
+        raise RegionPreflightError(
             f"azure pre-flight: PostgreSQL Flexible Server is restricted for this subscription in {region}"
         )
     found = sku_capability(capabilities, sku)
     if found is None:
-        raise PreflightError(f"azure pre-flight: {region} does not offer the SKU {sku}")
+        raise RegionPreflightError(f"azure pre-flight: {region} does not offer the SKU {sku}")
     edition, listed = found
     if listed.get("status") == "Disabled":
-        raise PreflightError(
+        raise RegionPreflightError(
             f"azure pre-flight: {sku} is disabled in {region}: {listed.get('reason') or 'no reason given'}"
         )
     storages = {s.get("name") for s in edition.get("supportedStorageEditions") or []}
     if storages and storage_edition not in storages:
-        raise PreflightError(f"azure pre-flight: {region} offers {sku} with {sorted(storages)}, not {storage_edition}")
-    if reason := headroom(usages, family, vcpus):
-        raise PreflightError(f"azure pre-flight: {sku} in {region}: {reason}")
+        raise RegionPreflightError(
+            f"azure pre-flight: {region} offers {sku} with {sorted(storages)}, not {storage_edition}"
+        )
+    if shortage := headroom(usages, family, vcpus):
+        reason, never = shortage
+        raise (RegionPreflightError if never else PreflightError)(f"azure pre-flight: {sku} in {region}: {reason}")
     return list(listed.get("supportedZones") or [])

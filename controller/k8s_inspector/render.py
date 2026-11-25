@@ -38,6 +38,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from k8s_inspector.model import (
+    REGION_UNAVAILABLE,
     AttemptStatus,
     BenchmarkRun,
     CapacityType,
@@ -54,7 +55,12 @@ from k8s_inspector.model import (
 NOT_FINAL_CODES = (ExitCode.NEVER_FINISHED, ExitCode.RETRIES_EXHAUSTED)  # never finished: no variant dir, no outputs
 MAX_START_RETRIES = 3  # three `-4` in a row become `-5` (exit-codes.md)
 START_FAILURE_PREFIX = "cannot start command:"  # sc-run's error_msg when the task's command does not start
-START_FAILURE_PREFIXES = (START_FAILURE_PREFIX, "DBAAS_CLIENT_FAILED:", "DBAAS_LEFTOVER_STACK:")
+START_FAILURE_PREFIXES = (
+    START_FAILURE_PREFIX,
+    "DBAAS_CLIENT_FAILED:",
+    "DBAAS_LEFTOVER_STACK:",
+    REGION_UNAVAILABLE,
+)
 ERROR_MSG_MAX = 200  # published error_msg length; a longer one keeps its start and end
 
 LEGACY_META_FIELDS = (
@@ -272,6 +278,8 @@ def dump_meta(meta: dict) -> str:
     out = _canonical_meta(meta, with_added=False)
     if "last_attempt" in meta:  # schedule metas only
         out["last_attempt"] = meta["last_attempt"]
+    if meta.get("failed_regions"):  # DBaaS metas only: the regions of the start failures in a row
+        out["failed_regions"] = meta["failed_regions"]
     return json.dumps(out, separators=(",", ":"), ensure_ascii=False)
 
 
@@ -781,17 +789,20 @@ def refresh_schedule_meta(instance_root: Path, task: str, attempt: dict, extra: 
 
 def _is_start_failure(meta: dict) -> bool:
     """A `-1` published for a command that did not start (see `published_meta`) or for a DBaaS run that got no client
-    node or no clean slate: the same failure again and again ends as `-5`."""
+    node, no clean slate or no way to create the database in the region: the same failure again and again ends as
+    `-5`."""
     return meta.get("exit_code") == ExitCode.NO_NODE and str(meta.get("error_msg")).startswith(START_FAILURE_PREFIXES)
 
 
-def _apply_start_retries(meta: dict, prior: dict | None) -> None:
+def _apply_start_retries(meta: dict, prior: dict | None) -> bool:
     """`prior` is the latest attempt before this one (`latest_attempt`). `start_retries` counts consecutive start
     attempts of the same task hash that never produced a result: a `-4` or a start-failure `-1` (a command that does
     not start). It is +1 on such a code after one of that hash, otherwise 1 on such a code and 0 on any other code
     (success, a changed task hash, another failure; `-5` counts as a `-4` here). The third in a row becomes `-5`.
-    The same run and start seen again (re-render after a crash) keeps its count."""
+    The same run and start seen again (re-render after a crash) keeps its count. True when the attempt continues
+    `prior`'s chain (or is its re-render), so that what the chain carries may be carried on."""
     counted = meta["exit_code"] == ExitCode.NEVER_FINISHED or _is_start_failure(meta)
+    chained = True
     if prior and prior.get("run_id") == meta["run_id"] and prior.get("start") == meta["start"]:
         retries = prior.get("start_retries", 0)
     elif not counted:
@@ -803,11 +814,12 @@ def _apply_start_retries(meta: dict, prior: dict | None) -> None:
     ):
         retries = prior.get("start_retries", 0) + 1
     else:
-        retries = 1
+        retries, chained = 1, False
     meta["start_retries"] = retries
     if counted and retries >= MAX_START_RETRIES:
         meta["exit_code"] = int(ExitCode.RETRIES_EXHAUSTED)
         meta["error_msg"] = f"exceeded {MAX_START_RETRIES} start retries"
+    return chained
 
 
 # --------------------------------------------------------------------------- rendering
@@ -893,6 +905,15 @@ def render_task(tree: Path, vendor: str, sku: str, variant: int | None, inp: Ren
     return written + ([schedule] if schedule else [])
 
 
+def _apply_failed_regions(meta: dict, prior: dict | None, chained: bool, region: str) -> None:
+    """`failed_regions`: the database regions of the consecutive start failures, carried like `start_retries`
+    (`chained`: this one continues the chain) and gone with any other result. The next plan tries others first."""
+    if not meta["start_retries"]:
+        return
+    regions = list(prior.get("failed_regions") or []) if prior and chained else []
+    meta["failed_regions"] = regions if region in regions else [*regions, region]
+
+
 def render_dbaas_task(tree: Path, database: dict, inp: RenderInput) -> list[Path]:
     """DBaaS result: `dbaas/<vendor>/<id>/postgres/<engineVersion>/standalone/<task>/{meta.json,stdout}`
     (`database` is `RunSpec.database`). No variant, no schedule."""
@@ -906,7 +927,8 @@ def render_dbaas_task(tree: Path, database: dict, inp: RenderInput) -> list[Path
     previous = _read_meta(task_dir / "meta.json")
     if meta["exit_code"] != ExitCode.OK and previous and previous.get("exit_code") == ExitCode.OK:
         return []  # a failure never replaces a good result (sc-crawler reads the stdout without the exit code)
-    _apply_start_retries(meta, previous)
+    chained = _apply_start_retries(meta, previous)
+    _apply_failed_regions(meta, previous, chained, database["region"])
     if meta["version"] is None:  # no version command runs against a managed database: the legacy wrote the image tag
         meta["version"] = inp.task.image.rsplit(":", 1)[-1]
     stdout = inp.stdout if inp.stdout and meta["exit_code"] not in NOT_FINAL_CODES else b""

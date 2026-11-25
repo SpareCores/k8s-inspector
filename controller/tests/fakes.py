@@ -307,6 +307,7 @@ class Cluster:
         self.kube, self.clock = kube, clock
         self.behaviour: dict[str, list[dict]] = {}
         self.capacity = "spot"
+        self.up_error = "quota exceeded"  # the error of a failing up Job
         self.sku = "client-x"  # the SKU of the nodes of anchors that do not name one (DBaaS clients)
         self.node_labels: dict[str, str] = {}
         self.node_allocatable: dict[str, str] = {"memory": "15Gi", "cpu": "2"}
@@ -501,7 +502,7 @@ class Cluster:
         message = json.dumps(self.db_outputs if kind == "up" else {"destroyed": True})
         phase = {"ok": "Succeeded", "fail": "Failed", "hang": "Running"}[outcome]
         if outcome == "fail":
-            message = json.dumps({"error": "quota exceeded"})
+            message = json.dumps({"error": self.up_error})
         status = {"phase": phase, "containerStatuses": [{"name": "provisioner", "state": {"running": {}}}]}
         if outcome != "hang":
             status["containerStatuses"] = [

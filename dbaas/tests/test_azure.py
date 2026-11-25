@@ -5,7 +5,8 @@ import pulumi
 import pytest
 
 from k8s_inspector_dbaas import azure_preflight
-from k8s_inspector_dbaas.azure_preflight import PreflightError
+from k8s_inspector_dbaas.azure_preflight import PreflightError, RegionPreflightError
+from k8s_inspector_dbaas.errors import RegionUnavailable
 from k8s_inspector_dbaas.spec import DbSpec
 from k8s_inspector_dbaas.vendors import azure
 
@@ -143,6 +144,12 @@ def test_a_client_zone_the_sku_does_not_offer_is_not_requested(mocks, checked):
     return registered(mocks, make_spec(zone="westeurope-3")).apply(check)
 
 
+def test_a_pre_flight_refusal_is_marked_as_region_unavailable_for_the_controller():
+    error = RegionPreflightError("azure pre-flight: restricted in eastus")
+    assert isinstance(error, RegionUnavailable)
+    assert str(error) == "DBAAS_REGION_UNAVAILABLE: azure pre-flight: restricted in eastus"
+
+
 def test_a_failed_pre_flight_creates_nothing(mocks, monkeypatch):
     def refuse(*args):
         raise PreflightError("azure pre-flight: no quota")
@@ -251,6 +258,22 @@ def test_the_pre_flight_refuses_with_the_reason(arm, change, message):
     arm.update(change)
     with pytest.raises(PreflightError, match=message):
         azure_preflight.check("westeurope", "Standard_D4ds_v5", 4, "ManagedDiskV2")
+
+
+@pytest.mark.parametrize(
+    ("change", "region_fatal"),
+    [
+        ({"usages": usages(cores=(98, 100))}, False),  # used up by running servers: it may free up
+        ({"usages": usages(family=("standardDdsv5Family", 98, 100))}, False),
+        ({"usages": usages(cores=(0, 2))}, True),  # the limit itself is below the 4 vCPUs needed
+        ({"usages": usages(family=("standardDdsv5Family", 0, 2))}, True),
+    ],
+)
+def test_only_a_quota_limit_below_the_need_is_region_unavailable(arm, change, region_fatal):
+    arm.update(change)
+    with pytest.raises(PreflightError) as caught:
+        azure_preflight.check("westeurope", "Standard_D4ds_v5", 4, "ManagedDiskV2")
+    assert isinstance(caught.value, RegionUnavailable) is region_fatal
 
 
 def test_a_missing_cores_quota_is_logged_and_passes(arm, caplog):

@@ -333,6 +333,29 @@ def test_a_dbaas_run_without_an_offering_ends_with_its_result_and_defers_no_sku(
     assert launch.read(h.kube, "oci") == {}  # server runs of these SKUs are not held back by a DBaaS run
 
 
+def test_a_job_that_cannot_work_in_the_region_ends_with_its_own_reason_and_the_clients_region(h):
+    h.cluster.jobs["up"] = ["fail"]
+    h.cluster.up_error = (
+        "Program failed with an unhandled exception:\n"
+        "RegionUnavailable: DBAAS_REGION_UNAVAILABLE: azure pre-flight: restricted in eastus\n"
+        "more of the traceback"
+    )
+    h.start_db()
+    h.drive(stop=lambda run: run.status.phase == RunPhase.FAILED)
+    code, message = h.codes()[TASK]
+    assert code == ExitCode.NO_NODE
+    assert message == "DBAAS_REGION_UNAVAILABLE: azure pre-flight: restricted in eastus"
+    assert h.run.status.region == "eu-test-1"  # published with the meta: the next plan tries another region first
+
+
+def test_a_region_unavailable_marker_without_a_cause_still_ends_the_run(h):
+    h.cluster.jobs["up"] = ["fail"]
+    h.cluster.up_error = "DBAAS_REGION_UNAVAILABLE:"
+    h.start_db()
+    h.drive(stop=lambda run: run.status.phase == RunPhase.FAILED)
+    assert h.codes()[TASK][1] == "DBAAS_REGION_UNAVAILABLE: no cause given"
+
+
 def test_a_failed_up_job_and_its_pod_stay_for_their_logs_through_the_destroy(h):
     h.cluster.jobs["up"] = ["fail"]
     h.start_db()
