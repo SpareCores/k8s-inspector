@@ -299,6 +299,11 @@ regions. Like every failure, this is published only while no older good result o
 replaces a good result): then there is no cap and no rotation, only the usual retry wait. A vendor module raises
 `RegionUnavailable` for what is region-fatal.
 
+Azure's `RegionalAllocationFailed` error (no capacity for the SKU in the region), which only the create itself reports,
+is also a `RegionUnavailable` error: `stack.up` turns it into `DBAAS_REGION_UNAVAILABLE: azure has no capacity in the
+region: ...` (without `[vendor-wide]`, another SKU may still fit). The handling is the one above, and the run's `down`
+destroys what the failed create left, as after any failed `up`.
+
 A restricted offer is the same for every database of the vendor in that region, unlike a missing SKU or a quota limit.
 Its message carries `[vendor-wide]` after the marker (`DBAAS_REGION_UNAVAILABLE: [vendor-wide] ...`, the per-database
 handling above applies unchanged). The controller then also records the database region as blocked for the vendor for

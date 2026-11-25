@@ -13,12 +13,14 @@ from collections.abc import Callable
 from pulumi import automation as auto
 
 from k8s_inspector_dbaas import vendors
+from k8s_inspector_dbaas.errors import RegionUnavailable
 from k8s_inspector_dbaas.spec import DbOutputs, DbSpec
 
 PROJECT = "k8s-inspector-dbaas"
 # The controller (`k8s_inspector.dbaas_jobs.STACK_PREFIX`) is a separate package that shares no code with this image, so
 # the prefix is written in both; a test of the controller compares the two.
 STACK_PREFIX = "k8s-dbaas-"
+AZURE_NO_CAPACITY = 'Code="RegionalAllocationFailed"'  # Azure has no capacity for the SKU in the region
 
 
 class PendingOperations(Exception):
@@ -55,7 +57,14 @@ def up(spec: DbSpec, on_output: Callable[[str], None] = print) -> DbOutputs:
     stack = auto.create_or_select_stack(
         stack_name(spec.run), project_name=PROJECT, program=program, opts=_options(program)
     )
-    result = stack.up(on_output=on_output, show_secrets=False)
+    try:
+        result = stack.up(on_output=on_output, show_secrets=False)
+    except auto.CommandError as e:
+        # The partial state stays: the controller runs `down` after any failed `up`.
+        if AZURE_NO_CAPACITY in str(e):
+            line = next(line for line in str(e).splitlines() if AZURE_NO_CAPACITY in line)
+            raise RegionUnavailable(f"azure has no capacity in the region: {line.strip()}") from e
+        raise
     return DbOutputs.from_exports({name: output.value for name, output in result.outputs.items()})
 
 
