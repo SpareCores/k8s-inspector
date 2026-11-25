@@ -11,6 +11,7 @@ import pytest
 
 from k8s_inspector_dbaas import __main__ as entry
 from k8s_inspector_dbaas import stack, vendors
+from k8s_inspector_dbaas.errors import RegionUnavailable, VendorRegionUnavailable
 from k8s_inspector_dbaas.spec import DbOutputs, load_spec
 
 SPEC_JSON = {
@@ -288,3 +289,36 @@ def test_down_runs_the_vendors_cleanup_with_the_run_name_and_keeps_the_state_whe
 
 def test_usage():
     assert entry.main(["x"]) == 2 and entry.main(["x", "sideways"]) == 2
+
+
+def test_an_azure_allocation_failure_is_region_unavailable_but_not_vendor_wide(spec, monkeypatch):
+    output = (
+        "Updating (k8s-dbaas-azure-x-1)\n"
+        '  azure-native:dbforpostgresql:Server db creating (65s) error: Status=200 Code="RegionalAllocationFailed" '
+        'Message="We do not have sufficient capacity"\n'
+        "error: update failed"
+    )
+
+    class FakeStack:
+        def up(self, **kwargs):
+            raise stack.auto.CommandError(output)
+
+    monkeypatch.setenv("PULUMI_BACKEND_URL", "file:///unused")
+    monkeypatch.setattr(stack.auto, "create_or_select_stack", lambda *args, **kwargs: FakeStack())
+    with pytest.raises(RegionUnavailable) as caught:
+        stack.up(spec)
+    message = str(caught.value)
+    assert message.startswith("DBAAS_REGION_UNAVAILABLE: ") and "\n" not in message
+    assert "RegionalAllocationFailed" in message and "[vendor-wide]" not in message
+    assert not isinstance(caught.value, VendorRegionUnavailable)
+
+
+def test_another_failed_up_stays_an_ordinary_error(spec, monkeypatch):
+    class FakeStack:
+        def up(self, **kwargs):
+            raise stack.auto.CommandError('Code="QuotaExceeded"')
+
+    monkeypatch.setenv("PULUMI_BACKEND_URL", "file:///unused")
+    monkeypatch.setattr(stack.auto, "create_or_select_stack", lambda *args, **kwargs: FakeStack())
+    with pytest.raises(stack.auto.CommandError):
+        stack.up(spec)
