@@ -26,8 +26,9 @@ class Mocks(pulumi.runtime.Mocks):
                 "serviceHost": "public.example",
                 "servicePort": 11550,
                 "components": [
-                    {"component": "pg", "host": "private-db.example", "port": 11551, "route": "private"},
-                    {"component": "pg", "host": "public.example", "port": 11550, "route": "public"},
+                    {"component": "pg", "host": "db.example", "port": 11551, "route": "dynamic"},
+                    {"component": "pg", "host": "public-db.example", "port": 11551, "route": "public"},
+                    {"component": "pgbouncer", "host": "db.example", "port": 11552, "route": "dynamic"},
                 ],
             }
         return [args.name + "-id", outputs]
@@ -92,7 +93,7 @@ def test_the_database_joins_the_private_network(spec, upcloud_vendor):
 
     def check(values):
         host, port = values
-        assert (host, port) == ("private-db.example", 11551)
+        assert (host, port) == ("db.example", 11551)
         (provider,) = [r for r in mocks.resources if r.typ == "pulumi:providers:upcloud"]
         assert "token" not in provider.inputs
         (db,) = [r for r in mocks.resources if r.typ.endswith("ManagedDatabasePostgresql")]
@@ -133,17 +134,36 @@ def test_inventory_lists_the_tagged_postgres_services(upcloud_vendor, monkeypatc
     assert len(seen) == 1
 
 
-def test_connection_uses_the_private_pg_component(upcloud_vendor):
+ATTACHED = [{"name": "bench", "type": "private", "uuid": "u"}]
+
+
+def test_connection_prefers_a_private_pg_route(upcloud_vendor):
     components = [
         {"component": "pg", "route": "public", "host": "pub.example", "port": 11},
+        {"component": "pg", "route": "dynamic", "host": "dyn.example", "port": 11},
         {"component": "pg", "route": "private", "host": "priv.example", "port": "11569"},
     ]
-    assert upcloud_vendor._connection(components) == ("priv.example", 11569)
+    assert upcloud_vendor._connection(components, ATTACHED) == ("priv.example", 11569)
 
 
-def test_connection_without_a_private_pg_component_is_an_error(upcloud_vendor):
-    with pytest.raises(RuntimeError, match="no private pg component"):
-        upcloud_vendor._connection([{"component": "pg", "route": "public", "host": "pub.example", "port": 11}])
+def test_connection_uses_the_dynamic_pg_host_on_an_attached_network(upcloud_vendor):
+    components = [
+        {"component": "pgbouncer", "route": "dynamic", "host": "bouncer.example", "port": 12},
+        {"component": "pg", "route": "public", "host": "pub.example", "port": 11},
+        {"component": "pg", "route": "dynamic", "host": "dyn.example", "port": 11},
+    ]
+    assert upcloud_vendor._connection(components, ATTACHED) == ("dyn.example", 11)
+
+
+def test_connection_without_an_attached_network_is_an_error(upcloud_vendor):
+    components = [{"component": "pg", "route": "dynamic", "host": "dyn.example", "port": 11}]
+    with pytest.raises(RuntimeError, match="not attached"):
+        upcloud_vendor._connection(components, [])
+
+
+def test_connection_never_falls_back_to_the_public_host(upcloud_vendor):
+    with pytest.raises(RuntimeError, match="no private or dynamic"):
+        upcloud_vendor._connection([{"component": "pg", "route": "public", "host": "p", "port": 11}], ATTACHED)
 
 
 def test_labels_come_as_a_list_or_a_dict(upcloud_vendor):
