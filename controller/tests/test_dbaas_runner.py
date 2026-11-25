@@ -3,6 +3,7 @@ parallel with the node release, retries, restarts, the finalizer. Jobs and Pods 
 
 import base64
 import json
+import logging
 import re
 from dataclasses import replace
 from datetime import timedelta
@@ -838,12 +839,84 @@ def test_the_up_job_gets_the_public_addresses_of_the_client_node(h):
     assert json.loads(env["DBAAS_SPEC"])["clientAddresses"] == ["203.0.113.7/32", "2001:db8::7/128"]
 
 
-def test_a_node_without_public_addresses_gives_an_empty_list(h):
-    h.start_db()
-    h.until_phase(DbPhase.CREATING)
+def _spec_of_up_job(h) -> dict:
     (job,) = h.kube.list("job")
     env = {e["name"]: e.get("value") for e in job["spec"]["template"]["spec"]["containers"][0]["env"]}
-    assert json.loads(env["DBAAS_SPEC"])["clientAddresses"] == []
+    return json.loads(env["DBAAS_SPEC"])
+
+
+def _client_node_without_address(h):
+    h.cluster.node_addresses = []
+    h.start_db()
+    h.drive(stop=lambda run: run.status.database is not None)  # Creating, the node is up
+    h.runner.reconcile(h.name)
+
+
+def test_the_up_job_waits_for_the_public_address_of_the_client_node(h, caplog):
+    caplog.set_level(logging.INFO)
+    _client_node_without_address(h)
+    assert h.kube.list("job") == [] and h.run.status.database.phase == DbPhase.CREATING
+    assert "waiting for the public address" in caplog.text
+    node = h.kube.list("node")[0]["metadata"]["name"]
+    h.clock.advance(minutes=2)  # SCarpenter's sweep writes the annotation
+    h.kube.merge_patch(
+        "node", node, {"metadata": {"annotations": {"scarpenter.sparecores.com/public-ipv4": "203.0.113.9"}}}
+    )
+    h.runner.reconcile(h.name)
+    assert _spec_of_up_job(h)["clientAddresses"] == ["203.0.113.9/32"]
+    timing = h.run.status.database.timing
+    assert timing["api_start"] == h.clock.now and h.run.status.database.since < timing["api_start"]  # the Job's start
+
+
+def test_the_wait_logs_only_at_the_start_and_makes_no_keeper_or_secret_call(h, caplog, monkeypatch):
+    caplog.set_level(logging.INFO)
+    _client_node_without_address(h)
+    logged = caplog.text.count("waiting for the public address")  # the first poll(s), right at the start
+    assert logged >= 1
+    asked = []
+    monkeypatch.setattr(dbaas_keeper, "database", lambda *a: asked.append(a) or dict(RECORD))
+    for _ in range(3):
+        h.clock.advance(seconds=15)
+        h.runner.reconcile(h.name)
+    assert asked == [] and f"{h.name}-db" not in h.kube.objects.get("secret", {})
+    assert caplog.text.count("waiting for the public address") == logged  # none after the first poll
+
+
+def test_an_address_only_on_the_nodeclaim_is_enough(h):
+    _client_node_without_address(h)
+    (claim,) = h.kube.list("nodeclaim")
+    h.kube.merge_patch(
+        "nodeclaim", claim["metadata"]["name"],
+        {"metadata": {"annotations": {"scarpenter.sparecores.com/public-ipv4": "203.0.113.8"}}},
+    )  # fmt: skip
+    h.runner.reconcile(h.name)
+    assert _spec_of_up_job(h)["clientAddresses"] == ["203.0.113.8/32"]
+
+
+def test_a_new_attempt_waits_for_the_address_of_its_new_node(h):
+    _client_node_without_address(h)
+    h.clock.advance(minutes=4)
+    h.runner.reconcile(h.name)
+    assert h.kube.list("job") == []
+    (node,) = h.kube.list("node")
+    h.kube.delete("node", node["metadata"]["name"])  # the node is lost during the wait
+    h.drive(stop=lambda run: run.status.attempt == 2 and run.status.phase == RunPhase.RUNNING)
+    h.clock.advance(minutes=2)  # 6 minutes since the first node, 2 since the second
+    h.runner.reconcile(h.name)
+    assert h.kube.list("job") == []
+    h.clock.advance(minutes=4)
+    h.runner.reconcile(h.name)
+    assert _spec_of_up_job(h)["clientAddresses"] == []
+
+
+def test_the_up_job_starts_without_an_address_once_the_wait_is_over(h):
+    _client_node_without_address(h)
+    h.clock.advance(minutes=4)
+    h.runner.reconcile(h.name)
+    assert h.kube.list("job") == []
+    h.clock.advance(minutes=2)  # a vendor that needs no address is not blocked
+    h.runner.reconcile(h.name)
+    assert _spec_of_up_job(h)["clientAddresses"] == []
 
 
 def test_a_vendor_generated_password_replaces_the_one_the_benchmark_uses_and_the_up_job_is_deleted(h):

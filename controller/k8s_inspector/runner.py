@@ -85,6 +85,7 @@ from k8s_inspector.model import (
     BenchmarkRun,
     CapacityType,
     Config,
+    DbPhase,
     ExitCode,
     LaunchFailure,
     NodeFacts,
@@ -1366,6 +1367,9 @@ class Runner(DbaasMixin):
 
         def mutate(status: RunStatus) -> None:
             status.phase = RunPhase.RUNNING
+            db = status.database
+            if db is not None and db.phase == DbPhase.CREATING and "api_start" not in db.timing:
+                db.since = self._now()  # a new attempt's node: the wait for its address starts over
             status.node, status.region, status.zone = facts.node_name, facts.region, facts.zone
             if run.spec.database:
                 status.client_sku = sku

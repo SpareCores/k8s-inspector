@@ -42,7 +42,9 @@ log = logging.getLogger(__name__)
 
 ERROR_CHARS = 2000  # of a Job's error in `status.database.error`: the provisioner condenses it to fit (`__main__`)
 TIMEOUT_MARGIN = timedelta(minutes=5)  # the controller judges the create deadline a little after the Job's own
+ADDRESS_POLL_SECONDS = 15  # while waiting for the client node's public address
 POLL_SECONDS = 60  # while waiting for a Job: the Job and Pod watches wake the run, this bounds the wait for a deadline
+CLIENT_ADDRESS_WAIT = timedelta(minutes=5)  # how long the up Job waits for the client node's public address
 WAIT_FOR_POD_SECONDS = 10  # the up Job's Pod is still going away; the down Job must not start before it is gone
 RETRY_MIN_SECONDS, RETRY_MAX_SECONDS = 60, 1800  # between destroy attempts: doubles from a minute to half an hour
 ENDED_PHASES = ("Succeeded", "Failed")  # any other Pod phase (even Unknown) may still run the Pulumi process
@@ -121,9 +123,7 @@ class DbaasMixin:
         expires = dbaas_jobs.expiry(now, cfg, self._dbaas_task(run))
         run = self._set_database(
             run,
-            lambda status: setattr(
-                status, "database", DbStatus(DbPhase.CREATING, now, expires, timing={"api_start": now})
-            ),
+            lambda status: setattr(status, "database", DbStatus(DbPhase.CREATING, now, expires)),
         )
         self._database_creating(run, cfg, live)
 
@@ -180,15 +180,36 @@ class DbaasMixin:
 
     def _create_up_job(self, run: BenchmarkRun, cfg: Config) -> None:
         db = run.spec.database
+        nd = self._nodes[run.name]
+        node = self._get_node(nd.facts.node_name) or {}
+        addresses = dbaas_jobs.client_addresses(node, nd.claim)
+        if not addresses:
+            # SCarpenter writes the address at create when the vendor returns it, else with its next sweep (~2 minutes).
+            # A vendor that needs none is not held up for long; one that does fails loudly after the wait. The wait
+            # starts with the node (`status.database.since`, reset by a new attempt's node).
+            waited = self._now() - run.status.database.since
+            if waited < CLIENT_ADDRESS_WAIT:
+                if waited < timedelta(seconds=ADDRESS_POLL_SECONDS):  # the first poll only
+                    log.info(
+                        "run %s: waiting for the public address of the client node %s", run.name, nd.facts.node_name
+                    )
+                return self._enqueue_later(run.name, ADDRESS_POLL_SECONDS)
+            log.warning(
+                "run %s: no public address of the client node %s after %s",
+                run.name,
+                nd.facts.node_name,
+                CLIENT_ADDRESS_WAIT,
+            )
         record = dbaas_keeper.database(cfg.env, db["vendor"], db["id"])
         if record is None:
             return self._database_fail(run, "DBAAS_UNKNOWN_DATABASE", f"Keeper does not know {db['vendor']}/{db['id']}")
         self._password(run)
         network = cfg.settings.dbaas.vendors[db["vendor"]].networks[pods.client_region(db)]
-        nd = self._nodes[run.name]
-        node = self._get_node(nd.facts.node_name) or {}
-        addresses = dbaas_jobs.client_addresses(node, nd.claim)
         spec = dbaas_jobs.build_spec(run, cfg, record, network, run.status.database.expires, addresses)
+        now = self._now()
+        # the create time starts with the Job, not with the wait for the address; stamped first, so that a restart
+        # between the two calls cannot lose it
+        self._set_database(run, lambda status: status.database.timing.__setitem__("api_start", now))
         self._create("job", dbaas_jobs.up_job(run, cfg, spec, self._run_owner(run)))
 
     def _database_creating(self, run: BenchmarkRun, cfg: Config, live: dict[str, dict]) -> None:
@@ -203,7 +224,8 @@ class DbaasMixin:
             message = dbaas_jobs.job_message(self.kube, name).get("error") or "the Job failed"
             return self._database_fail(run, "DBAAS_CREATE_FAILED", message)
         if state == "running":
-            if self._now() - db.since > timedelta(minutes=cfg.settings.dbaas.create_minutes) + TIMEOUT_MARGIN:
+            started = db.timing.get("api_start") or db.since
+            if self._now() - started > timedelta(minutes=cfg.settings.dbaas.create_minutes) + TIMEOUT_MARGIN:
                 return self._database_fail(
                     run, "DBAAS_CREATE_TIMEOUT", f"not created within {cfg.settings.dbaas.create_minutes} minutes"
                 )
