@@ -904,6 +904,12 @@ def node_api_reference(node: dict) -> str | None:
     return (node.get("metadata", {}).get("labels") or {}).get(API_REFERENCE_LABEL)
 
 
+def claim_run_requirement(claim: dict) -> str | None:
+    """The run a NodeClaim's `spec.requirements` name (a single `In` value), None when it has no such requirement or an
+    `Exists` one (a claim of an anchor made before the run key: the NodePool's `Exists` gets a generated label)."""
+    return _claim_requirement(claim, RUN_NODE_LABEL)
+
+
 def claim_run(claim: dict) -> str | None:
     """The run a NodeClaim is for: the label (after launch), else the requirement (from creation)."""
     labels = claim.get("metadata", {}).get("labels") or {}

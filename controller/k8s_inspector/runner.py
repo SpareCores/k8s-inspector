@@ -1301,7 +1301,7 @@ class Runner(DbaasMixin):
             if run_name:
                 return pods.claim_run(claim) == run_name
             return (  # not a claim of a run with a node of its own that happens to have the SKU
-                pods.claim_run(claim) is None
+                pods.claim_run_requirement(claim) is None
                 and pods.claim_vendor(claim) == selector[pods.VENDOR_LABEL]
                 and pods.claim_api_reference(claim) == selector[pods.API_REFERENCE_LABEL]
             )

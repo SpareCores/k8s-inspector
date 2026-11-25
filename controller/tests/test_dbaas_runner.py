@@ -267,6 +267,13 @@ def test_an_anchor_made_before_the_run_label_finds_its_claims_by_vendor_and_sku(
         "nodeclaim", "of-a-run-with-its-own-node",
         {"spec": {"requirements": [*claim["spec"]["requirements"][:-1], run_requirement]}},
     )  # fmt: skip
+    _unlaunched_claim(h, h.kube.get("pod", anchor), "stamped")  # the NodePool's `Exists` gave it a generated label
+    stamped = h.kube.get("nodeclaim", "stamped")
+    exists = {"key": "inspector.sparecores.com/run", "operator": "Exists"}
+    h.kube.merge_patch("nodeclaim", "stamped", {
+        "metadata": {"labels": {"inspector.sparecores.com/run": "4711"}},
+        "spec": {"requirements": [*stamped["spec"]["requirements"], exists]},
+    })  # fmt: skip
     crd.request_cancel(h.kube, h.name)
     h.runner.reconcile(h.name)
     assert [c["metadata"]["name"] for c in h.kube.list("nodeclaim")] == ["of-a-run-with-its-own-node"]
