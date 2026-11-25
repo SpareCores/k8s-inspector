@@ -39,7 +39,7 @@ def error_message(text: str) -> str:
     the cause in a line like `... creating (0s) error: ...`, far from the end) and the tail of the output. It always
     fits `MAX_MESSAGE` as valid JSON (escaping makes the text longer, so the text shrinks until the JSON fits)."""
     budget = MAX_MESSAGE
-    while True:
+    while True:  # ends: a budget of a few characters always fits
         tail = text[-TAIL_CHARS:]
         lines = text[: len(text) - len(tail)].splitlines()
         errors = list(dict.fromkeys(line.strip()[:ERROR_LINE_CHARS] for line in lines if "error" in line.lower()))

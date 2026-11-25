@@ -416,7 +416,7 @@ def up_job(run: BenchmarkRun, cfg: Config, spec: dict, owner: OwnerRef) -> dict:
 
 def failure_counted(job: dict, db) -> bool:
     """The failure of a failed down Job is already in `db.destroy_failures`: the Job was created after that many
-    failures, so it counts once a failure is recorded after it."""
+    failures, so it counts once a failure is recorded after it. A Job without the annotation is never counted."""
     created_after = (job["metadata"].get("annotations") or {}).get(ANNOTATION_DESTROY_FAILURES)
     return created_after is not None and created_after != str(db.destroy_failures)
 

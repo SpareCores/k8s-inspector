@@ -33,6 +33,7 @@ spec:
   runId: r20261120t0930-3f9c
   tasks: []                 # empty = every due task; otherwise exactly these
   force: false              # skip Keeper's eligibility check; launch failures end as -1 results
+                            # (a forced DBaaS run also records a NO_OFFERING deferral for vendor+SKU: server runs of the SKU wait 24 h)
   capacity: SpotFirst       # SpotFirst | OnDemand (default from the vendor setting)
   holdAfter: 0s             # keep the node after the last step (debugging)
   database: null            # DBaaS runs: {vendor, id, engineVersion, region, vcpus, memoryGib}

@@ -267,6 +267,24 @@ def test_a_create_that_takes_too_long_ends_the_task_but_the_up_job_is_never_kill
     h.until_phase(DbPhase.DESTROYED)
 
 
+def test_a_failed_up_job_whose_pod_still_runs_holds_back_the_destroy(h):
+    h.cluster.jobs["up"] = ["hang"]
+    h.start_db()
+    h.until_phase(DbPhase.CREATING)
+    h.cluster.react()
+    h.runner.reconcile(h.name)
+    h.clock.advance(minutes=66)
+    h.runner.reconcile(h.name)
+    up = f"dbaas-up-{h.name}"
+    h.kube.set_status("job", up, {"conditions": [{"type": "Failed", "status": "True"}]})  # the deadline passed
+    for _ in range(3):
+        h.runner.reconcile(h.name)  # the Pod is Running through its grace period: Pulumi finishes the create
+    assert h.jobs() == [up] and h.db.phase == DbPhase.DESTROYING
+    h.cluster.finish_job(up, "fail")
+    h.runner.reconcile(h.name)
+    assert f"dbaas-down-{h.name}" in h.jobs() and f"{up}-pod" in h.pod_names()  # the Pod stays for its logs
+
+
 @pytest.mark.parametrize("how", ["cancel", "delete"])
 def test_a_teardown_waits_for_a_running_up_job_and_its_pod_before_the_destroy(h, how):
     h.cluster.jobs["up"] = ["hang"]
@@ -492,6 +510,23 @@ def test_the_destroy_is_retried_with_a_growing_wait_until_it_succeeds(h):
     h.cluster.react()
     h.runner.reconcile(h.name)
     assert h.db.phase == DbPhase.DESTROYED
+
+
+def test_a_failed_destroy_job_from_before_the_failure_annotation_is_counted_once_and_retried(h):
+    h.cluster.jobs["down"] = ["fail"]
+    h.start_db()
+    h.drive(stop=lambda run: run.status.phase == RunPhase.PUBLISHING)
+    h.runner.reconcile(h.name)
+    h.cluster.react()
+    down = f"dbaas-down-{h.name}"
+    del h.kube.objects["job"][down]["metadata"]["annotations"][dbaas_jobs.ANNOTATION_DESTROY_FAILURES]
+    h.runner.reconcile(h.name)
+    assert h.db.destroy_failures == 1 and ("job", down) in h.kube.deleted  # counted once, the Job is replaced
+    h.clock.advance(minutes=1, seconds=1)
+    h.runner.reconcile(h.name)
+    h.cluster.react()
+    h.runner.reconcile(h.name)
+    assert h.db.phase == DbPhase.DESTROYED and h.db.destroy_failures == 1
 
 
 def test_a_restarted_controller_continues_creating_and_runs_the_destroy(h):

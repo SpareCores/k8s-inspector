@@ -45,6 +45,7 @@ TIMEOUT_MARGIN = timedelta(minutes=5)  # the controller judges the create deadli
 POLL_SECONDS = 60  # while waiting for a Job: the Job and Pod watches wake the run, this bounds the wait for a deadline
 WAIT_FOR_POD_SECONDS = 10  # the up Job's Pod is still going away; the down Job must not start before it is gone
 RETRY_MIN_SECONDS, RETRY_MAX_SECONDS = 60, 1800  # between destroy attempts: doubles from a minute to half an hour
+PULUMI_PHASES = ("Pending", "Running")  # Pod phases in which the Pulumi process may still run
 CLEAR_ATTEMPTS = 3  # failed destroys of a leftover stack after which the run ends -1 and leaves it to the sweeper
 RUNNING_PHASES = (RunPhase.PENDING, RunPhase.PROVISIONING, RunPhase.RUNNING)
 
@@ -310,7 +311,14 @@ class DbaasMixin:
                 self._enqueue_later(run.name, POLL_SECONDS)
                 return None, run
             self.kube.delete("job", up)
-        if not keep_up and self.kube.list("pod", labels={dbaas_jobs.LABEL_JOB: up}):  # gone before the destroy starts
+        pods_left = self.kube.list("pod", labels={dbaas_jobs.LABEL_JOB: up})
+        if keep_up:  # the kept Pod stays: only one that may still run Pulumi (even in its grace period) is waited for
+            pods_left = [
+                pod
+                for pod in pods_left
+                if pod["metadata"].get("deletionTimestamp") or (pod.get("status") or {}).get("phase") in PULUMI_PHASES
+            ]
+        if pods_left:  # the destroy starts when the up Pulumi process cannot run any more
             self._enqueue_later(run.name, WAIT_FOR_POD_SECONDS)
             return None, run
         name = dbaas_jobs.down_job_name(run.name)
@@ -320,7 +328,7 @@ class DbaasMixin:
             job = None
         if job is not None and dbaas_jobs.job_state(job) == "failed":
             if not dbaas_jobs.failure_counted(job, db):
-                return None, self._destroy_failed(run, name, db)
+                return None, self._destroy_failed(run, job, db)
             if db.retry_after and self._now() < db.retry_after:  # the failed Job stays until its retry replaces it
                 self._enqueue_later(run.name, max(1.0, (db.retry_after - self._now()).total_seconds()))
                 return None, run
@@ -341,13 +349,17 @@ class DbaasMixin:
         self.kube.delete("job", name)
         return dbaas_jobs.job_completed_at(job, self._now()), run
 
-    def _destroy_failed(self, run: BenchmarkRun, name: str, db: DbStatus) -> BenchmarkRun:
-        """The destroy failed: try again later, as long as it takes (a database that bills must not stay)."""
+    def _destroy_failed(self, run: BenchmarkRun, job: dict, db: DbStatus) -> BenchmarkRun:
+        """The destroy failed: try again later, as long as it takes (a database that bills must not stay). A Job
+        without the failure annotation is from before it existed: it is deleted here so it is counted once."""
+        name = job["metadata"]["name"]
         message = dbaas_jobs.job_message(self.kube, name).get("error") or "the destroy Job failed"
         failures = db.destroy_failures + 1
         wait = min(RETRY_MIN_SECONDS * 2 ** (failures - 1), RETRY_MAX_SECONDS)
         retry_after = self._now() + timedelta(seconds=wait)
         log.error("run %s: destroying the database failed (%d), retrying in %ds", run.name, failures, wait)
+        if dbaas_jobs.ANNOTATION_DESTROY_FAILURES not in (job["metadata"].get("annotations") or {}):
+            self.kube.delete("job", name)
 
         def mutate(status: RunStatus) -> None:
             status.database.destroy_failures, status.database.retry_after = failures, retry_after
