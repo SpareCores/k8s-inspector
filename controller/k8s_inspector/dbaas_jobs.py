@@ -184,10 +184,18 @@ def labels(run_id: str, expires: datetime) -> dict[str, str]:
     return {"sc_inspector_run": run_id.lower(), "sc_inspector_expires": _stamp(expires)}
 
 
+PUBLIC_IP_ANNOTATIONS = ("scarpenter.sparecores.com/public-ipv4", "scarpenter.sparecores.com/public-ipv6")
+
+
 def client_addresses(node: dict) -> list[str]:
-    """The ExternalIP addresses of the client Node as `/32` and `/128` networks, for the allowlist of a vendor whose
-    database is on a public endpoint. Empty when the Node has none."""
-    found = (a["address"] for a in node.get("status", {}).get("addresses") or [] if a.get("type") == "ExternalIP")
+    """The public addresses of the client Node as `/32` and `/128` networks, for the allowlist of a vendor whose
+    database is on a public endpoint. SCarpenter's public-ipv4/public-ipv6 annotations come first (the only source on
+    OVH, whose Nodes have no ExternalIP); the ExternalIP addresses are the fallback when there are none. Empty when
+    the Node has neither."""
+    annotations = node.get("metadata", {}).get("annotations") or {}
+    found = [annotations[key] for key in PUBLIC_IP_ANNOTATIONS if annotations.get(key)]
+    if not found:
+        found = [a["address"] for a in node.get("status", {}).get("addresses") or [] if a.get("type") == "ExternalIP"]
     return [ipaddress.ip_network(address).with_prefixlen for address in found]
 
 

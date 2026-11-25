@@ -127,19 +127,41 @@ def test_a_stack_is_as_old_as_its_first_update_whatever_its_state_file_was_last_
     assert jobs(kube) == ["dbaas-down-aws-leak-1"]  # past the 6 h from its creation
 
 
-def test_the_client_addresses_are_the_external_ips_of_the_node_as_host_networks():
-    node = {
+def _node(annotations: dict | None = None, external: tuple[str, ...] = ()) -> dict:
+    return {
+        "metadata": {"annotations": annotations or {}},
         "status": {
-            "addresses": [
-                {"type": "InternalIP", "address": "10.0.0.4"},
-                {"type": "ExternalIP", "address": "203.0.113.7"},
-                {"type": "ExternalIP", "address": "2001:db8::7"},
-                {"type": "Hostname", "address": "node-1"},
-            ]
-        }
+            "addresses": [{"type": "InternalIP", "address": "10.0.0.4"}]
+            + [{"type": "ExternalIP", "address": a} for a in external]
+            + [{"type": "Hostname", "address": "node-1"}]
+        },
     }
+
+
+def test_the_client_addresses_are_the_scarpenter_annotations_as_host_networks():
+    node = _node(
+        {
+            "scarpenter.sparecores.com/public-ipv4": "203.0.113.7",
+            "scarpenter.sparecores.com/public-ipv6": "2001:db8::7",
+        }
+    )
+    assert dbaas_jobs.client_addresses(node) == ["203.0.113.7/32", "2001:db8::7/128"]
+
+
+def test_the_client_addresses_fall_back_to_the_external_ips():
+    node = _node(external=("203.0.113.7", "2001:db8::7"))
     assert dbaas_jobs.client_addresses(node) == ["203.0.113.7/32", "2001:db8::7/128"]
     assert dbaas_jobs.client_addresses({"status": {}}) == [] and dbaas_jobs.client_addresses({}) == []
+
+
+def test_the_client_addresses_prefer_the_annotations_over_the_external_ips():
+    node = _node({"scarpenter.sparecores.com/public-ipv4": "198.51.100.9"}, external=("203.0.113.7", "2001:db8::7"))
+    assert dbaas_jobs.client_addresses(node) == ["198.51.100.9/32"]
+
+
+def test_the_client_addresses_of_an_ipv6_only_node():
+    node = _node({"scarpenter.sparecores.com/public-ipv6": "2001:db8::7"})
+    assert dbaas_jobs.client_addresses(node) == ["2001:db8::7/128"]
 
 
 def test_every_database_is_labelled_with_the_run_and_an_expiry():

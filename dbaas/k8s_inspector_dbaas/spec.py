@@ -56,7 +56,7 @@ class DbSpec:
     # that needs an allowlist on a private network (UpCloud, Vultr, OCI) the platform puts the client CIDRs in it
     network: dict
     record: dict  # Keeper's record of the database (vcpus, memory_amount, storage_size, api_reference_object ...)
-    # ExternalIP addresses of the client node as /32 or /128, for a vendor whose nodes have no private network (OVH):
+    # public addresses of the client node (SCarpenter annotations, else ExternalIP) as /32 or /128, for a vendor whose nodes have no private network (OVH):
     # the database is on a public endpoint with TLS and allows these. Empty when the node has none.
     client_addresses: list[str] = field(default_factory=list)
     password: str = field(repr=False, default="")  # admin password, from `DBAAS_PASSWORD`; a Pulumi secret
