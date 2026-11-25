@@ -765,7 +765,7 @@ def test_rescan_routes_dbaas_runs_by_run_json(tmp_path, origin, cluster):
     git(seed, "push", "origin", "HEAD:main")
     today = datetime.now(UTC).date()
     run = RunKey("hcloud", "cax31", today, "r-db")
-    database = {"vendor": "hcloud", "id": "db1", "engineVersion": 16, "vcpus": 2, "memoryGib": 8.0}
+    database = {"vendor": "hcloud", "id": "db1", "engineVersion": 16, "region": "r", "vcpus": 2, "memoryGib": 8.0}
     storage.put_task("pgbench", {"start": "2026-10-01T10:00:00", "end": "2026-10-01T10:05:00", "exit_code": 0,
                                  "task_hash": "h", "run_id": "r-db"}, b"tps", run=run)  # fmt: skip
     storage.objects[okey(run, "run.json")] = json.dumps({"database": database}).encode()
@@ -1172,7 +1172,16 @@ def test_a_dbaas_result_is_published_with_the_bootstrap_settings_merged_into_std
         }
     ).encode()
     storage.objects[okey(run, "run.json")] = json.dumps(
-        {"database": {"vendor": "gcp", "id": "db1", "engineVersion": 18, "region": "r", "vcpus": 4, "memoryGib": 16.0}}
+        {
+            "database": {
+                "vendor": "gcp",
+                "id": "db1",
+                "engineVersion": 18,
+                "region": "r",
+                "vcpus": 4,
+                "memoryGib": 16.0,
+            }
+        }
     ).encode()
     tasks = {**TASKS, "pgbench": TaskDef("pgbench", "img", None, timedelta(minutes=5))}
     env = EnvConfig(bucket="b", bucket_region="r", git_url=origin.as_uri())
@@ -1206,7 +1215,7 @@ def test_a_dbaas_result_is_published_with_the_bootstrap_settings_merged_into_std
 
 
 def test_a_dbaas_run_is_published_by_its_database_not_by_its_client_sku():
-    database = {"vendor": "gcp", "id": "db1", "engineVersion": "18"}
+    database = {"vendor": "gcp", "id": "db1", "engineVersion": "18", "region": "r"}
     run = BenchmarkRun(
         "gcp-x-1", "inspector", "u", "1", datetime.now(UTC), RunSpec("gcp", "client-sku", "r", database=database)
     )
@@ -1219,7 +1228,7 @@ def test_a_dbaas_run_is_published_by_its_database_not_by_its_client_sku():
 
 def test_dbaas_timing_is_published_and_the_destroy_files_follow_later(tmp_path, origin):
     t = datetime(2026, 11, 24, 21, 50, 0, 123, tzinfo=UTC)
-    database = {"vendor": "gcp", "id": "db1", "engineVersion": "18"}
+    database = {"vendor": "gcp", "id": "db1", "engineVersion": "18", "region": "r"}
     task = TaskStatus("pgbench", state=TaskState.DONE, start=t + timedelta(minutes=10), end=t + timedelta(minutes=30))
     task.published = True
     run = BenchmarkRun("gcp-x-1", "inspector", "u", "1", t, RunSpec("gcp", "client-sku", "r-db", database=database))
@@ -1250,7 +1259,7 @@ def test_dbaas_timing_is_published_and_the_destroy_files_follow_later(tmp_path, 
 
 def test_dbaas_timing_skips_runs_without_recorded_timing_and_prunes_what_is_gone(tmp_path, origin):
     t = datetime(2026, 11, 24, 21, 50, 0, tzinfo=UTC)
-    database = {"vendor": "gcp", "id": "db1", "engineVersion": "18"}
+    database = {"vendor": "gcp", "id": "db1", "engineVersion": "18", "region": "r"}
     task = TaskStatus("pgbench", state=TaskState.DONE, start=t, end=t + timedelta(minutes=30))
     task.published = True
     run = BenchmarkRun("gcp-x-1", "inspector", "u", "1", t, RunSpec("gcp", "client-sku", "r-old", database=database))

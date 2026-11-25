@@ -44,6 +44,11 @@ class RunPhase(StrEnum):
     CANCELLED = "Cancelled"
 
 
+# In the error of an up Job that cannot create the database in its region, whatever else happens (the provisioner's
+# `RegionUnavailable`): the run ends with this reason and the next plan tries other regions first.
+REGION_UNAVAILABLE = "DBAAS_REGION_UNAVAILABLE:"
+
+
 class DbPhase(StrEnum):
     """`status.database.phase`: where the managed database of a DBaaS run is. Absent: nothing was created yet."""
 

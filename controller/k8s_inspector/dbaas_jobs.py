@@ -26,9 +26,6 @@ STATE_PROJECT = "k8s-inspector-dbaas"  # the Pulumi project: `<prefix>.pulumi/st
 PASSPHRASE_SECRET = "k8s-inspector-dbaas-state"  # key `passphrase`: the secrets provider of the stacks
 DEFAULT_SERVICE_ACCOUNT = "k8s-inspector-dbaas"
 LABEL_JOB = "inspector.sparecores.com/dbaas-job"  # on the Pods of a Job: its name
-REGION_UNAVAILABLE = (
-    "DBAAS_REGION_UNAVAILABLE:"  # in the error of a Job that cannot work in the region (the provisioner's)
-)
 LABEL_DBAAS = "inspector.sparecores.com/dbaas"  # on Jobs: up | down
 LABEL_SWEEP = "inspector.sparecores.com/dbaas-sweep"  # on a down Job that belongs to no BenchmarkRun
 ANNOTATION_RUN = "inspector.sparecores.com/dbaas-run"  # on up and down Jobs: the full run name (the Job name is short)

@@ -286,14 +286,20 @@ SKUs) is not an error: it is logged at info level and only the regional cores qu
 The pre-flight runs in the `azure` vendor module before the first resource (`azure_preflight.py`), with the Job's workload
 identity. It refuses, with a message that names the cause, when the subscription is restricted for the offer in the
 region, the region does not list the SKU (or lists it as disabled), the region lacks the storage the plan needs, or the
-regional cores or the family quota are short. These refusals mean the database cannot be created in this region
-whatever happens, so they are a `RegionUnavailable` error: its message starts with `DBAAS_REGION_UNAVAILABLE:`, which
+regional cores or the family quota are short. A restricted offer, a missing or disabled SKU, a missing storage
+edition and a quota whose limit is below the vCPUs needed mean the database cannot be created in this region
+whatever happens: they are a `RegionUnavailable` error, whose message starts with `DBAAS_REGION_UNAVAILABLE:`, which
 survives Pulumi's wrapping of the exception. The up Job fails at once and the run ends `-1` with
-`DBAAS_REGION_UNAVAILABLE: <cause>` (any other create failure is `DBAAS_CREATE_FAILED`), with the client region
-recorded. The result counts as a start retry like `DBAAS_CLIENT_FAILED`, so the third in a row ends as `-5`. The
-published `meta.json` carries `failed_regions`, the regions of the start failures in a row (carried like
-`start_retries`, gone with any other result), and the next plan puts all of them last: with the cap of three, the run
-tries up to three different regions. A vendor module raises `RegionUnavailable` for what is region-fatal. A check that cannot be made
+`DBAAS_REGION_UNAVAILABLE: <cause>`, with the client region recorded. A shortfall that running servers cause (usage
+against a limit that would fit) may be gone later: it is an ordinary `DBAAS_CREATE_FAILED`. The result counts as a
+start retry like `DBAAS_CLIENT_FAILED`, so the third in a row ends as `-5`. The published `meta.json` carries
+`failed_regions`, the database regions of the start failures in a row (carried like `start_retries`, gone with any
+other result), and the next plan puts all of them last: with the cap of three, the run tries up to three different
+regions. Like every failure, this is published only while no older good result of the database exists (a failure never
+replaces a good result): then there is no cap and no rotation, only the usual retry wait. A vendor module raises
+`RegionUnavailable` for what is region-fatal.
+
+A check that cannot be made
 (ARM unreachable, an unexpected answer) is logged and does not stop the create; the client node's zone is then requested
 as is.
 

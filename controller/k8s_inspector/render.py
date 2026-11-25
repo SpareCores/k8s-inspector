@@ -38,6 +38,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from k8s_inspector.model import (
+    REGION_UNAVAILABLE,
     AttemptStatus,
     BenchmarkRun,
     CapacityType,
@@ -58,7 +59,7 @@ START_FAILURE_PREFIXES = (
     START_FAILURE_PREFIX,
     "DBAAS_CLIENT_FAILED:",
     "DBAAS_LEFTOVER_STACK:",
-    "DBAAS_REGION_UNAVAILABLE:",
+    REGION_UNAVAILABLE,
 )
 ERROR_MSG_MAX = 200  # published error_msg length; a longer one keeps its start and end
 
@@ -793,13 +794,15 @@ def _is_start_failure(meta: dict) -> bool:
     return meta.get("exit_code") == ExitCode.NO_NODE and str(meta.get("error_msg")).startswith(START_FAILURE_PREFIXES)
 
 
-def _apply_start_retries(meta: dict, prior: dict | None) -> None:
+def _apply_start_retries(meta: dict, prior: dict | None) -> bool:
     """`prior` is the latest attempt before this one (`latest_attempt`). `start_retries` counts consecutive start
     attempts of the same task hash that never produced a result: a `-4` or a start-failure `-1` (a command that does
     not start). It is +1 on such a code after one of that hash, otherwise 1 on such a code and 0 on any other code
     (success, a changed task hash, another failure; `-5` counts as a `-4` here). The third in a row becomes `-5`.
-    The same run and start seen again (re-render after a crash) keeps its count."""
+    The same run and start seen again (re-render after a crash) keeps its count. True when the attempt continues
+    `prior`'s chain (or is its re-render), so that what the chain carries may be carried on."""
     counted = meta["exit_code"] == ExitCode.NEVER_FINISHED or _is_start_failure(meta)
+    chained = True
     if prior and prior.get("run_id") == meta["run_id"] and prior.get("start") == meta["start"]:
         retries = prior.get("start_retries", 0)
     elif not counted:
@@ -811,11 +814,12 @@ def _apply_start_retries(meta: dict, prior: dict | None) -> None:
     ):
         retries = prior.get("start_retries", 0) + 1
     else:
-        retries = 1
+        retries, chained = 1, False
     meta["start_retries"] = retries
     if counted and retries >= MAX_START_RETRIES:
         meta["exit_code"] = int(ExitCode.RETRIES_EXHAUSTED)
         meta["error_msg"] = f"exceeded {MAX_START_RETRIES} start retries"
+    return chained
 
 
 # --------------------------------------------------------------------------- rendering
@@ -901,17 +905,13 @@ def render_task(tree: Path, vendor: str, sku: str, variant: int | None, inp: Ren
     return written + ([schedule] if schedule else [])
 
 
-def _apply_failed_regions(meta: dict, prior: dict | None) -> None:
-    """`failed_regions`: the regions of the consecutive start failures, carried like `start_retries` (which says
-    whether this one continues the chain, or is a re-render of the same run) and gone with any other result. The next
-    plan tries a region not in it first."""
+def _apply_failed_regions(meta: dict, prior: dict | None, chained: bool, region: str) -> None:
+    """`failed_regions`: the database regions of the consecutive start failures, carried like `start_retries`
+    (`chained`: this one continues the chain) and gone with any other result. The next plan tries others first."""
     if not meta["start_retries"]:
         return
-    chained = meta["start_retries"] > 1 or (prior and prior.get("run_id") == meta["run_id"])
     regions = list(prior.get("failed_regions") or []) if prior and chained else []
-    if meta.get("region") and meta["region"] not in regions:
-        regions.append(meta["region"])
-    meta["failed_regions"] = regions
+    meta["failed_regions"] = regions if region in regions else [*regions, region]
 
 
 def render_dbaas_task(tree: Path, database: dict, inp: RenderInput) -> list[Path]:
@@ -927,8 +927,8 @@ def render_dbaas_task(tree: Path, database: dict, inp: RenderInput) -> list[Path
     previous = _read_meta(task_dir / "meta.json")
     if meta["exit_code"] != ExitCode.OK and previous and previous.get("exit_code") == ExitCode.OK:
         return []  # a failure never replaces a good result (sc-crawler reads the stdout without the exit code)
-    _apply_start_retries(meta, previous)
-    _apply_failed_regions(meta, previous)
+    chained = _apply_start_retries(meta, previous)
+    _apply_failed_regions(meta, previous, chained, database["region"])
     if meta["version"] is None:  # no version command runs against a managed database: the legacy wrote the image tag
         meta["version"] = inp.task.image.rsplit(":", 1)[-1]
     stdout = inp.stdout if inp.stdout and meta["exit_code"] not in NOT_FINAL_CODES else b""

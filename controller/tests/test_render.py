@@ -526,7 +526,7 @@ def test_render_variant_and_timing(tmp_path):
 
 
 def test_dbaas_layout(tmp_path):
-    db = {"vendor": "ovh", "id": "postgresql-discovery-b3-4", "engineVersion": "18"}
+    db = {"vendor": "ovh", "id": "postgresql-discovery-b3-4", "engineVersion": "18", "region": "r"}
     inp = plain_input("pgbench_postgres_dbaas_ro_durable")
     written = render.render_dbaas_task(tmp_path, db, inp)
     base = tmp_path / "dbaas/ovh/postgresql-discovery-b3-4/postgres/18/standalone/pgbench_postgres_dbaas_ro_durable"
@@ -542,7 +542,7 @@ def test_dbaas_layout(tmp_path):
     ],
 )
 def test_dbaas_start_failures_count_as_start_retries_and_end_as_minus_five(tmp_path, error):
-    db = {"vendor": "ovh", "id": "pg", "engineVersion": "18"}
+    db = {"vendor": "ovh", "id": "pg", "engineVersion": "18", "region": "r"}
     task = "pgbench_postgres_dbaas_ro_durable"
     meta = tmp_path / "dbaas/ovh/pg/postgres/18/standalone" / task / "meta.json"
     for n in (1, 2, 3):
@@ -552,32 +552,32 @@ def test_dbaas_start_failures_count_as_start_retries_and_end_as_minus_five(tmp_p
     assert (written["start_retries"], written["exit_code"]) == (3, -5)
 
 
-def test_dbaas_failed_regions_are_carried_through_the_start_failures_in_a_row_and_reset(tmp_path):
-    db = {"vendor": "azure", "id": "pg", "engineVersion": "18"}
+def test_dbaas_failed_regions_are_database_regions_carried_through_the_start_failures_and_reset(tmp_path):
     task = "pgbench_postgres_dbaas_ro_durable"
-    path = tmp_path / "dbaas/azure/pg/postgres/18/standalone" / task / "meta.json"
-    error = "DBAAS_REGION_UNAVAILABLE: azure pre-flight: restricted"
+    path = tmp_path / "dbaas/ovh/pg/postgres/18/standalone" / task / "meta.json"
+    error = "DBAAS_REGION_UNAVAILABLE: restricted"
 
     def attempt(n: int, region: str, exit_code=-1, error_msg=error, stdout=b""):
+        db = {"vendor": "ovh", "id": "pg", "engineVersion": "18", "region": region}  # OVH: databases in GRA ...
         inp = plain_input(
-            task, exit_code, f"2026-10-0{n}T10:00:00", f"r{n}", stdout, error_msg=error_msg, region=region
-        )
+            task, exit_code, f"2026-10-0{n}T10:00:00", f"r{n}", stdout, error_msg=error_msg, region=f"{region}7"
+        )  # ... the client node in GRA7: the meta's own region
         render.render_dbaas_task(tmp_path, db, inp)
         return json.loads(path.read_text())
 
-    assert attempt(1, "eastus")["failed_regions"] == ["eastus"]
-    assert attempt(1, "eastus")["failed_regions"] == ["eastus"]  # a re-render of the same run
-    assert attempt(2, "westus")["failed_regions"] == ["eastus", "westus"]
-    last = attempt(3, "northeurope")  # the third in a row: no more retries, and the regions that were tried
-    assert (last["exit_code"], last["failed_regions"]) == (-5, ["eastus", "westus", "northeurope"])
-    other = attempt(4, "eastus", error_msg="DBAAS_CREATE_FAILED: quota exceeded")  # not a start failure: a new chain
+    assert attempt(1, "GRA")["failed_regions"] == ["GRA"]
+    assert attempt(1, "GRA")["failed_regions"] == ["GRA"]  # a re-render of the same run
+    assert attempt(2, "SBG")["failed_regions"] == ["GRA", "SBG"]
+    last = attempt(3, "BHS")  # the third in a row: no more retries, and the regions that were tried
+    assert (last["exit_code"], last["failed_regions"]) == (-5, ["GRA", "SBG", "BHS"])
+    other = attempt(4, "GRA", error_msg="DBAAS_CREATE_FAILED: quota exceeded")  # not a start failure: a new chain
     assert "failed_regions" not in other
-    assert attempt(5, "eastus")["failed_regions"] == ["eastus"]
-    assert "failed_regions" not in attempt(6, "eastus", exit_code=0, error_msg=None, stdout=b"out")
+    assert attempt(5, "GRA")["failed_regions"] == ["GRA"]
+    assert "failed_regions" not in attempt(6, "GRA", exit_code=0, error_msg=None, stdout=b"out")
 
 
 def test_dbaas_version_is_the_image_tag_unless_the_status_has_one(tmp_path):
-    db = {"vendor": "ovh", "id": "pg", "engineVersion": "18"}
+    db = {"vendor": "ovh", "id": "pg", "engineVersion": "18", "region": "r"}
     task = "pgbench_postgres_dbaas_ro_durable"
     base = tmp_path / "dbaas/ovh/pg/postgres/18/standalone" / task
     render.render_dbaas_task(tmp_path, db, plain_input(task))
@@ -726,7 +726,7 @@ def test_published_meta_is_redacted(tmp_path):
 
 
 def test_dbaas_failure_does_not_replace_a_good_result_and_minus_four_has_no_output(tmp_path):
-    db = {"vendor": "ovh", "id": "pg", "engineVersion": 18}
+    db = {"vendor": "ovh", "id": "pg", "engineVersion": 18, "region": "r"}
     task = "pgbench_postgres_dbaas_ro_durable"
     render.render_dbaas_task(tmp_path, db, plain_input(task, stdout=b"good"))
     base = tmp_path / "dbaas/ovh/pg/postgres/18/standalone" / task
@@ -740,7 +740,7 @@ def test_dbaas_failure_does_not_replace_a_good_result_and_minus_four_has_no_outp
 
 @pytest.mark.parametrize("exit_code", [-4, -5, 1, 137, 256])
 def test_dbaas_failure_with_a_changed_hash_does_not_replace_a_good_result(tmp_path, exit_code):
-    db = {"vendor": "ovh", "id": "pg", "engineVersion": 18}
+    db = {"vendor": "ovh", "id": "pg", "engineVersion": 18, "region": "r"}
     task = "pgbench_postgres_dbaas_ro_durable"
     render.render_dbaas_task(tmp_path, db, plain_input(task, stdout=b"good"))
     base = tmp_path / "dbaas/ovh/pg/postgres/18/standalone" / task

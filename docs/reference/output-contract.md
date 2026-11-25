@@ -99,6 +99,9 @@ the capacity type of the node the task ran on, and `null` for a task that never 
 Added fields (sc-crawler reads `meta.json` as a dict and ignores unknown keys):
 `run_id, image, zone, capacity_type, price, spot_attempts, node_os, kubelet, runtime, nodeclass_hash, nice` (`nice`: the nice
 value the task ran at, from `sc-run`'s `result.json`; null when nice was disabled or could not be set).
+A DBaaS meta may also carry `failed_regions`, the database regions of the start failures in a row (`DBAAS_CLIENT_FAILED`,
+`DBAAS_LEFTOVER_STACK`, `DBAAS_REGION_UNAVAILABLE`), carried like `start_retries`: written only when non-empty, and
+gone with any other result.
 
 Exit codes: [exit codes](exit-codes.md).
 
