@@ -59,8 +59,8 @@ def spend_per_hour(runs: list[BenchmarkRun]) -> float:
 
 def holding_runs(kube: Kube, runs: list[BenchmarkRun], vendor: str) -> list[BenchmarkRun]:
     """Server runs of `vendor` that hold or are acquiring a node: in an active phase, or (Failed, Cancelled) with an
-    anchor Pod still alive. DBaaS runs are not counted: they have their own limit of one per vendor
-    (`dbaas_plan.check_vendor`)."""
+    anchor Pod still alive. DBaaS runs are not counted: they have their own limit, `dbaasMaxInFlight`
+    (`dbaas_plan.check_in_flight`)."""
     anchored = {
         _labels(pod).get(crd.LABEL_RUN) for pod in kube.list("pod", labels={pods.LABEL_ROLE: PodRole.ANCHOR.value})
     }

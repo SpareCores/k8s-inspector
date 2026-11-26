@@ -303,12 +303,12 @@ deleted) and the live NodeClaims of the vendor in the bench NodePool (NodeClaims
 lower bound ("at least" that many instances); leftover NodeClaims without a holding run count as instances but do
 not add to the spend. It applies to runs started without `--force` ([forced runs](../how-to/run-forced.md) skip it but count toward it); [autoPlan](#autoplan) uses the same check before every run it creates.
 
-`maxUsdPerHour`, when set, is checked before a run starts against the node prices of the holding runs. A run in
+`maxUsdPerHour`, when set, is checked before a run starts (forced runs skip it) against the node prices of the holding runs. A run in
 Pending or Provisioning has no node and no price yet, so while one exists a new run is refused ("wait until ... has
 a price"). A run that has a node but no `scarpenter.sparecores.com/price` annotation counts as unknown spend: the
 controller logs a warning and refuses the new run (the operator must check SCarpenter). When SCarpenter marks a
 NodeClaim `price-incomplete: "true"`, the run records `status.priceIncomplete: true`; such a price understates the
 spend, so the cap is checked against too low a sum.
 
-The check is not atomic: two concurrent `run` commands for different SKUs can both pass it and exceed the limit by one.
+Without `--force` the check is not atomic: two concurrent `run` commands for different SKUs can both pass it and exceed the limit by one.
 The planner of `serve` is single-threaded, so autoPlan does not add to this race.

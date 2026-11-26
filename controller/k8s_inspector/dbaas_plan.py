@@ -70,7 +70,7 @@ def holding_runs(runs: list[BenchmarkRun], vendor: str) -> list[BenchmarkRun]:
     return [run for run in runs if run.spec.vendor == vendor and holds_database(run)]
 
 
-def check_vendor(cfg: Config, vendor: str, runs: list[BenchmarkRun]) -> None:
+def check_vendor(cfg: Config, vendor: str) -> None:
     """Raise `ValueError` unless the vendor is enabled and has networks configured (no DBaaS run is possible else)."""
     vendor_settings = cfg.settings.vendors.get(vendor)
     if vendor_settings is None or not vendor_settings.enabled:
@@ -277,7 +277,7 @@ def force_run(
     if client and not pods.is_label_value(client):
         raise ValueError(f"{client} is not a valid label value: SCarpenter cannot select it by api-reference")
     runs = crd.list_runs(kube)
-    check_vendor(cfg, vendor, runs)
+    check_vendor(cfg, vendor)
     if not force:
         check_in_flight(cfg, vendor, runs)
     if existing := database_run(runs, vendor, database_id):
@@ -353,7 +353,7 @@ def plan_cycle(
     for vendor in vendors:
         try:
             runs = crd.list_runs(kube)
-            check_vendor(cfg, vendor, runs)
+            check_vendor(cfg, vendor)
             check_in_flight(cfg, vendor, runs)
             if launch.paused(kube, vendor, datetime.now(UTC)):
                 raise ValueError("its nodes do not come up")
