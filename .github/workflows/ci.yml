@@ -50,77 +50,79 @@ jobs:
       - run: uv run ruff format --check .
       - run: uv run pytest
 
+  # Each image builds once per architecture on a native runner: no QEMU, which made the arm64 builds of the
+  # Python images take up to 20 minutes. Build layers are kept in the GitHub Actions cache, so a build whose
+  # dependencies did not change reuses them. On pushes, `image` joins the per-architecture images into the tags.
+  image-build:
+    needs: [test, controller, dbaas]
+    strategy:
+      fail-fast: false
+      matrix:
+        image:
+          - { name: k8s-inspector-sc-run, context: . }
+          - { name: k8s-inspector, context: controller }
+          - { name: k8s-inspector-dbaas, context: dbaas }
+        platform:
+          - { arch: amd64, runner: ubuntu-24.04 }
+          - { arch: arm64, runner: ubuntu-24.04-arm }
+    runs-on: ${{ matrix.platform.runner }}
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - if: github.event_name == 'push'
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: build
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: ${{ matrix.image.context }}
+          platforms: linux/${{ matrix.platform.arch }}
+          # Pushed untagged; pull requests and dispatches only build.
+          outputs: type=image,name=ghcr.io/sparecores/${{ matrix.image.name }},push-by-digest=true,name-canonical=true,push=${{ github.event_name == 'push' }}
+          cache-from: type=gha,scope=${{ matrix.image.name }}-${{ matrix.platform.arch }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.image.name }}-${{ matrix.platform.arch }}
+      - if: github.event_name == 'push'
+        run: mkdir digests && touch "digests/${DIGEST#sha256:}"
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+      - if: github.event_name == 'push'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: digest.${{ matrix.image.name }}.${{ matrix.platform.arch }}
+          path: digests/*
+          retention-days: 1
+
   image:
-    needs: test
+    if: github.event_name == 'push'
+    needs: image-build
     runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: write
+    strategy:
+      matrix:
+        name: [k8s-inspector-sc-run, k8s-inspector, k8s-inspector-dbaas]
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          pattern: digest.${{ matrix.name }}.*
+          path: digests
+          merge-multiple: true
       - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
-      - if: github.event_name == 'push'
-        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
-        with:
-          context: .
-          platforms: linux/amd64,linux/arm64
-          push: ${{ github.event_name == 'push' }}  # pull requests and dispatches only build
-          tags: |
-            ghcr.io/sparecores/k8s-inspector-sc-run:main
-            ghcr.io/sparecores/k8s-inspector-sc-run:${{ github.sha }}
-
-  controller-image:
-    needs: controller
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      packages: write
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
-      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
-      - if: github.event_name == 'push'
-        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-      - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
-        with:
-          context: controller
-          platforms: linux/amd64,linux/arm64
-          push: ${{ github.event_name == 'push' }}  # pull requests and dispatches only build
-          tags: |
-            ghcr.io/sparecores/k8s-inspector:main
-            ghcr.io/sparecores/k8s-inspector:${{ github.sha }}
-
-  dbaas-image:
-    needs: dbaas
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      packages: write
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
-      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
-      - if: github.event_name == 'push'
-        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-      - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
-        with:
-          context: dbaas
-          platforms: linux/amd64,linux/arm64
-          push: ${{ github.event_name == 'push' }}  # pull requests and dispatches only build
-          tags: |
-            ghcr.io/sparecores/k8s-inspector-dbaas:main
-            ghcr.io/sparecores/k8s-inspector-dbaas:${{ github.sha }}
+      - working-directory: digests
+        run: |
+          image=ghcr.io/sparecores/${{ matrix.name }}
+          sources=()
+          for digest in *; do sources+=("$image@sha256:$digest"); done
+          docker buildx imagetools create --tag "$image:main" --tag "$image:$GITHUB_SHA" "${sources[@]}"
