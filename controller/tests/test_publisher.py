@@ -1491,7 +1491,7 @@ def test_cost_lines_are_logged_once_when_the_record_is_written(tmp_path, origin,
         pub.publish_once(ENABLED)
     lines = cost_lines(caplog)
     events = [line["event"] for line in lines]
-    assert events == ["run_attempt_cost"] + ["task_cost"] * (len(events) - 2) + ["run_cost"]  # once, not twice
+    assert events == ["run_attempt_cost"] + ["task_cost"] * len(NAMES) + ["run_cost"]  # once, not twice
     task = next(line for line in lines if line["event"] == "task_cost")
     assert (task["task"], task["duration_s"], task["cost_usd"]) == (NAMES[0], 60.0, round(0.5 / 60, 6))
     lines = [lines[0], lines[-1]]
@@ -1605,6 +1605,17 @@ def test_emit_cost_logs_logs_past_records_with_current_prices_and_changes_nothin
     assert (second["ondemand_price"], second["ondemand_price_source"]) == (0.9, "launch")  # stored: kept
     assert summary["event"] == "run_cost" and summary["backfill"] is True and summary["used_spot"] is True
     assert git(clone(origin, tmp_path), "rev-parse", "HEAD") == head
+
+
+def test_a_record_with_family_but_no_vcpus_gets_only_the_missing_facts(tmp_path, origin, monkeypatch):
+    monkeypatch.setattr(
+        keeper,
+        "server_facts",
+        lambda env, vendor, sku: {"family": "new", "series": "s", "vcpus": 8, "memory_gib": 16.0},
+    )
+    record = {"vendor": "hcloud", "sku": "cax31", "family": "launch", "attempts": []}
+    make_publisher(tmp_path, origin, FakeStorage())._fill_from_keeper(record, {}, {}, set())
+    assert (record["family"], record["series"], record["vcpus"], record["memory_gib"]) == ("launch", "s", 8, 16.0)
 
 
 def test_emit_cost_logs_leaves_unknown_useful_time_null(tmp_path, origin, caplog):

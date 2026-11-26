@@ -26,6 +26,7 @@ class Span:
     kept: bool
     task: str = ""
     exit_code: int = 0
+    error_msg: str | None = None
 
     @property
     def finished(self) -> bool:
@@ -54,7 +55,7 @@ def spans_from_metas(attempts: list[dict], metas: Iterable[dict]) -> list[Span]:
             opened, closed = parse_time(a.get("api_start")), parse_time(a.get("end"))
             if start and opened and opened <= start and (closed is None or start <= closed):
                 attempt = a["attempt"]
-        spans.append(Span(attempt, start, end, True, meta.get("task", ""), meta["exit_code"]))
+        spans.append(Span(attempt, start, end, True, meta.get("task", ""), meta["exit_code"], meta.get("error_msg")))
     return spans
 
 
@@ -159,9 +160,9 @@ def run_summary(record: dict) -> dict:
 
 
 def task_result(exit_code: int) -> str:
-    """`ok` (0), `lost` (`-4`: the node went away under the task) or `failed` (the task's own code, `256`, `-6`, ...)
-    (exit-codes.md)."""
-    return "ok" if exit_code == 0 else "lost" if exit_code == -4 else "failed"
+    """`ok` (0), `unfinished` (`-4`: the task never finished, `error_msg` says why: node lost, deadline, cancel, ...)
+    or `failed` (the task's own code, `256`, `-6`, ...) (exit-codes.md)."""
+    return "ok" if exit_code == 0 else "unfinished" if exit_code == -4 else "failed"
 
 
 def log_task_cost_lines(record: dict, spans: list[Span], *, backfill: bool = False) -> None:
@@ -195,6 +196,7 @@ def log_task_cost_lines(record: dict, spans: list[Span], *, backfill: bool = Fal
                 "cost_usd": round(duration / 3600 * price, 6),
                 "exit_code": s.exit_code,
                 "result": task_result(s.exit_code),
+                "error_msg": s.error_msg,
                 "backfill": backfill,
             },
         )

@@ -592,8 +592,8 @@ class Publisher:
                 records.append(record)
             needs_meta = [r for r in records if not r.get("database")]
             if needs_meta:
-                skus = sorted({f"/{_record_dir(r)}/*/*/meta.json" for r in needs_meta})
-                self._sync(record_files + skus, cone=False)
+                metas = sorted({f"/{_record_dir(r)}/{_variant_glob(r)}/*/meta.json" for r in needs_meta})
+                self._sync(record_files + metas, cone=False)
             prices: dict[tuple[str, str], dict[str, float]] = {}
             facts: dict[tuple[str, str], dict] = {}
             down: set[str] = set()
@@ -616,7 +616,7 @@ class Publisher:
             if "vcpus" not in record:
                 if sku not in facts:
                     facts[sku] = keeper.server_facts(self._env, *sku) or {}
-                record.update(facts[sku])
+                record |= {k: v for k, v in facts[sku].items() if k not in record}
             for a in record["attempts"]:
                 gap = a.get("ondemand_price_reason") in ("keeper_unreachable", "keeper_unknown_sku")
                 if ("ondemand_price" in a and not gap) or not a.get("region"):
@@ -1174,10 +1174,16 @@ def _task_spans(run: BenchmarkRun) -> list[cost.Span]:
             t.published and bool(t.commit),
             t.name,
             t.exit_code,
+            t.error_msg,
         )
         for t in run.status.tasks
         if t.state == TaskState.DONE and t.exit_code is not None
     ]
+
+
+def _variant_glob(record: dict) -> str:
+    """The variant directory of a record's results in the tree: its `variant`, any number when it has none."""
+    return "[0-9]*" if record.get("variant") is None else str(record["variant"])
 
 
 def _attempt_entry(run_json: dict | None, n: int | None) -> dict | None:

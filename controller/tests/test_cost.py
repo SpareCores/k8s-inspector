@@ -313,7 +313,7 @@ def test_task_cost_is_the_task_duration_times_the_node_price(caplog):
     spans = [
         cost.Span(3, t("2026-11-26T09:43:57"), t("2026-11-26T10:43:57"), True, "membench", 0),  # one hour
         cost.Span(1, t("2026-11-26T08:20:00"), t("2026-11-26T08:30:00"), False, "geekbench", 1),
-        cost.Span(1, t("2026-11-26T08:30:00"), t("2026-11-26T08:31:00"), False, "stress_ng", -4),
+        cost.Span(1, t("2026-11-26T08:30:00"), t("2026-11-26T08:31:00"), False, "stress_ng", -4, "DEADLINE_EXCEEDED"),
         cost.Span(1, t("2026-11-26T08:31:55"), t("2026-11-26T08:31:55"), False, "never_ran", -4),  # written off
         cost.Span(2, t("2026-11-26T08:40:00"), t("2026-11-26T08:50:00"), False, "slow", -6),
     ]
@@ -321,7 +321,7 @@ def test_task_cost_is_the_task_duration_times_the_node_price(caplog):
         cost.log_cost_lines(record, spans)
     lines = task_lines(caplog)
     assert [(x["task"], x["attempt"], x["result"], x["exit_code"]) for x in lines] == [
-        ("membench", 3, "ok", 0), ("geekbench", 1, "failed", 1), ("stress_ng", 1, "lost", -4),
+        ("membench", 3, "ok", 0), ("geekbench", 1, "failed", 1), ("stress_ng", 1, "unfinished", -4),
         ("slow", 2, "failed", -6),
     ]  # fmt: skip
     membench, geekbench, lost, _ = lines
@@ -331,6 +331,7 @@ def test_task_cost_is_the_task_duration_times_the_node_price(caplog):
     )  # fmt: skip
     assert geekbench["cost_usd"] == pytest.approx(600 / 3600 * 0.31903013698630134, abs=1e-6)
     assert lost["capacity_type"] == "spot" and lost["zone"] == "ca-central-1a"
+    assert (lost["error_msg"], membench["error_msg"]) == ("DEADLINE_EXCEEDED", None)
     assert all(x["backfill"] is False for x in lines)
 
 

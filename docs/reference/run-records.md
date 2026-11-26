@@ -119,8 +119,9 @@ Definitions, per attempt (`start` is `api_start`):
   0.
 - `useful_s`: for a `Completed` attempt its `duration_s`; otherwise the seconds from `start` to the end of the last
   task of that attempt that finished (exit code 0 or more) and whose result was kept (published, not discarded); 0
-  when it kept none. A task the controller wrote off (`-4` lost with the node, `-1` never ran) did not run: it has no
-  real times and is never kept. An attempt that ran no task (no node, `ProvisioningFailed`, `LaunchFailed`) has 0,
+  when it kept none. A task the controller wrote off (`-4`, `-1`) is never kept and does not finish (a `-4` task that was
+  running keeps its real start and gets a `task_cost` line, a task that never started has start and end of the same
+  moment). An attempt that ran no task (no node, `ProvisioningFailed`, `LaunchFailed`) has 0,
   also when the task files are unknown (a backfill). Task times and
   attempt numbers are the run's `status.tasks`, which hold the latest execution of each task: a task that ran again
   on a later attempt counts there only.
@@ -145,9 +146,9 @@ Definitions, per attempt (`start` is `api_start`):
 | `start_hour_utc`, `start_weekday_utc` | hour `0`-`23` and weekday `Mon`-`Sun` of `start`, UTC |
 | `backfill` | `false` |
 
-`task_cost`, one line per task execution that ran on a node of the run (the latest execution of each task, like
-`useful_s`), including failed ones and the vLLM probes (`vllm-probe-<image>`); a task that never started (no node, precheck, written off when the node was
-lost before it ran: start and end are the same moment) has none:
+`task_cost`, one line per task execution that ran on a node of the run that has a `price` (the latest execution of each task, like
+`useful_s`), including failed ones and the vLLM probes (`vllm-probe-<image>`); a task that never started (no node, precheck, written off before it ran: start and
+end are the same moment) has none:
 
 | Field | Value |
 |---|---|
@@ -158,7 +159,7 @@ lost before it ran: start and end are the same moment) has none:
 | `start`, `end`, `duration_s` | the task's start and end (ISO, UTC) and their difference in seconds |
 | `price` | the attempt's `price` (USD per hour) |
 | `cost_usd` | `duration_s` / 3600 × `price` |
-| `exit_code`, `result` | the task's [exit code](exit-codes.md) and `ok` (`0`), `lost` (`-4`: the node went away under the task) or `failed` (any other code, such as the task's own, `256` or `-6`) |
+| `exit_code`, `result`, `error_msg` | the task's [exit code](exit-codes.md), `ok` (`0`), `unfinished` (`-4`) or `failed` (any other code, such as the task's own, `256` or `-6`), and the task's `error_msg` (`null` when none): for `-4` the reason (`SPOT_INTERRUPTED`, `NODE_LOST`, `DEADLINE_EXCEEDED`, `CANCELLED`, ...) |
 | `backfill` | `false` |
 
 `cost_usd` of a task is the node's price for the time the task ran. Tasks that run in parallel on the node (the
@@ -206,15 +207,16 @@ container log that the log shipping reads; it works because the exec'd process a
 runs`. It changes nothing in git.
 
 Re-emitted lines have `ts` = now, not the time of the run, and a rerun logs them all again. So consumers must bucket
-by `start`, keep one line per `run` (and attempt), and a live alert must filter on `backfill:false`.
+by `start`, keep one line per `run` and `attempt` (`task_cost`: `run`, `attempt` and `task`), and a live alert must filter on `backfill:false`.
 
 Values the record lacks (records written before the cost fields) are filled in:
 
 - `ondemand_price` from Keeper now (`"ondemand_price_source": "current"`), also for a stored `null` with the
   reason `keeper_unreachable` or `keeper_unknown_sku`; any other stored price or reason stays (`launch`). `family`
-  and `series` likewise.
+  and `series` likewise; `vcpus` and `memory_gib` are filled when the record has no `vcpus`, only the keys it lacks.
 - `useful_s` and `setup_s` from the `start` and `end` of the `meta.json` files with an exit code of 0 or more of
-  the run id under `data/<vendor>/<sku>/<variant>/<task>/`, each assigned to the attempt that was open when the task
+  the run id under `data/<vendor>/<sku>/<variant>/<task>/` (only the record's `variant` is checked out, any variant
+  when it has none), each assigned to the attempt that was open when the task
   started. Only results still in the tree count (a replaced result and the vLLM probe keys are missing); `null`
   when the run has no `meta.json` there and for a DBaaS run, so its `wasted_usd`, the run's `wasted_usd` and the
   counterfactual are `null` too. A `Completed` attempt is useful as a whole either way.
