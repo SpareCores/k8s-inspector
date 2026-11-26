@@ -284,13 +284,13 @@ without `truncated` counts as complete; the optional `zonesOmitted` field is ign
 
 `k8s-inspector serve | plan [--dry-run] | run <vendor> <sku> [--tasks …] [--force] [--on-demand] [--hold 2h] |
 run <vendor> --database <id> [--region <region>] [--client-region <region>] [<client sku>] [--force] [--hold 2h] |
-status [--failing] | cancel <run> | publish [--rescan --since 7d [--sku <sku>]…]`. Inside the cluster:
+status [--failing] | cancel <run> | publish [--rescan --since 7d [--sku <sku>]… | --backfill-runs --since 120d]`. Inside the cluster:
 `kubectl -n inspector exec deploy/k8s-inspector -- k8s-inspector …`.
 
 `cancel` only sets the annotation `inspector.sparecores.com/cancel: "true"` on the `BenchmarkRun` and returns; the
 `serve` process ends the run in place (unfinished tasks `-4 CANCELLED`, Pods and the run's NodeClaims deleted, so a node that is still booting is removed too, phase `Cancelled`; the
 publisher writes nothing for those tasks, so the previous results stay) and keeps the `BenchmarkRun` until the publisher purges it, so the CLI never races the runner. Deleting the `BenchmarkRun` with `kubectl` also stops the run, but drops
-the record. `--sku` (repeatable, with `--rescan`) names a SKU that was never published, so its outputs are recovered too.
+the record. `--sku` (repeatable, with `--rescan`) names a SKU that was never published, so its outputs are recovered too. `--backfill-runs` writes the [run records](run-records.md#backfill) of past runs.
 Every command logs JSON lines on stderr.
 
 ## Running instances per vendor

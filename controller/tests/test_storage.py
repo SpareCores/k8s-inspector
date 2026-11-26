@@ -324,3 +324,19 @@ def test_pulumi_state_is_listed_and_deleted_below_the_key_prefix(monkeypatch):
         assert prefixed.list_objects("dbaas-state/") == []
         assert [o["Key"] for o in s3.list_objects_v2(Bucket=BUCKET)["Contents"]] == ["dbaas-state/other"]
         prefixed.delete_objects([])  # nothing to do
+
+
+def test_list_runs_walks_the_directories_and_honours_since(store):
+    runs = [
+        RunKey("aws", "m5.large", date(2026, 3, 7), "r1"),
+        RunKey("aws", "m5.large", date(2026, 3, 7), "r2"),
+        RunKey("aws", "c5.large", date(2026, 3, 1), "r3"),
+        RunKey("aws", "c5.large", date(2025, 12, 31), "old"),
+        RunKey("gcp", "n2", date(2026, 3, 7), "other-vendor"),
+    ]
+    for run in runs:
+        store.write_run_json(run, {"vendor": run.vendor})
+    found = store.list_runs("aws", date(2026, 3, 2))
+    assert sorted(r.run_id for r in found) == ["r1", "r2"]
+    assert sorted(r.run_id for r in store.list_runs("aws", date(2025, 1, 1))) == ["old", "r1", "r2", "r3"]
+    assert RunKey("aws", "m5.large", date(2026, 3, 7), "r1") in found

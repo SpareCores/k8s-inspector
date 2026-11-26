@@ -64,10 +64,15 @@ the contract to keep.
 | `.../dmidecode/parsed.json`, `.../openssl/parsed.json` | parsers | yes |
 | `.../stressnglongrun/parsed.csv`, `.../lstopo/lstopo.svg` | parsers | no (website) |
 | `data/<vendor>/<sku>/<N>/timing/<run_id>/{api_start,api_end,machine_start,…}` | one ISO UTC line each | `api_start`, `machine_start` |
+| `data/<vendor>/<sku>/runs/<run_id>.json`, `dbaas/<vendor>/<id>/runs/<run_id>.json` | run record: `run.json` without lscpu plus the final phase, [run records](run-records.md) | no |
 | `data/<vendor>/<sku>/schedule/<task>/meta.json` | union view across variants (ported `select_schedule_meta`), plus [`last_attempt`](#last_attempt) | no (planner) |
 | `dbaas/<vendor>/<id>/postgres/<ver>/standalone/<task>/{meta.json,stdout}` | DBaaS results | yes |
 | `dbaas/<vendor>/<id>/postgres/<ver>/standalone/timing/<run_id>/{api_start,api_end,inspector_start,inspector_end,api_destroy_start,api_destroy_end}` | one ISO UTC line each | `inspector_start`, `inspector_end` |
 | not carried over to git | `resource_tracker.jsonl`, `postgres.log`, `result.json`, `manifest.json`, `status.json`, `version`: object storage only | — |
+
+`runs/` is no hardware variant: sc-crawler lists the variant directories of a SKU by `p.is_dir() and p.name.isdigit()`
+(`sc_crawler/inspector.py`, `_server_variants`), like `schedule/`, and reads DBaaS results by explicit paths. The
+record's content, write rule and backfill are in [run records](run-records.md).
 
 Timing files (from the task's attempt in `run.json`): `api_start` = the attempt's anchor created, `api_end` =
 NodeClaim launched, `machine_start` = kernel boot time from `sc-run`, plus `node_registered`, `node_ready`,

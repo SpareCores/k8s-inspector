@@ -60,7 +60,9 @@ classification exact and the flush complete.
 8. **Statistics are recorded.** `status.attempts` lists each attempt's node, the capacity type of that node (none for an
    attempt that never got one), duration and outcome.
    `meta.json` gets `capacity_type` and `spot_attempts`; the controller exports interruption counts per vendor and SKU
-   as metrics ([monitoring](monitoring.md)).
+   as metrics ([monitoring](monitoring.md)). When a run ends, the publisher writes its attempts, interruptions
+   included, to `runs/<run_id>.json` in sc-inspector-data, which is kept permanently
+   ([run records](../reference/run-records.md)).
 
 Worst case per run: two lost tasks plus two extra node boots, then the rest on-demand. There is no retry loop: the
 attempt counter lives in the run object, and a run that exhausts its budgets either completes on-demand or ends with

@@ -402,6 +402,32 @@ class Storage:
 
     # ---- Pulumi state of the DBaaS stacks (`dbaas-state/`, written by the provisioner Jobs)
 
+    def list_prefixes(self, prefix: str) -> list[str]:
+        """The "directories" directly under a logical prefix (with trailing slash)."""
+        pages = self.s3.get_paginator("list_objects_v2").paginate(
+            Bucket=self.bucket, Prefix=self._k(prefix), Delimiter="/"
+        )
+        return [p["Prefix"].removeprefix(self._prefix) for page in pages for p in page.get("CommonPrefixes", [])]
+
+    def list_runs(self, vendor: str, since: date) -> list[RunKey]:
+        """Every run of the vendor that started on or after `since` (`logs/inspect/<vendor>/<sku>/<Y>/<m>/<d>/<run>/`),
+        found by walking the directories, so the cost follows the number of runs, not of SKUs times days."""
+        runs = []
+        for sku_dir in self.list_prefixes(f"logs/inspect/{vendor}/"):
+            for year_dir in self.list_prefixes(sku_dir):
+                if int(year_dir.split("/")[-2]) < since.year:
+                    continue
+                for month_dir in self.list_prefixes(year_dir):
+                    if (int(year_dir.split("/")[-2]), int(month_dir.split("/")[-2])) < (since.year, since.month):
+                        continue
+                    for day_dir in self.list_prefixes(month_dir):
+                        y, m, d = (int(part) for part in day_dir.split("/")[-4:-1])
+                        if date(y, m, d) < since:
+                            continue
+                        for run_dir in self.list_prefixes(day_dir):
+                            runs.append(RunKey(vendor, sku_dir.split("/")[-2], date(y, m, d), run_dir.split("/")[-2]))
+        return runs
+
     def list_objects(self, prefix: str) -> list[tuple[str, datetime]]:
         """`(logical key, last modified)` of every object under a logical prefix."""
         pages = self.s3.get_paginator("list_objects_v2").paginate(Bucket=self.bucket, Prefix=self._k(prefix))

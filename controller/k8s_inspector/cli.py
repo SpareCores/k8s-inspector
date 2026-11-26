@@ -104,6 +104,11 @@ def build_parser() -> argparse.ArgumentParser:
     pub = sub.add_parser("publish", help="publish finished tasks now")
     pub.add_argument("--rescan", action="store_true", help="recover from object storage after a cluster loss")
     pub.add_argument("--since", type=parse_duration, default=timedelta(days=7))
+    pub.add_argument(
+        "--backfill-runs",
+        action="store_true",
+        help="write the run records of past runs from run.json in object storage",
+    )
     pub.add_argument("--sku", action="append", default=[], help="with --rescan: a SKU never published (repeatable)")
     return p
 
@@ -424,14 +429,18 @@ def cmd_cancel(args: argparse.Namespace) -> int:
 
 
 def cmd_publish(args: argparse.Namespace) -> int:
-    """One publish cycle (or `--rescan`) in a throwaway checkout, so it never shares a working tree with the
-    `serve` process."""
+    """One publish cycle (or `--rescan`, or `--backfill-runs`) in a throwaway checkout, so it never shares a working
+    tree with the `serve` process."""
     kube, provider = _connect()
     cfg = provider()
     storage = Storage(cfg.env, cfg.settings.uploads)
     with tempfile.TemporaryDirectory(prefix="k8si-publish-") as workdir:
         publisher = Publisher(kube, storage, cfg.env, Path(workdir), settings_provider=lambda: cfg.settings)
         try:
+            if args.backfill_runs:
+                records = publisher.backfill_run_records(args.since.days)
+                print(f"wrote {records} run records")
+                return 0
             result = publisher.rescan(args.since.days, skus=args.sku) if args.rescan else publisher.publish_once()
         except Exception as e:
             log.exception("publish failed")
