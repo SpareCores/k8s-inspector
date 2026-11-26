@@ -90,7 +90,8 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument(
         "--force",
         action="store_true",
-        help="skip Keeper's eligibility check; launch failures end as -1 results, not launch backoff",
+        help="skip Keeper's eligibility check and the vendor limits (maxInFlight, maxUsdPerHour, dbaasMax*); "
+        "launch failures end as -1 results, not launch backoff",
     )
     run.add_argument("--on-demand", action="store_true", help="do not use spot")
     run.add_argument("--hold", type=parse_duration, default=timedelta(0), help="keep the node after the last step")

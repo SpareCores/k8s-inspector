@@ -59,8 +59,8 @@ def spend_per_hour(runs: list[BenchmarkRun]) -> float:
 
 def holding_runs(kube: Kube, runs: list[BenchmarkRun], vendor: str) -> list[BenchmarkRun]:
     """Server runs of `vendor` that hold or are acquiring a node: in an active phase, or (Failed, Cancelled) with an
-    anchor Pod still alive. DBaaS runs are not counted: they have their own limit of one per vendor
-    (`dbaas_plan.check_vendor`)."""
+    anchor Pod still alive. DBaaS runs are not counted: they have their own limit, `dbaasMaxInFlight`
+    (`dbaas_plan.check_in_flight`)."""
     anchored = {
         _labels(pod).get(crd.LABEL_RUN) for pod in kube.list("pod", labels={pods.LABEL_ROLE: PodRole.ANCHOR.value})
     }
@@ -90,7 +90,7 @@ def check_vendor_budget(kube: Kube, cfg: Config, vendor: str, runs: list[Benchma
     `maxUsdPerHour` is set and the holding runs already cost the cap, or one of them has no price (a run still in
     Pending or Provisioning: wait; a run with a node: unknown spend, refused, with a warning). In flight =
     max(`holding_runs`, live bench NodeClaims), a lower bound ("at least"): leftover NodeClaims without a holding
-    run add to the count but not to the spend. Shared by `force_run` and autoPlan. Not atomic: two
+    run add to the count but not to the spend. Used by `force_run` (without `force`) and autoPlan. Not atomic: two
     concurrent callers can both pass the check."""
     settings = cfg.settings
     vendor_settings = settings.vendors[vendor]
@@ -148,9 +148,10 @@ def force_run(
 
     Validation: the vendor is `enabled`; every task name is in the catalogue (`tasks.select_tasks`; empty =
     every server task, except the `keeper_gated` ones, which run only when named; DBaaS tasks need a database
-    and are refused); the vendor is below `maxInFlight` and `maxUsdPerHour`. Without `force` Keeper must also find
-    every task eligible (`keeper.block_reasons`; an unknown SKU is blocked, an unreachable Keeper fails closed).
-    With `force` the SKU is not checked here: a SKU SCarpenter cannot offer ends in `-1 SCARPENTER_NO_OFFERING`."""
+    and are refused). Without `force` the vendor must be below `maxInFlight` (0 pauses it) and `maxUsdPerHour`, and
+    Keeper must find every task eligible (`keeper.block_reasons`; an unknown SKU is blocked, an unreachable Keeper
+    fails closed). With `force` neither is checked (the run still counts toward both limits for autoPlan) and the
+    SKU is not checked here: a SKU SCarpenter cannot offer ends in `-1 SCARPENTER_NO_OFFERING`."""
     settings = cfg.settings
     vendor_settings = settings.vendors.get(vendor)
     if vendor_settings is None or not vendor_settings.enabled:
@@ -162,7 +163,7 @@ def force_run(
     names = [task.name for task in selected]
     if not force:
         _check_keeper(cfg, vendor, sku, names)
-    check_vendor_budget(kube, cfg, vendor, crd.list_runs(kube))
+        check_vendor_budget(kube, cfg, vendor, crd.list_runs(kube))
 
     return _create_run(kube, cfg, vendor, sku, names, force=force, capacity=capacity, hold_after=hold_after)
 

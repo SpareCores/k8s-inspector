@@ -3,8 +3,10 @@
 *Planned: describes the CLI once it exists.*
 
 `k8s-inspector run` benchmarks one SKU now, whether or not its tasks are due. With `--force` it also skips Keeper's
-eligibility check, and its launch failures are recorded as `-1` results instead of launch backoff entries ([launch
-retries](../explanation/launch-retries.md)); the enabled vendor, `maxInFlight` and `maxUsdPerHour` checks apply either way.
+eligibility check and the vendor limits (`maxInFlight`, which also pauses a vendor at 0, and `maxUsdPerHour`), and its
+launch failures are recorded as `-1` results instead of launch backoff entries ([launch
+retries](../explanation/launch-retries.md)). A vendor that is not enabled is refused either way. Forced runs still count
+toward both limits, so autoPlan waits for them.
 It is for operators: to rerun a SKU or a task now, or to run a SKU Keeper blocks. The controller picks SKUs itself when `autoPlan` is on for the
 vendor ([autoPlan](../reference/configuration.md#autoplan));
 a forced run of such a SKU takes the SKU's lease like any other run, so autoPlan does not start it twice.
@@ -76,7 +78,7 @@ with a network (`--region <region>` picks one); the client's region defaults to 
 Keeper city (`--client-region <region>` overrides it, with or without `--region`: the region needs a network in the
 ConfigMap, and nothing checks that it is near the database), and the client server to the one the picker chooses (the
 optional `<sku>` argument names one). Without
-`--force` Keeper must find the database eligible. The vendor's `dbaasMaxInFlight` and `dbaasMaxUsdPerHour` apply (a forced run is refused with the reason). Follow it with
+`--force` Keeper must find the database eligible and the vendor's `dbaasMaxInFlight` and `dbaasMaxUsdPerHour` apply (a run is refused with the reason); `--force` skips all three. The vendor must be enabled and have DBaaS networks either way. Follow it with
 `kubectl -n inspector get benchmarkruns -w` and `get jobs`; the run ends with the database destroyed and the finalizer gone.
 `k8s-inspector cancel <run>` cancels it and destroys the database. `--tasks` and `--on-demand` do not apply: the run
 always benchmarks the DBaaS task, on demand.

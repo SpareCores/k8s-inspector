@@ -189,11 +189,13 @@ not count against `maxInFlight` and `maxUsdPerHour`, and a server run does not c
   vendor's DBaaS runs in flight. The price of a run is recorded in its `spec.database.usdPerHour` when it is created: the
   database's standalone price in the chosen region from Keeper's price data, plus the `min_price_ondemand` of the dearest Keeper server in the client region that matches the same labels
   (the most the cluster may launch). A new run is refused when the running ones plus its own price would pass the cap, so the
-  planner tries the next database; a forced run is refused with the reason. With a cap set, a price that Keeper does not
-  know (a client it does not list) is refused too.
+  planner tries the next database; a run started by hand is refused with the reason, unless it is forced (`--force` skips the limits). With a cap set, a price that Keeper does not
+  know (a client it does not list) is refused too, without `--force`. A forced run with an unknown price blocks DBaaS
+  autoPlan for the vendor until the run ends, because the unknown-spend check refuses it.
 
-The planner creates at most one new DBaaS run per vendor and cycle. The checks are not atomic: a forced run and an
-autoPlan cycle at the same instant can both pass, so the vendor may briefly exceed a limit by one run.
+The planner creates at most one new DBaaS run per vendor and cycle. Forced runs skip the limits, so each
+forced run can push the vendor over them. For runs without `--force` and for autoPlan the checks are not atomic: two of
+them at the same instant can both pass, so the vendor may briefly exceed a limit by one run.
 
 ### Pulumi state and leaks
 

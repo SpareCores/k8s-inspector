@@ -448,7 +448,8 @@ def test_a_forced_run_is_refused_without_networks_or_while_another_runs(kube, wo
         force(kube, world, make_config(networks={}))
     force(kube, world)
     with pytest.raises(ValueError, match="dbaasMaxInFlight limit"):
-        dbaas_plan.force_run(kube, make_config(), "oci", "db-b")
+        dbaas_plan.force_run(kube, make_config(), "oci", "db-b", force=False)
+    assert dbaas_plan.force_run(kube, make_config(), "oci", "db-b", force=True)  # force skips the limit
 
 
 def test_a_forced_run_of_a_disabled_vendor_is_refused(kube, world):
@@ -471,7 +472,8 @@ def test_dbaas_max_in_flight_lets_more_runs_start_one_per_cycle(kube, world):
 def test_dbaas_max_in_flight_zero_pauses_the_vendor(kube, world):
     assert plan(kube, make_config(dbaas_max_in_flight=0), world) == []
     with pytest.raises(ValueError, match=r"dbaasMaxInFlight limit \(0 of 0"):
-        force(kube, world, make_config(dbaas_max_in_flight=0))
+        force(kube, world, make_config(dbaas_max_in_flight=0), force=False)
+    assert force(kube, world, make_config(dbaas_max_in_flight=0), force=True)  # an explicit operator action
 
 
 def test_server_runs_do_not_use_up_the_dbaas_limits(kube, world):
@@ -507,14 +509,21 @@ def test_a_run_that_alone_passes_the_cap_is_never_planned_and_a_cheaper_database
     assert planned.database_id == "db-b"
     with pytest.raises(ValueError, match="would pass its dbaasMaxUsdPerHour cap"):
         dbaas_plan.force_run(
-            kube, make_config(auto=False, dbaas_max_in_flight=3, dbaas_max_usd_per_hour=1.0), "oci", "db-a"
+            kube, make_config(auto=False, dbaas_max_in_flight=3, dbaas_max_usd_per_hour=1.0), "oci", "db-a", force=False
         )
+    forced = make_config(auto=False, dbaas_max_in_flight=3, dbaas_max_usd_per_hour=1.0)
+    assert dbaas_plan.force_run(kube, forced, "oci", "db-a", force=True)  # force skips the cap
+
+
+def test_force_skips_the_cap_even_when_the_price_is_unknown(kube, world):
+    cfg = make_config(auto=False, dbaas_max_usd_per_hour=1.0)
+    assert force(kube, world, cfg, region="eu-1", client="my-client", force=True)
 
 
 def test_an_unknown_price_is_refused_when_a_cap_is_set(kube, world):
     cfg = make_config(auto=False, dbaas_max_usd_per_hour=1.0)
     with pytest.raises(ValueError, match="price of the database or client is unknown"):
-        force(kube, world, cfg, region="eu-1", client="my-client")  # Keeper lists no such client
+        force(kube, world, cfg, region="eu-1", client="my-client", force=False)  # Keeper lists no such client
     assert force(kube, world, make_config(auto=False), region="eu-1", client="my-client")  # no cap: fine
 
 

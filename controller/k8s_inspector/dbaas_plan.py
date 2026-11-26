@@ -70,16 +70,20 @@ def holding_runs(runs: list[BenchmarkRun], vendor: str) -> list[BenchmarkRun]:
     return [run for run in runs if run.spec.vendor == vendor and holds_database(run)]
 
 
-def check_vendor(cfg: Config, vendor: str, runs: list[BenchmarkRun]) -> None:
-    """Raise `ValueError` unless one more DBaaS run of `vendor` may start: the vendor is enabled, has networks
-    configured, and is below its `dbaasMaxInFlight` (0 pauses; server runs have their own limit)."""
+def check_vendor(cfg: Config, vendor: str) -> None:
+    """Raise `ValueError` unless the vendor is enabled and has networks configured (no DBaaS run is possible else)."""
     vendor_settings = cfg.settings.vendors.get(vendor)
     if vendor_settings is None or not vendor_settings.enabled:
         raise ValueError(f"vendor {vendor} is not enabled in the ConfigMap")
     vendor_config = cfg.settings.dbaas.vendors.get(vendor)
     if vendor_config is None or not vendor_config.networks:
         raise ValueError(f"no dbaas.vendors.{vendor}.networks in the ConfigMap: the platform provides no DBaaS network")
-    limit = vendor_settings.dbaas_max_in_flight
+
+
+def check_in_flight(cfg: Config, vendor: str, runs: list[BenchmarkRun]) -> None:
+    """Raise `ValueError` unless the vendor is below its `dbaasMaxInFlight` (0 pauses; server runs have their own
+    limit)."""
+    limit = cfg.settings.vendors[vendor].dbaas_max_in_flight
     running = [run.name for run in holding_runs(runs, vendor)]
     if len(running) >= limit:
         raise ValueError(
@@ -266,13 +270,16 @@ def force_run(
 ) -> BenchmarkRun:
     """`k8s-inspector run <vendor> --database <id>`: a DBaaS run of one database now. Raise `ValueError` for validation
     errors and `crd.RunExists` when the database already has a run. Without `force` Keeper must find the database
-    eligible (unreachable Keeper: refused); with it only Keeper's record must exist. `region` is the database's;
+    eligible (unreachable Keeper: refused) and the vendor must be below `dbaasMaxInFlight` and `dbaasMaxUsdPerHour`;
+    with it only Keeper's record must exist and the vendor must be enabled with networks. `region` is the database's;
     `region`, `client_region` and `client` default to the cheapest database region with a client region (its own or
     one of its city, with a network) and any small x86_64 client type."""
     if client and not pods.is_label_value(client):
         raise ValueError(f"{client} is not a valid label value: SCarpenter cannot select it by api-reference")
     runs = crd.list_runs(kube)
-    check_vendor(cfg, vendor, runs)
+    check_vendor(cfg, vendor)
+    if not force:
+        check_in_flight(cfg, vendor, runs)
     if existing := database_run(runs, vendor, database_id):
         raise crd.RunExists(existing.name)
     try:
@@ -308,7 +315,8 @@ def force_run(
         )
     except RuntimeError as e:
         raise ValueError(f"cannot read regions or servers from Keeper: {e}") from e
-    check_spend(cfg, vendor, crd.list_runs(kube), placement.usd_per_hour)
+    if not force:
+        check_spend(cfg, vendor, crd.list_runs(kube), placement.usd_per_hour)
     return _create_run(kube, cfg, vendor, record, version, placement, names, force=force, hold_after=hold_after)
 
 
@@ -344,7 +352,9 @@ def plan_cycle(
     planned = []
     for vendor in vendors:
         try:
-            check_vendor(cfg, vendor, crd.list_runs(kube))
+            runs = crd.list_runs(kube)
+            check_vendor(cfg, vendor)
+            check_in_flight(cfg, vendor, runs)
             if launch.paused(kube, vendor, datetime.now(UTC)):
                 raise ValueError("its nodes do not come up")
         except ValueError as e:

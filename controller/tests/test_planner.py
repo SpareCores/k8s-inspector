@@ -172,22 +172,29 @@ def test_force_run_existing_run_raises_run_exists(kube):
         planner.force_run(kube, make_config(), "oci", "sku")
 
 
+@pytest.fixture
+def keeper_allows(monkeypatch):
+    monkeypatch.setattr(keeper, "block_reasons", lambda env, vendor, skus, names: {sku: {} for sku in skus})
+
+
+@pytest.mark.usefixtures("keeper_allows")
 def test_max_in_flight_counts_active_runs_only(kube):
     cfg = make_config(max_in_flight=2)
-    first = planner.force_run(kube, cfg, "oci", "a")
-    second = planner.force_run(kube, cfg, "oci", "b")
+    first = planner.force_run(kube, cfg, "oci", "a", force=False)
+    second = planner.force_run(kube, cfg, "oci", "b", force=False)
     with pytest.raises(ValueError, match="maxInFlight"):
-        planner.force_run(kube, cfg, "oci", "c")
+        planner.force_run(kube, cfg, "oci", "c", force=False)
 
     kube.set_status(first.name, phase="Done")
     kube.set_status(second.name, phase="Cancelled")
-    planner.force_run(kube, cfg, "oci", "c")
+    planner.force_run(kube, cfg, "oci", "c", force=False)
 
 
+@pytest.mark.usefixtures("keeper_allows")
 def test_max_in_flight_counts_failed_and_cancelled_runs_until_anchor_is_gone(kube):
     cfg = make_config(max_in_flight=2)
-    first = planner.force_run(kube, cfg, "oci", "a")
-    second = planner.force_run(kube, cfg, "oci", "b")
+    first = planner.force_run(kube, cfg, "oci", "a", force=False)
+    second = planner.force_run(kube, cfg, "oci", "b", force=False)
     kube.set_status(first.name, phase="Failed")
     kube.set_status(second.name, phase="Cancelled")
     kube.pods = [
@@ -195,57 +202,63 @@ def test_max_in_flight_counts_failed_and_cancelled_runs_until_anchor_is_gone(kub
         for name in (first.name, second.name)
     ]
     with pytest.raises(ValueError, match="2 of 2"):
-        planner.force_run(kube, cfg, "oci", "c")
+        planner.force_run(kube, cfg, "oci", "c", force=False)
 
     kube.pods = kube.pods[:1]  # the runner deleted the second anchor
-    planner.force_run(kube, cfg, "oci", "c")
+    planner.force_run(kube, cfg, "oci", "c", force=False)
 
 
+@pytest.mark.usefixtures("keeper_allows")
 def test_max_in_flight_zero_pauses_vendor(kube):
     with pytest.raises(ValueError, match="maxInFlight"):
-        planner.force_run(kube, make_config(max_in_flight=0), "oci", "sku")
+        planner.force_run(kube, make_config(max_in_flight=0), "oci", "sku", force=False)
 
 
+@pytest.mark.usefixtures("keeper_allows")
 def test_max_in_flight_falls_back_to_defaults(kube):
     cfg = Config(
         EnvConfig(bucket="b", bucket_region="r"),
         Settings(vendors={"oci": VendorSettings(enabled=True)}, defaults=Defaults(max_in_flight=1)),
     )
-    planner.force_run(kube, cfg, "oci", "a")
+    planner.force_run(kube, cfg, "oci", "a", force=False)
     with pytest.raises(ValueError, match="1 of 1"):
-        planner.force_run(kube, cfg, "oci", "b")
+        planner.force_run(kube, cfg, "oci", "b", force=False)
 
 
+@pytest.mark.usefixtures("keeper_allows")
 def test_max_usd_per_hour(kube):
     cfg = make_config(max_in_flight=5, max_usd_per_hour=1.0)
-    first = planner.force_run(kube, cfg, "oci", "a")
+    first = planner.force_run(kube, cfg, "oci", "a", force=False)
     kube.set_status(first.name, phase="Running", pricePerHour="0.6")
-    planner.force_run(kube, cfg, "oci", "b")  # 0.6 < 1.0
+    planner.force_run(kube, cfg, "oci", "b", force=False)  # 0.6 < 1.0
 
     kube.set_status(first.name, pricePerHour="1.2")
     with pytest.raises(ValueError, match="maxUsdPerHour"):
-        planner.force_run(kube, cfg, "oci", "c")
+        planner.force_run(kube, cfg, "oci", "c", force=False)
 
 
+@pytest.mark.usefixtures("keeper_allows")
 def test_max_usd_per_hour_waits_for_runs_without_price(kube):
     cfg = make_config(max_in_flight=5, max_usd_per_hour=1.0)
-    first = planner.force_run(kube, cfg, "oci", "a")
+    first = planner.force_run(kube, cfg, "oci", "a", force=False)
     with pytest.raises(ValueError, match=f"wait until {first.name} has a price"):
-        planner.force_run(kube, cfg, "oci", "b")
+        planner.force_run(kube, cfg, "oci", "b", force=False)
 
     no_cap = make_config(max_in_flight=5)
-    planner.force_run(kube, no_cap, "oci", "b")  # no cap: prices do not matter
+    planner.force_run(kube, no_cap, "oci", "b", force=False)  # no cap: prices do not matter
 
 
+@pytest.mark.usefixtures("keeper_allows")
 def test_max_usd_per_hour_refuses_a_running_run_without_price(kube, caplog):
     cfg = make_config(max_in_flight=5, max_usd_per_hour=1.0)
-    first = planner.force_run(kube, cfg, "oci", "a")
+    first = planner.force_run(kube, cfg, "oci", "a", force=False)
     kube.set_status(first.name, phase="Running", node="n1")
     with caplog.at_level("WARNING"), pytest.raises(ValueError, match=rf"node of {first.name} has no price annotation"):
-        planner.force_run(kube, cfg, "oci", "b")
+        planner.force_run(kube, cfg, "oci", "b", force=False)
     assert [r.message for r in caplog.records if first.name in r.message]
 
 
+@pytest.mark.usefixtures("keeper_allows")
 def test_max_in_flight_counts_live_nodeclaims_beyond_runs(kube):
     cfg = make_config(max_in_flight=2)
     claim = lambda pool, vendor: {  # noqa: E731
@@ -254,25 +267,27 @@ def test_max_in_flight_counts_live_nodeclaims_beyond_runs(kube):
     # Two OCI claims in the shared bench pool count; another vendor's claim and another pool's claim do not.
     kube.nodeclaims = [claim("bench", "oci"), claim("bench", "oci"), claim("bench", "aws"), claim("other-pool", "oci")]
     with pytest.raises(ValueError, match="2 of 2"):  # no run holds an anchor, two instances are still up
-        planner.force_run(kube, cfg, "oci", "a")
+        planner.force_run(kube, cfg, "oci", "a", force=False)
 
     kube.nodeclaims = kube.nodeclaims[1:]
-    planner.force_run(kube, cfg, "oci", "a")
+    planner.force_run(kube, cfg, "oci", "a", force=False)
 
 
+@pytest.mark.usefixtures("keeper_allows")
 def test_unlaunched_nodeclaims_count_by_spec_requirements(kube):
     cfg = make_config(max_in_flight=1)
     pool = {"karpenter.sh/nodepool": "bench"}
     requirements = [{"key": "scarpenter.sparecores.com/vendor", "operator": "In", "values": ["oci"]}]
     kube.nodeclaims = [{"metadata": {"labels": pool}, "spec": {"requirements": requirements}}]
     with pytest.raises(ValueError, match="1 of 1"):
-        planner.force_run(kube, cfg, "oci", "a")
+        planner.force_run(kube, cfg, "oci", "a", force=False)
     kube.nodeclaims = [
         {"metadata": {"labels": pool}, "spec": {"requirements": [{**requirements[0], "values": ["aws"]}]}}
     ]
-    planner.force_run(kube, cfg, "oci", "a")
+    planner.force_run(kube, cfg, "oci", "a", force=False)
 
 
+@pytest.mark.usefixtures("keeper_allows")
 def test_other_vendors_do_not_count(kube):
     cfg = Config(
         EnvConfig(bucket="b", bucket_region="r"),
@@ -280,8 +295,36 @@ def test_other_vendors_do_not_count(kube):
             vendors={"oci": VendorSettings(enabled=True, max_in_flight=1), "aws": VendorSettings(enabled=True)},
         ),
     )
-    planner.force_run(kube, cfg, "aws", "a")
-    planner.force_run(kube, cfg, "oci", "a")
+    planner.force_run(kube, cfg, "aws", "a", force=False)
+    planner.force_run(kube, cfg, "oci", "a", force=False)
+
+
+@pytest.mark.usefixtures("keeper_allows")
+def test_force_skips_max_in_flight_but_still_counts_toward_it(kube):
+    cfg = make_config(max_in_flight=1)
+    first = planner.force_run(kube, cfg, "oci", "a", force=False)
+    forced = planner.force_run(kube, cfg, "oci", "b", force=True)  # at the limit: forced anyway
+    assert forced.spec.force is True
+    kube.set_status(first.name, phase="Done")
+    with pytest.raises(ValueError, match="1 of 1"):  # the forced run still holds the vendor's slot
+        planner.force_run(kube, cfg, "oci", "c", force=False)
+
+
+def test_force_overrides_a_paused_vendor(kube):
+    planner.force_run(kube, make_config(max_in_flight=0), "oci", "sku", force=True)
+
+
+def test_force_skips_max_usd_per_hour(kube):
+    cfg = make_config(max_in_flight=5, max_usd_per_hour=1.0)
+    first = planner.force_run(kube, cfg, "oci", "a", force=True)
+    kube.set_status(first.name, phase="Running", pricePerHour="1.2")
+    planner.force_run(kube, cfg, "oci", "b", force=True)  # over the cap
+
+
+def test_force_still_refuses_a_disabled_vendor(kube):
+    cfg = Config(EnvConfig(bucket="b", bucket_region="r"), Settings(vendors={"oci": VendorSettings(enabled=False)}))
+    with pytest.raises(ValueError, match="not enabled"):
+        planner.force_run(kube, cfg, "oci", "sku", force=True)
 
 
 def test_without_force_keeper_must_allow(kube, monkeypatch):
