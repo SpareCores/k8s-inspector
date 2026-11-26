@@ -1533,6 +1533,31 @@ def test_a_record_of_a_run_without_price_data_gets_keeper_current_price_or_a_rea
     assert cost_lines(caplog)[0]["ondemand_price"] == 0.8
 
 
+def test_a_keeper_outage_is_asked_once_per_pass_and_leaves_the_reason(tmp_path, origin, storage, cluster, monkeypatch):
+    cluster.add_run(NAMES)
+    doc = json.loads(storage.objects[okey(KEY, "run.json")])
+    doc["attempts"][0] |= {
+        "attempt": 1, "api_start": "2026-09-29T12:57:00Z", "end": "2026-09-29T13:57:00+00:00",
+        "outcome": "Completed", "capacity_type": "spot", "price": "0.5", "region": "fsn1",
+    }  # fmt: skip
+    calls = []
+
+    def down(env, vendor, sku):
+        calls.append(sku)
+        raise RuntimeError("keeper down")
+
+    monkeypatch.setattr(keeper, "server_facts", down)
+    monkeypatch.setattr(keeper, "ondemand_prices", down)
+    pub = make_publisher(tmp_path, origin, storage)
+    records = [{"vendor": "hcloud", "sku": s, "attempts": [dict(doc["attempts"][0])]} for s in ("a", "b", "c")]
+    seen: set = set()
+    for record in records:
+        pub._fill_from_keeper(record, {}, {}, seen)
+    assert len(calls) == 1  # the later records do not wait for Keeper again
+    assert all(r["attempts"][0]["ondemand_price_reason"] == "keeper_unreachable" for r in records)
+    assert all(r["attempts"][0]["ondemand_price"] is None for r in records)
+
+
 def test_emit_cost_logs_logs_past_records_with_current_prices_and_changes_nothing(
     tmp_path, origin, caplog, monkeypatch
 ):

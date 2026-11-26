@@ -487,6 +487,7 @@ class Publisher:
         todo = []
         prices: dict[tuple[str, str], dict[str, float]] = {}
         facts: dict[tuple[str, str], dict] = {}
+        down: set[str] = set()
         for run in runs:
             if run.name in self._records_written or not self._record_due(run, settings):
                 continue
@@ -505,7 +506,7 @@ class Publisher:
                 log.error("run %s: no run.json, no run record", run.name)
                 self._records_written.add(run.name)
                 continue
-            self._fill_from_keeper(run_json, prices, facts)  # a run launched by an older controller lacks them
+            self._fill_from_keeper(run_json, prices, facts, down)  # a run launched by an older controller lacks them
             todo.append((run, cost.add_costs(run_json, _task_spans(run))))
         if not todo:
             return
@@ -593,18 +594,23 @@ class Publisher:
                 self._sync(record_files + skus, cone=False)
             prices: dict[tuple[str, str], dict[str, float]] = {}
             facts: dict[tuple[str, str], dict] = {}
+            down: set[str] = set()
             for record in records:
-                self._fill_from_keeper(record, prices, facts)
+                self._fill_from_keeper(record, prices, facts, down)
                 spans = self._spans_from_tree(record) if _lacks_costs(record) else []
                 cost.log_cost_lines(cost.add_costs(record, spans), backfill=True)
             return len(records)
 
-    def _fill_from_keeper(self, record: dict, prices: dict, facts: dict) -> None:
+    def _fill_from_keeper(self, record: dict, prices: dict, facts: dict, down: set) -> None:
         """Keeper's current `family`, `series`, `cpu_arch`, `gpu_count` and `ondemand_price` for what the record
         lacks, or has only as a null from a Keeper that could not be asked at launch. What Keeper cannot tell stays
-        missing (logged as null); an attempt that got a node always ends with a price or a reason."""
+        missing (logged as null); an attempt that got a node always ends with a price or a reason. After the first
+        `RuntimeError` Keeper is not asked again (`down` is shared by the records of one pass): the attempts keep the
+        reason `keeper_unreachable` and are filled by a later pass."""
         sku = (record["vendor"], record["sku"])
         try:
+            if down:
+                raise RuntimeError("Keeper was unreachable earlier in this pass")
             if "family" not in record:
                 if sku not in facts:
                     facts[sku] = keeper.server_facts(self._env, *sku) or {}
@@ -619,7 +625,9 @@ class Publisher:
                 a |= keeper.ondemand_price_fields(prices[sku], a["region"])
                 a["ondemand_price_source"] = "current"
         except RuntimeError as e:
-            log.warning("cost logs: no Keeper data for %s/%s (%s)", *sku, e)
+            if not down:
+                log.warning("cost logs: no Keeper data for %s/%s (%s)", *sku, e)
+            down.add("keeper")
             for a in record["attempts"]:
                 if a.get("region") and "ondemand_price" not in a:
                     a |= {"ondemand_price": None, "ondemand_price_reason": "keeper_unreachable"}

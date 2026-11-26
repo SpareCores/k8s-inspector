@@ -139,7 +139,7 @@ Definitions, per attempt (`start` is `api_start`):
 | `region`, `zone`, `capacity_type`, `outcome` | as in the attempt (`null` when absent) |
 | `start`, `end` | the attempt's `api_start` and `end` |
 | `duration_s`, `useful_s`, `setup_s`, `task_s`, `price`, `ondemand_price`, `cost_usd`, `wasted_usd` | as defined above; `ondemand_price` is the attempt's |
-| `ondemand_price_source` | `launch`: captured when the attempt got its node; `current`: Keeper's price when the record or the backfill was written, for an attempt launched without one (an older controller, or Keeper unreachable); an attempt that got a node always has `ondemand_price` or an `ondemand_price_reason` |
+| `ondemand_price_source` | `launch`: captured when the attempt got its node; `current`: Keeper's price when the record or the backfill was written, for an attempt launched without one (an older controller, or Keeper unreachable); after one failed Keeper call a pass does not ask again, and the remaining attempts keep `ondemand_price_reason: keeper_unreachable`; an attempt that got a node always has `ondemand_price` or an `ondemand_price_reason` |
 | `start_hour_utc`, `start_weekday_utc` | hour `0`-`23` and weekday `Mon`-`Sun` of `start`, UTC |
 | `backfill` | `false` |
 
@@ -151,9 +151,9 @@ Definitions, per attempt (`start` is `api_start`):
 | `run`, `vendor`, `sku`, `family`, `series` | as above |
 | `final_region`, `final_capacity_type` | of the last attempt |
 | `attempts`, `spot_interruptions` | attempts, and those that ended `SpotInterrupted` |
-| `used_spot` | some spot attempt got a node (has a `price`); a spot attempt that never got one does not count; every run is logged, so filter on it |
+| `used_spot` | some spot attempt got a node; a spot attempt that never got one does not count; every run is logged, so filter on it |
 | `paid_usd`, `wasted_usd` | sums over the attempts |
-| `ondemand_counterfactual_usd` | price of the reference attempt × (sum of `task_s` over all attempts + `setup_s` of the reference attempt) / 3600: on-demand would need one setup plus the kept task time. The reference attempt is the `Completed` one, else the last attempt that got a node (the results a run kept are published, so it did useful work). Its price is its own `price` when it is on-demand, else its `ondemand_price`. `null` without a reference attempt or its price, or when a task time is unknown |
+| `ondemand_counterfactual_usd` | price of the reference attempt × (sum of `task_s` over all attempts + `setup_s` of the reference attempt) / 3600: on-demand would need one setup plus the kept task time. The reference attempt is the `Completed` one, else the last attempt with kept task time (`task_s` > 0; the results a run kept are published, so it did useful work) Its price is its own `price` when it is on-demand, else its `ondemand_price`. `null` without a reference attempt (a run with no kept task time), without its price, or when a task time is unknown |
 | `spot_net_usd` | `paid_usd` − `ondemand_counterfactual_usd`, `null` with it; positive means spot cost more than on-demand would have |
 | `backfill` | `false` |
 
@@ -162,8 +162,8 @@ server, so small gaps between them are expected. That is why an on-demand `Compl
 `price` in the counterfactual: the on-demand alternative is then exactly as dear as the attempt it replaces. A
 `null` `setup_s` counts as 0.
 
-OCI node prices include a flat extra of about $0.0075/h on top of compute, while Keeper's on-demand price is compute
-only: for tiny OCI shapes spot can show slightly dearer than on-demand (a positive `spot_net_usd`).
+The node prices of some vendors include extras, such as the boot volume, that Keeper's on-demand list price does not,
+so small gaps are expected, and for a small shape spot can show slightly dearer than on-demand.
 
 Lines exist only for runs that get a record, that is runs of vendors and SKUs enabled for publishing. They are
 logged after the record's commit is pushed, so a controller crash between the push and the logging loses that run's

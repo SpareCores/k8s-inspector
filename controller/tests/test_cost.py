@@ -142,6 +142,24 @@ def test_counterfactual_without_a_completed_attempt_prices_the_kept_work_of_the_
     assert summary["ondemand_counterfactual_usd"] is None and summary["spot_net_usd"] is None
 
 
+def test_counterfactual_is_null_when_no_task_was_kept():
+    lost = attempt(1, "2026-11-26T08:00:00Z", "2026-11-26T09:00:00+00:00", "NodeLost", "spot", "1.0", "r1", 2.0)
+    summary = cost.run_summary(cost.add_costs({"attempts": [lost]}, []))
+    assert summary["paid_usd"] == 1.0 and summary["wasted_usd"] == 1.0
+    assert summary["ondemand_counterfactual_usd"] is None and summary["spot_net_usd"] is None  # not 0
+
+
+def test_counterfactual_references_the_last_attempt_with_kept_work_not_a_lost_last_one():
+    first = attempt(1, "2026-11-26T08:00:00Z", "2026-11-26T09:00:00+00:00", "SpotInterrupted", "spot", "1.0", "r1", 2.0)
+    lost = attempt(2, "2026-11-26T09:00:00Z", "2026-11-26T10:00:00+00:00", "NodeLost", "spot", "1.0", "r2", 3.0)
+    spans = [cost.Span(1, t("2026-11-26T08:10:00"), t("2026-11-26T08:30:00"), kept=True)]
+    a1, a2 = (a for a in cost.add_costs({"attempts": [first, lost]}, spans)["attempts"])
+    assert a2["setup_s"] is None and a2["task_s"] == 0.0  # no finished task: no setup either
+    summary = cost.run_summary({"attempts": [a1, a2]})
+    # attempt 1's list price x (its 1200 s of task time + its 600 s setup)
+    assert summary["ondemand_counterfactual_usd"] == pytest.approx(2.0 * 1800 / 3600, abs=1e-5)
+
+
 def test_counterfactual_is_null_without_a_node_attempt():
     record = {"attempts": [{"attempt": 1, "api_start": "2026-11-26T08:00:00Z", "outcome": "ProvisioningFailed"}]}
     summary = cost.run_summary(cost.add_costs(record, []))

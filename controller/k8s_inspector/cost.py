@@ -119,12 +119,13 @@ def run_summary(record: dict) -> dict:
 
     The on-demand counterfactual is what the run would have cost on-demand in the region of its reference attempt:
     all kept task time plus one setup, that attempt's. The reference attempt is the Completed one, else the last
-    attempt that got a node (a run that ended otherwise still published the results it kept). Its price is its own
+    attempt with kept task time (`task_s` > 0, so it has a `setup_s`; a run that ended otherwise still published the
+    results it kept). Its price is its own
     `price` when it is on-demand, else its `ondemand_price`. It is null without a reference attempt, without that
     price, or when the task time of an attempt is unknown. A null `setup_s` counts as 0."""
     attempts = record.get("attempts") or []
     done = next((a for a in attempts if a.get("outcome") == "Completed"), None)
-    ref = done or next((a for a in reversed(attempts) if has_node(a)), None)
+    ref = done or next((a for a in reversed(attempts) if (a.get("task_s") or 0) > 0), None)
     task = _sum(a.get("task_s") for a in attempts)
     counterfactual = None
     price = None
@@ -142,7 +143,7 @@ def run_summary(record: dict) -> dict:
         "final_capacity_type": last.get("capacity_type"),
         "attempts": len(attempts),
         "spot_interruptions": sum(1 for a in attempts if a.get("outcome") == "SpotInterrupted"),
-        "used_spot": any(a.get("capacity_type") == "spot" and a.get("price") for a in attempts),
+        "used_spot": any(a.get("capacity_type") == "spot" and has_node(a) for a in attempts),
         "paid_usd": paid,
         "wasted_usd": _sum(a.get("wasted_usd") for a in attempts),
         "ondemand_counterfactual_usd": counterfactual,
