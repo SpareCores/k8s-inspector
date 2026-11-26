@@ -19,7 +19,7 @@ DBaaS results by explicit paths, so it never sees `runs/` ([output contract](out
 ## Content
 
 The record is the controller's [`run.json`](output-contract.md#runjson) without every `lscpu_stdout` field (top level
-and per attempt) plus `phase`. It is written with sorted keys and two-space indentation, so diffs are stable.
+and per attempt) plus `phase`, with `variant` set as below. It is written with sorted keys and two-space indentation, so diffs are stable.
 
 | Field | Meaning |
 |---|---|
@@ -27,7 +27,7 @@ and per attempt) plus `phase`. It is written with sorted keys and two-space inde
 | `run_id` | the run, `r<YYYYMMDD>t<HHMM>-<hex>` |
 | `phase` | the run's final phase: `Done`, `Failed` or `Cancelled`; `unknown` in a [backfilled](#backfill) record whose attempts do not tell |
 | `plan` | task names of the run, in order |
-| `variant` | the hardware variant number the run's results were filed under, `null` when none |
+| `variant` | the hardware variant number the run's results were filed under, `null` when none (DBaaS: always). Not `run.json`'s own `variant`, which is the runner's last snapshot: the publisher decides the variant later. Live: the run's `status.variant`; backfilled: the number of the directory holding the run's `timing/<run_id>/` in the tree (`data/<vendor>/<sku>/<N>/timing/<run_id>/`), `null` when there is none |
 | `database` | `null` for a server run; for DBaaS the database object (`vendor`, `id`, `engineVersion`, `region`, `vcpus`, `memoryGib`, `usdPerHour`) |
 | `timing` | the latest attempt's `api_start`, `api_end`, `machine_start`, `node_registered`, `node_ready` (ISO UTC; only those known) |
 | `attempts[]` | one entry per node the run used, oldest first |
@@ -68,14 +68,15 @@ The publisher writes the record, in its own commit `k8s-inspector: run records (
   results.
 
 Write once: when the file is already in the tree it is not rewritten. The controller does not delete a finished,
-publishable run (`keepRunHours`) before its record is in git. A run whose `run.json` is gone gets no record (logged
-as an error) and is deleted as usual.
+publishable run (`keepRunHours`) before its record is in git, also after a controller restart. A run whose `run.json`
+is gone or unusable (malformed, or without a safe vendor and SKU) gets no record (logged as an error) and is deleted
+as usual; a storage or rendering error is retried every cycle.
 
 ## What is not recorded
 
 - Runs deleted by the launch deferral (a temporary launch failure such as no capacity: the `BenchmarkRun` is deleted
-  and the SKU waits for its backoff, [launch retries](../explanation/launch-retries.md)) and Failed runs whose tasks
-  all ended `-1` with a temporary launch reason.
+  and the SKU waits for its backoff, [launch retries](../explanation/launch-retries.md)), Failed runs whose tasks
+  all ended `-1` with a temporary launch reason, and runs deleted because Keeper no longer lists their SKU.
 - Runs of SKUs that are not enabled for publishing.
 - Runs of the legacy sc-inspector, which has no `run.json`.
 - Runs older than the 90 days object storage keeps, and anything `run.json` never held.
@@ -87,7 +88,7 @@ as an error) and is deleted as usual.
 that still exist in the cluster (their record comes when they end) and records git already has, and commits in
 batches of 200. It can be rerun at any time. The phase is derived from the last attempt's `outcome`: `Completed` is
 `Done`, `Cancelled` is `Cancelled`, `ProvisioningFailed` and `HarnessError` are `Failed`, anything else is
-`unknown`. A run deleted by the launch deferral cannot be told from a failed one and is recorded as `Failed`.
+`unknown`. A run the launch deferral deleted has no `run.json` (skipped) or an open or `NodeLost` last attempt (`unknown`); it is never `Failed`. A malformed `run.json` is skipped with a warning.
 
 Run it in the controller Pod, which has the object storage role, the deploy key and the cluster permissions:
 

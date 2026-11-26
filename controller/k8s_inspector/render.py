@@ -977,9 +977,10 @@ def render_dbaas_timing(tree: Path, database: dict, run_id: str, timings: dict[s
         _write(run_dir / name, value + "\n")
 
 
-def render_run_record(tree: Path, run_json: dict, phase: str) -> bool:
+def render_run_record(tree: Path, run_json: dict, phase: str, variant: int | None) -> bool:
     """`data/<vendor>/<sku>/runs/<run_id>.json` (DBaaS: `dbaas/<vendor>/<id>/runs/<run_id>.json`): the run's
-    `run.json` without the `lscpu_stdout` fields, plus its final `phase`, with sorted keys. Written once: False
+    `run.json` without the `lscpu_stdout` fields, plus its final `phase` and its `variant` (run.json holds the
+    runner's last snapshot, the publisher decides the variant later), with sorted keys. Written once: False
     (nothing written) when the file exists."""
     database = run_json.get("database")
     base = (
@@ -993,6 +994,7 @@ def render_run_record(tree: Path, run_json: dict, phase: str) -> bool:
     record = {k: v for k, v in run_json.items() if k != "lscpu_stdout"}
     record["attempts"] = [{k: v for k, v in a.items() if k != "lscpu_stdout"} for a in run_json.get("attempts") or []]
     record["phase"] = phase
+    record["variant"] = variant
     _write(path, json.dumps(record, indent=2, sort_keys=True) + "\n")
     return True
 

@@ -101,7 +101,11 @@ MAX_RENDER_FAILURES = 12  # cycles a task may fail to render before it is publis
 DONE_PHASES = (RunPhase.PUBLISHING, RunPhase.DONE, RunPhase.FAILED, RunPhase.CANCELLED)
 TERMINAL_PHASES = (RunPhase.DONE, RunPhase.FAILED, RunPhase.CANCELLED)
 BACKFILL_BATCH = 200  # run records per commit of `backfill_run_records`
-RECORD_FILES = ("/data/*/*/runs/*.json", "/dbaas/*/*/runs/*.json")  # sparse patterns: only the records are checked out
+RECORD_FILES = (  # sparse patterns of the backfill: the records, and one timing file per run (its variant dir)
+    "/data/*/*/runs/*.json",
+    "/dbaas/*/*/runs/*.json",
+    "/data/*/*/*/timing/*/inspector_start",
+)
 KNOWN_HOSTS = Path(__file__).parent / "github_known_hosts"  # GitHub's published SSH host keys
 VLLM_PROBE_PREFIX = "vllm-probe-"
 TIMING_NAMES = (
@@ -485,8 +489,12 @@ class Publisher:
             try:
                 run_json = self._read_run_json(crd.run_key(run))
                 if run_json is not None:
-                    _record_dir(run_json)  # a run.json without vendor and sku raises here
-            except Exception:
+                    _record_dir(run_json)
+            except (KeyError, ValueError, TypeError, AttributeError) as e:  # malformed: trying again changes nothing
+                log.error("run %s: unusable run.json (%r), no run record", run.name, e)
+                self._records_written.add(run.name)
+                continue
+            except Exception:  # storage error
                 log.exception("cannot read run.json of %s, trying again next cycle", run.name)
                 continue
             if run_json is None:
@@ -497,22 +505,27 @@ class Publisher:
         if not todo:
             return
 
+        done: set[str] = set()  # runs whose record is in the tree now (written, or there before)
+
         def render_all() -> list:
+            done.clear()
             written = []
             for run, run_json in todo:
                 try:
-                    if render.render_run_record(self._repo, run_json, run.status.phase.value):
+                    if render.render_run_record(self._repo, run_json, run.status.phase.value, run.status.variant):
                         written.append(run)
+                    done.add(run.name)
                 except Exception:
-                    log.exception("cannot render the record of %s, skipping", run.name)
+                    log.exception("cannot render the record of %s, trying again next cycle", run.name)
             return written
 
         self._commit_pushed(
-            sorted({_record_dir(run_json) for _, run_json in todo}),
+            [f"/{_record_dir(run_json)}/runs/" for _, run_json in todo],
             render_all,
             lambda written: f"k8s-inspector: run records ({', '.join(r.spec.run_id for r in written)})",
+            cone=False,
         )
-        self._records_written.update(run.name for run, _ in todo)
+        self._records_written |= done
 
     def backfill_run_records(self, since_days: int, settings: Settings | None = None) -> int:
         """`publish --backfill-runs --since 120d`: write the records of the runs of the last `since_days` days from
@@ -528,7 +541,13 @@ class Publisher:
             batch: list[dict] = []
             for vendor in (v for v in settings.vendors if vendor_allowed(settings, v)):
                 for run_key in self._storage.list_runs(vendor, datetime.now(UTC).date() - timedelta(days=since_days)):
-                    run_json = self._read_run_json(run_key) if run_key.run_id not in live else None
+                    if run_key.run_id in live:
+                        continue
+                    try:
+                        run_json = self._read_run_json(run_key)
+                    except ValueError as e:  # malformed JSON
+                        log.warning("backfill: skipping %s: unreadable run.json (%r)", run_key.run_id, e)
+                        continue
                     if run_json and _recordable(settings, run_json):
                         batch.append(run_json)
                     if len(batch) >= BACKFILL_BATCH:
@@ -536,9 +555,20 @@ class Publisher:
                         batch = []
             return written + self._backfill_batch(batch)
 
+    def _variant_in_tree(self, run_json: dict) -> int | None:
+        """The variant a past run was published under: the number of the directory holding its timing dir
+        `data/<vendor>/<sku>/<N>/timing/<run_id>/`; None for a DBaaS run or a run without one."""
+        if run_json.get("database"):
+            return None
+        sku_dir = self._repo / "data" / run_json["vendor"] / run_json["sku"]
+        for path in sku_dir.glob(f"[0-9]*/timing/{run_json['run_id']}"):
+            if path.parts[-3].isdigit():
+                return int(path.parts[-3])
+        return None
+
     def _backfill_batch(self, batch: list[dict]) -> int:
         def render_all() -> list:
-            return [r for r in batch if render.render_run_record(self._repo, r, _phase_of(r))]
+            return [r for r in batch if render.render_run_record(self._repo, r, _phase_of(r), self._variant_in_tree(r))]
 
         written = self._commit_pushed(
             list(RECORD_FILES), render_all, lambda done: f"k8s-inspector: backfill {len(done)} run records", cone=False
@@ -999,7 +1029,9 @@ _DISCARDED = object()  # a task with nothing to publish: marked published withou
 
 
 def _record_dir(run_json: dict) -> str:
-    """The sparse directory of a run record: the SKU's (DBaaS: the database's) directory."""
+    """The directory of a run's record (DBaaS: of its database) below the tree root; raises KeyError or ValueError
+    for a run.json without the parts or with an unsafe one."""
+    _safe_part(run_json["run_id"])
     database = run_json.get("database")
     if database:
         return f"dbaas/{_safe_part(database['vendor'])}/{_safe_part(database['id'])}"
@@ -1007,12 +1039,16 @@ def _record_dir(run_json: dict) -> str:
 
 
 def _recordable(settings: Settings, run_json: dict) -> bool:
-    """A backfill candidate: its SKU (DBaaS: database) may be published and it got as far as an attempt."""
-    database = run_json.get("database")
-    vendor, sku = (database["vendor"], database["id"]) if database else (run_json.get("vendor"), run_json.get("sku"))
-    return bool(vendor and sku and run_json.get("run_id") and run_json.get("attempts")) and publish_allowed(
-        settings, vendor, sku
-    )
+    """A backfill candidate: a usable run.json with an attempt whose SKU (DBaaS: database) may be published."""
+    try:
+        _record_dir(run_json)
+        database = run_json.get("database")
+        vendor, sku = (database["vendor"], database["id"]) if database else (run_json["vendor"], run_json["sku"])
+        attempts = run_json["attempts"]
+    except (KeyError, ValueError, TypeError, AttributeError) as e:
+        log.warning("backfill: skipping a malformed run.json (%r)", e)
+        return False
+    return bool(attempts) and publish_allowed(settings, vendor, sku)
 
 
 def _phase_of(run_json: dict) -> str:

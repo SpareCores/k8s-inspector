@@ -326,7 +326,7 @@ def test_pulumi_state_is_listed_and_deleted_below_the_key_prefix(monkeypatch):
         prefixed.delete_objects([])  # nothing to do
 
 
-def test_list_runs_walks_the_directories_and_honours_since(store):
+def test_list_runs_finds_run_json_keys_and_honours_since(store):
     runs = [
         RunKey("aws", "m5.large", date(2026, 3, 7), "r1"),
         RunKey("aws", "m5.large", date(2026, 3, 7), "r2"),
@@ -336,6 +336,8 @@ def test_list_runs_walks_the_directories_and_honours_since(store):
     ]
     for run in runs:
         store.write_run_json(run, {"vendor": run.vendor})
+    store.write_status_json(RunKey("aws", "m5.large", date(2026, 3, 7), "no-run-json"), "lscpu", {})  # legacy run
+    store.s3.put_object(Bucket=BUCKET, Key="logs/inspect/aws/m5.large/0/legacy/run.json", Body=b"{}")  # odd key
     found = store.list_runs("aws", date(2026, 3, 2))
     assert sorted(r.run_id for r in found) == ["r1", "r2"]
     assert sorted(r.run_id for r in store.list_runs("aws", date(2025, 1, 1))) == ["old", "r1", "r2", "r3"]

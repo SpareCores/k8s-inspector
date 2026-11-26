@@ -1394,3 +1394,70 @@ def test_backfill_does_not_overwrite_a_live_record(tmp_path, origin, cluster):
 def test_backfill_needs_an_enabled_vendor(tmp_path, origin, cluster):
     pub = make_publisher(tmp_path, origin, backfill_storage({"r1": "Completed"}))
     assert pub.backfill_run_records(30, Settings()) == 0
+
+
+def test_run_record_takes_the_variant_from_the_run_status(tmp_path, origin, storage, cluster):
+    run = cluster.add_run(["lscpu"], phase=RunPhase.CANCELLED)
+    run.status.tasks[0].published = True
+    run.status.variant = 3  # run.json holds the runner's snapshot: no variant
+    make_publisher(tmp_path, origin, storage).publish_once(ENABLED)
+    assert run_record(origin, tmp_path)["variant"] == 3
+
+
+def test_restarted_controller_holds_the_run_until_the_record_is_checked(tmp_path, origin, storage, cluster):
+    run = cluster.add_run(NAMES, phase=RunPhase.DONE)
+    for t in run.status.tasks:
+        t.published = True
+    old = datetime.now(UTC) - timedelta(hours=99)
+    run.status.conditions = [{"type": "Published", "lastTransitionTime": old.isoformat().replace("+00:00", "Z")}]
+    settings = replace(ENABLED, publish=PublishSettings(keep_run_hours=24))
+    make_publisher(tmp_path, origin, storage).publish_once(settings)
+    restarted = make_publisher(tmp_path, origin, storage)  # empty in-memory set
+    assert restarted.delete_expired_runs(settings) == 0
+    restarted.publish_once(settings)  # finds the record in the tree, writes nothing
+    assert git(clone(origin, tmp_path), "log", "--format=%s").splitlines()[0].startswith("k8s-inspector: run records")
+    assert restarted.delete_expired_runs(settings) == 1
+
+
+@pytest.mark.parametrize("raw", [b"{not json", b'{"vendor": "..", "sku": "x", "run_id": "r"}', b'{"run_id": "r"}'])
+def test_unusable_run_json_gives_up_and_does_not_hold_the_run(tmp_path, origin, cluster, raw):
+    run = cluster.add_run(["lscpu"], phase=RunPhase.DONE)
+    run.status.tasks[0].published = True
+    storage = FakeStorage()
+    storage.objects[okey(KEY, "run.json")] = raw
+    pub = make_publisher(tmp_path, origin, storage)
+    pub.publish_once(ENABLED)
+    assert run.name in pub._records_written
+    assert git(clone(origin, tmp_path), "log", "--format=%s").splitlines() == ["seed"]
+
+
+def test_storage_error_or_failed_render_is_retried(tmp_path, origin, storage, cluster, monkeypatch):
+    run = cluster.add_run(["lscpu"], phase=RunPhase.DONE)
+    run.status.tasks[0].published = True
+    pub = make_publisher(tmp_path, origin, storage)
+    monkeypatch.setattr(pub, "_read_run_json", lambda key: (_ for _ in ()).throw(OSError("s3 down")))
+    pub.publish_once(ENABLED)
+    assert run.name not in pub._records_written
+    monkeypatch.delattr(pub, "_read_run_json")
+    monkeypatch.setattr(publisher.render, "render_run_record", lambda *args: (_ for _ in ()).throw(ValueError("x")))
+    pub.publish_once(ENABLED)
+    assert run.name not in pub._records_written  # rendering raised: kept, not deleted without a record
+
+
+def test_backfill_takes_the_variant_from_git_and_skips_malformed_run_json(tmp_path, origin, cluster):
+    seed = clone(origin, tmp_path, "seed5")
+    (seed / "data/hcloud/cax31/2/timing/r-done").mkdir(parents=True)
+    (seed / "data/hcloud/cax31/2/timing/r-done/inspector_start").write_text("2026-10-01T10:00:00Z\n")
+    git(seed, "add", "-A")
+    git(seed, "commit", "-m", "variant 2")
+    git(seed, "push", "origin", "HEAD:main")
+    storage = backfill_storage({"r-done": "Completed", "r-novariant": "Completed", "r-bad": "Completed"})
+    day = datetime.now(UTC).date()
+    storage.objects[okey(RunKey("hcloud", "cax31", day, "r-bad"), "run.json")] = b"{not json"
+    unsafe = {"vendor": "hcloud", "sku": "..", "run_id": "r-unsafe", "attempts": [{"attempt": 1}]}
+    storage.objects[okey(RunKey("hcloud", "cax31", day, "r-unsafe"), "run.json")] = json.dumps(unsafe).encode()
+    pub = make_publisher(tmp_path, origin, storage)
+    assert pub.backfill_run_records(30, ENABLED) == 2
+    check = clone(origin, tmp_path) / "data/hcloud/cax31/runs"
+    assert json.loads((check / "r-done.json").read_text())["variant"] == 2
+    assert json.loads((check / "r-novariant.json").read_text())["variant"] is None
