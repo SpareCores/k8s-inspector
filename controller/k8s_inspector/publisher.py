@@ -47,6 +47,13 @@ Decisions:
   `inspector_start`/`inspector_end` = first task start / last task end. They go to the variant of that attempt.
 - A DBaaS run's timing files (`render.render_dbaas_timing`) come from `status.database.timing`, rendered once its
   results are published and again when the timing grew (the destroy ends later).
+- Run records (`render.render_run_record`): once a run is Done, Failed or Cancelled, all its tasks are published (or
+  given up) and it is publishable, `runs/<run_id>.json` is written next to its variants (DBaaS: next to `postgres/`)
+  in an own commit. The record is the run's `run.json` (read from object storage, which expires) minus the lscpu
+  output, plus the final phase. Write once: an existing file is never rewritten. `delete_expired_runs` keeps a
+  finished, publishable run until its record is written; a run without `run.json` is logged and given up. Runs
+  deleted by `_defer_launch` get no record. `backfill_run_records` writes the records of past runs from the
+  `run.json` files in object storage.
 - `rescan` finds the SKUs of a vendor from the git tree (`data/<vendor>/*`): a SKU never published has to be
   passed with `skus`. A DBaaS run is recognised by `run.json` `database`.
 """
@@ -71,6 +78,7 @@ from k8s_inspector import storage as storage_keys
 from k8s_inspector import variant as variants
 from k8s_inspector.kube import Kube, NotFound
 from k8s_inspector.model import (
+    AttemptOutcome,
     BenchmarkRun,
     EnvConfig,
     ExitCode,
@@ -91,6 +99,13 @@ SSH_OPTIONS = "-o ConnectTimeout=30 -o ServerAliveInterval=15 -o ServerAliveCoun
 MAX_PUSH_ATTEMPTS = 5
 MAX_RENDER_FAILURES = 12  # cycles a task may fail to render before it is published without parser output
 DONE_PHASES = (RunPhase.PUBLISHING, RunPhase.DONE, RunPhase.FAILED, RunPhase.CANCELLED)
+TERMINAL_PHASES = (RunPhase.DONE, RunPhase.FAILED, RunPhase.CANCELLED)
+BACKFILL_BATCH = 200  # run records per commit of `backfill_run_records`
+RECORD_FILES = (  # sparse patterns of the backfill: the records, and one timing file per run (its variant dir)
+    "/data/*/*/runs/*.json",
+    "/dbaas/*/*/runs/*.json",
+    "/data/*/*/*/timing/*/inspector_start",
+)
 KNOWN_HOSTS = Path(__file__).parent / "github_known_hosts"  # GitHub's published SSH host keys
 VLLM_PROBE_PREFIX = "vllm-probe-"
 TIMING_NAMES = (
@@ -230,6 +245,7 @@ class Publisher:
         self._lock = threading.Lock()  # one cycle at a time (run_forever, CLI, trigger)
         self._wake = threading.Event()
         self._timing_rendered: dict[str, dict[str, str]] = {}  # DBaaS run name -> the timing files last published
+        self._records_written: set[str] = set()  # names of the runs whose record is in git (or given up)
 
     # ------------------------------------------------------------------ public
 
@@ -252,6 +268,7 @@ class Publisher:
                 items.extend(self._items_of(run, settings))
             result = self._publish(items, settings)
             self._publish_dbaas_timing(runs, settings)
+            self._publish_run_records(settings)
             return result
 
     def rescan(self, since_days: int, skus: Iterable[str] = (), settings: Settings | None = None) -> PublishResult:
@@ -308,6 +325,8 @@ class Publisher:
         for run in crd.list_runs(self._kube):
             published_at = _published_at(run)
             if _all_published(run) and published_at:
+                if run.name not in self._records_written and self._record_due(run, settings):
+                    continue  # the run's record is not in git yet
                 since, why = published_at, "published"
             elif settings.from_configmap and run.status.phase in DONE_PHASES and not _publishable(settings, run):
                 since, why = _finished_at(run), "never to be published"
@@ -406,9 +425,8 @@ class Publisher:
         self._timing_rendered = {n: t for n, t in self._timing_rendered.items() if n in names}
         if not todo:
             return
-        rendered = []
-        for attempt in range(1, MAX_PUSH_ATTEMPTS + 1):
-            self._sync(sorted({f"dbaas/{r.spec.database['vendor']}/{r.spec.database['id']}" for r, _ in todo}))
+
+        def render_all() -> list:
             rendered = []
             for run, timings in todo:
                 try:
@@ -416,14 +434,13 @@ class Publisher:
                     rendered.append((run, timings))
                 except Exception:
                     log.exception("cannot render the timing of %s, skipping", run.name)
-            run_ids = ", ".join(r.spec.run_id for r, _ in rendered)
-            if self._commit([], f"k8s-inspector: DBaaS timing ({run_ids})") is None:
-                break
-            if self._push():
-                break
-            log.warning("push rejected (attempt %d), starting again from a fresh fetch", attempt)
-        else:
-            raise RuntimeError(f"push rejected {MAX_PUSH_ATTEMPTS} times")
+            return rendered
+
+        rendered = self._commit_pushed(
+            sorted({f"dbaas/{r.spec.database['vendor']}/{r.spec.database['id']}" for r, _ in todo}),
+            render_all,
+            lambda done: f"k8s-inspector: DBaaS timing ({', '.join(r.spec.run_id for r, _ in done)})",
+        )
         for run, timings in rendered:
             self._timing_rendered[run.name] = timings
 
@@ -442,6 +459,122 @@ class Publisher:
         if ends:
             timing["inspector_end"] = max(ends)
         return {name: render.format_timing_utc(value) for name, value in timing.items()}
+
+    def _commit_pushed(self, sparse: list[str], render_all: Callable[[], list], message: Callable[[list], str],
+                       *, cone: bool = True) -> list:  # fmt: skip
+        """Fresh checkout of `sparse`, `render_all()` into it (returns what it rendered), one commit with
+        `message(rendered)`, push; on non-fast-forward start again from a fresh fetch. Returns what was rendered."""
+        for attempt in range(1, MAX_PUSH_ATTEMPTS + 1):
+            self._sync(sparse, cone=cone)
+            rendered = render_all()
+            if self._commit([], message(rendered)) is None or self._push():
+                return rendered
+            log.warning("push rejected (attempt %d), starting again from a fresh fetch", attempt)
+        raise RuntimeError(f"push rejected {MAX_PUSH_ATTEMPTS} times")
+
+    @staticmethod
+    def _record_due(run: BenchmarkRun, settings: Settings) -> bool:
+        """The run ended, everything of it is published and its record is not written yet."""
+        return run.status.phase in TERMINAL_PHASES and _publishable(settings, run) and _all_published(run)
+
+    def _publish_run_records(self, settings: Settings) -> None:
+        """`runs/<run_id>.json` of the runs that ended and whose tasks are all published (see the module docstring).
+        The runs are listed again: the cycle has just marked tasks published and finished runs."""
+        runs = crd.list_runs(self._kube)
+        self._records_written &= {run.name for run in runs}
+        todo = []
+        for run in runs:
+            if run.name in self._records_written or not self._record_due(run, settings):
+                continue
+            try:
+                run_json = self._read_run_json(crd.run_key(run))
+                if run_json is not None:
+                    _record_dir(run_json)
+            except (KeyError, ValueError, TypeError, AttributeError) as e:  # malformed: trying again changes nothing
+                log.error("run %s: unusable run.json (%r), no run record", run.name, e)
+                self._records_written.add(run.name)
+                continue
+            except Exception:  # storage error
+                log.exception("cannot read run.json of %s, trying again next cycle", run.name)
+                continue
+            if run_json is None:
+                log.error("run %s: no run.json, no run record", run.name)
+                self._records_written.add(run.name)
+                continue
+            todo.append((run, run_json))
+        if not todo:
+            return
+
+        done: set[str] = set()  # runs whose record is in the tree now (written, or there before)
+
+        def render_all() -> list:
+            done.clear()
+            written = []
+            for run, run_json in todo:
+                try:
+                    if render.render_run_record(self._repo, run_json, run.status.phase.value, run.status.variant):
+                        written.append(run)
+                    done.add(run.name)
+                except Exception:
+                    log.exception("cannot render the record of %s, trying again next cycle", run.name)
+            return written
+
+        self._commit_pushed(
+            [f"/{_record_dir(run_json)}/runs/" for _, run_json in todo],
+            render_all,
+            lambda written: f"k8s-inspector: run records ({', '.join(r.spec.run_id for r in written)})",
+            cone=False,
+        )
+        self._records_written |= done
+
+    def backfill_run_records(self, since_days: int, settings: Settings | None = None) -> int:
+        """`publish --backfill-runs --since 120d`: write the records of the runs of the last `since_days` days from
+        the `run.json` files in object storage, in commits of `BACKFILL_BATCH`. Skips records git has and runs that
+        still exist in the cluster (their record comes when they end). The phase is derived from the attempts
+        (`_phase_of`). Safe to rerun. Returns how many records were written."""
+        with self._lock:
+            settings = self._settings(settings)
+            if settings is None:
+                return 0
+            live = {run.spec.run_id for run in crd.list_runs(self._kube)}
+            written = 0
+            batch: list[dict] = []
+            for vendor in (v for v in settings.vendors if vendor_allowed(settings, v)):
+                for run_key in self._storage.list_runs(vendor, datetime.now(UTC).date() - timedelta(days=since_days)):
+                    if run_key.run_id in live:
+                        continue
+                    try:
+                        run_json = self._read_run_json(run_key)
+                    except ValueError as e:  # malformed JSON
+                        log.warning("backfill: skipping %s: unreadable run.json (%r)", run_key.run_id, e)
+                        continue
+                    if run_json and _recordable(settings, run_json):
+                        batch.append(run_json)
+                    if len(batch) >= BACKFILL_BATCH:
+                        written += self._backfill_batch(batch)
+                        batch = []
+            return written + self._backfill_batch(batch)
+
+    def _variant_in_tree(self, run_json: dict) -> int | None:
+        """The variant a past run was published under: the number of the directory holding its timing dir
+        `data/<vendor>/<sku>/<N>/timing/<run_id>/`; None for a DBaaS run or a run without one."""
+        if run_json.get("database"):
+            return None
+        sku_dir = self._repo / "data" / run_json["vendor"] / run_json["sku"]
+        for path in sku_dir.glob(f"[0-9]*/timing/{run_json['run_id']}"):
+            if path.parts[-3].isdigit():
+                return int(path.parts[-3])
+        return None
+
+    def _backfill_batch(self, batch: list[dict]) -> int:
+        def render_all() -> list:
+            return [r for r in batch if render.render_run_record(self._repo, r, _phase_of(r), self._variant_in_tree(r))]
+
+        written = self._commit_pushed(
+            list(RECORD_FILES), render_all, lambda done: f"k8s-inspector: backfill {len(done)} run records", cone=False
+        )
+        log.info("backfill: %d of %d run records were new", len(written), len(batch))
+        return len(written)
 
     def _items_in_bucket(self, settings: Settings, vendor: str, sku: str, day: date) -> list[_Item]:
         prefix = storage_keys.day_prefix(vendor, sku, day)
@@ -893,6 +1026,42 @@ class Publisher:
 
 _SKIPPED = object()  # a task that cannot be published yet (no variant)
 _DISCARDED = object()  # a task with nothing to publish: marked published without a commit
+
+
+def _record_dir(run_json: dict) -> str:
+    """The directory of a run's record (DBaaS: of its database) below the tree root; raises KeyError or ValueError
+    for a run.json without the parts or with an unsafe one."""
+    _safe_part(run_json["run_id"])
+    database = run_json.get("database")
+    if database:
+        return f"dbaas/{_safe_part(database['vendor'])}/{_safe_part(database['id'])}"
+    return f"data/{_safe_part(run_json['vendor'])}/{_safe_part(run_json['sku'])}"
+
+
+def _recordable(settings: Settings, run_json: dict) -> bool:
+    """A backfill candidate: a usable run.json with an attempt whose SKU (DBaaS: database) may be published."""
+    try:
+        _record_dir(run_json)
+        database = run_json.get("database")
+        vendor, sku = (database["vendor"], database["id"]) if database else (run_json["vendor"], run_json["sku"])
+        attempts = run_json["attempts"]
+    except (KeyError, ValueError, TypeError, AttributeError) as e:
+        log.warning("backfill: skipping a malformed run.json (%r)", e)
+        return False
+    return bool(attempts) and publish_allowed(settings, vendor, sku)
+
+
+def _phase_of(run_json: dict) -> str:
+    """The final phase of a past run, from its last attempt: Done (completed), Cancelled, Failed (no node, harness
+    error), else "unknown" (still open when `run.json` was last written)."""
+    outcome = run_json["attempts"][-1].get("outcome")
+    if outcome == AttemptOutcome.COMPLETED:
+        return RunPhase.DONE.value
+    if outcome == AttemptOutcome.CANCELLED:
+        return RunPhase.CANCELLED.value
+    if outcome in (AttemptOutcome.PROVISIONING_FAILED, AttemptOutcome.HARNESS_ERROR):
+        return RunPhase.FAILED.value
+    return "unknown"
 
 
 def _attempt_entry(run_json: dict | None, n: int | None) -> dict | None:

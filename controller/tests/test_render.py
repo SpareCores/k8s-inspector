@@ -748,3 +748,31 @@ def test_dbaas_failure_with_a_changed_hash_does_not_replace_a_good_result(tmp_pa
     failed = plain_input(task, exit_code=exit_code, start="2026-10-02T10:00:00", run_id="r2", task_hash="new")
     assert render.render_dbaas_task(tmp_path, db, failed) == []
     assert (base / "stdout").read_bytes() == b"good" and (base / "meta.json").read_text() == before
+
+
+def test_run_record_drops_lscpu_adds_phase_sorts_keys_and_is_written_once(tmp_path):
+    run_json = {
+        "vendor": "aws", "sku": "c6a.large", "run_id": "r1", "variant": None, "database": None,
+        "attempts": [
+            {"attempt": 1, "outcome": "SpotInterrupted", "capacity_type": "spot", "lscpu_stdout": "big"},
+            {"attempt": 2, "outcome": "Completed", "capacity_type": "on-demand", "lscpu_stdout": "big"},
+        ],
+    }  # fmt: skip
+    assert render.render_run_record(tmp_path, run_json, "Done", 1)
+    path = tmp_path / "data/aws/c6a.large/runs/r1.json"
+    text = path.read_text()
+    record = json.loads(text)
+    assert "lscpu_stdout" not in text and record["phase"] == "Done" and record["variant"] == 1  # run.json: null
+    assert [a["outcome"] for a in record["attempts"]] == ["SpotInterrupted", "Completed"]
+    assert text == json.dumps(record, indent=2, sort_keys=True) + "\n"
+    assert run_json["attempts"][0]["lscpu_stdout"] == "big"  # the input is not changed
+    assert not render.render_run_record(tmp_path, run_json, "Failed", 2)  # write once
+    assert json.loads(path.read_text())["phase"] == "Done"
+
+
+def test_dbaas_run_record_goes_next_to_postgres(tmp_path):
+    database = {"vendor": "aws", "id": "db.m5.large", "engineVersion": "18"}
+    run_json = {"vendor": "aws", "sku": "m5.xlarge", "run_id": "r2", "database": database, "attempts": []}
+    assert render.render_run_record(tmp_path, run_json, "Done", None)
+    assert json.loads((tmp_path / "dbaas/aws/db.m5.large/runs/r2.json").read_text())["database"] == database
+    assert not (tmp_path / "data").exists()

@@ -402,6 +402,22 @@ class Storage:
 
     # ---- Pulumi state of the DBaaS stacks (`dbaas-state/`, written by the provisioner Jobs)
 
+    def list_runs(self, vendor: str, since: date) -> list[RunKey]:
+        """The runs of the vendor with a `run.json` that started on or after `since`
+        (`logs/inspect/<vendor>/<sku>/<Y>/<m>/<d>/<run>/run.json`); other objects and malformed keys are ignored."""
+        runs = []
+        for key, _ in self.list_objects(f"logs/inspect/{vendor}/"):
+            parts = key.split("/")
+            if len(parts) != 9 or parts[8] != "run.json":
+                continue
+            try:
+                day = date(int(parts[4]), int(parts[5]), int(parts[6]))
+            except ValueError:
+                continue
+            if day >= since:
+                runs.append(RunKey(vendor, parts[3], day, parts[7]))
+        return runs
+
     def list_objects(self, prefix: str) -> list[tuple[str, datetime]]:
         """`(logical key, last modified)` of every object under a logical prefix."""
         pages = self.s3.get_paginator("list_objects_v2").paginate(Bucket=self.bucket, Prefix=self._k(prefix))

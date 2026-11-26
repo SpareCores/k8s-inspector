@@ -98,7 +98,7 @@ class FakeStorage:
             "machine_start": "2026-09-29T12:58:07Z",
             "lscpu_stdout": lscpu_stdout,
         }
-        doc = {"attempts": [attempt]}
+        doc = {"vendor": run.vendor, "sku": run.sku, "run_id": run.run_id, "attempts": [attempt]}
         self.objects[okey(run, "run.json")] = json.dumps(doc).encode()
 
     def read_json(self, run, key, name):
@@ -107,6 +107,11 @@ class FakeStorage:
 
     def read_bytes(self, object_key):
         return self.objects.get(object_key)
+
+    def list_runs(self, vendor, since):
+        keys = (k.split("/") for k in self.objects if k.endswith("/run.json"))
+        found = [RunKey(p[2], p[3], date(int(p[4]), int(p[5]), int(p[6])), p[7]) for p in keys if p[2] == vendor]
+        return [r for r in found if r.day >= since]
 
     def list_status_keys(self, prefix):
         return sorted(k for k in self.objects if k.startswith(prefix) and k.endswith("status.json"))
@@ -201,8 +206,8 @@ def test_publish_once_writes_the_legacy_tree_one_commit_and_marks_published(tmp_
     assert (result.tasks_published, result.run_ids) == (4, (RUN_ID,))
     check = clone(origin, tmp_path)
     log = git(check, "log", "--format=%s").splitlines()
-    assert log == [f"k8s-inspector: publish 4 results ({RUN_ID})", "seed"]
-    assert result.commit == git(check, "rev-parse", "HEAD").strip()
+    assert log == [f"k8s-inspector: run records ({RUN_ID})", f"k8s-inspector: publish 4 results ({RUN_ID})", "seed"]
+    assert result.commit == git(check, "rev-parse", "HEAD~1").strip()
 
     inst = check / "data/hcloud/cax31"
     assert (inst / "0/variant.json").read_text() == (GOLDEN / "variant.json").read_text().replace(
@@ -240,8 +245,9 @@ def test_crash_between_push_and_patch_republishes_without_a_new_commit(tmp_path,
     run.status.phase = RunPhase.PUBLISHING
     again = pub.publish_once(ENABLED)
     assert again.commit is None and again.tasks_published == 4
-    assert all(t.published and t.commit == first.commit for t in run.status.tasks)
-    assert len(git(clone(origin, tmp_path), "log", "--format=%s").splitlines()) == 2
+    head = git(clone(origin, tmp_path), "rev-parse", "HEAD").strip()  # no new diff: marked with the tree's HEAD
+    assert first.commit and all(t.published and t.commit == head for t in run.status.tasks)
+    assert len(git(clone(origin, tmp_path), "log", "--format=%s").splitlines()) == 3  # seed, results, run record
 
 
 def test_non_fast_forward_starts_again_from_a_fresh_fetch(tmp_path, origin, storage, cluster):
@@ -264,7 +270,7 @@ def test_non_fast_forward_starts_again_from_a_fresh_fetch(tmp_path, origin, stor
     pub = Racing(None, storage, env, tmp_path / "work", get_task=TASKS.__getitem__)
     result = pub.publish_once(ENABLED)
     log = git(clone(origin, tmp_path), "log", "--format=%s").splitlines()
-    assert log == [f"k8s-inspector: publish 4 results ({RUN_ID})", "competing", "seed"]
+    assert log[1:] == [f"k8s-inspector: publish 4 results ({RUN_ID})", "competing", "seed"]
     assert result.commit is not None
 
 
@@ -1275,3 +1281,183 @@ def test_dbaas_timing_skips_runs_without_recorded_timing_and_prunes_what_is_gone
     pub._timing_rendered["gone"] = {"api_start": "x"}
     pub._publish_dbaas_timing([run], settings)
     assert pub._timing_rendered == {}
+
+
+def run_record(origin, tmp_path, rest="data/hcloud/cax31/runs") -> dict:
+    return json.loads((clone(origin, tmp_path) / rest / f"{RUN_ID}.json").read_text())
+
+
+def test_run_record_is_written_when_the_run_ended_and_everything_is_published(tmp_path, origin, storage, cluster):
+    run = cluster.add_run(NAMES)
+    doc = json.loads(storage.objects[okey(KEY, "run.json")])
+    doc["attempts"][0] |= {"outcome": "Completed", "capacity_type": "spot"}
+    storage.objects[okey(KEY, "run.json")] = json.dumps(doc).encode()
+    pub = make_publisher(tmp_path, origin, storage)
+    pub.publish_once(ENABLED)
+    record = run_record(origin, tmp_path)
+    assert record["phase"] == "Done" and record["attempts"][0]["capacity_type"] == "spot"
+    assert "lscpu_stdout" not in record["attempts"][0]
+    commits = git(clone(origin, tmp_path), "log", "--format=%s").splitlines()
+    assert commits[0] == f"k8s-inspector: run records ({RUN_ID})"
+    pub.publish_once(ENABLED)  # written once
+    assert git(clone(origin, tmp_path), "log", "--format=%s").splitlines() == commits
+    assert run.name in pub._records_written
+
+
+def test_run_record_waits_for_unpublished_tasks_and_a_run_that_has_not_ended(tmp_path, origin, storage, cluster):
+    run = cluster.add_run(NAMES, phase=RunPhase.RUNNING)
+    for t in run.status.tasks:
+        t.published = True
+    pub = make_publisher(tmp_path, origin, storage)
+    pub.publish_once(ENABLED)
+    assert "runs" not in git(clone(origin, tmp_path), "ls-tree", "-r", "--name-only", "HEAD")
+    run.status.phase = RunPhase.FAILED
+    run.status.tasks[0].published = False
+    run.status.tasks[0].state = TaskState.PENDING
+    assert not pub._record_due(run, ENABLED)
+
+
+def test_cancelled_run_gets_a_record(tmp_path, origin, storage, cluster):
+    run = cluster.add_run(["lscpu"], phase=RunPhase.CANCELLED)
+    run.status.tasks[0].published = True
+    make_publisher(tmp_path, origin, storage).publish_once(ENABLED)
+    assert run_record(origin, tmp_path)["phase"] == "Cancelled"
+
+
+def test_run_is_kept_until_its_record_is_written(tmp_path, origin, storage, cluster):
+    run = cluster.add_run(NAMES, phase=RunPhase.DONE)
+    for t in run.status.tasks:
+        t.published = True
+    old = datetime.now(UTC) - timedelta(hours=99)
+    run.status.conditions = [{"type": "Published", "lastTransitionTime": old.isoformat().replace("+00:00", "Z")}]
+    settings = replace(ENABLED, publish=PublishSettings(keep_run_hours=24))
+    pub = make_publisher(tmp_path, origin, storage)
+    assert pub.delete_expired_runs(settings) == 0  # the record is not in git yet
+    pub.publish_once(settings)
+    assert (clone(origin, tmp_path) / "data/hcloud/cax31/runs" / f"{RUN_ID}.json").exists()
+    assert pub.delete_expired_runs(settings) == 1
+
+
+def test_run_without_run_json_does_not_block_its_deletion(tmp_path, origin, cluster):
+    run = cluster.add_run(["lscpu"], phase=RunPhase.DONE)
+    run.status.tasks[0].published = True
+    pub = make_publisher(tmp_path, origin, FakeStorage())
+    pub.publish_once(ENABLED)
+    assert run.name in pub._records_written
+
+
+def backfill_storage(runs: dict[str, str | None]) -> FakeStorage:
+    """`runs`: run id -> outcome of its only attempt."""
+    storage = FakeStorage()
+    day = datetime.now(UTC).date()
+    for run_id, outcome in runs.items():
+        run = RunKey("hcloud", "cax31", day, run_id)
+        attempt = {"attempt": 1, "outcome": outcome, "lscpu_stdout": "x"}
+        doc = {"vendor": "hcloud", "sku": "cax31", "run_id": run_id, "attempts": [attempt], "database": None}
+        storage.objects[okey(run, "run.json")] = json.dumps(doc).encode()
+    return storage
+
+
+def test_backfill_writes_records_in_batches_and_skips_existing_ones_and_live_runs(
+    tmp_path, origin, cluster, monkeypatch
+):
+    monkeypatch.setattr(publisher, "BACKFILL_BATCH", 2)
+    storage = backfill_storage(
+        {"r-done": "Completed", "r-failed": "ProvisioningFailed", "r-open": None, "r-live": "Completed"}
+    )
+    live = cluster.add_run(["lscpu"])
+    live.spec.run_id = "r-live"
+    pub = make_publisher(tmp_path, origin, storage)
+    assert pub.backfill_run_records(30, ENABLED) == 3
+    check = clone(origin, tmp_path) / "data/hcloud/cax31/runs"
+    phases = {p.stem: json.loads(p.read_text())["phase"] for p in check.iterdir()}
+    assert phases == {"r-done": "Done", "r-failed": "Failed", "r-open": "unknown"}
+    assert "lscpu_stdout" not in (check / "r-done.json").read_text()
+    log = git(clone(origin, tmp_path), "log", "--format=%s").splitlines()
+    assert log == ["k8s-inspector: backfill 1 run records", "k8s-inspector: backfill 2 run records", "seed"]
+    assert pub.backfill_run_records(30, ENABLED) == 0  # rerun: nothing new, no commit
+    assert git(clone(origin, tmp_path), "log", "--format=%s").splitlines() == log
+
+
+def test_backfill_does_not_overwrite_a_live_record(tmp_path, origin, cluster):
+    seed = clone(origin, tmp_path, "seed4")
+    (seed / "data/hcloud/cax31/runs").mkdir(parents=True)
+    (seed / "data/hcloud/cax31/runs/r-done.json").write_text('{"phase": "Done", "kept": true}\n')
+    git(seed, "add", "-A")
+    git(seed, "commit", "-m", "record")
+    git(seed, "push", "origin", "HEAD:main")
+    pub = make_publisher(tmp_path, origin, backfill_storage({"r-done": "Cancelled"}))
+    assert pub.backfill_run_records(30, ENABLED) == 0
+    assert json.loads((clone(origin, tmp_path) / "data/hcloud/cax31/runs/r-done.json").read_text())["kept"]
+
+
+def test_backfill_needs_an_enabled_vendor(tmp_path, origin, cluster):
+    pub = make_publisher(tmp_path, origin, backfill_storage({"r1": "Completed"}))
+    assert pub.backfill_run_records(30, Settings()) == 0
+
+
+def test_run_record_takes_the_variant_from_the_run_status(tmp_path, origin, storage, cluster):
+    run = cluster.add_run(["lscpu"], phase=RunPhase.CANCELLED)
+    run.status.tasks[0].published = True
+    run.status.variant = 3  # run.json holds the runner's snapshot: no variant
+    make_publisher(tmp_path, origin, storage).publish_once(ENABLED)
+    assert run_record(origin, tmp_path)["variant"] == 3
+
+
+def test_restarted_controller_holds_the_run_until_the_record_is_checked(tmp_path, origin, storage, cluster):
+    run = cluster.add_run(NAMES, phase=RunPhase.DONE)
+    for t in run.status.tasks:
+        t.published = True
+    old = datetime.now(UTC) - timedelta(hours=99)
+    run.status.conditions = [{"type": "Published", "lastTransitionTime": old.isoformat().replace("+00:00", "Z")}]
+    settings = replace(ENABLED, publish=PublishSettings(keep_run_hours=24))
+    make_publisher(tmp_path, origin, storage).publish_once(settings)
+    restarted = make_publisher(tmp_path, origin, storage)  # empty in-memory set
+    assert restarted.delete_expired_runs(settings) == 0
+    restarted.publish_once(settings)  # finds the record in the tree, writes nothing
+    assert git(clone(origin, tmp_path), "log", "--format=%s").splitlines()[0].startswith("k8s-inspector: run records")
+    assert restarted.delete_expired_runs(settings) == 1
+
+
+@pytest.mark.parametrize("raw", [b"{not json", b'{"vendor": "..", "sku": "x", "run_id": "r"}', b'{"run_id": "r"}'])
+def test_unusable_run_json_gives_up_and_does_not_hold_the_run(tmp_path, origin, cluster, raw):
+    run = cluster.add_run(["lscpu"], phase=RunPhase.DONE)
+    run.status.tasks[0].published = True
+    storage = FakeStorage()
+    storage.objects[okey(KEY, "run.json")] = raw
+    pub = make_publisher(tmp_path, origin, storage)
+    pub.publish_once(ENABLED)
+    assert run.name in pub._records_written
+    assert git(clone(origin, tmp_path), "log", "--format=%s").splitlines() == ["seed"]
+
+
+def test_storage_error_or_failed_render_is_retried(tmp_path, origin, storage, cluster, monkeypatch):
+    run = cluster.add_run(["lscpu"], phase=RunPhase.DONE)
+    run.status.tasks[0].published = True
+    pub = make_publisher(tmp_path, origin, storage)
+    monkeypatch.setattr(pub, "_read_run_json", lambda key: (_ for _ in ()).throw(OSError("s3 down")))
+    pub.publish_once(ENABLED)
+    assert run.name not in pub._records_written
+    monkeypatch.delattr(pub, "_read_run_json")
+    monkeypatch.setattr(publisher.render, "render_run_record", lambda *args: (_ for _ in ()).throw(ValueError("x")))
+    pub.publish_once(ENABLED)
+    assert run.name not in pub._records_written  # rendering raised: kept, not deleted without a record
+
+
+def test_backfill_takes_the_variant_from_git_and_skips_malformed_run_json(tmp_path, origin, cluster):
+    seed = clone(origin, tmp_path, "seed5")
+    (seed / "data/hcloud/cax31/2/timing/r-done").mkdir(parents=True)
+    (seed / "data/hcloud/cax31/2/timing/r-done/inspector_start").write_text("2026-10-01T10:00:00Z\n")
+    git(seed, "add", "-A")
+    git(seed, "commit", "-m", "variant 2")
+    git(seed, "push", "origin", "HEAD:main")
+    storage = backfill_storage({"r-done": "Completed", "r-novariant": "Completed", "r-bad": "Completed"})
+    day = datetime.now(UTC).date()
+    storage.objects[okey(RunKey("hcloud", "cax31", day, "r-bad"), "run.json")] = b"{not json"
+    unsafe = {"vendor": "hcloud", "sku": "..", "run_id": "r-unsafe", "attempts": [{"attempt": 1}]}
+    storage.objects[okey(RunKey("hcloud", "cax31", day, "r-unsafe"), "run.json")] = json.dumps(unsafe).encode()
+    pub = make_publisher(tmp_path, origin, storage)
+    assert pub.backfill_run_records(30, ENABLED) == 2
+    check = clone(origin, tmp_path) / "data/hcloud/cax31/runs"
+    assert json.loads((check / "r-done.json").read_text())["variant"] == 2
+    assert json.loads((check / "r-novariant.json").read_text())["variant"] is None

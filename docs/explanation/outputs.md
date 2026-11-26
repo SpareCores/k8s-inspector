@@ -165,8 +165,11 @@ the lease about twice `keepRunHours` after its end.
    storage plus the tree, so there is no rebase or conflict handling.
 5. After the push, set `published: true` (with the commit SHA) on those tasks. A crash between push and patch
    re-renders the same content, finds no diff and patches.
+6. When a run has ended and all its tasks are published, write its record `runs/<run_id>.json` (the run's
+   `run.json` without the lscpu output, plus the final phase) in a commit of its own, once, and keep the
+   `BenchmarkRun` until it is in git ([run records](../reference/run-records.md)).
 
-When all tasks of a run are published, the controller deletes the `BenchmarkRun` after 24 h.
+When all tasks of a run are published and its record is written, the controller deletes the `BenchmarkRun` after 24 h.
 `resource_tracker.jsonl` and `postgres.log` stay in object storage only (not in git, as today).
 
 ## Why a custom uploader

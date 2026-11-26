@@ -424,6 +424,10 @@ def test_publish_command(env, monkeypatch, capsys):
             calls.append(("rescan", since_days, list(skus)))
             return cli.PublishResult(0, None, ())
 
+        def backfill_run_records(self, since_days):
+            calls.append(("backfill", since_days))
+            return 5
+
     monkeypatch.setattr(cli, "Publisher", FakePublisher)
     monkeypatch.setattr(cli, "Storage", lambda env, uploads: object())
 
@@ -432,6 +436,9 @@ def test_publish_command(env, monkeypatch, capsys):
     assert cli.main(["publish", "--rescan", "--since", "3d", "--sku", "s1"]) == 0
     assert calls == ["once", ("rescan", 3, ["s1"])]
     assert "published 0 tasks" in capsys.readouterr().out
+    assert cli.main(["publish", "--backfill-runs", "--since", "120d"]) == 0
+    assert calls[-1] == ("backfill", 120)
+    assert "wrote 5 run records" in capsys.readouterr().out
 
 
 def test_publish_failure_exits_1(env, monkeypatch, capsys):
