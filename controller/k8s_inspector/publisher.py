@@ -597,8 +597,9 @@ class Publisher:
             return len(records)
 
     def _fill_from_keeper(self, record: dict, prices: dict, facts: dict) -> None:
-        """Keeper's current `family`, `cpu_arch`, `gpu_count` and `ondemand_price` for what the record lacks. What
-        Keeper cannot tell stays missing (logged as null)."""
+        """Keeper's current `family`, `series`, `cpu_arch`, `gpu_count` and `ondemand_price` for what the record
+        lacks, or has only as a null from a Keeper that could not be asked at launch. What Keeper cannot tell stays
+        missing (logged as null)."""
         sku = (record["vendor"], record["sku"])
         try:
             if "family" not in record:
@@ -606,11 +607,13 @@ class Publisher:
                     facts[sku] = keeper.server_facts(self._env, *sku) or {}
                 record.update(facts[sku])
             for a in record["attempts"]:
-                if "ondemand_price" in a or not a.get("region"):
+                gap = a.get("ondemand_price_reason") in ("keeper_unreachable", "keeper_unknown_sku")
+                if ("ondemand_price" in a and not gap) or not a.get("region"):
                     continue
                 if sku not in prices:
                     prices[sku] = keeper.ondemand_prices(self._env, *sku)
-                a["ondemand_price"] = prices[sku].get(a["region"])
+                a.pop("ondemand_price_reason", None)
+                a |= keeper.ondemand_price_fields(prices[sku], a["region"])
                 a["ondemand_price_source"] = "current"
         except RuntimeError as e:
             log.warning("cost logs: no Keeper data for %s/%s (%s)", *sku, e)
@@ -1143,12 +1146,14 @@ def _phase_of(run_json: dict) -> str:
 
 
 def _task_spans(run: BenchmarkRun) -> list[cost.Span]:
-    """The task executions the run's status remembers (the latest of each task). A task is kept when its result
-    was published; discarded ones are marked published without a commit."""
+    """The finished task executions the run's status remembers (the latest of each task). A task the controller
+    wrote off (`-1` never ran, `-4` lost with its node) is left out: it has no real start or end although it is
+    committed to `schedule/`. A task is kept when its result was published; discarded ones are marked published
+    without a commit."""
     return [
         cost.Span(t.attempt, t.start and _utc(t.start), t.end and _utc(t.end), kept=t.published and bool(t.commit))
         for t in run.status.tasks
-        if t.state == TaskState.DONE
+        if t.state == TaskState.DONE and t.exit_code is not None and t.exit_code >= 0
     ]
 
 

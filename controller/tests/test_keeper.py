@@ -129,8 +129,9 @@ def test_server_facts_come_from_the_v2_server_record(monkeypatch):
     seen = []
     record = {"family": "Compute Optimized", "cpu_architecture": "x86_64", "accelerator_count": 4.0, "series": "c6a"}
     monkeypatch.setattr(keeper, "_get", lambda url, key: seen.append(url) or record)
-    facts = server_facts(EnvConfig(bucket="b", bucket_region="r", keeper_api_base="http://k"), "aws", "c6a.12xlarge")
-    assert facts == {"family": "Compute Optimized", "cpu_arch": "x86_64", "gpu_count": 4}
+    env = EnvConfig(bucket="b", bucket_region="r", keeper_api_base="http://k")
+    facts = server_facts(env, "aws", "c6a.12xlarge")
+    assert facts == {"family": "Compute Optimized", "series": "c6a", "cpu_arch": "x86_64", "gpu_count": 4}
     assert seen == ["http://k/v2/server/aws/c6a.12xlarge"]
 
 
@@ -139,25 +140,37 @@ def test_unknown_server_has_no_facts(monkeypatch):
     assert server_facts(EnvConfig(bucket="b", bucket_region="r"), "aws", "nope") is None
 
 
-def test_ondemand_prices_are_the_cheapest_active_zone_per_region_by_api_reference(monkeypatch):
-    from k8s_inspector import dbaas_keeper
+def fake_prices(monkeypatch, rows):
+    regions = [{"api_reference": f"eu-{i}", "region_id": rid, "vendor_id": "gcp"} for i, rid in enumerate("123")]
+    monkeypatch.setattr(keeper, "_fetch", lambda url, key: rows if "/prices" in url else regions)
 
+
+def test_ondemand_prices_are_the_cheapest_active_zone_per_region_by_api_reference(monkeypatch):
     def row(region, allocation, price, status="active"):
         return {"region_id": region, "allocation": allocation, "price": price, "status": status}
 
-    rows = [
-        row("1000", "ondemand", 1.2),
-        row("1000", "ondemand", 1.1),
-        row("1000", "spot", 0.4),
-        row("1100", "ondemand", 2.0, status="inactive"),
-        row("1200", "ondemand", None),
-        row("9999", "ondemand", 3.0),  # not a region of the vendor
-    ]
-    regions = [
-        {"api_reference": f"eu-{i}", "region_id": rid, "vendor_id": "gcp"}
-        for i, rid in enumerate(("1000", "1100", "1200"))
-    ]
-    monkeypatch.setattr(
-        dbaas_keeper, "_list", lambda env, path, params=(): rows if path.endswith("/prices") else regions
+    fake_prices(
+        monkeypatch,
+        [
+            row("1", "ondemand", 1.2),
+            row("1", "ondemand", 1.1),
+            row("1", "spot", 0.4),
+            row("2", "ondemand", 2.0, status="inactive"),
+            row("9", "ondemand", 3.0),  # not a region of the vendor
+        ],
     )
-    assert ondemand_prices(EnvConfig(bucket="b", bucket_region="r"), "gcp", "n2") == {"eu-0": 1.1}
+    prices = ondemand_prices(EnvConfig(bucket="b", bucket_region="r"), "gcp", "n2")
+    assert prices == {"eu-0": 1.1, "eu-1": None, "eu-2": None}  # None: no on-demand offer
+    assert keeper.ondemand_price_fields(prices, "eu-0") == {"ondemand_price": 1.1}
+    assert keeper.ondemand_price_fields(prices, "eu-1") == {
+        "ondemand_price": None,
+        "ondemand_price_reason": "no_ondemand_offer",
+    }
+    assert keeper.ondemand_price_fields(prices, "elsewhere")["ondemand_price_reason"] == "region_not_in_keeper"
+
+
+def test_an_sku_unknown_to_keeper_has_no_prices(monkeypatch):
+    monkeypatch.setattr(keeper, "_fetch", lambda url, key: None)
+    prices = ondemand_prices(EnvConfig(bucket="b", bucket_region="r"), "aws", "nope")
+    assert prices is None
+    assert keeper.ondemand_price_fields(prices, "eu-0")["ondemand_price_reason"] == "keeper_unknown_sku"

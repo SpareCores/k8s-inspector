@@ -222,12 +222,22 @@ class KeeperCache:
     def __init__(self) -> None:
         self._asked = 0.0
         self._answer: dict | None = None
+        self._cost_data: dict[tuple[str, str], tuple[float, tuple]] = {}
 
     def get(self, env, task_names: list[str]) -> dict:
         if self._answer is None or time.monotonic() - self._asked >= KEEPER_CACHE_SECONDS:
             self._answer = keeper.active_servers_block_reasons(env, task_names)
             self._asked = time.monotonic()
         return self._answer
+
+    def server_cost_data(self, env, vendor: str, sku: str) -> tuple[dict | None, dict | None]:
+        """`(server facts, on-demand prices by region)` of one SKU (`keeper.server_facts`, `keeper.ondemand_prices`),
+        kept like the bulk answer. Raises `RuntimeError` when Keeper cannot be reached (nothing is kept then)."""
+        asked, data = self._cost_data.get((vendor, sku), (0.0, ()))
+        if not data or time.monotonic() - asked >= KEEPER_CACHE_SECONDS:
+            data = (keeper.server_facts(env, vendor, sku), keeper.ondemand_prices(env, vendor, sku))
+            self._cost_data[(vendor, sku)] = (time.monotonic(), data)
+        return data
 
 
 # `schedule/<task>/meta.json` of every SKU of a vendor: {sku: {task: meta}} (`Publisher.read_schedule_metas`);

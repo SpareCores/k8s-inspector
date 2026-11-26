@@ -113,6 +113,7 @@ MAX_FAILING = timedelta(minutes=30)  # reconciles of a run failing for this long
 SKU_NOT_SELECTABLE = "SKU name is not a valid label value; SCarpenter cannot select it by api-reference"
 ACTIVE = (RunPhase.PENDING, RunPhase.PROVISIONING, RunPhase.RUNNING, RunPhase.RELEASING)
 NO_NODE_YET = (RunPhase.PENDING, RunPhase.PROVISIONING)  # a DBaaS run in these phases has created nothing that bills
+SERVER_FACTS = ("family", "series", "cpu_arch", "gpu_count")  # Keeper's, in `run.json`
 MAX_PROVISION_RETRIES = 3  # attempts lost before a node was usable (stale node, anchor deleted)
 EXTRA_ATTEMPTS = 2  # attempts beyond `max_spot_attempts` (the on-demand one plus one spare)
 NOT_ELIGIBLE = "SKU is no longer eligible in Keeper"
@@ -897,6 +898,7 @@ class Runner(DbaasMixin):
         prior = json.loads(raw) if raw else {}
         before = {a["attempt"]: a for a in prior.get("attempts") or [] if "attempt" in a}
         attempts = []
+        server_facts: dict = {}
         for a in run.status.attempts:
             entry = {"api_end": None, "machine_start": None, "node_registered": None, "node_ready": None}
             entry |= {"lscpu_stdout": None} | before.get(a.n, {})
@@ -909,10 +911,12 @@ class Runner(DbaasMixin):
                 "end": a.end.isoformat() if a.end else None,
                 "outcome": a.outcome.value if a.outcome else None,
             }
-            if a.n == run.status.attempt and run.status.region:
+            if a.n == run.status.attempt and a.node and run.status.region:
                 entry |= {"region": run.status.region, "zone": run.status.zone, "price": run.status.price_per_hour}
                 if "ondemand_price" not in entry:
-                    entry |= self._ondemand_price(run)
+                    facts, price = self._keeper_cost_data(run)
+                    entry |= price
+                    server_facts = server_facts or facts
             if nd and nd.attempt == a.n:
                 claim = self._get_claim(nd.facts.node_claim) or nd.claim
                 for name, kind in (
@@ -944,32 +948,21 @@ class Runner(DbaasMixin):
             "timing": timing,
             "database": run.spec.database,
         }
-        facts = {k: prior[k] for k in ("family", "cpu_arch", "gpu_count") if k in prior}
-        doc |= facts or (self._server_facts(run) if run.status.region else {})
+        doc |= {k: prior[k] for k in SERVER_FACTS if k in prior} or server_facts
         self.storage.write_run_json(key, doc)
 
-    def _ondemand_price(self, run: BenchmarkRun) -> dict:
-        """The Keeper on-demand price of the run's SKU in its region, as `run.json` attempt fields, at the time the
-        attempt gets its node. Empty when Keeper cannot be asked: the next `run.json` write tries again."""
+    def _keeper_cost_data(self, run: BenchmarkRun) -> tuple[dict, dict]:
+        """`(server facts, ondemand_price fields)` for the attempt that just got its node, from Keeper (cached like
+        the planner's answer). Asked once per attempt: when Keeper cannot be reached the attempt gets a null price
+        with the reason `keeper_unreachable`, and the backfill (`publish --emit-cost-logs`) fills the gap later."""
         try:
-            price = keeper.ondemand_prices(self._cfg().env, run.spec.vendor, run.node_sku).get(run.status.region)
+            facts, prices = self._keeper_cache.server_cost_data(self._cfg().env, run.spec.vendor, run.node_sku)
         except RuntimeError as e:
-            log.warning("run %s: no on-demand price from Keeper (%s)", run.name, e)
-            return {}
-        return (
-            {"ondemand_price": price}
-            if price is not None
-            else {"ondemand_price": None, "ondemand_price_reason": "no_ondemand_offer"}
+            log.warning("run %s: no cost data from Keeper (%s)", run.name, e)
+            return {}, {"ondemand_price": None, "ondemand_price_reason": "keeper_unreachable"}
+        return {k: facts[k] for k in SERVER_FACTS if k in facts} if facts else {}, keeper.ondemand_price_fields(
+            prices, run.status.region
         )
-
-    def _server_facts(self, run: BenchmarkRun) -> dict:
-        """`family`, `cpu_arch` and `gpu_count` of the run's SKU from Keeper; empty when it is not known or cannot be
-        asked (the next `run.json` write tries again)."""
-        try:
-            return keeper.server_facts(self._cfg().env, run.spec.vendor, run.node_sku) or {}
-        except RuntimeError as e:
-            log.warning("run %s: no server facts from Keeper (%s)", run.name, e)
-            return {}
 
     # ----------------------------------------------------------------------- Pending
 

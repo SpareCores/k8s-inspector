@@ -18,7 +18,7 @@ from collections.abc import Callable, Collection
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
-from k8s_inspector import crd, dbaas_client, dbaas_keeper, launch, planner, pods, publisher, tasks
+from k8s_inspector import crd, dbaas_client, dbaas_keeper, keeper, launch, planner, pods, publisher, tasks
 from k8s_inspector.kube import Kube
 from k8s_inspector.model import BenchmarkRun, CapacityMode, Config, DbPhase, ExitCode, RunSpec, TaskDef
 
@@ -229,7 +229,7 @@ def _resolve(
         regions = region_order(reachable, reachable, failed)
     if not regions:
         raise ValueError(f"{vendor}/{database_id} has no standalone price in a region that has a DBaaS network")
-    ids = dbaas_keeper.region_ids(cfg.env, vendor)
+    ids = keeper.region_ids(cfg.env, vendor)
     for candidate in regions:
         for client_at in clients_of(candidate):
             if client_at not in ids:

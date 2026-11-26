@@ -20,6 +20,7 @@ from k8s_inspector import runner as runner_mod
 from k8s_inspector.kube import WatchEvent
 from k8s_inspector.model import (
     AttemptOutcome,
+    AttemptStatus,
     CapacityMode,
     CapacityType,
     Config,
@@ -1356,22 +1357,41 @@ def test_run_json_keeps_the_ondemand_price_of_the_launch_and_the_server_facts(h,
     assert (doc["family"], doc["cpu_arch"], doc["gpu_count"]) == ("F", "arm64", 0)
 
 
-def test_run_json_says_why_there_is_no_ondemand_price(h):
+def test_run_json_says_why_there_is_no_ondemand_price(h, monkeypatch):
+    monkeypatch.setattr(keeper, "ondemand_prices", lambda env, vendor, sku: {"eu-test-1": None})
     h.start(["membench"])
-    h.drive()  # Keeper (stubbed in conftest) has no on-demand offer
+    h.drive()
     attempt = h.storage.run_json["attempts"][0]
     assert attempt["ondemand_price"] is None and attempt["ondemand_price_reason"] == "no_ondemand_offer"
     assert "family" not in h.storage.run_json
 
 
-def test_run_json_has_no_ondemand_price_while_keeper_is_unreachable(h, monkeypatch):
+def test_keeper_outage_costs_one_ask_per_attempt_and_leaves_a_reason(h, monkeypatch):
+    asks = []
+
     def down(env, vendor, sku):
+        asks.append(sku)
         raise RuntimeError("keeper down")
 
-    monkeypatch.setattr(keeper, "ondemand_prices", down)
+    monkeypatch.setattr(keeper, "server_facts", down)
     h.start(["membench"])
     h.drive()
-    assert "ondemand_price" not in h.storage.run_json["attempts"][0]  # the next write asks again
+    h.runner.reconcile(h.name)
+    attempt = h.storage.run_json["attempts"][0]
+    assert attempt["ondemand_price"] is None and attempt["ondemand_price_reason"] == "keeper_unreachable"
+    assert len(asks) == 1  # not again on every run.json write
+
+
+def test_an_attempt_without_a_node_gets_no_region_price_or_ondemand_price(h, monkeypatch):
+    monkeypatch.setattr(keeper, "ondemand_prices", lambda env, vendor, sku: {"eu-test-1": 0.2})
+    h.start(["membench"])
+    h.drive()
+    run = h.run
+    run.status.attempts.append(AttemptStatus(n=2, start=h.clock.now, outcome=AttemptOutcome.CANCELLED))
+    run.status.attempt = 2  # status.region and price still hold attempt 1's node
+    h.runner._write_run_json(run, None)
+    second = h.storage.run_json["attempts"][1]
+    assert not {"region", "zone", "price", "ondemand_price"} & second.keys()
 
 
 def test_spot_node_loss_mid_step_resumes_with_the_remaining_tasks(h):

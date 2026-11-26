@@ -16,8 +16,9 @@ WEEKDAYS = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
 
 @dataclass(frozen=True)
 class Span:
-    """A task execution: the attempt it ran in, when it started and ended, and whether its result was kept
-    (published) or discarded."""
+    """A task that finished (exit code 0 or more): the attempt it ran in, when it started and ended, and whether its
+    result was kept (published) or discarded. A task the controller wrote off (`-1`, `-4`: no real start or end) is
+    no span."""
 
     attempt: int | None
     start: datetime | None
@@ -38,6 +39,8 @@ def spans_from_metas(attempts: list[dict], metas: Iterable[dict]) -> list[Span]:
     `meta.json` has no attempt number: the task belongs to the attempt that was open when it started."""
     spans = []
     for meta in metas:
+        if meta.get("exit_code") is None or meta["exit_code"] < 0:
+            continue
         start, end = parse_time(meta.get("start")), parse_time(meta.get("end"))
         attempt = None
         for a in attempts:
@@ -104,18 +107,24 @@ def run_summary(record: dict) -> dict:
     """The `run_cost` fields of a record whose attempts have their cost fields.
 
     The on-demand counterfactual is what the run would have cost on-demand in the region of its Completed
-    attempt: all kept task time plus one setup, that attempt's. It is null without such an attempt, without that
+    attempt: all kept task time plus one setup, that attempt's. Its price is the Completed attempt's own `price` when
+    that attempt is on-demand, else its `ondemand_price`. It is null without such an attempt, without that
     price, or when the task time of an attempt is unknown. A null `setup_s` counts as 0."""
     attempts = record.get("attempts") or []
     done = next((a for a in attempts if a.get("outcome") == "Completed"), None)
     task = _sum(a.get("task_s") for a in attempts)
     counterfactual = None
-    if done and done.get("ondemand_price") is not None and task is not None:
-        counterfactual = round(done["ondemand_price"] * (task + (done.get("setup_s") or 0.0)) / 3600, 6)
+    price = None
+    if done:
+        own = float(done["price"]) if done.get("price") else None
+        price = own if done.get("capacity_type") == "on-demand" and own is not None else done.get("ondemand_price")
+    if price is not None and task is not None:
+        counterfactual = round(price * (task + (done.get("setup_s") or 0.0)) / 3600, 6)
     paid = round(sum(a["cost_usd"] for a in attempts), 6)
     last = attempts[-1] if attempts else {}
     return {
         "family": record.get("family"),
+        "series": record.get("series"),
         "final_region": last.get("region"),
         "final_capacity_type": last.get("capacity_type"),
         "attempts": len(attempts),
@@ -141,6 +150,7 @@ def log_cost_lines(record: dict, *, backfill: bool = False) -> None:
                 "event": "run_attempt_cost",
                 **who,
                 "family": record.get("family"),
+                "series": record.get("series"),
                 "attempt": a["attempt"],
                 "region": a.get("region"),
                 "zone": a.get("zone"),

@@ -1525,8 +1525,8 @@ def test_emit_cost_logs_logs_past_records_with_current_prices_and_changes_nothin
         {"attempt": 2, "api_start": f"{day}T02:00:10Z", "end": f"{day}T03:00:10+00:00", "outcome": "Completed",
          "capacity_type": "on-demand", "price": "1.0", "region": "nbg1", "ondemand_price": 0.9},
     ]  # fmt: skip
-    meta = {"run_id": run_id, "start": f"{day}T01:10:00", "end": f"{day}T01:30:00"}
-    other = {"run_id": "r-other", "start": f"{day}T01:10:00", "end": f"{day}T01:50:00"}
+    meta = {"run_id": run_id, "start": f"{day}T01:10:00", "end": f"{day}T01:30:00", "exit_code": 0}
+    other = {"run_id": "r-other", "start": f"{day}T01:10:00", "end": f"{day}T01:50:00", "exit_code": 0}
     push_record(origin, tmp_path, run_id, attempts, {
         "data/hcloud/cax31/0/membench/meta.json": json.dumps(meta),
         "data/hcloud/cax31/0/lscpu/meta.json": json.dumps(other),
@@ -1561,3 +1561,13 @@ def test_emit_cost_logs_leaves_unknown_useful_time_null(tmp_path, origin, caplog
     attempt_line, summary = cost_lines(caplog)
     assert attempt_line["useful_s"] is None and attempt_line["wasted_usd"] is None
     assert summary["wasted_usd"] is None and summary["ondemand_counterfactual_usd"] is None
+
+
+def test_tasks_written_off_by_the_controller_are_not_task_spans(cluster):
+    """`-4` (lost with the node) and `-1` (never ran) are committed to `schedule/` with start and end of now."""
+    run = cluster.add_run(["lscpu", "geekbench", "openssl"])
+    now = datetime(2026, 9, 29, 13, 0, tzinfo=UTC)
+    for t, code in zip(run.status.tasks, (0, -4, -1), strict=True):
+        t.attempt, t.start, t.end, t.exit_code, t.published, t.commit = 1, now, now, code, True, "abc"
+    spans = publisher._task_spans(run)
+    assert [(s.attempt, s.kept) for s in spans] == [(1, True)]

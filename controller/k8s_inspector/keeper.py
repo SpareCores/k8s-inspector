@@ -98,34 +98,69 @@ def active_servers_block_reasons(
         raise RuntimeError(f"keeper returned unexpected JSON for {url}") from e
 
 
+def _base(env: EnvConfig) -> str:
+    return (env.keeper_api_base or DEFAULT_API_BASE).rstrip("/")
+
+
+def list_rows(env: EnvConfig, path: str, params: Sequence[tuple[str, str]] = ()) -> list[dict]:
+    """The JSON list a GET returns (empty on 404); `RuntimeError` for everything else."""
+    url = f"{_base(env)}{path}" + (f"?{urllib.parse.urlencode(params)}" if params else "")
+    data = _fetch(url, _read_key(env))
+    if data is None:
+        return []
+    if not isinstance(data, list):
+        raise RuntimeError(f"keeper returned unexpected JSON type for {url}")
+    return data
+
+
+def region_ids(env: EnvConfig, vendor: str) -> dict[str, str]:
+    """`{region api_reference: Keeper region_id}` of the vendor (price rows and server filters use the id)."""
+    rows = list_rows(env, "/regions", [("vendor", vendor)])
+    return {row["api_reference"]: str(row["region_id"]) for row in rows if row.get("vendor_id", vendor) == vendor}
+
+
 def server_facts(env: EnvConfig, vendor: str, sku: str) -> dict | None:
-    """`family`, `cpu_arch` and `gpu_count` of a server, from Keeper's `/v2/server/<vendor>/<sku>` fields `family`,
-    `cpu_architecture` and `accelerator_count`. None when Keeper does not know the SKU; `RuntimeError` when it
-    cannot be reached."""
+    """`family`, `series`, `cpu_arch` and `gpu_count` of a server, from Keeper's `/v2/server/<vendor>/<sku>` fields
+    `family`, `series`, `cpu_architecture` and `accelerator_count`. None when Keeper does not know the SKU;
+    `RuntimeError` when it cannot be reached."""
     path = f"/v2/server/{urllib.parse.quote(vendor, safe='')}/{urllib.parse.quote(sku, safe='')}"
-    data = _get(f"{(env.keeper_api_base or DEFAULT_API_BASE).rstrip('/')}{path}", _read_key(env))
+    data = _get(f"{_base(env)}{path}", _read_key(env))
     if data is None:
         return None
     count = data.get("accelerator_count")
     return {
         "family": data.get("family"),
+        "series": data.get("series"),
         "cpu_arch": data.get("cpu_architecture"),
         "gpu_count": int(count) if count is not None else None,
     }
 
 
-def ondemand_prices(env: EnvConfig, vendor: str, sku: str) -> dict[str, float]:
-    """`{region api_reference: USD per hour}` of the on-demand price of a server, from the ACTIVE price rows of
-    `/server/<vendor>/<sku>/prices` (the cheapest zone of the region). A region without a row is absent; a SKU
-    Keeper does not know has none. `RuntimeError` when Keeper cannot be reached."""
-    from k8s_inspector import dbaas_keeper
-
+def ondemand_prices(env: EnvConfig, vendor: str, sku: str) -> dict[str, float | None] | None:
+    """`{region api_reference: USD per hour}` of the on-demand price of a server in every region Keeper lists for
+    the vendor, from the ACTIVE price rows of `/server/<vendor>/<sku>/prices` (the cheapest zone); None for a
+    region without an on-demand offer. None when Keeper does not know the SKU; `RuntimeError` when it cannot be
+    reached."""
     path = f"/server/{urllib.parse.quote(vendor, safe='')}/{urllib.parse.quote(sku, safe='')}/prices"
-    names = {region_id: name for name, region_id in dbaas_keeper.region_ids(env, vendor).items()}
-    prices: dict[str, float] = {}
-    for row in dbaas_keeper._list(env, path):
+    data = _fetch(f"{_base(env)}{path}", _read_key(env))
+    if data is None:
+        return None
+    if not isinstance(data, list):
+        raise RuntimeError(f"keeper returned unexpected JSON type for {path}")
+    by_id: dict[str, float] = {}
+    for row in data:
         if row.get("status") == "active" and row.get("allocation") == "ondemand" and row.get("price") is not None:
-            region = names.get(str(row["region_id"]))
-            if region:
-                prices[region] = min(float(row["price"]), prices.get(region, float("inf")))
-    return prices
+            region = str(row["region_id"])
+            by_id[region] = min(float(row["price"]), by_id.get(region, float("inf")))
+    return {name: by_id.get(region_id) for name, region_id in region_ids(env, vendor).items()}
+
+
+def ondemand_price_fields(prices: dict[str, float | None] | None, region: str | None) -> dict:
+    """The `ondemand_price` and `ondemand_price_reason` attempt fields for `region`, from `ondemand_prices`."""
+    if prices is None:
+        return {"ondemand_price": None, "ondemand_price_reason": "keeper_unknown_sku"}
+    if region not in prices:
+        return {"ondemand_price": None, "ondemand_price_reason": "region_not_in_keeper"}
+    if prices[region] is None:
+        return {"ondemand_price": None, "ondemand_price_reason": "no_ondemand_offer"}
+    return {"ondemand_price": prices[region]}
