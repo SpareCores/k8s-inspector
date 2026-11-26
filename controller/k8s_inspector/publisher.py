@@ -485,6 +485,8 @@ class Publisher:
         runs = crd.list_runs(self._kube)
         self._records_written &= {run.name for run in runs}
         todo = []
+        prices: dict[tuple[str, str], dict[str, float]] = {}
+        facts: dict[tuple[str, str], dict] = {}
         for run in runs:
             if run.name in self._records_written or not self._record_due(run, settings):
                 continue
@@ -503,6 +505,7 @@ class Publisher:
                 log.error("run %s: no run.json, no run record", run.name)
                 self._records_written.add(run.name)
                 continue
+            self._fill_from_keeper(run_json, prices, facts)  # a run launched by an older controller lacks them
             todo.append((run, cost.add_costs(run_json, _task_spans(run))))
         if not todo:
             return
@@ -599,7 +602,7 @@ class Publisher:
     def _fill_from_keeper(self, record: dict, prices: dict, facts: dict) -> None:
         """Keeper's current `family`, `series`, `cpu_arch`, `gpu_count` and `ondemand_price` for what the record
         lacks, or has only as a null from a Keeper that could not be asked at launch. What Keeper cannot tell stays
-        missing (logged as null)."""
+        missing (logged as null); an attempt that got a node always ends with a price or a reason."""
         sku = (record["vendor"], record["sku"])
         try:
             if "family" not in record:
@@ -617,6 +620,9 @@ class Publisher:
                 a["ondemand_price_source"] = "current"
         except RuntimeError as e:
             log.warning("cost logs: no Keeper data for %s/%s (%s)", *sku, e)
+            for a in record["attempts"]:
+                if a.get("region") and "ondemand_price" not in a:
+                    a |= {"ondemand_price": None, "ondemand_price_reason": "keeper_unreachable"}
 
     def _spans_from_tree(self, record: dict) -> list[cost.Span] | None:
         """The task executions of a server run from the `meta.json` files filed under its run id in its variant

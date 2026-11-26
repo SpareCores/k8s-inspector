@@ -1513,6 +1513,26 @@ def push_record(origin, tmp_path, run_id, attempts, files=None):
     git(seed, "push", "origin", "HEAD:main")
 
 
+def test_a_record_of_a_run_without_price_data_gets_keeper_current_price_or_a_reason(
+    tmp_path, origin, storage, cluster, caplog, monkeypatch
+):
+    """A run launched by a controller that did not capture the on-demand price at launch."""
+    cluster.add_run(NAMES)
+    doc = json.loads(storage.objects[okey(KEY, "run.json")])
+    doc["attempts"][0] |= {
+        "attempt": 1, "api_start": "2026-09-29T12:57:00Z", "end": "2026-09-29T13:57:00+00:00",
+        "outcome": "Completed", "capacity_type": "spot", "price": "0.5", "region": "fsn1",
+    }  # fmt: skip
+    storage.objects[okey(KEY, "run.json")] = json.dumps(doc).encode()
+    monkeypatch.setattr(keeper, "ondemand_prices", lambda env, vendor, sku: {"fsn1": 0.8})
+    pub = make_publisher(tmp_path, origin, storage)
+    with caplog.at_level("INFO", logger="k8s_inspector.cost"):
+        pub.publish_once(ENABLED)
+    attempt = run_record(origin, tmp_path)["attempts"][0]
+    assert (attempt["ondemand_price"], attempt["ondemand_price_source"]) == (0.8, "current")
+    assert cost_lines(caplog)[0]["ondemand_price"] == 0.8
+
+
 def test_emit_cost_logs_logs_past_records_with_current_prices_and_changes_nothing(
     tmp_path, origin, caplog, monkeypatch
 ):

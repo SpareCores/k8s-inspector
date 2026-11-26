@@ -55,12 +55,19 @@ def _seconds(start: datetime | None, end: datetime | None) -> float | None:
     return round((end - start).total_seconds(), 3) if start and end else None
 
 
+def has_node(attempt: dict) -> bool:
+    """Whether the attempt got a node: only then it has a `region` (and `price`)."""
+    return bool(attempt.get("region"))
+
+
 def attempt_costs(attempt: dict, spans: list[Span] | None) -> dict:
     """`duration_s`, `useful_s`, `setup_s`, `task_s`, `cost_usd` and `wasted_usd` of one attempt of a run record.
 
     `spans` are the run's task executions; None when they are not known (a past run without result files):
     `useful_s`, `setup_s` and `wasted_usd` are then null, except for a Completed attempt, which is useful as a
-    whole. A `useful_s` the attempt already has is kept. An attempt without a price or an end costs 0."""
+    whole, and an attempt that ran no task (no node, or `ProvisioningFailed`/`LaunchFailed`): useful 0, so it wasted
+    what it cost. A `useful_s` the attempt already has is kept. An attempt without a node, a price or an end costs
+    0 and wastes 0."""
     start = parse_time(attempt.get("api_start"))
     duration = _seconds(start, parse_time(attempt.get("end")))
     price = float(attempt["price"]) if attempt.get("price") else None
@@ -69,15 +76,19 @@ def attempt_costs(attempt: dict, spans: list[Span] | None) -> dict:
         useful = attempt["useful_s"]
     elif attempt.get("outcome") == "Completed":
         useful = duration or 0.0
+    elif not has_node(attempt) or attempt.get("outcome") in ("ProvisioningFailed", "LaunchFailed"):
+        useful = 0.0
     elif spans is None:
         useful = None
     else:
         useful = max([_seconds(start, s.end) or 0.0 for s in mine if s.kept] + [0.0])
     starts = [s.start for s in mine if s.start]
     setup = attempt["setup_s"] if "setup_s" in attempt else _seconds(start, min(starts)) if starts else None
-    cost = round(duration / 3600 * price, 6) if duration is not None and price is not None else 0.0
+    cost = (
+        round(duration / 3600 * price, 6) if duration is not None and price is not None and has_node(attempt) else 0.0
+    )
     task = None if useful is None else round(max(useful - (setup or 0.0), 0.0), 3)
-    if attempt.get("outcome") == "Completed":
+    if attempt.get("outcome") == "Completed" or not has_node(attempt):
         wasted = 0.0
     else:
         wasted = None if task is None else round(cost - task / 3600 * (price or 0.0), 6)
@@ -106,20 +117,22 @@ def _sum(values: Iterable[float | None]) -> float | None:
 def run_summary(record: dict) -> dict:
     """The `run_cost` fields of a record whose attempts have their cost fields.
 
-    The on-demand counterfactual is what the run would have cost on-demand in the region of its Completed
-    attempt: all kept task time plus one setup, that attempt's. Its price is the Completed attempt's own `price` when
-    that attempt is on-demand, else its `ondemand_price`. It is null without such an attempt, without that
+    The on-demand counterfactual is what the run would have cost on-demand in the region of its reference attempt:
+    all kept task time plus one setup, that attempt's. The reference attempt is the Completed one, else the last
+    attempt that got a node (a run that ended otherwise still published the results it kept). Its price is its own
+    `price` when it is on-demand, else its `ondemand_price`. It is null without a reference attempt, without that
     price, or when the task time of an attempt is unknown. A null `setup_s` counts as 0."""
     attempts = record.get("attempts") or []
     done = next((a for a in attempts if a.get("outcome") == "Completed"), None)
+    ref = done or next((a for a in reversed(attempts) if has_node(a)), None)
     task = _sum(a.get("task_s") for a in attempts)
     counterfactual = None
     price = None
-    if done:
-        own = float(done["price"]) if done.get("price") else None
-        price = own if done.get("capacity_type") == "on-demand" and own is not None else done.get("ondemand_price")
+    if ref:
+        own = float(ref["price"]) if ref.get("price") else None
+        price = own if ref.get("capacity_type") == "on-demand" and own is not None else ref.get("ondemand_price")
     if price is not None and task is not None:
-        counterfactual = round(price * (task + (done.get("setup_s") or 0.0)) / 3600, 6)
+        counterfactual = round(price * (task + (ref.get("setup_s") or 0.0)) / 3600, 6)
     paid = round(sum(a["cost_usd"] for a in attempts), 6)
     last = attempts[-1] if attempts else {}
     return {
@@ -129,7 +142,7 @@ def run_summary(record: dict) -> dict:
         "final_capacity_type": last.get("capacity_type"),
         "attempts": len(attempts),
         "spot_interruptions": sum(1 for a in attempts if a.get("outcome") == "SpotInterrupted"),
-        "used_spot": any(a.get("capacity_type") == "spot" for a in attempts),
+        "used_spot": any(a.get("capacity_type") == "spot" and a.get("price") for a in attempts),
         "paid_usd": paid,
         "wasted_usd": _sum(a.get("wasted_usd") for a in attempts),
         "ondemand_counterfactual_usd": counterfactual,

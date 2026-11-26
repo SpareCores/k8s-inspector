@@ -129,12 +129,45 @@ def test_counterfactual_is_null_without_the_ondemand_price():
     assert summary["ondemand_counterfactual_usd"] == pytest.approx(1.0 * (60 + 1560 + 6108 + 120) / 3600, abs=1e-5)
 
 
-def test_counterfactual_is_null_without_a_completed_attempt():
+def test_counterfactual_without_a_completed_attempt_prices_the_kept_work_of_the_last_node_attempt():
     record = c6a()
-    record["attempts"] = record["attempts"][:2]
+    record["attempts"] = record["attempts"][:2]  # both spot, interrupted; the kept results were published
+    summary = cost.run_summary(cost.add_costs(record, SPANS))
+    expected = 1.0 * (60 + 1560 + 120) / 3600  # attempt 2's list price x (kept task time + attempt 2's setup)
+    assert summary["ondemand_counterfactual_usd"] == pytest.approx(expected, abs=1e-5)
+    assert summary["spot_net_usd"] == pytest.approx(summary["paid_usd"] - expected, abs=1e-5)
+    assert summary["spot_interruptions"] == 2 and summary["used_spot"] is True
+    record["attempts"][1]["ondemand_price"] = None  # no price: null
     summary = cost.run_summary(cost.add_costs(record, SPANS))
     assert summary["ondemand_counterfactual_usd"] is None and summary["spot_net_usd"] is None
-    assert summary["spot_interruptions"] == 2 and summary["used_spot"] is True
+
+
+def test_counterfactual_is_null_without_a_node_attempt():
+    record = {"attempts": [{"attempt": 1, "api_start": "2026-11-26T08:00:00Z", "outcome": "ProvisioningFailed"}]}
+    summary = cost.run_summary(cost.add_costs(record, []))
+    assert summary["ondemand_counterfactual_usd"] is None and summary["spot_net_usd"] is None
+
+
+def test_used_spot_needs_a_spot_attempt_that_got_a_node():
+    never = {"attempt": 1, "api_start": "2026-11-26T08:00:00Z", "end": "2026-11-26T08:05:00+00:00",
+             "outcome": "LaunchFailed", "capacity_type": "spot"}  # fmt: skip
+    record = {"attempts": [never, attempt(2, "2026-11-26T08:05:00Z", "2026-11-26T09:00:00+00:00", "Completed",
+                                          "on-demand", "1.0", "r1", 1.0, useful_s=3300.0, setup_s=0.0)]}  # fmt: skip
+    assert cost.run_summary(cost.add_costs(record, []))["used_spot"] is False
+    record["attempts"][1] |= {"capacity_type": "spot"}
+    assert cost.run_summary(cost.add_costs(record, []))["used_spot"] is True
+
+
+@pytest.mark.parametrize("spans", [None, []])  # results replaced (backfill) or known: the same answer
+def test_failed_launches_and_attempts_without_a_node_waste_what_they_cost(spans):
+    failed = {"attempt": 1, "api_start": "2026-11-26T08:00:00Z", "end": "2026-11-26T08:10:00+00:00",
+              "outcome": "ProvisioningFailed", "capacity_type": "spot"}  # fmt: skip
+    launch_failed = attempt(2, "2026-11-26T08:10:00Z", "2026-11-26T08:40:00+00:00", "LaunchFailed", "spot", "2.0", "r1")
+    a1, a2 = cost.add_costs({"attempts": [failed, launch_failed]}, spans)["attempts"]
+    assert (a1["cost_usd"], a1["useful_s"], a1["task_s"], a1["wasted_usd"]) == (0.0, 0.0, 0.0, 0.0)
+    assert (a2["useful_s"], a2["wasted_usd"]) == (0.0, a2["cost_usd"]) and a2["cost_usd"] == pytest.approx(1.0)
+    summary = cost.run_summary({"attempts": [a1, a2]})
+    assert summary["wasted_usd"] == pytest.approx(1.0)
 
 
 def test_unknown_task_times_leave_useful_time_and_waste_null():
@@ -234,11 +267,11 @@ def test_the_real_c6a_run():
     assert (a1["task_s"], a2["task_s"], a3["task_s"]) == (20.571, 1523.258, 6113.704)
     assert (a1["wasted_usd"], a2["wasted_usd"], a3["wasted_usd"]) == (0.094959, 0.03424, 0.0)
     summary = cost.run_summary(record)
-    assert summary["paid_usd"] == pytest.approx(2.1646, abs=1e-4)
+    assert summary["paid_usd"] == pytest.approx(2.164638, abs=1e-6)
     assert summary["wasted_usd"] == pytest.approx(0.1292, abs=1e-4)
     # the on-demand attempt 3 counts with its own price 1.143, not Keeper's list price 1.122
-    assert summary["ondemand_counterfactual_usd"] == pytest.approx(2.4674, abs=1e-4)
-    assert summary["spot_net_usd"] == pytest.approx(-0.3028, abs=1e-4)
+    assert summary["ondemand_counterfactual_usd"] == pytest.approx(2.467421, abs=1e-6)
+    assert summary["spot_net_usd"] == pytest.approx(-0.302783, abs=1e-6)
 
 
 def test_an_attempt_without_a_node_costs_nothing_and_does_not_set_the_final_region():
