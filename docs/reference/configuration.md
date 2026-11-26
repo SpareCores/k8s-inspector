@@ -301,7 +301,7 @@ size or total bound. The cap on started and running instances of a vendor is `ve
 acquiring a node (Pending, Provisioning, Running, Releasing, and a Failed or Cancelled run until its anchor Pod is
 deleted) and the live NodeClaims of the vendor in the bench NodePool (NodeClaims carry the vendor in `spec.requirements` from creation and as the label `scarpenter.sparecores.com/vendor` after launch; anchors select the SKU by `scarpenter.sparecores.com/api-reference`, so SKUs whose names are not valid label values are refused; an instance can outlive its anchor). This is a
 lower bound ("at least" that many instances); leftover NodeClaims without a holding run count as instances but do
-not add to the spend. It applies to forced runs; [autoPlan](#autoplan) uses the same check before every run it creates.
+not add to the spend. It applies to runs started without `--force` ([forced runs](../how-to/run-forced.md) skip it but count toward it); [autoPlan](#autoplan) uses the same check before every run it creates.
 
 `maxUsdPerHour`, when set, is checked before a run starts against the node prices of the holding runs. A run in
 Pending or Provisioning has no node and no price yet, so while one exists a new run is refused ("wait until ... has

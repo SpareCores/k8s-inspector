@@ -189,7 +189,7 @@ not count against `maxInFlight` and `maxUsdPerHour`, and a server run does not c
   vendor's DBaaS runs in flight. The price of a run is recorded in its `spec.database.usdPerHour` when it is created: the
   database's standalone price in the chosen region from Keeper's price data, plus the `min_price_ondemand` of the dearest Keeper server in the client region that matches the same labels
   (the most the cluster may launch). A new run is refused when the running ones plus its own price would pass the cap, so the
-  planner tries the next database; a forced run is refused with the reason. With a cap set, a price that Keeper does not
+  planner tries the next database; a run started by hand is refused with the reason, unless it is forced (`--force` skips the limits). With a cap set, a price that Keeper does not
   know (a client it does not list) is refused too.
 
 The planner creates at most one new DBaaS run per vendor and cycle. The checks are not atomic: a forced run and an
