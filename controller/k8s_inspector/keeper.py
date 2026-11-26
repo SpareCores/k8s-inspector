@@ -120,19 +120,23 @@ def region_ids(env: EnvConfig, vendor: str) -> dict[str, str]:
 
 
 def server_facts(env: EnvConfig, vendor: str, sku: str) -> dict | None:
-    """`family`, `series`, `cpu_arch` and `gpu_count` of a server, from Keeper's `/v2/server/<vendor>/<sku>` fields
-    `family`, `series`, `cpu_architecture` and `accelerator_count`. None when Keeper does not know the SKU;
+    """`family`, `series`, `cpu_arch`, `gpu_count`, `vcpus` and `memory_gib` of a server, from Keeper's
+    `/v2/server/<vendor>/<sku>` fields `family`, `series`, `cpu_architecture`, `accelerator_count`, `vcpus` and
+    `memory_amount` (MiB, converted to GiB). A field Keeper lacks is None. None when Keeper does not know the SKU;
     `RuntimeError` when it cannot be reached."""
     path = f"/v2/server/{urllib.parse.quote(vendor, safe='')}/{urllib.parse.quote(sku, safe='')}"
     data = _get(f"{_base(env)}{path}", _read_key(env))
     if data is None:
         return None
     count = data.get("accelerator_count")
+    memory_mib = data.get("memory_amount")
     return {
         "family": data.get("family"),
         "series": data.get("series"),
         "cpu_arch": data.get("cpu_architecture"),
         "gpu_count": int(count) if count is not None else None,
+        "vcpus": data.get("vcpus"),
+        "memory_gib": memory_mib / 1024 if memory_mib is not None else None,
     }
 
 

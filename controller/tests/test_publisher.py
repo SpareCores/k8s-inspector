@@ -1490,7 +1490,11 @@ def test_cost_lines_are_logged_once_when_the_record_is_written(tmp_path, origin,
         pub.publish_once(ENABLED)
         pub.publish_once(ENABLED)
     lines = cost_lines(caplog)
-    assert [line["event"] for line in lines] == ["run_attempt_cost", "run_cost"]
+    events = [line["event"] for line in lines]
+    assert events == ["run_attempt_cost"] + ["task_cost"] * len(NAMES) + ["run_cost"]  # once, not twice
+    task = next(line for line in lines if line["event"] == "task_cost")
+    assert (task["task"], task["duration_s"], task["cost_usd"]) == (NAMES[0], 60.0, round(0.5 / 60, 6))
+    lines = [lines[0], lines[-1]]
     setup = lines[0]["setup_s"]  # the first task start of the attempt, from the status tasks
     assert setup is not None and lines[1]["paid_usd"] == 0.5
     assert lines[1]["ondemand_counterfactual_usd"] == pytest.approx(1.0, abs=1e-5)  # one setup plus the task time
@@ -1571,27 +1575,47 @@ def test_emit_cost_logs_logs_past_records_with_current_prices_and_changes_nothin
          "capacity_type": "on-demand", "price": "1.0", "region": "nbg1", "ondemand_price": 0.9},
     ]  # fmt: skip
     meta = {"run_id": run_id, "start": f"{day}T01:10:00", "end": f"{day}T01:30:00", "exit_code": 0}
+    failed = {"run_id": run_id, "start": f"{day}T02:10:00", "end": f"{day}T02:20:00", "exit_code": 1}
     other = {"run_id": "r-other", "start": f"{day}T01:10:00", "end": f"{day}T01:50:00", "exit_code": 0}
     push_record(origin, tmp_path, run_id, attempts, {
         "data/hcloud/cax31/0/membench/meta.json": json.dumps(meta),
+        "data/hcloud/cax31/0/geekbench/meta.json": json.dumps(failed),
         "data/hcloud/cax31/0/lscpu/meta.json": json.dumps(other),
     })  # fmt: skip
     push_record(origin, tmp_path, "r20200101t0000-old", attempts)  # older than --since
     monkeypatch.setattr(keeper, "ondemand_prices", lambda env, vendor, sku: {"fsn1": 0.8, "nbg1": 0.7})
     monkeypatch.setattr(
-        keeper, "server_facts", lambda env, vendor, sku: {"family": "F", "cpu_arch": "arm64", "gpu_count": 0}
+        keeper,
+        "server_facts",
+        lambda env, vendor, sku: {"family": "F", "cpu_arch": "arm64", "gpu_count": 0, "vcpus": 8, "memory_gib": 16.0},
     )
     pub = make_publisher(tmp_path, origin, FakeStorage())
     head = git(clone(origin, tmp_path), "rev-parse", "HEAD")
     with caplog.at_level("INFO", logger="k8s_inspector.cost"):
         assert pub.emit_cost_logs(30) == 1
-    first, second, summary = cost_lines(caplog)
+    first, second, task_a, task_b, summary = cost_lines(caplog)
+    assert (first["vcpus"], first["memory_gib"]) == (8, 16.0)
+    assert [(x["event"], x["task"], x["attempt"], x["result"], x["backfill"]) for x in (task_a, task_b)] == [
+        ("task_cost", "geekbench", 2, "failed", True), ("task_cost", "membench", 1, "ok", True),
+    ]  # fmt: skip
+    assert (task_b["duration_s"], task_b["price"], task_b["cost_usd"]) == (1200.0, 0.5, round(1200 / 3600 * 0.5, 6))
     assert first["backfill"] is True and first["family"] == "F"
     assert (first["ondemand_price"], first["ondemand_price_source"]) == (0.8, "current")
     assert (first["useful_s"], first["setup_s"]) == (1800.0, 600.0)  # the one result file of its run id
     assert (second["ondemand_price"], second["ondemand_price_source"]) == (0.9, "launch")  # stored: kept
     assert summary["event"] == "run_cost" and summary["backfill"] is True and summary["used_spot"] is True
     assert git(clone(origin, tmp_path), "rev-parse", "HEAD") == head
+
+
+def test_a_record_with_family_but_no_vcpus_gets_only_the_missing_facts(tmp_path, origin, monkeypatch):
+    monkeypatch.setattr(
+        keeper,
+        "server_facts",
+        lambda env, vendor, sku: {"family": "new", "series": "s", "vcpus": 8, "memory_gib": 16.0},
+    )
+    record = {"vendor": "hcloud", "sku": "cax31", "family": "launch", "attempts": []}
+    make_publisher(tmp_path, origin, FakeStorage())._fill_from_keeper(record, {}, {}, set())
+    assert (record["family"], record["series"], record["vcpus"], record["memory_gib"]) == ("launch", "s", 8, 16.0)
 
 
 def test_emit_cost_logs_leaves_unknown_useful_time_null(tmp_path, origin, caplog):
@@ -1608,11 +1632,12 @@ def test_emit_cost_logs_leaves_unknown_useful_time_null(tmp_path, origin, caplog
     assert summary["wasted_usd"] is None and summary["ondemand_counterfactual_usd"] is None
 
 
-def test_tasks_written_off_by_the_controller_are_not_task_spans(cluster):
+def test_tasks_written_off_by_the_controller_are_not_finished_spans(cluster):
     """`-4` (lost with the node) and `-1` (never ran) are committed to `schedule/` with start and end of now."""
     run = cluster.add_run(["lscpu", "geekbench", "openssl"])
     now = datetime(2026, 9, 29, 13, 0, tzinfo=UTC)
     for t, code in zip(run.status.tasks, (0, -4, -1), strict=True):
         t.attempt, t.start, t.end, t.exit_code, t.published, t.commit = 1, now, now, code, True, "abc"
     spans = publisher._task_spans(run)
-    assert [(s.attempt, s.kept) for s in spans] == [(1, True)]
+    assert [(s.attempt, s.kept) for s in spans if s.finished] == [(1, True)]
+    assert [(s.task, s.exit_code) for s in spans] == [("lscpu", 0), ("geekbench", -4), ("openssl", -1)]

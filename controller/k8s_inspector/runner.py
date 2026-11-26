@@ -113,7 +113,7 @@ MAX_FAILING = timedelta(minutes=30)  # reconciles of a run failing for this long
 SKU_NOT_SELECTABLE = "SKU name is not a valid label value; SCarpenter cannot select it by api-reference"
 ACTIVE = (RunPhase.PENDING, RunPhase.PROVISIONING, RunPhase.RUNNING, RunPhase.RELEASING)
 NO_NODE_YET = (RunPhase.PENDING, RunPhase.PROVISIONING)  # a DBaaS run in these phases has created nothing that bills
-SERVER_FACTS = ("family", "series", "cpu_arch", "gpu_count")  # Keeper's, in `run.json`
+SERVER_FACTS = ("family", "series", "cpu_arch", "gpu_count", "vcpus", "memory_gib")  # Keeper's, in `run.json`
 MAX_PROVISION_RETRIES = 3  # attempts lost before a node was usable (stale node, anchor deleted)
 EXTRA_ATTEMPTS = 2  # attempts beyond `max_spot_attempts` (the on-demand one plus one spare)
 NOT_ELIGIBLE = "SKU is no longer eligible in Keeper"

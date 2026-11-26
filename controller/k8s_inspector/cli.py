@@ -440,7 +440,7 @@ def cmd_publish(args: argparse.Namespace) -> int:
     kube, provider = _connect()
     cfg = provider()
     storage = Storage(cfg.env, cfg.settings.uploads)
-    with tempfile.TemporaryDirectory(prefix="k8si-publish-") as workdir:
+    with tempfile.TemporaryDirectory(prefix="k8si-publish-", dir=Path.home()) as workdir:  # /work: /tmp is small
         publisher = Publisher(kube, storage, cfg.env, Path(workdir), settings_provider=lambda: cfg.settings)
         try:
             if args.emit_cost_logs:

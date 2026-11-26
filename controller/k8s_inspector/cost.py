@@ -16,14 +16,21 @@ WEEKDAYS = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
 
 @dataclass(frozen=True)
 class Span:
-    """A task that finished (exit code 0 or more): the attempt it ran in, when it started and ended, and whether its
-    result was kept (published) or discarded. A task the controller wrote off (`-1`, `-4`: no real start or end) is
-    no span."""
+    """A task execution: the attempt it ran in, when it started and ended, and whether its result was kept (published)
+    or discarded. A task the controller wrote off (`-1`, `-4`: start and end of the moment it was written off) has a
+    span too; only `finished` ones (exit code 0 or more) count for `attempt_costs`."""
 
     attempt: int | None
     start: datetime | None
     end: datetime | None
     kept: bool
+    task: str = ""
+    exit_code: int = 0
+    error_msg: str | None = None
+
+    @property
+    def finished(self) -> bool:
+        return self.exit_code >= 0
 
 
 def parse_time(text: str | datetime | None) -> datetime | None:
@@ -35,11 +42,12 @@ def parse_time(text: str | datetime | None) -> datetime | None:
 
 
 def spans_from_metas(attempts: list[dict], metas: Iterable[dict]) -> list[Span]:
-    """The kept tasks of a past run, from the `start`/`end` of the `meta.json` files filed under its run id. A
-    `meta.json` has no attempt number: the task belongs to the attempt that was open when it started."""
+    """The tasks of a past run, from the `start`/`end` of the `meta.json` files filed under its run id (the caller adds
+    the `task` name). A `meta.json` has no attempt number: the task belongs to the attempt that was open when it
+    started."""
     spans = []
     for meta in metas:
-        if meta.get("exit_code") is None or meta["exit_code"] < 0:
+        if meta.get("exit_code") is None:
             continue
         start, end = parse_time(meta.get("start")), parse_time(meta.get("end"))
         attempt = None
@@ -47,7 +55,7 @@ def spans_from_metas(attempts: list[dict], metas: Iterable[dict]) -> list[Span]:
             opened, closed = parse_time(a.get("api_start")), parse_time(a.get("end"))
             if start and opened and opened <= start and (closed is None or start <= closed):
                 attempt = a["attempt"]
-        spans.append(Span(attempt, start, end, kept=True))
+        spans.append(Span(attempt, start, end, True, meta.get("task", ""), meta["exit_code"], meta.get("error_msg")))
     return spans
 
 
@@ -71,7 +79,7 @@ def attempt_costs(attempt: dict, spans: list[Span] | None) -> dict:
     start = parse_time(attempt.get("api_start"))
     duration = _seconds(start, parse_time(attempt.get("end")))
     price = float(attempt["price"]) if attempt.get("price") else None
-    mine = [s for s in spans or [] if s.attempt == attempt["attempt"]]
+    mine = [s for s in spans or [] if s.attempt == attempt["attempt"] and s.finished]
     if "useful_s" in attempt:
         useful = attempt["useful_s"]
     elif attempt.get("outcome") == "Completed":
@@ -151,10 +159,53 @@ def run_summary(record: dict) -> dict:
     }
 
 
-def log_cost_lines(record: dict, *, backfill: bool = False) -> None:
-    """One `run_attempt_cost` line per attempt and one `run_cost` line for the run (info, JSON logger). The
-    record's attempts must carry the cost fields (`add_costs`). An attempt without `ondemand_price_source` has
-    the price of its launch."""
+def task_result(exit_code: int) -> str:
+    """`ok` (0), `unfinished` (`-4`: the task never finished, `error_msg` says why: node lost, deadline, cancel, ...)
+    or `failed` (the task's own code, `256`, `-6`, ...) (exit-codes.md)."""
+    return "ok" if exit_code == 0 else "unfinished" if exit_code == -4 else "failed"
+
+
+def log_task_cost_lines(record: dict, spans: list[Span], *, backfill: bool = False) -> None:
+    """One `task_cost` line per task execution that ran on a node: it has an end after its start and its attempt got
+    a node and a price. A task that never started (written off with start and end of the same moment) has none."""
+    attempts = {a["attempt"]: a for a in record.get("attempts") or []}
+    for s in spans:
+        a = attempts.get(s.attempt)
+        if not (a and has_node(a) and a.get("price") and s.start and s.end and s.end > s.start):
+            continue
+        price = float(a["price"])
+        duration = _seconds(s.start, s.end)
+        log.info(
+            "task cost",
+            extra={
+                "event": "task_cost",
+                "run": record["run_id"],
+                "attempt": s.attempt,
+                "task": s.task,
+                "vendor": record["vendor"],
+                "sku": record["sku"],
+                "family": record.get("family"),
+                "series": record.get("series"),
+                "region": a["region"],
+                "zone": a.get("zone"),
+                "capacity_type": a.get("capacity_type"),
+                "start": s.start.isoformat(),
+                "end": s.end.isoformat(),
+                "duration_s": duration,
+                "price": price,
+                "cost_usd": round(duration / 3600 * price, 6),
+                "exit_code": s.exit_code,
+                "result": task_result(s.exit_code),
+                "error_msg": s.error_msg,
+                "backfill": backfill,
+            },
+        )
+
+
+def log_cost_lines(record: dict, spans: list[Span] | None = None, *, backfill: bool = False) -> None:
+    """One `run_attempt_cost` line per attempt, one `task_cost` line per task (`log_task_cost_lines`) and one
+    `run_cost` line for the run (info, JSON logger). The record's attempts must carry the cost fields
+    (`add_costs`). An attempt without `ondemand_price_source` has the price of its launch."""
     who = {"run": record["run_id"], "vendor": record["vendor"], "sku": record["sku"]}
     for a in record.get("attempts") or []:
         start = parse_time(a.get("api_start"))
@@ -165,7 +216,11 @@ def log_cost_lines(record: dict, *, backfill: bool = False) -> None:
                 **who,
                 "family": record.get("family"),
                 "series": record.get("series"),
+                "vcpus": record.get("vcpus"),
+                "memory_gib": record.get("memory_gib"),
                 "attempt": a["attempt"],
+                "node": a.get("node"),
+                "nodeclaim": a.get("node_claim"),
                 "region": a.get("region"),
                 "zone": a.get("zone"),
                 "capacity_type": a.get("capacity_type"),
@@ -186,4 +241,5 @@ def log_cost_lines(record: dict, *, backfill: bool = False) -> None:
                 "backfill": backfill,
             },
         )
+    log_task_cost_lines(record, spans or [], backfill=backfill)
     log.info("run cost", extra={"event": "run_cost", **who, **run_summary(record), "backfill": backfill})

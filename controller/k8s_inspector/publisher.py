@@ -485,6 +485,7 @@ class Publisher:
         runs = crd.list_runs(self._kube)
         self._records_written &= {run.name for run in runs}
         todo = []
+        spans: dict[str, list[cost.Span]] = {}
         prices: dict[tuple[str, str], dict[str, float]] = {}
         facts: dict[tuple[str, str], dict] = {}
         down: set[str] = set()
@@ -507,7 +508,8 @@ class Publisher:
                 self._records_written.add(run.name)
                 continue
             self._fill_from_keeper(run_json, prices, facts, down)  # a run launched by an older controller lacks them
-            todo.append((run, cost.add_costs(run_json, _task_spans(run))))
+            spans[run.name] = _task_spans(run)
+            todo.append((run, cost.add_costs(run_json, spans[run.name])))
         if not todo:
             return
 
@@ -534,7 +536,7 @@ class Publisher:
         self._records_written |= done
         costed = {run.name: run_json for run, run_json in todo}
         for run in written:  # once per record: a record already in git is not logged again
-            cost.log_cost_lines(costed[run.name])
+            cost.log_cost_lines(costed[run.name], spans[run.name])
 
     def backfill_run_records(self, since_days: int, settings: Settings | None = None) -> int:
         """`publish --backfill-runs --since 120d`: write the records of the runs of the last `since_days` days from
@@ -569,7 +571,7 @@ class Publisher:
         the run records in git whose run is at most `since_days` days old. Changes nothing in git. An attempt
         without a stored `ondemand_price` gets Keeper's current one (`ondemand_price_source: current`); one
         without stored cost fields gets `useful_s` and `setup_s` from the `meta.json` files of its run in the tree, null
-        when there are none. Returns the number of runs logged."""
+        when there are none. The `task_cost` lines come from those files too. Returns the number of runs logged."""
         with self._lock:
             record_files = ["/data/*/*/runs/*.json", "/dbaas/*/*/runs/*.json"]
             self._sync(record_files, cone=False)
@@ -588,33 +590,33 @@ class Publisher:
                     log.warning("cost logs: skipping %s (%r)", path.name, e)
                     continue
                 records.append(record)
-            needs_meta = [r for r in records if not r.get("database") and _lacks_costs(r)]
+            needs_meta = [r for r in records if not r.get("database")]
             if needs_meta:
-                skus = sorted({f"/{_record_dir(r)}/*/*/meta.json" for r in needs_meta})
-                self._sync(record_files + skus, cone=False)
+                metas = sorted({f"/{_record_dir(r)}/{_variant_glob(r)}/*/meta.json" for r in needs_meta})
+                self._sync(record_files + metas, cone=False)
             prices: dict[tuple[str, str], dict[str, float]] = {}
             facts: dict[tuple[str, str], dict] = {}
             down: set[str] = set()
             for record in records:
                 self._fill_from_keeper(record, prices, facts, down)
-                spans = self._spans_from_tree(record) if _lacks_costs(record) else []
-                cost.log_cost_lines(cost.add_costs(record, spans), backfill=True)
+                spans = self._spans_from_tree(record)
+                cost.log_cost_lines(cost.add_costs(record, spans), spans, backfill=True)
             return len(records)
 
     def _fill_from_keeper(self, record: dict, prices: dict, facts: dict, down: set) -> None:
-        """Keeper's current `family`, `series`, `cpu_arch`, `gpu_count` and `ondemand_price` for what the record
-        lacks, or has only as a null from a Keeper that could not be asked at launch. What Keeper cannot tell stays
-        missing (logged as null); an attempt that got a node always ends with a price or a reason. After the first
-        `RuntimeError` Keeper is not asked again (`down` is shared by the records of one pass): the attempts keep the
-        reason `keeper_unreachable` and are filled by a later pass."""
+        """Keeper's current `family`, `series`, `cpu_arch`, `gpu_count`, `vcpus`, `memory_gib` and `ondemand_price` for
+        what the record lacks, or has only as a null from a Keeper that could not be asked at launch. What Keeper
+        cannot tell stays missing (logged as null); an attempt that got a node always ends with a price or a reason.
+        After the first `RuntimeError` Keeper is not asked again (`down` is shared by the records of one pass): the
+        attempts keep the reason `keeper_unreachable` and are filled by a later pass."""
         sku = (record["vendor"], record["sku"])
         try:
             if down:
                 raise RuntimeError("Keeper was unreachable earlier in this pass")
-            if "family" not in record:
+            if "vcpus" not in record:
                 if sku not in facts:
                     facts[sku] = keeper.server_facts(self._env, *sku) or {}
-                record.update(facts[sku])
+                record |= {k: v for k, v in facts[sku].items() if k not in record}
             for a in record["attempts"]:
                 gap = a.get("ondemand_price_reason") in ("keeper_unreachable", "keeper_unknown_sku")
                 if ("ondemand_price" in a and not gap) or not a.get("region"):
@@ -639,7 +641,7 @@ class Publisher:
             return None
         sku_dir = self._repo / _record_dir(record)
         metas = []
-        for path in sku_dir.glob("[0-9]*/*/meta.json"):
+        for path in sorted(sku_dir.glob("[0-9]*/*/meta.json")):
             if not path.parts[-3].isdigit():
                 continue
             try:
@@ -647,7 +649,7 @@ class Publisher:
             except ValueError:
                 continue
             if meta.get("run_id") == record["run_id"]:
-                metas.append(meta)
+                metas.append(meta | {"task": path.parts[-2]})
         return cost.spans_from_metas(record["attempts"], metas) if metas else None
 
     def _variant_in_tree(self, run_json: dict) -> int | None:
@@ -1160,20 +1162,28 @@ def _phase_of(run_json: dict) -> str:
 
 
 def _task_spans(run: BenchmarkRun) -> list[cost.Span]:
-    """The finished task executions the run's status remembers (the latest of each task). A task the controller
-    wrote off (`-1` never ran, `-4` lost with its node) is left out: it has no real start or end although it is
-    committed to `schedule/`. A task is kept when its result was published; discarded ones are marked published
+    """The task executions the run's status remembers (the latest of each task). A task the controller wrote off
+    (`-1` never ran, `-4` lost with its node) has start and end of that moment unless it was running, so it is no
+    `finished` span (`cost.Span`). A task is kept when its result was published; discarded ones are marked published
     without a commit."""
     return [
-        cost.Span(t.attempt, t.start and _utc(t.start), t.end and _utc(t.end), kept=t.published and bool(t.commit))
+        cost.Span(
+            t.attempt,
+            t.start and _utc(t.start),
+            t.end and _utc(t.end),
+            t.published and bool(t.commit),
+            t.name,
+            t.exit_code,
+            t.error_msg,
+        )
         for t in run.status.tasks
-        if t.state == TaskState.DONE and t.exit_code is not None and t.exit_code >= 0
+        if t.state == TaskState.DONE and t.exit_code is not None
     ]
 
 
-def _lacks_costs(record: dict) -> bool:
-    """A record from before the cost fields: its `useful_s` and `setup_s` come from the result files."""
-    return any("setup_s" not in a for a in record["attempts"])
+def _variant_glob(record: dict) -> str:
+    """The variant directory of a record's results in the tree: its `variant`, any number when it has none."""
+    return "[0-9]*" if record.get("variant") is None else str(record["variant"])
 
 
 def _attempt_entry(run_json: dict | None, n: int | None) -> dict | None:

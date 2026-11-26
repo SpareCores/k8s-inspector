@@ -127,12 +127,24 @@ def test_real_bulk_response_keeps_oci_skus_with_their_blocked_tasks(monkeypatch)
 
 def test_server_facts_come_from_the_v2_server_record(monkeypatch):
     seen = []
-    record = {"family": "Compute Optimized", "cpu_architecture": "x86_64", "accelerator_count": 4.0, "series": "c6a"}
+    record = {"family": "Compute Optimized", "cpu_architecture": "x86_64", "accelerator_count": 4.0, "series": "c6a",
+              "vcpus": 48, "memory_amount": 98304}  # fmt: skip
     monkeypatch.setattr(keeper, "_get", lambda url, key: seen.append(url) or record)
     env = EnvConfig(bucket="b", bucket_region="r", keeper_api_base="http://k")
     facts = server_facts(env, "aws", "c6a.12xlarge")
-    assert facts == {"family": "Compute Optimized", "series": "c6a", "cpu_arch": "x86_64", "gpu_count": 4}
+    assert facts == {
+        "family": "Compute Optimized", "series": "c6a", "cpu_arch": "x86_64", "gpu_count": 4,
+        "vcpus": 48, "memory_gib": 96.0,
+    }  # fmt: skip
     assert seen == ["http://k/v2/server/aws/c6a.12xlarge"]
+
+
+def test_vcpus_and_memory_are_null_when_keeper_lacks_them(monkeypatch):
+    monkeypatch.setattr(keeper, "_get", lambda url, key: {"family": "F", "memory_amount": 512})
+    facts = server_facts(EnvConfig(bucket="b", bucket_region="r"), "aws", "x")
+    assert (facts["vcpus"], facts["memory_gib"]) == (None, 0.5)
+    monkeypatch.setattr(keeper, "_get", lambda url, key: {"family": "F", "vcpus": 2})
+    assert server_facts(EnvConfig(bucket="b", bucket_region="r"), "aws", "x")["memory_gib"] is None
 
 
 def test_unknown_server_has_no_facts(monkeypatch):

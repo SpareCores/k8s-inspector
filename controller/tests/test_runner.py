@@ -1346,7 +1346,9 @@ def test_run_json_keeps_the_ondemand_price_of_the_launch_and_the_server_facts(h,
     prices = {"eu-test-1": 0.2}
     monkeypatch.setattr(keeper, "ondemand_prices", lambda env, vendor, sku: prices)
     monkeypatch.setattr(
-        keeper, "server_facts", lambda env, vendor, sku: {"family": "F", "cpu_arch": "arm64", "gpu_count": 0}
+        keeper,
+        "server_facts",
+        lambda env, vendor, sku: {"family": "F", "cpu_arch": "arm64", "gpu_count": 0, "vcpus": 4, "memory_gib": 8.0},
     )
     h.start(["membench"])
     h.drive()
@@ -1355,6 +1357,7 @@ def test_run_json_keeps_the_ondemand_price_of_the_launch_and_the_server_facts(h,
     doc = h.storage.run_json
     assert doc["attempts"][0]["ondemand_price"] == 0.2 and "ondemand_price_reason" not in doc["attempts"][0]
     assert (doc["family"], doc["cpu_arch"], doc["gpu_count"]) == ("F", "arm64", 0)
+    assert (doc["vcpus"], doc["memory_gib"]) == (4, 8.0)
 
 
 def test_run_json_says_why_there_is_no_ondemand_price(h, monkeypatch):
