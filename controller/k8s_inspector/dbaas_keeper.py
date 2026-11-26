@@ -21,19 +21,9 @@ def _base(env: EnvConfig) -> str:
     return (env.keeper_api_base or keeper.DEFAULT_API_BASE).rstrip("/")
 
 
-def _list(env: EnvConfig, path: str, params: Sequence[tuple[str, str]] = ()) -> list[dict]:
-    url = f"{_base(env)}{path}" + (f"?{urllib.parse.urlencode(params)}" if params else "")
-    data = keeper._fetch(url, keeper._read_key(env))
-    if data is None:
-        return []
-    if not isinstance(data, list):
-        raise RuntimeError(f"keeper returned unexpected JSON type for {url}")
-    return data
-
-
 def databases(env: EnvConfig, vendor: str) -> list[dict]:
     """Keeper's records of the vendor's ACTIVE PostgreSQL databases (`/databases`)."""
-    rows = _list(env, "/databases", [("vendor", vendor), ("only_active", "true"), ("limit", "-1")])
+    rows = keeper.list_rows(env, "/databases", [("vendor", vendor), ("only_active", "true"), ("limit", "-1")])
     return [row for row in rows if str(row.get("engine", "")).lower() in ("postgresql", "postgres")]
 
 
@@ -76,16 +66,10 @@ def database_block_reasons(
     return {task: list(reasons) for task, reasons in data.items() if reasons}
 
 
-def region_ids(env: EnvConfig, vendor: str) -> dict[str, str]:
-    """`{region api_reference: Keeper region_id}` of the vendor (price rows and server filters use the id)."""
-    rows = _list(env, "/regions", [("vendor", vendor)])
-    return {row["api_reference"]: str(row["region_id"]) for row in rows if row.get("vendor_id", vendor) == vendor}
-
-
 def region_cities(env: EnvConfig, vendor: str) -> dict[str, tuple[str, str]]:
     """`{region api_reference: (Keeper country_id, city)}` of the vendor's regions that have a city. A vendor whose
     database regions differ from its server regions (OVH) is matched by it."""
-    rows = _list(env, "/regions", [("vendor", vendor)])
+    rows = keeper.list_rows(env, "/regions", [("vendor", vendor)])
     return {
         row["api_reference"]: (row.get("country_id"), row["city"])
         for row in rows
@@ -99,7 +83,7 @@ def standalone_prices(env: EnvConfig, vendor: str, database_id: str) -> dict[str
     path = f"/database/{urllib.parse.quote(vendor, safe='')}/{urllib.parse.quote(database_id, safe='')}/prices"
     rows = [
         row
-        for row in _list(env, path)
+        for row in keeper.list_rows(env, path)
         if row.get("status") == "active" and row.get("allocation") == "ondemand" and row.get("price") is not None
     ]
     level = next((lv for lv in STANDALONE_LEVELS if any(row.get("ha") == lv for row in rows)), None)
@@ -108,7 +92,7 @@ def standalone_prices(env: EnvConfig, vendor: str, database_id: str) -> dict[str
         if row.get("ha") == level:
             region = str(row["region_id"])
             by_id[region] = min(float(row["price"]), by_id.get(region, float("inf")))
-    names = {rid: name for name, rid in region_ids(env, vendor).items()}
+    names = {rid: name for name, rid in keeper.region_ids(env, vendor).items()}
     return {names[rid]: price for rid, price in by_id.items() if rid in names}
 
 
@@ -127,7 +111,7 @@ def client_servers(env: EnvConfig, vendor: str, region_id: str) -> list[dict]:
         ("best_price_allocation", "ONDEMAND_ONLY"),
         ("limit", "-1"),
     ]
-    return _list(env, "/servers", params)
+    return keeper.list_rows(env, "/servers", params)
 
 
 def engine_version(record: dict, preferred: str) -> str | None:

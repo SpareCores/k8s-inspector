@@ -7,7 +7,7 @@ from datetime import UTC, datetime, timedelta
 import pytest
 from fakes import Clock, FakeKube
 
-from k8s_inspector import crd, dbaas_client, dbaas_keeper, dbaas_plan, launch, planner
+from k8s_inspector import crd, dbaas_client, dbaas_keeper, dbaas_plan, keeper, launch, planner
 from k8s_inspector.model import (
     CapacityMode,
     Config,
@@ -86,7 +86,7 @@ def world(monkeypatch) -> World:
         dbaas_keeper, "database_block_reasons", lambda env, vendor, name, tasks: w.blocked.get(name, {})
     )
     monkeypatch.setattr(dbaas_keeper, "standalone_prices", lambda env, vendor, name: dict(w.prices))
-    monkeypatch.setattr(dbaas_keeper, "region_ids", lambda env, vendor: {r: f"id-{r}" for r in (*PRICES, "eu-3")})
+    monkeypatch.setattr(keeper, "region_ids", lambda env, vendor: {r: f"id-{r}" for r in (*PRICES, "eu-3")})
 
     def client_servers(env, vendor, region_id):
         w.asked.append(region_id)
@@ -540,7 +540,7 @@ def split(world, monkeypatch):
     """Databases are priced in db-a and db-b, servers exist in srv-a, srv-a2 and srv-b (same cities)."""
     world.prices = {"db-a": 0.30, "db-b": 0.20}
     monkeypatch.setattr(dbaas_keeper, "region_cities", lambda env, vendor: dict(CITIES))
-    monkeypatch.setattr(dbaas_keeper, "region_ids", lambda env, vendor: {r: f"id-{r}" for r in CITIES})
+    monkeypatch.setattr(keeper, "region_ids", lambda env, vendor: {r: f"id-{r}" for r in CITIES})
     return world
 
 

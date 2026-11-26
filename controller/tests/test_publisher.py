@@ -10,7 +10,7 @@ from pathlib import Path
 
 import pytest
 
-from k8s_inspector import crd, launch, publisher
+from k8s_inspector import crd, keeper, launch, publisher
 from k8s_inspector import storage as storage_keys
 from k8s_inspector.kube import NotFound
 from k8s_inspector.model import (
@@ -1461,3 +1461,113 @@ def test_backfill_takes_the_variant_from_git_and_skips_malformed_run_json(tmp_pa
     check = clone(origin, tmp_path) / "data/hcloud/cax31/runs"
     assert json.loads((check / "r-done.json").read_text())["variant"] == 2
     assert json.loads((check / "r-novariant.json").read_text())["variant"] is None
+
+
+def cost_lines(caplog) -> list[dict]:
+    return [r.__dict__ for r in caplog.records if getattr(r, "event", "").endswith("cost")]
+
+
+def test_cost_lines_are_logged_once_when_the_record_is_written(tmp_path, origin, storage, cluster, caplog):
+    run = cluster.add_run(NAMES)
+    start = datetime(2026, 9, 29, 12, 57, tzinfo=UTC)
+    run.status.tasks[0].attempt, run.status.tasks[0].start = 1, start + timedelta(minutes=2)
+    run.status.tasks[0].end, run.status.tasks[0].commit = start + timedelta(minutes=3), "abc"
+    doc = json.loads(storage.objects[okey(KEY, "run.json")])
+    doc["attempts"][0] |= {
+        "attempt": 1,
+        "api_start": "2026-09-29T12:57:00Z",
+        "end": "2026-09-29T13:57:00+00:00",
+        "outcome": "Completed",
+        "capacity_type": "spot",
+        "price": "0.5",
+        "region": "fsn1",
+        "ondemand_price": 1.0,
+    }
+    doc["family"] = "Cost Optimized"
+    storage.objects[okey(KEY, "run.json")] = json.dumps(doc).encode()
+    pub = make_publisher(tmp_path, origin, storage)
+    with caplog.at_level("INFO", logger="k8s_inspector.cost"):
+        pub.publish_once(ENABLED)
+        pub.publish_once(ENABLED)
+    lines = cost_lines(caplog)
+    assert [line["event"] for line in lines] == ["run_attempt_cost", "run_cost"]
+    setup = lines[0]["setup_s"]  # the first task start of the attempt, from the status tasks
+    assert setup is not None and lines[1]["paid_usd"] == 0.5
+    assert lines[1]["ondemand_counterfactual_usd"] == pytest.approx(1.0, abs=1e-5)  # one setup plus the task time
+    assert lines[0]["backfill"] is False and lines[0]["ondemand_price_source"] == "launch"
+    record = run_record(origin, tmp_path)
+    assert record["attempts"][0]["cost_usd"] == 0.5 and record["attempts"][0]["setup_s"] == setup
+
+
+def push_record(origin, tmp_path, run_id, attempts, files=None):
+    seed = clone(origin, tmp_path, "seed-cost")
+    runs = seed / "data/hcloud/cax31/runs"
+    runs.mkdir(parents=True, exist_ok=True)
+    record = {"run_id": run_id, "vendor": "hcloud", "sku": "cax31", "database": None, "attempts": attempts}
+    (runs / f"{run_id}.json").write_text(json.dumps(record))
+    for rel, text in (files or {}).items():
+        (seed / rel).parent.mkdir(parents=True, exist_ok=True)
+        (seed / rel).write_text(text)
+    git(seed, "add", "-A")
+    git(seed, "commit", "-m", "record")
+    git(seed, "push", "origin", "HEAD:main")
+
+
+def test_emit_cost_logs_logs_past_records_with_current_prices_and_changes_nothing(
+    tmp_path, origin, caplog, monkeypatch
+):
+    today = datetime.now(UTC)
+    run_id = f"r{today:%Y%m%d}t0100-aaaa"
+    day = f"{today:%Y-%m-%d}"
+    attempts = [
+        {"attempt": 1, "api_start": f"{day}T01:00:00Z", "end": f"{day}T02:00:00+00:00", "outcome": "SpotInterrupted",
+         "capacity_type": "spot", "price": "0.5", "region": "fsn1"},
+        {"attempt": 2, "api_start": f"{day}T02:00:10Z", "end": f"{day}T03:00:10+00:00", "outcome": "Completed",
+         "capacity_type": "on-demand", "price": "1.0", "region": "nbg1", "ondemand_price": 0.9},
+    ]  # fmt: skip
+    meta = {"run_id": run_id, "start": f"{day}T01:10:00", "end": f"{day}T01:30:00", "exit_code": 0}
+    other = {"run_id": "r-other", "start": f"{day}T01:10:00", "end": f"{day}T01:50:00", "exit_code": 0}
+    push_record(origin, tmp_path, run_id, attempts, {
+        "data/hcloud/cax31/0/membench/meta.json": json.dumps(meta),
+        "data/hcloud/cax31/0/lscpu/meta.json": json.dumps(other),
+    })  # fmt: skip
+    push_record(origin, tmp_path, "r20200101t0000-old", attempts)  # older than --since
+    monkeypatch.setattr(keeper, "ondemand_prices", lambda env, vendor, sku: {"fsn1": 0.8, "nbg1": 0.7})
+    monkeypatch.setattr(
+        keeper, "server_facts", lambda env, vendor, sku: {"family": "F", "cpu_arch": "arm64", "gpu_count": 0}
+    )
+    pub = make_publisher(tmp_path, origin, FakeStorage())
+    head = git(clone(origin, tmp_path), "rev-parse", "HEAD")
+    with caplog.at_level("INFO", logger="k8s_inspector.cost"):
+        assert pub.emit_cost_logs(30) == 1
+    first, second, summary = cost_lines(caplog)
+    assert first["backfill"] is True and first["family"] == "F"
+    assert (first["ondemand_price"], first["ondemand_price_source"]) == (0.8, "current")
+    assert (first["useful_s"], first["setup_s"]) == (1800.0, 600.0)  # the one result file of its run id
+    assert (second["ondemand_price"], second["ondemand_price_source"]) == (0.9, "launch")  # stored: kept
+    assert summary["event"] == "run_cost" and summary["backfill"] is True and summary["used_spot"] is True
+    assert git(clone(origin, tmp_path), "rev-parse", "HEAD") == head
+
+
+def test_emit_cost_logs_leaves_unknown_useful_time_null(tmp_path, origin, caplog):
+    today = datetime.now(UTC)
+    day = f"{today:%Y-%m-%d}"
+    attempts = [{"attempt": 1, "api_start": f"{day}T01:00:00Z", "end": f"{day}T02:00:00+00:00",
+                 "outcome": "SpotInterrupted", "capacity_type": "spot", "price": "0.5", "region": "fsn1"}]  # fmt: skip
+    push_record(origin, tmp_path, f"r{today:%Y%m%d}t0100-bbbb", attempts)  # no result files of the run
+    pub = make_publisher(tmp_path, origin, FakeStorage())
+    with caplog.at_level("INFO", logger="k8s_inspector.cost"):
+        pub.emit_cost_logs(30)
+    attempt_line, summary = cost_lines(caplog)
+    assert attempt_line["useful_s"] is None and attempt_line["wasted_usd"] is None
+    assert summary["wasted_usd"] is None and summary["ondemand_counterfactual_usd"] is None
+
+
+def test_tasks_written_off_by_the_controller_are_not_task_spans(cluster):
+    """`-4` (lost with the node) and `-1` (never ran) are committed to `schedule/` with start and end of now."""
+    run = cluster.add_run(["lscpu", "geekbench", "openssl"])
+    now = datetime(2026, 9, 29, 13, 0, tzinfo=UTC)
+    for t, code in zip(run.status.tasks, (0, -4, -1), strict=True):
+        t.attempt, t.start, t.end, t.exit_code, t.published, t.commit = 1, now, now, code, True, "abc"
+    spans = publisher._task_spans(run)
+    assert [(s.attempt, s.kept) for s in spans] == [(1, True)]
