@@ -51,7 +51,8 @@ Decisions:
   given up) and it is publishable, `runs/<run_id>.json` is written next to its variants (DBaaS: next to `postgres/`)
   in an own commit. The record is the run's `run.json` (read from object storage, which expires) minus the lscpu
   output, plus the final phase and the cost of its attempts (`cost.add_costs`, logged by `cost.log_cost_lines` when the
-  record is pushed; `emit_cost_logs` logs them again for the records in git). Write once: an existing file is never rewritten. `delete_expired_runs` keeps a
+  record is pushed; `emit_cost_logs` logs them again for the records in git).
+  Write once: an existing file is never rewritten. `delete_expired_runs` keeps a
   finished, publishable run until its record is written; a run without `run.json` is logged and given up. Runs
   deleted by `_defer_launch` get no record. `backfill_run_records` writes the records of past runs from the
   `run.json` files in object storage.
