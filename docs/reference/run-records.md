@@ -43,7 +43,7 @@ An attempt:
 | `price` | the node's price per hour in USD as a string, same availability as `region` |
 | `ondemand_price` | USD per hour of the on-demand price of the same SKU in the attempt's region, from Keeper (ACTIVE `ondemand` price rows, the cheapest zone), captured when the attempt gets its node, so it is the price at launch time. `null` when Keeper has no on-demand offer there; absent when Keeper could not be asked |
 | `ondemand_price_reason` | `no_ondemand_offer`, with a `null` `ondemand_price` |
-| `duration_s`, `useful_s`, `setup_s`, `cost_usd`, `wasted_usd` | what the attempt cost and how much of it was useful, see [Cost log lines](#cost-log-lines); written into the record, not into `run.json` |
+| `duration_s`, `useful_s`, `setup_s`, `task_s`, `cost_usd`, `wasted_usd` | what the attempt cost and how much of it was useful, see [Cost log lines](#cost-log-lines); written into the record, not into `run.json` |
 | `node`, `node_claim` | names of the Kubernetes node and its NodeClaim; `null` without a node |
 | `api_start` | the attempt's anchor Pod was created (the start of the attempt) |
 | `api_end`, `machine_start`, `node_registered`, `node_ready` | NodeClaim launched, kernel boot, node registered, node ready; `null` when not reached |
@@ -119,8 +119,10 @@ Definitions, per attempt (`start` is `api_start`):
   task of that attempt whose result was kept (published, not discarded); 0 when it kept none. Task times and
   attempt numbers are the run's `status.tasks`, which hold the latest execution of each task: a task that ran again
   on a later attempt counts there only.
-- `wasted_usd` = `cost_usd` − `useful_s` / 3600 × `price`.
 - `setup_s`: `start` to the first task start of the attempt (kept or not); `null` when no task of it is known.
+- `task_s` = max(`useful_s` − `setup_s`, 0): the kept task time (a `null` `setup_s` counts as 0).
+- `wasted_usd`: 0 for the `Completed` attempt; otherwise `cost_usd` − `task_s` / 3600 × `price`, so the attempt's
+  setup and the time after its last kept task are waste.
 
 `run_attempt_cost`:
 
@@ -131,7 +133,7 @@ Definitions, per attempt (`start` is `api_start`):
 | `attempt` | number, from 1 |
 | `region`, `zone`, `capacity_type`, `outcome` | as in the attempt (`null` when absent) |
 | `start`, `end` | the attempt's `api_start` and `end` |
-| `duration_s`, `useful_s`, `setup_s`, `price`, `ondemand_price`, `cost_usd`, `wasted_usd` | as defined above; `ondemand_price` is the attempt's |
+| `duration_s`, `useful_s`, `setup_s`, `task_s`, `price`, `ondemand_price`, `cost_usd`, `wasted_usd` | as defined above; `ondemand_price` is the attempt's |
 | `ondemand_price_source` | `launch`: captured when the attempt got its node; `current`: Keeper's price at backfill time |
 | `start_hour_utc`, `start_weekday_utc` | hour `0`-`23` and weekday `Mon`-`Sun` of `start`, UTC |
 | `backfill` | `false` |
@@ -146,13 +148,12 @@ Definitions, per attempt (`start` is `api_start`):
 | `attempts`, `spot_interruptions` | attempts, and those that ended `SpotInterrupted` |
 | `used_spot` | any attempt ran on spot; every run is logged, so filter on it |
 | `paid_usd`, `wasted_usd` | sums over the attempts |
-| `ondemand_counterfactual_usd` | `ondemand_price` of the `Completed` attempt × (sum of `useful_s` over all attempts + `setup_s` of the `Completed` attempt) / 3600; `null` without a `Completed` attempt or its `ondemand_price` |
+| `ondemand_counterfactual_usd` | `ondemand_price` of the `Completed` attempt × (sum of `task_s` over all attempts + `setup_s` of the `Completed` attempt) / 3600: on-demand would need one setup plus the kept task time; `null` without a `Completed` attempt or its `ondemand_price` |
 | `spot_net_usd` | `paid_usd` − `ondemand_counterfactual_usd`, `null` with it; positive means spot cost more than on-demand would have |
 | `backfill` | `false` |
 
-The `Completed` attempt's `setup_s` lies inside its `useful_s`, so the counterfactual counts it twice. `setup_s`
-counts as 0 when `null`. The price is the node's price from the cluster (it can include extras such as disk), the
-on-demand price is Keeper's list price of the server, so the two differ a little even for an on-demand attempt.
+`price` is the node's actual price including extras (such as disk); `ondemand_price` is Keeper's list price of the
+server, so small gaps between them are expected, also for an on-demand attempt. A `null` `setup_s` counts as 0.
 
 ### Re-emit
 

@@ -67,9 +67,10 @@ def test_attempt_costs_of_the_interrupted_and_the_completed_attempts():
     a1, a2, a3 = cost.add_costs(c6a(), SPANS)["attempts"]
     assert (a1["duration_s"], a1["useful_s"], a1["setup_s"]) == (1092.0, 180.0, 120.0)  # last kept task ends 08:16:43
     assert a1["cost_usd"] == pytest.approx(1092 / 3600 * 0.36)
-    assert a1["wasted_usd"] == pytest.approx((1092 - 180) / 3600 * 0.36)
-    assert (a2["useful_s"], a2["setup_s"]) == (28 * 60.0, 120.0)
-    assert (a3["useful_s"], a3["duration_s"], a3["wasted_usd"]) == (6228.0, 6228.0, 0.0)  # Completed: all useful
+    assert a1["task_s"] == 60.0  # useful time without the setup
+    assert a1["wasted_usd"] == pytest.approx((1092 - 60) / 3600 * 0.36)  # setup and the tail count as waste
+    assert (a2["useful_s"], a2["setup_s"], a2["task_s"]) == (28 * 60.0, 120.0, 1560.0)
+    assert (a3["useful_s"], a3["duration_s"], a3["task_s"], a3["wasted_usd"]) == (6228.0, 6228.0, 6108.0, 0.0)
 
 
 def test_an_attempt_without_a_kept_task_wastes_everything_and_one_without_a_node_costs_nothing():
@@ -95,11 +96,11 @@ def test_an_attempt_without_a_kept_task_wastes_everything_and_one_without_a_node
 def test_run_summary_with_spot_interruptions_then_on_demand():
     summary = cost.run_summary(cost.add_costs(c6a(), SPANS))
     paid = (1092 * 0.36 + 2448 * 0.18 + 6228 * 1.2) / 3600
-    useful = 180 + 1680 + 6228
+    tasks = 60 + 1560 + 6108
     assert summary["paid_usd"] == pytest.approx(paid, abs=1e-5)
-    # counterfactual: the completed attempt's price x (all useful time + the completed attempt's setup of 120 s)
-    assert summary["ondemand_counterfactual_usd"] == pytest.approx(1.122 * (useful + 120) / 3600, abs=1e-5)
-    assert summary["spot_net_usd"] == pytest.approx(paid - 1.122 * (useful + 120) / 3600, abs=1e-5)
+    # counterfactual: the completed attempt's price x (all task time + the completed attempt's setup, 120 s)
+    assert summary["ondemand_counterfactual_usd"] == pytest.approx(1.122 * (tasks + 120) / 3600, abs=1e-5)
+    assert summary["spot_net_usd"] == pytest.approx(paid - 1.122 * (tasks + 120) / 3600, abs=1e-5)
     assert summary | {"paid_usd": 0, "wasted_usd": 0, "ondemand_counterfactual_usd": 0, "spot_net_usd": 0} == {
         "family": "Compute Optimized",
         "final_region": "r3",
@@ -158,7 +159,7 @@ def test_log_lines_carry_the_documented_fields(caplog):
     ]
     attempt_fields = {
         "run", "vendor", "sku", "family", "region", "zone", "capacity_type", "outcome", "start", "end", "duration_s",
-        "useful_s", "setup_s", "price", "ondemand_price", "cost_usd", "wasted_usd", "start_hour_utc",
+        "useful_s", "setup_s", "task_s", "price", "ondemand_price", "cost_usd", "wasted_usd", "start_hour_utc",
         "start_weekday_utc",
     }  # fmt: skip
     run_fields = {

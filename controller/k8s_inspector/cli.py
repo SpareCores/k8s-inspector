@@ -112,7 +112,8 @@ def build_parser() -> argparse.ArgumentParser:
     pub.add_argument(
         "--emit-cost-logs",
         action="store_true",
-        help="log the cost lines of the run records in git (with --since); changes nothing in git",
+        help="log the cost lines of the run records in git (with --since); changes nothing in git. Via kubectl exec "
+        "run it as sh -c '… 2>/proc/1/fd/2' so the lines reach the container log",
     )
     pub.add_argument("--sku", action="append", default=[], help="with --rescan: a SKU never published (repeatable)")
     return p

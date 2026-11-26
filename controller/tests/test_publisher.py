@@ -1493,7 +1493,7 @@ def test_cost_lines_are_logged_once_when_the_record_is_written(tmp_path, origin,
     assert [line["event"] for line in lines] == ["run_attempt_cost", "run_cost"]
     setup = lines[0]["setup_s"]  # the first task start of the attempt, from the status tasks
     assert setup is not None and lines[1]["paid_usd"] == 0.5
-    assert lines[1]["ondemand_counterfactual_usd"] == pytest.approx(1.0 * (3600 + setup) / 3600, abs=1e-5)
+    assert lines[1]["ondemand_counterfactual_usd"] == pytest.approx(1.0, abs=1e-5)  # one setup plus the task time
     assert lines[0]["backfill"] is False and lines[0]["ondemand_price_source"] == "launch"
     record = run_record(origin, tmp_path)
     assert record["attempts"][0]["cost_usd"] == 0.5 and record["attempts"][0]["setup_s"] == setup

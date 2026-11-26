@@ -53,7 +53,7 @@ def _seconds(start: datetime | None, end: datetime | None) -> float | None:
 
 
 def attempt_costs(attempt: dict, spans: list[Span] | None) -> dict:
-    """`duration_s`, `useful_s`, `setup_s`, `cost_usd` and `wasted_usd` of one attempt of a run record.
+    """`duration_s`, `useful_s`, `setup_s`, `task_s`, `cost_usd` and `wasted_usd` of one attempt of a run record.
 
     `spans` are the run's task executions; None when they are not known (a past run without result files):
     `useful_s`, `setup_s` and `wasted_usd` are then null, except for a Completed attempt, which is useful as a
@@ -73,8 +73,19 @@ def attempt_costs(attempt: dict, spans: list[Span] | None) -> dict:
     starts = [s.start for s in mine if s.start]
     setup = attempt["setup_s"] if "setup_s" in attempt else _seconds(start, min(starts)) if starts else None
     cost = round(duration / 3600 * price, 6) if duration is not None and price is not None else 0.0
-    wasted = None if useful is None else round(cost - useful / 3600 * (price or 0.0), 6)
-    return {"duration_s": duration, "useful_s": useful, "setup_s": setup, "cost_usd": cost, "wasted_usd": wasted}
+    task = None if useful is None else round(max(useful - (setup or 0.0), 0.0), 3)
+    if attempt.get("outcome") == "Completed":
+        wasted = 0.0
+    else:
+        wasted = None if task is None else round(cost - task / 3600 * (price or 0.0), 6)
+    return {
+        "duration_s": duration,
+        "useful_s": useful,
+        "setup_s": setup,
+        "task_s": task,
+        "cost_usd": cost,
+        "wasted_usd": wasted,
+    }
 
 
 def add_costs(run_json: dict, spans: list[Span] | None) -> dict:
@@ -93,14 +104,14 @@ def run_summary(record: dict) -> dict:
     """The `run_cost` fields of a record whose attempts have their cost fields.
 
     The on-demand counterfactual is what the run would have cost on-demand in the region of its Completed
-    attempt: all useful time plus that attempt's setup. It is null without such an attempt, without that price, or
-    when the useful time of an attempt is unknown. A null `setup_s` counts as 0."""
+    attempt: all kept task time plus one setup, that attempt's. It is null without such an attempt, without that
+    price, or when the task time of an attempt is unknown. A null `setup_s` counts as 0."""
     attempts = record.get("attempts") or []
     done = next((a for a in attempts if a.get("outcome") == "Completed"), None)
-    useful = _sum(a.get("useful_s") for a in attempts)
+    task = _sum(a.get("task_s") for a in attempts)
     counterfactual = None
-    if done and done.get("ondemand_price") is not None and useful is not None:
-        counterfactual = round(done["ondemand_price"] * (useful + (done.get("setup_s") or 0.0)) / 3600, 6)
+    if done and done.get("ondemand_price") is not None and task is not None:
+        counterfactual = round(done["ondemand_price"] * (task + (done.get("setup_s") or 0.0)) / 3600, 6)
     paid = round(sum(a["cost_usd"] for a in attempts), 6)
     last = attempts[-1] if attempts else {}
     return {
@@ -140,6 +151,7 @@ def log_cost_lines(record: dict, *, backfill: bool = False) -> None:
                 "duration_s": a["duration_s"],
                 "useful_s": a["useful_s"],
                 "setup_s": a["setup_s"],
+                "task_s": a["task_s"],
                 "price": float(a["price"]) if a.get("price") else None,
                 "ondemand_price": a.get("ondemand_price"),
                 "ondemand_price_source": a.get("ondemand_price_source", "launch"),
