@@ -28,7 +28,7 @@ and per attempt) plus `phase`, with `variant` set as below. It is written with s
 | `phase` | the run's final phase: `Done`, `Failed` or `Cancelled`; `unknown` in a [backfilled](#backfill) record whose attempts do not tell |
 | `plan` | task names of the run, in order |
 | `variant` | the hardware variant number the run's results were filed under, `null` when none (DBaaS: always). Not `run.json`'s own `variant`, which is the runner's last snapshot: the publisher decides the variant later. Live: the run's `status.variant`; backfilled: the number of the directory holding the run's `timing/<run_id>/` in the tree (`data/<vendor>/<sku>/<N>/timing/<run_id>/`), `null` when there is none |
-| `family`, `series`, `cpu_arch`, `gpu_count` | Keeper's `family` (e.g. `Compute Optimized`), `series` (e.g. `c6a`), `cpu_architecture` and `accelerator_count` of the SKU (the client node for a DBaaS run), read once when the run's first attempt gets its node; absent when Keeper could not be asked |
+| `family`, `series`, `cpu_arch`, `gpu_count`, `vcpus`, `memory_gib` | Keeper's `family` (e.g. `Compute Optimized`), `series` (e.g. `c6a`), `cpu_architecture`, `accelerator_count`, `vcpus` and `memory_amount` of the SKU (the client node for a DBaaS run), read once when the run's first attempt gets its node; `memory_gib` is Keeper's `memory_amount` (MiB) divided by 1024. A value Keeper lacks is `null`; all are absent when Keeper could not be asked, and the publisher and the [re-emit](#re-emit) fill them from Keeper's current data when `vcpus` is absent (a run launched before it existed, or an outage at launch) |
 | `database` | `null` for a server run; for DBaaS the database object (`vendor`, `id`, `engineVersion`, `region`, `vcpus`, `memoryGib`, `usdPerHour`) |
 | `timing` | the latest attempt's `api_start`, `api_end`, `machine_start`, `node_registered`, `node_ready` (ISO UTC; only those known) |
 | `attempts[]` | one entry per node the run used, oldest first |
@@ -106,7 +106,7 @@ prints `wrote <n> run records`.
 ## Cost log lines
 
 When a run record is written (once per run, after its commit is pushed) the controller logs what the run's attempts
-cost, one `run_attempt_cost` line per attempt and one `run_cost` line for the run, at info level in the normal JSON
+cost, one `run_attempt_cost` line per attempt, one `task_cost` line per task that ran and one `run_cost` line for the run, at info level in the normal JSON
 log (`msg`, `event` and the fields below next to `ts`, `level` and `logger`). A record already in git is not logged
 again, also after a controller restart.
 
@@ -135,13 +135,37 @@ Definitions, per attempt (`start` is `api_start`):
 |---|---|
 | `msg`, `event` | `run attempt cost`, `run_attempt_cost` |
 | `run`, `vendor`, `sku`, `family`, `series` | run id, the run's vendor and SKU, Keeper's family and series (`null` when unknown) |
+| `vcpus`, `memory_gib` | the record's (`null` when Keeper lacks them) |
 | `attempt` | number, from 1 |
+| `node`, `nodeclaim` | the attempt's `node` and `node_claim` names (`null` without a node) |
 | `region`, `zone`, `capacity_type`, `outcome` | as in the attempt (`null` when absent) |
 | `start`, `end` | the attempt's `api_start` and `end` |
 | `duration_s`, `useful_s`, `setup_s`, `task_s`, `price`, `ondemand_price`, `cost_usd`, `wasted_usd` | as defined above; `ondemand_price` is the attempt's |
 | `ondemand_price_source` | `launch`: captured when the attempt got its node; `current`: Keeper's price when the record or the backfill was written, for an attempt launched without one (an older controller, or Keeper unreachable); after one failed Keeper call a pass does not ask again, and the remaining attempts keep `ondemand_price_reason: keeper_unreachable`; an attempt that got a node always has `ondemand_price` or an `ondemand_price_reason` |
 | `start_hour_utc`, `start_weekday_utc` | hour `0`-`23` and weekday `Mon`-`Sun` of `start`, UTC |
 | `backfill` | `false` |
+
+`task_cost`, one line per task execution that ran on a node of the run (the latest execution of each task, like
+`useful_s`), including failed ones and the vLLM probes (`vllm-probe-<image>`); a task that never started (no node, precheck, written off when the node was
+lost before it ran: start and end are the same moment) has none:
+
+| Field | Value |
+|---|---|
+| `msg`, `event` | `task cost`, `task_cost` |
+| `run`, `attempt`, `task` | run id, the attempt the task ran in, task name |
+| `vendor`, `sku`, `family`, `series` | as above |
+| `region`, `zone`, `capacity_type` | of the attempt |
+| `start`, `end`, `duration_s` | the task's start and end (ISO, UTC) and their difference in seconds |
+| `price` | the attempt's `price` (USD per hour) |
+| `cost_usd` | `duration_s` / 3600 × `price` |
+| `exit_code`, `result` | the task's [exit code](exit-codes.md) and `ok` (`0`), `lost` (`-4`: the node went away under the task) or `failed` (any other code, such as the task's own, `256` or `-6`) |
+| `backfill` | `false` |
+
+`cost_usd` of a task is the node's price for the time the task ran. Tasks that run in parallel on the node (the
+containers of the probe step) each get their own duration times the full node price, so their lines overlap in time
+and do not sum to the attempt's `cost_usd`; neither does the sum of all tasks, which leaves out the setup and the idle
+time between tasks. In a [re-emit](#re-emit) the tasks come from the `meta.json` files of the run id in the tree, so a
+task whose result was replaced by a later run, a `-4` task (never filed as a result) and a vLLM probe have no line.
 
 `run_cost`:
 

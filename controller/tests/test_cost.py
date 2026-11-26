@@ -217,8 +217,8 @@ def test_log_lines_carry_the_documented_fields(caplog):
         ("run_cost", "run cost"),
     ]
     attempt_fields = {
-        "run", "vendor", "sku", "family", "series", "region", "zone", "capacity_type", "outcome", "start", "end",
-        "duration_s",
+        "run", "vendor", "sku", "family", "series", "vcpus", "memory_gib", "node", "nodeclaim", "region", "zone",
+        "capacity_type", "outcome", "start", "end", "duration_s",
         "useful_s", "setup_s", "task_s", "price", "ondemand_price", "cost_usd", "wasted_usd", "start_hour_utc",
         "start_weekday_utc",
     }  # fmt: skip
@@ -248,7 +248,7 @@ def test_tasks_the_controller_wrote_off_do_not_count_as_kept():
         {"start": "2026-11-26T09:00:00", "end": "2026-11-26T09:00:00", "exit_code": -1},
     ]
     spans = cost.spans_from_metas(attempts, metas)
-    assert len(spans) == 1
+    assert [s.finished for s in spans] == [True, False, False]
     a = cost.add_costs({"attempts": attempts}, spans)["attempts"][0]
     assert (a["useful_s"], a["setup_s"], a["task_s"]) == (600.0, 300.0, 300.0)
     assert a["wasted_usd"] == pytest.approx((3600 - 300) / 3600)
@@ -302,3 +302,80 @@ def test_an_attempt_without_a_node_costs_nothing_and_does_not_set_the_final_regi
     }  # fmt: skip
     summary = cost.run_summary(cost.add_costs(record, []))
     assert summary["final_region"] is None and summary["paid_usd"] == 1.0
+
+
+def task_lines(caplog) -> list[dict]:
+    return [r.__dict__ for r in caplog.records if r.__dict__.get("event") == "task_cost"]
+
+
+def test_task_cost_is_the_task_duration_times_the_node_price(caplog):
+    record = cost.add_costs(REAL_C6A, [])
+    spans = [
+        cost.Span(3, t("2026-11-26T09:43:57"), t("2026-11-26T10:43:57"), True, "membench", 0),  # one hour
+        cost.Span(1, t("2026-11-26T08:20:00"), t("2026-11-26T08:30:00"), False, "geekbench", 1),
+        cost.Span(1, t("2026-11-26T08:30:00"), t("2026-11-26T08:31:00"), False, "stress_ng", -4),
+        cost.Span(1, t("2026-11-26T08:31:55"), t("2026-11-26T08:31:55"), False, "never_ran", -4),  # written off
+        cost.Span(2, t("2026-11-26T08:40:00"), t("2026-11-26T08:50:00"), False, "slow", -6),
+    ]
+    with caplog.at_level(logging.INFO, logger="k8s_inspector.cost"):
+        cost.log_cost_lines(record, spans)
+    lines = task_lines(caplog)
+    assert [(x["task"], x["attempt"], x["result"], x["exit_code"]) for x in lines] == [
+        ("membench", 3, "ok", 0), ("geekbench", 1, "failed", 1), ("stress_ng", 1, "lost", -4),
+        ("slow", 2, "failed", -6),
+    ]  # fmt: skip
+    membench, geekbench, lost, _ = lines
+    assert (membench["duration_s"], membench["price"], membench["cost_usd"]) == (3600.0, 1.1429912328767124, 1.142991)
+    assert (membench["vendor"], membench["sku"], membench["region"], membench["capacity_type"]) == (
+        "aws", "c6a.12xlarge", "ap-south-1", "on-demand",
+    )  # fmt: skip
+    assert geekbench["cost_usd"] == pytest.approx(600 / 3600 * 0.31903013698630134, abs=1e-6)
+    assert lost["capacity_type"] == "spot" and lost["zone"] == "ca-central-1a"
+    assert all(x["backfill"] is False for x in lines)
+
+
+def test_parallel_tasks_each_get_the_full_node_price(caplog):
+    record = cost.add_costs(REAL_C6A, [])
+    start, end = t("2026-11-26T09:20:00"), t("2026-11-26T09:30:00")
+    spans = [cost.Span(3, start, end, True, name, 0) for name in ("dmidecode", "lscpu")]
+    with caplog.at_level(logging.INFO, logger="k8s_inspector.cost"):
+        cost.log_cost_lines(record, spans)
+    one, two = task_lines(caplog)
+    assert one["cost_usd"] == two["cost_usd"] == pytest.approx(600 / 3600 * 1.1429912328767124, abs=1e-6)
+    assert one["cost_usd"] + two["cost_usd"] > 600 / 3600 * 1.1429912328767124  # they overlap
+
+
+def test_a_task_of_an_attempt_without_a_node_has_no_line(caplog):
+    record = cost.add_costs({"run_id": "r", "vendor": "v", "sku": "s", "attempts": [
+        {"attempt": 1, "api_start": "2026-11-26T08:00:00Z", "end": "2026-11-26T08:10:00+00:00", "node": None},
+    ]}, [])  # fmt: skip
+    with caplog.at_level(logging.INFO, logger="k8s_inspector.cost"):
+        cost.log_cost_lines(record, [cost.Span(1, t("2026-11-26T08:01:00"), t("2026-11-26T08:02:00"), True, "a", 0)])
+    assert task_lines(caplog) == []
+
+
+def test_the_task_spans_of_a_real_run_do_not_change_its_cost():
+    spans = [cost.Span(n, t(f"2026-11-26T{a}"), t(f"2026-11-26T{b}"), True, "x", 0) for n, a, b in REAL_C6A_TASKS]
+    spans.append(cost.Span(1, t("2026-11-26T08:31:55"), t("2026-11-26T08:31:55"), False, "lost", -4))
+    summary = cost.run_summary(cost.add_costs(REAL_C6A, spans))
+    assert summary["paid_usd"] == pytest.approx(2.164638, abs=1e-6)
+    assert summary["ondemand_counterfactual_usd"] == pytest.approx(2.467421, abs=1e-6)
+
+
+def test_node_fields_and_server_size_are_in_the_attempt_lines(caplog):
+    record = c6a() | {"vcpus": 48, "memory_gib": 96.0}
+    record["attempts"][0] |= {"node": "ip-10-0-0-1", "node_claim": "pool-abcde"}
+    with caplog.at_level(logging.INFO, logger="k8s_inspector.cost"):
+        cost.log_cost_lines(cost.add_costs(record, SPANS))
+    first, second = [r.__dict__ for r in caplog.records][:2]
+    assert (first["node"], first["nodeclaim"], first["vcpus"], first["memory_gib"]) == (
+        "ip-10-0-0-1",
+        "pool-abcde",
+        48,
+        96.0,
+    )
+    assert (second["node"], second["nodeclaim"]) == (None, None)
+    caplog.clear()
+    with caplog.at_level(logging.INFO, logger="k8s_inspector.cost"):
+        cost.log_cost_lines(cost.add_costs(c6a(), SPANS))
+    assert (caplog.records[0].vcpus, caplog.records[0].memory_gib) == (None, None)
