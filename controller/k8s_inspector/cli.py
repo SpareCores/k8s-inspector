@@ -109,6 +109,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="write the run records of past runs from run.json in object storage",
     )
+    pub.add_argument(
+        "--emit-cost-logs",
+        action="store_true",
+        help="log the cost lines of the run records in git (with --since); changes nothing in git",
+    )
     pub.add_argument("--sku", action="append", default=[], help="with --rescan: a SKU never published (repeatable)")
     return p
 
@@ -429,14 +434,17 @@ def cmd_cancel(args: argparse.Namespace) -> int:
 
 
 def cmd_publish(args: argparse.Namespace) -> int:
-    """One publish cycle (or `--rescan`, or `--backfill-runs`) in a throwaway checkout, so it never shares a working
-    tree with the `serve` process."""
+    """One publish cycle (or `--rescan`, `--backfill-runs` or `--emit-cost-logs`) in a throwaway checkout, so it never
+    shares a working tree with the `serve` process."""
     kube, provider = _connect()
     cfg = provider()
     storage = Storage(cfg.env, cfg.settings.uploads)
     with tempfile.TemporaryDirectory(prefix="k8si-publish-") as workdir:
         publisher = Publisher(kube, storage, cfg.env, Path(workdir), settings_provider=lambda: cfg.settings)
         try:
+            if args.emit_cost_logs:
+                print(f"logged the cost lines of {publisher.emit_cost_logs(args.since.days)} runs")
+                return 0
             if args.backfill_runs:
                 records = publisher.backfill_run_records(args.since.days)
                 print(f"wrote {records} run records")

@@ -50,7 +50,8 @@ Decisions:
 - Run records (`render.render_run_record`): once a run is Done, Failed or Cancelled, all its tasks are published (or
   given up) and it is publishable, `runs/<run_id>.json` is written next to its variants (DBaaS: next to `postgres/`)
   in an own commit. The record is the run's `run.json` (read from object storage, which expires) minus the lscpu
-  output, plus the final phase. Write once: an existing file is never rewritten. `delete_expired_runs` keeps a
+  output, plus the final phase and the cost of its attempts (`cost.add_costs`, logged by `cost.log_cost_lines` when the
+  record is pushed; `emit_cost_logs` logs them again for the records in git). Write once: an existing file is never rewritten. `delete_expired_runs` keeps a
   finished, publishable run until its record is written; a run without `run.json` is logged and given up. Runs
   deleted by `_defer_launch` get no record. `backfill_run_records` writes the records of past runs from the
   `run.json` files in object storage.
@@ -73,7 +74,7 @@ from datetime import UTC, date, datetime, timedelta
 from functools import partial
 from pathlib import Path
 
-from k8s_inspector import crd, dbaas_bench, launch, render, tasks
+from k8s_inspector import cost, crd, dbaas_bench, keeper, launch, render, tasks
 from k8s_inspector import storage as storage_keys
 from k8s_inspector import variant as variants
 from k8s_inspector.kube import Kube, NotFound
@@ -501,7 +502,7 @@ class Publisher:
                 log.error("run %s: no run.json, no run record", run.name)
                 self._records_written.add(run.name)
                 continue
-            todo.append((run, run_json))
+            todo.append((run, cost.add_costs(run_json, _task_spans(run))))
         if not todo:
             return
 
@@ -519,13 +520,16 @@ class Publisher:
                     log.exception("cannot render the record of %s, trying again next cycle", run.name)
             return written
 
-        self._commit_pushed(
+        written = self._commit_pushed(
             [f"/{_record_dir(run_json)}/runs/" for _, run_json in todo],
             render_all,
             lambda written: f"k8s-inspector: run records ({', '.join(r.spec.run_id for r in written)})",
             cone=False,
         )
         self._records_written |= done
+        costed = {run.name: run_json for run, run_json in todo}
+        for run in written:  # once per record: a record already in git is not logged again
+            cost.log_cost_lines(costed[run.name])
 
     def backfill_run_records(self, since_days: int, settings: Settings | None = None) -> int:
         """`publish --backfill-runs --since 120d`: write the records of the runs of the last `since_days` days from
@@ -554,6 +558,79 @@ class Publisher:
                         written += self._backfill_batch(batch)
                         batch = []
             return written + self._backfill_batch(batch)
+
+    def emit_cost_logs(self, since_days: int) -> int:
+        """`publish --emit-cost-logs --since 120d`: log the cost lines (`cost.log_cost_lines`, `backfill: true`) of
+        the run records in git whose run is at most `since_days` days old. Changes nothing in git. An attempt
+        without a stored `ondemand_price` gets Keeper's current one (`ondemand_price_source: current`); one
+        without stored cost fields gets `useful_s` and `setup_s` from the `meta.json` files of its run in the tree, null
+        when there are none. Returns the number of runs logged."""
+        with self._lock:
+            record_files = ["/data/*/*/runs/*.json", "/dbaas/*/*/runs/*.json"]
+            self._sync(record_files, cone=False)
+            cutoff = (datetime.now(UTC) - timedelta(days=since_days)).strftime("%Y%m%d")
+            records = []
+            for path in sorted(self._repo.glob("data/*/*/runs/*.json")) + sorted(
+                self._repo.glob("dbaas/*/*/runs/*.json")
+            ):
+                if path.stem[1:9] < cutoff:
+                    continue
+                try:
+                    record = json.loads(path.read_text())
+                    _record_dir(record)
+                    record["attempts"]
+                except (ValueError, KeyError, TypeError) as e:
+                    log.warning("cost logs: skipping %s (%r)", path.name, e)
+                    continue
+                records.append(record)
+            needs_meta = [r for r in records if not r.get("database") and _lacks_costs(r)]
+            if needs_meta:
+                skus = sorted({f"/{_record_dir(r)}/*/*/meta.json" for r in needs_meta})
+                self._sync(record_files + skus, cone=False)
+            prices: dict[tuple[str, str], dict[str, float]] = {}
+            facts: dict[tuple[str, str], dict] = {}
+            for record in records:
+                self._fill_from_keeper(record, prices, facts)
+                spans = self._spans_from_tree(record) if _lacks_costs(record) else []
+                cost.log_cost_lines(cost.add_costs(record, spans), backfill=True)
+            return len(records)
+
+    def _fill_from_keeper(self, record: dict, prices: dict, facts: dict) -> None:
+        """Keeper's current `family`, `cpu_arch`, `gpu_count` and `ondemand_price` for what the record lacks. What
+        Keeper cannot tell stays missing (logged as null)."""
+        sku = (record["vendor"], record["sku"])
+        try:
+            if "family" not in record:
+                if sku not in facts:
+                    facts[sku] = keeper.server_facts(self._env, *sku) or {}
+                record.update(facts[sku])
+            for a in record["attempts"]:
+                if "ondemand_price" in a or not a.get("region"):
+                    continue
+                if sku not in prices:
+                    prices[sku] = keeper.ondemand_prices(self._env, *sku)
+                a["ondemand_price"] = prices[sku].get(a["region"])
+                a["ondemand_price_source"] = "current"
+        except RuntimeError as e:
+            log.warning("cost logs: no Keeper data for %s/%s (%s)", *sku, e)
+
+    def _spans_from_tree(self, record: dict) -> list[cost.Span] | None:
+        """The task executions of a server run from the `meta.json` files filed under its run id in its variant
+        directories; None when there are none (a DBaaS run, or results that were replaced since)."""
+        if record.get("database"):
+            return None
+        sku_dir = self._repo / _record_dir(record)
+        metas = []
+        for path in sku_dir.glob("[0-9]*/*/meta.json"):
+            if not path.parts[-3].isdigit():
+                continue
+            try:
+                meta = json.loads(path.read_text())
+            except ValueError:
+                continue
+            if meta.get("run_id") == record["run_id"]:
+                metas.append(meta)
+        return cost.spans_from_metas(record["attempts"], metas) if metas else None
 
     def _variant_in_tree(self, run_json: dict) -> int | None:
         """The variant a past run was published under: the number of the directory holding its timing dir
@@ -1062,6 +1139,21 @@ def _phase_of(run_json: dict) -> str:
     if outcome in (AttemptOutcome.PROVISIONING_FAILED, AttemptOutcome.HARNESS_ERROR):
         return RunPhase.FAILED.value
     return "unknown"
+
+
+def _task_spans(run: BenchmarkRun) -> list[cost.Span]:
+    """The task executions the run's status remembers (the latest of each task). A task is kept when its result
+    was published; discarded ones are marked published without a commit."""
+    return [
+        cost.Span(t.attempt, t.start and _utc(t.start), t.end and _utc(t.end), kept=t.published and bool(t.commit))
+        for t in run.status.tasks
+        if t.state == TaskState.DONE
+    ]
+
+
+def _lacks_costs(record: dict) -> bool:
+    """A record from before the cost fields: its `useful_s` and `setup_s` come from the result files."""
+    return any("setup_s" not in a for a in record["attempts"])
 
 
 def _attempt_entry(run_json: dict | None, n: int | None) -> dict | None:

@@ -1,0 +1,177 @@
+"""Cost math and cost log lines: the c6a.12xlarge run of 2026-11-26 (two interrupted spot attempts that kept some
+tasks, then on-demand)."""
+
+import json
+import logging
+from datetime import UTC, datetime
+
+import pytest
+
+from k8s_inspector import cost
+
+
+def t(text: str) -> datetime:
+    return datetime.fromisoformat(text).replace(tzinfo=UTC)
+
+
+def attempt(n, start, end, outcome, capacity, price, region, ondemand=None, **extra):
+    return {
+        "attempt": n,
+        "api_start": start,
+        "end": end,
+        "outcome": outcome,
+        "capacity_type": capacity,
+        "price": price,
+        "region": region,
+        "zone": region + "a",
+        "ondemand_price": ondemand,
+    } | extra
+
+
+def c6a(ondemand_final=1.122) -> dict:
+    return {
+        "run_id": "r20261126t0813-cd26",
+        "vendor": "aws",
+        "sku": "c6a.12xlarge",
+        "family": "Compute Optimized",
+        "attempts": [
+            attempt(
+                1, "2026-11-26T08:13:43Z", "2026-11-26T08:31:55+00:00", "SpotInterrupted", "spot", "0.36", "r1", 2.0
+            ),
+            attempt(
+                2, "2026-11-26T08:32:00Z", "2026-11-26T09:12:48+00:00", "SpotInterrupted", "spot", "0.18", "r2", 1.0
+            ),
+            attempt(
+                3,
+                "2026-11-26T09:13:00Z",
+                "2026-11-26T10:56:48+00:00",
+                "Completed",
+                "on-demand",
+                "1.2",
+                "r3",
+                ondemand_final,
+            ),
+        ],
+    }
+
+
+SPANS = [
+    cost.Span(1, t("2026-11-26T08:15:43"), t("2026-11-26T08:16:43"), kept=True),
+    cost.Span(1, t("2026-11-26T08:16:43"), t("2026-11-26T08:17:43"), kept=False),  # discarded: not useful
+    cost.Span(2, t("2026-11-26T08:34:00"), t("2026-11-26T09:00:00"), kept=True),
+    cost.Span(3, t("2026-11-26T09:15:00"), t("2026-11-26T10:56:00"), kept=True),
+]
+
+
+def test_attempt_costs_of_the_interrupted_and_the_completed_attempts():
+    a1, a2, a3 = cost.add_costs(c6a(), SPANS)["attempts"]
+    assert (a1["duration_s"], a1["useful_s"], a1["setup_s"]) == (1092.0, 180.0, 120.0)  # last kept task ends 08:16:43
+    assert a1["cost_usd"] == pytest.approx(1092 / 3600 * 0.36)
+    assert a1["wasted_usd"] == pytest.approx((1092 - 180) / 3600 * 0.36)
+    assert (a2["useful_s"], a2["setup_s"]) == (28 * 60.0, 120.0)
+    assert (a3["useful_s"], a3["duration_s"], a3["wasted_usd"]) == (6228.0, 6228.0, 0.0)  # Completed: all useful
+
+
+def test_an_attempt_without_a_kept_task_wastes_everything_and_one_without_a_node_costs_nothing():
+    record = {
+        "attempts": [
+            attempt(1, "2026-11-26T08:00:00Z", "2026-11-26T09:00:00+00:00", "SpotInterrupted", "spot", "1.0", "r1"),
+            {
+                "attempt": 2,
+                "api_start": "2026-11-26T09:00:00Z",
+                "end": "2026-11-26T09:05:00+00:00",
+                "outcome": "ProvisioningFailed",
+            },
+        ]
+    }
+    a1, a2 = cost.add_costs(record, [cost.Span(1, t("2026-11-26T08:10:00"), t("2026-11-26T08:20:00"), kept=False)])[
+        "attempts"
+    ]
+    assert (a1["useful_s"], a1["cost_usd"], a1["wasted_usd"]) == (0.0, 1.0, 1.0)
+    assert a1["setup_s"] == 600.0  # the first task started, kept or not
+    assert (a2["cost_usd"], a2["useful_s"], a2["wasted_usd"], a2["setup_s"]) == (0.0, 0.0, 0.0, None)
+
+
+def test_run_summary_with_spot_interruptions_then_on_demand():
+    summary = cost.run_summary(cost.add_costs(c6a(), SPANS))
+    paid = (1092 * 0.36 + 2448 * 0.18 + 6228 * 1.2) / 3600
+    useful = 180 + 1680 + 6228
+    assert summary["paid_usd"] == pytest.approx(paid, abs=1e-5)
+    # counterfactual: the completed attempt's price x (all useful time + the completed attempt's setup of 120 s)
+    assert summary["ondemand_counterfactual_usd"] == pytest.approx(1.122 * (useful + 120) / 3600, abs=1e-5)
+    assert summary["spot_net_usd"] == pytest.approx(paid - 1.122 * (useful + 120) / 3600, abs=1e-5)
+    assert summary | {"paid_usd": 0, "wasted_usd": 0, "ondemand_counterfactual_usd": 0, "spot_net_usd": 0} == {
+        "family": "Compute Optimized",
+        "final_region": "r3",
+        "final_capacity_type": "on-demand",
+        "attempts": 3,
+        "spot_interruptions": 2,
+        "used_spot": True,
+        "paid_usd": 0,
+        "wasted_usd": 0,
+        "ondemand_counterfactual_usd": 0,
+        "spot_net_usd": 0,
+    }
+
+
+def test_counterfactual_is_null_without_the_ondemand_price():
+    summary = cost.run_summary(cost.add_costs(c6a(ondemand_final=None), SPANS))
+    assert summary["ondemand_counterfactual_usd"] is None and summary["spot_net_usd"] is None
+    assert summary["paid_usd"] > 0
+
+
+def test_counterfactual_is_null_without_a_completed_attempt():
+    record = c6a()
+    record["attempts"] = record["attempts"][:2]
+    summary = cost.run_summary(cost.add_costs(record, SPANS))
+    assert summary["ondemand_counterfactual_usd"] is None and summary["spot_net_usd"] is None
+    assert summary["spot_interruptions"] == 2 and summary["used_spot"] is True
+
+
+def test_unknown_task_times_leave_useful_time_and_waste_null():
+    a1, _, a3 = cost.add_costs(c6a(), None)["attempts"]
+    assert (a1["useful_s"], a1["setup_s"], a1["wasted_usd"]) == (None, None, None)
+    assert a3["useful_s"] == 6228.0
+    summary = cost.run_summary(cost.add_costs(c6a(), None))
+    assert summary["wasted_usd"] is None and summary["ondemand_counterfactual_usd"] is None
+
+
+def test_spans_from_metas_assign_a_task_to_the_attempt_open_when_it_started():
+    attempts = cost.add_costs(c6a(), SPANS)["attempts"]
+    metas = [
+        {"start": "2026-11-26T08:15:43.5", "end": "2026-11-26T08:16:43"},
+        {"start": "2026-11-26T09:15:00", "end": "2026-11-26T10:56:00"},
+    ]
+    assert [s.attempt for s in cost.spans_from_metas(attempts, metas)] == [1, 3]
+
+
+def test_log_lines_carry_the_documented_fields(caplog):
+    record = cost.add_costs(c6a(), SPANS)
+    with caplog.at_level(logging.INFO, logger="k8s_inspector.cost"):
+        cost.log_cost_lines(record)
+    lines = [r.__dict__ for r in caplog.records]
+    assert [(r["event"], r["msg"]) for r in lines] == [
+        ("run_attempt_cost", "run attempt cost"),
+        ("run_attempt_cost", "run attempt cost"),
+        ("run_attempt_cost", "run attempt cost"),
+        ("run_cost", "run cost"),
+    ]
+    attempt_fields = {
+        "run", "vendor", "sku", "family", "region", "zone", "capacity_type", "outcome", "start", "end", "duration_s",
+        "useful_s", "setup_s", "price", "ondemand_price", "cost_usd", "wasted_usd", "start_hour_utc",
+        "start_weekday_utc",
+    }  # fmt: skip
+    run_fields = {
+        "run", "vendor", "sku", "family", "final_region", "final_capacity_type", "attempts", "spot_interruptions",
+        "used_spot", "paid_usd", "wasted_usd", "ondemand_counterfactual_usd", "spot_net_usd",
+    }  # fmt: skip
+    assert attempt_fields <= lines[0].keys() and run_fields <= lines[3].keys()
+    assert (lines[0]["start_hour_utc"], lines[0]["start_weekday_utc"]) == (8, "Thu")
+    assert (lines[0]["ondemand_price_source"], lines[0]["backfill"]) == ("launch", False)
+    json.dumps({k: v for k, v in lines[3].items() if k in run_fields})
+
+
+def test_backfill_lines_say_so(caplog):
+    with caplog.at_level(logging.INFO, logger="k8s_inspector.cost"):
+        cost.log_cost_lines(cost.add_costs(c6a(), SPANS), backfill=True)
+    assert all(r.backfill is True for r in caplog.records)

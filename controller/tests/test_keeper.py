@@ -10,6 +10,8 @@ import pytest
 from k8s_inspector import keeper
 from k8s_inspector.model import EnvConfig
 
+server_facts, ondemand_prices = keeper.server_facts, keeper.ondemand_prices  # conftest stubs the module's names
+
 
 @pytest.fixture
 def server():
@@ -121,3 +123,41 @@ def test_real_bulk_response_keeps_oci_skus_with_their_blocked_tasks(monkeypatch)
     assert set(result["oci"]) == {"BM.DenseIO.A4.Ax.72", "VM.Optimized3.Flex.1-4"}
     assert set(result["oci"]["VM.Optimized3.Flex.1-4"]) == {"stressnglongrun", "nvidia_smi"}  # lscpu, llm... eligible
     assert set(result["oci"]["BM.DenseIO.A4.Ax.72"]) == {"geekbench", "stressnglongrun", "nvidia_smi"}
+
+
+def test_server_facts_come_from_the_v2_server_record(monkeypatch):
+    seen = []
+    record = {"family": "Compute Optimized", "cpu_architecture": "x86_64", "accelerator_count": 4.0, "series": "c6a"}
+    monkeypatch.setattr(keeper, "_get", lambda url, key: seen.append(url) or record)
+    facts = server_facts(EnvConfig(bucket="b", bucket_region="r", keeper_api_base="http://k"), "aws", "c6a.12xlarge")
+    assert facts == {"family": "Compute Optimized", "cpu_arch": "x86_64", "gpu_count": 4}
+    assert seen == ["http://k/v2/server/aws/c6a.12xlarge"]
+
+
+def test_unknown_server_has_no_facts(monkeypatch):
+    monkeypatch.setattr(keeper, "_get", lambda url, key: None)
+    assert server_facts(EnvConfig(bucket="b", bucket_region="r"), "aws", "nope") is None
+
+
+def test_ondemand_prices_are_the_cheapest_active_zone_per_region_by_api_reference(monkeypatch):
+    from k8s_inspector import dbaas_keeper
+
+    def row(region, allocation, price, status="active"):
+        return {"region_id": region, "allocation": allocation, "price": price, "status": status}
+
+    rows = [
+        row("1000", "ondemand", 1.2),
+        row("1000", "ondemand", 1.1),
+        row("1000", "spot", 0.4),
+        row("1100", "ondemand", 2.0, status="inactive"),
+        row("1200", "ondemand", None),
+        row("9999", "ondemand", 3.0),  # not a region of the vendor
+    ]
+    regions = [
+        {"api_reference": f"eu-{i}", "region_id": rid, "vendor_id": "gcp"}
+        for i, rid in enumerate(("1000", "1100", "1200"))
+    ]
+    monkeypatch.setattr(
+        dbaas_keeper, "_list", lambda env, path, params=(): rows if path.endswith("/prices") else regions
+    )
+    assert ondemand_prices(EnvConfig(bucket="b", bucket_region="r"), "gcp", "n2") == {"eu-0": 1.1}

@@ -28,6 +28,7 @@ and per attempt) plus `phase`, with `variant` set as below. It is written with s
 | `phase` | the run's final phase: `Done`, `Failed` or `Cancelled`; `unknown` in a [backfilled](#backfill) record whose attempts do not tell |
 | `plan` | task names of the run, in order |
 | `variant` | the hardware variant number the run's results were filed under, `null` when none (DBaaS: always). Not `run.json`'s own `variant`, which is the runner's last snapshot: the publisher decides the variant later. Live: the run's `status.variant`; backfilled: the number of the directory holding the run's `timing/<run_id>/` in the tree (`data/<vendor>/<sku>/<N>/timing/<run_id>/`), `null` when there is none |
+| `family`, `cpu_arch`, `gpu_count` | Keeper's `family`, `cpu_architecture` and `accelerator_count` of the SKU (the client node for a DBaaS run), read once when the run's first attempt gets its node; absent when Keeper could not be asked |
 | `database` | `null` for a server run; for DBaaS the database object (`vendor`, `id`, `engineVersion`, `region`, `vcpus`, `memoryGib`, `usdPerHour`) |
 | `timing` | the latest attempt's `api_start`, `api_end`, `machine_start`, `node_registered`, `node_ready` (ISO UTC; only those known) |
 | `attempts[]` | one entry per node the run used, oldest first |
@@ -40,6 +41,9 @@ An attempt:
 | `capacity_type` | `spot` or `on-demand`; `null` for an attempt that never got a node |
 | `region`, `zone` | where the node ran; only on the attempt the run's status carried the region of (usually the last), absent otherwise |
 | `price` | the node's price per hour in USD as a string, same availability as `region` |
+| `ondemand_price` | USD per hour of the on-demand price of the same SKU in the attempt's region, from Keeper (ACTIVE `ondemand` price rows, the cheapest zone), captured when the attempt gets its node, so it is the price at launch time. `null` when Keeper has no on-demand offer there; absent when Keeper could not be asked |
+| `ondemand_price_reason` | `no_ondemand_offer`, with a `null` `ondemand_price` |
+| `duration_s`, `useful_s`, `setup_s`, `cost_usd`, `wasted_usd` | what the attempt cost and how much of it was useful, see [Cost log lines](#cost-log-lines); written into the record, not into `run.json` |
 | `node`, `node_claim` | names of the Kubernetes node and its NodeClaim; `null` without a node |
 | `api_start` | the attempt's anchor Pod was created (the start of the attempt) |
 | `api_end`, `machine_start`, `node_registered`, `node_ready` | NodeClaim launched, kernel boot, node registered, node ready; `null` when not reached |
@@ -98,6 +102,76 @@ kubectl -n inspector exec deploy/k8s-inspector -- k8s-inspector publish --backfi
 
 `kubectl create job --from` does not apply: it needs a CronJob, and the controller is a Deployment. The command
 prints `wrote <n> run records`.
+
+## Cost log lines
+
+When a run record is written (once per run, after its commit is pushed) the controller logs what the run's attempts
+cost, one `run_attempt_cost` line per attempt and one `run_cost` line for the run, at info level in the normal JSON
+log (`msg`, `event` and the fields below next to `ts`, `level` and `logger`). A record already in git is not logged
+again, also after a controller restart.
+
+Definitions, per attempt (`start` is `api_start`):
+
+- `duration_s`: `end` minus `start`.
+- `price`: the node's price per hour, a number (`null` for an attempt that never got a node).
+- `cost_usd` = `duration_s` / 3600 × `price`; 0 for an attempt without a node or an `end`.
+- `useful_s`: for a `Completed` attempt its `duration_s`; otherwise the seconds from `start` to the end of the last
+  task of that attempt whose result was kept (published, not discarded); 0 when it kept none. Task times and
+  attempt numbers are the run's `status.tasks`, which hold the latest execution of each task: a task that ran again
+  on a later attempt counts there only.
+- `wasted_usd` = `cost_usd` − `useful_s` / 3600 × `price`.
+- `setup_s`: `start` to the first task start of the attempt (kept or not); `null` when no task of it is known.
+
+`run_attempt_cost`:
+
+| Field | Value |
+|---|---|
+| `msg`, `event` | `run attempt cost`, `run_attempt_cost` |
+| `run`, `vendor`, `sku`, `family` | run id, the run's vendor and SKU, Keeper's family (`null` when unknown) |
+| `attempt` | number, from 1 |
+| `region`, `zone`, `capacity_type`, `outcome` | as in the attempt (`null` when absent) |
+| `start`, `end` | the attempt's `api_start` and `end` |
+| `duration_s`, `useful_s`, `setup_s`, `price`, `ondemand_price`, `cost_usd`, `wasted_usd` | as defined above; `ondemand_price` is the attempt's |
+| `ondemand_price_source` | `launch`: captured when the attempt got its node; `current`: Keeper's price at backfill time |
+| `start_hour_utc`, `start_weekday_utc` | hour `0`-`23` and weekday `Mon`-`Sun` of `start`, UTC |
+| `backfill` | `false` |
+
+`run_cost`:
+
+| Field | Value |
+|---|---|
+| `msg`, `event` | `run cost`, `run_cost` |
+| `run`, `vendor`, `sku`, `family` | as above |
+| `final_region`, `final_capacity_type` | of the last attempt |
+| `attempts`, `spot_interruptions` | attempts, and those that ended `SpotInterrupted` |
+| `used_spot` | any attempt ran on spot; every run is logged, so filter on it |
+| `paid_usd`, `wasted_usd` | sums over the attempts |
+| `ondemand_counterfactual_usd` | `ondemand_price` of the `Completed` attempt × (sum of `useful_s` over all attempts + `setup_s` of the `Completed` attempt) / 3600; `null` without a `Completed` attempt or its `ondemand_price` |
+| `spot_net_usd` | `paid_usd` − `ondemand_counterfactual_usd`, `null` with it; positive means spot cost more than on-demand would have |
+| `backfill` | `false` |
+
+The `Completed` attempt's `setup_s` lies inside its `useful_s`, so the counterfactual counts it twice. `setup_s`
+counts as 0 when `null`. The price is the node's price from the cluster (it can include extras such as disk), the
+on-demand price is Keeper's list price of the server, so the two differ a little even for an on-demand attempt.
+
+### Re-emit
+
+```sh
+kubectl -n inspector exec deploy/k8s-inspector -- sh -c 'k8s-inspector publish --emit-cost-logs --since 120d 2>/proc/1/fd/2'
+```
+
+logs the same lines for the run records in git whose run id date is within `--since`, with `"backfill": true`. The
+redirect puts the lines into the controller's container log, which is what the log shipping reads; the command
+prints `logged the cost lines of <n> runs`. It changes nothing in git and can be rerun, which logs the lines again.
+Values the record lacks (records written before the cost fields) are filled in:
+
+- `ondemand_price` from Keeper now (`"ondemand_price_source": "current"`; a stored one stays, as `launch`), `family`
+  likewise.
+- `useful_s` and `setup_s` from the `start` and `end` of the `meta.json` files of the run id under
+  `data/<vendor>/<sku>/<variant>/<task>/`, each assigned to the attempt that was open when the task started. Only
+  results still in the tree count (a replaced result and the vLLM probe keys are missing); `null` when the run has
+  no `meta.json` there and for a DBaaS run, so its `wasted_usd`, the run's `wasted_usd` and the counterfactual are
+  `null` too. A `Completed` attempt is useful as a whole either way.
 
 ## Queries
 

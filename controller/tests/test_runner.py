@@ -1341,6 +1341,39 @@ def lose_node(h: Harness, attempt: int = 1) -> None:
     h.kube.delete("pod", f"{h.name}-a{attempt}")
 
 
+def test_run_json_keeps_the_ondemand_price_of_the_launch_and_the_server_facts(h, monkeypatch):
+    prices = {"eu-test-1": 0.2}
+    monkeypatch.setattr(keeper, "ondemand_prices", lambda env, vendor, sku: prices)
+    monkeypatch.setattr(
+        keeper, "server_facts", lambda env, vendor, sku: {"family": "F", "cpu_arch": "arm64", "gpu_count": 0}
+    )
+    h.start(["membench"])
+    h.drive()
+    prices["eu-test-1"] = 0.3  # a later change does not touch what was captured at launch
+    h.runner.reconcile(h.name)
+    doc = h.storage.run_json
+    assert doc["attempts"][0]["ondemand_price"] == 0.2 and "ondemand_price_reason" not in doc["attempts"][0]
+    assert (doc["family"], doc["cpu_arch"], doc["gpu_count"]) == ("F", "arm64", 0)
+
+
+def test_run_json_says_why_there_is_no_ondemand_price(h):
+    h.start(["membench"])
+    h.drive()  # Keeper (stubbed in conftest) has no on-demand offer
+    attempt = h.storage.run_json["attempts"][0]
+    assert attempt["ondemand_price"] is None and attempt["ondemand_price_reason"] == "no_ondemand_offer"
+    assert "family" not in h.storage.run_json
+
+
+def test_run_json_has_no_ondemand_price_while_keeper_is_unreachable(h, monkeypatch):
+    def down(env, vendor, sku):
+        raise RuntimeError("keeper down")
+
+    monkeypatch.setattr(keeper, "ondemand_prices", down)
+    h.start(["membench"])
+    h.drive()
+    assert "ondemand_price" not in h.storage.run_json["attempts"][0]  # the next write asks again
+
+
 def test_spot_node_loss_mid_step_resumes_with_the_remaining_tasks(h):
     h.start(["membench", "geekbench"])
     h.drive(stop=in_step("03-membench"))

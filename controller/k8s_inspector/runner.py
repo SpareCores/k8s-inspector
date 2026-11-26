@@ -77,7 +77,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 
-from k8s_inspector import crd, launch, planner, pods, render, spot, steps, tasks, variant
+from k8s_inspector import crd, keeper, launch, planner, pods, render, spot, steps, tasks, variant
 from k8s_inspector.kube import AlreadyExists, Forbidden, Kube, NotFound, backoff_delay, retry_until_ok
 from k8s_inspector.model import (
     AttemptOutcome,
@@ -894,7 +894,8 @@ class Runner(DbaasMixin):
         controller does not lose what the NodeClaim of an earlier attempt said."""
         key = crd.run_key(run)
         raw = self.storage.read_bytes(run_json_key(key))
-        before = {a["attempt"]: a for a in json.loads(raw).get("attempts") or [] if "attempt" in a} if raw else {}
+        prior = json.loads(raw) if raw else {}
+        before = {a["attempt"]: a for a in prior.get("attempts") or [] if "attempt" in a}
         attempts = []
         for a in run.status.attempts:
             entry = {"api_end": None, "machine_start": None, "node_registered": None, "node_ready": None}
@@ -910,6 +911,8 @@ class Runner(DbaasMixin):
             }
             if a.n == run.status.attempt and run.status.region:
                 entry |= {"region": run.status.region, "zone": run.status.zone, "price": run.status.price_per_hour}
+                if "ondemand_price" not in entry:
+                    entry |= self._ondemand_price(run)
             if nd and nd.attempt == a.n:
                 claim = self._get_claim(nd.facts.node_claim) or nd.claim
                 for name, kind in (
@@ -941,7 +944,32 @@ class Runner(DbaasMixin):
             "timing": timing,
             "database": run.spec.database,
         }
+        facts = {k: prior[k] for k in ("family", "cpu_arch", "gpu_count") if k in prior}
+        doc |= facts or (self._server_facts(run) if run.status.region else {})
         self.storage.write_run_json(key, doc)
+
+    def _ondemand_price(self, run: BenchmarkRun) -> dict:
+        """The Keeper on-demand price of the run's SKU in its region, as `run.json` attempt fields, at the time the
+        attempt gets its node. Empty when Keeper cannot be asked: the next `run.json` write tries again."""
+        try:
+            price = keeper.ondemand_prices(self._cfg().env, run.spec.vendor, run.node_sku).get(run.status.region)
+        except RuntimeError as e:
+            log.warning("run %s: no on-demand price from Keeper (%s)", run.name, e)
+            return {}
+        return (
+            {"ondemand_price": price}
+            if price is not None
+            else {"ondemand_price": None, "ondemand_price_reason": "no_ondemand_offer"}
+        )
+
+    def _server_facts(self, run: BenchmarkRun) -> dict:
+        """`family`, `cpu_arch` and `gpu_count` of the run's SKU from Keeper; empty when it is not known or cannot be
+        asked (the next `run.json` write tries again)."""
+        try:
+            return keeper.server_facts(self._cfg().env, run.spec.vendor, run.node_sku) or {}
+        except RuntimeError as e:
+            log.warning("run %s: no server facts from Keeper (%s)", run.name, e)
+            return {}
 
     # ----------------------------------------------------------------------- Pending
 

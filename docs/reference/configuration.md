@@ -284,7 +284,7 @@ without `truncated` counts as complete; the optional `zonesOmitted` field is ign
 
 `k8s-inspector serve | plan [--dry-run] | run <vendor> <sku> [--tasks …] [--force] [--on-demand] [--hold 2h] |
 run <vendor> --database <id> [--region <region>] [--client-region <region>] [<client sku>] [--force] [--hold 2h] |
-status [--failing] | cancel <run> | publish [--rescan --since 7d [--sku <sku>]… | --backfill-runs --since 120d]`. Inside the cluster:
+status [--failing] | cancel <run> | publish [--rescan --since 7d [--sku <sku>]… | --backfill-runs --since 120d | --emit-cost-logs --since 120d]`. Inside the cluster:
 `kubectl -n inspector exec deploy/k8s-inspector -- k8s-inspector …`.
 
 `cancel` only sets the annotation `inspector.sparecores.com/cancel: "true"` on the `BenchmarkRun` and returns; the

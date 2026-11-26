@@ -41,14 +41,16 @@ entries are kept.
 ```json
 {"vendor": "oci", "sku": "VM.Standard.E5.Flex.2-16", "run_id": "r20261120t0930-3f9c",
  "plan": ["lscpu", "stressngfull"], "variant": 0, "database": null,
+ "family": "…", "cpu_arch": "x86_64", "gpu_count": 0,
  "timing": {"api_start": "…", "api_end": "…", "machine_start": "…", "node_registered": "…", "node_ready": "…"},
  "attempts": [{"attempt": 1, "api_start": "…", "api_end": "…", "machine_start": "…", "node_registered": "…",
                "node_ready": "…", "lscpu_stdout": "…", "capacity_type": "spot", "node": "…", "node_claim": "…",
-               "end": "…", "outcome": "SpotInterrupted", "region": "…", "zone": "…", "price": "0.0337"}]}
+               "end": "…", "outcome": "SpotInterrupted", "region": "…", "zone": "…", "price": "0.0337", "ondemand_price": 0.0791}]}
 ```
 
 `timing` repeats the latest attempt's timings. `api_start` of an attempt is the creation of its anchor. Each attempt's
-`lscpu_stdout` is what picks the [variant](#sc-inspector-data) of the tasks that ran in it.
+`lscpu_stdout` is what picks the [variant](#sc-inspector-data) of the tasks that ran in it. `family`, `cpu_arch`,
+`gpu_count` and the attempt's `ondemand_price` come from Keeper ([run records](run-records.md)).
 
 ## sc-inspector-data
 
