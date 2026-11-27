@@ -306,7 +306,7 @@ tasks:
   # Might be slow with large models. GPU first, CPU fallback (no `gpu: true`).
   - name: llm
     image: ghcr.io/sparecores/benchmark-llm:main
-    digest: sha256:786b29bafdbd0d8539bad8a56ecf50f91c8d93634176d1edc99bcd1dc51a36bd
+    digest: sha256:66f63b7dd73775aac471606acb3e0c8dda9a228ce948c9c9b00dd39af11cb8c0
     entrypoint: [/usr/local/bin/resource-tracker, --, /benchmark.py]
     command: null
     version_command: --version
@@ -323,9 +323,9 @@ tasks:
       - ghcr.io/sparecores/benchmark-vllm-cpu:main
       - ghcr.io/sparecores/benchmark-vllm-cpu-avx2:main
     digests:
-      ghcr.io/sparecores/benchmark-vllm-gpu:main: sha256:650ab0dad9264638f9152fe35bf1800eb5ec6e85b8cc7099456a38c926879639
-      ghcr.io/sparecores/benchmark-vllm-cpu:main: sha256:54336500099120f929f1a5cd60d23427cf459ab9132c7e4a0fdddf3e3dcab6b0
-      ghcr.io/sparecores/benchmark-vllm-cpu-avx2:main: sha256:5aef8eee792cc24815481a4854c8a2fa8dbf953240f2fea8b528baee24d87e70
+      ghcr.io/sparecores/benchmark-vllm-gpu:main: sha256:81648f1f668a324d4824675f0817318f36dad515f0b54e99504718fcbcd2f199
+      ghcr.io/sparecores/benchmark-vllm-cpu:main: sha256:bf3604dfa243e212e6549207639088d1bb0849d5617227d4213936bed4131d96
+      ghcr.io/sparecores/benchmark-vllm-cpu-avx2:main: sha256:4520b171734539904d61f7931ff0319c9e7167fcbc111774dc4b321591e8acc4
     entrypoint: [/usr/local/bin/resource-tracker, --, python3, /benchmark.py]
     command: null
     version_command: --version
