@@ -199,3 +199,24 @@ def test_sku_market_reads_series_breadth_inputs_and_prices(monkeypatch):
     }  # fmt: skip
     monkeypatch.setattr(keeper, "_get", lambda url, key: None)
     assert keeper.sku_market(ENV, "aws", "nope", {}) is None
+
+
+def test_a_failing_region_lookup_cools_down_without_a_negative_entry(monkeypatch):
+    clock = [1000.0]
+    monkeypatch.setattr(popularity.time, "monotonic", lambda: clock[0])
+    asked = []
+
+    def region_ids(env, vendor):
+        asked.append(vendor)
+        if len(asked) == 1:
+            raise RuntimeError("keeper HTTP 503")
+        return {}
+
+    monkeypatch.setattr(keeper, "region_ids", region_ids)
+    monkeypatch.setattr(keeper, "sku_market", lambda env, vendor, sku, ids: market(sku))
+    cache = popularity.PopularityCache()
+    cache.warm(ENV, "v", ["a"])
+    clock[0] += popularity.COOLDOWN_SECONDS + 1
+    cache.begin_cycle()
+    cache.warm(ENV, "v", ["a"])
+    assert set(cache.markets("v")) == {"a"}  # "a" was not put on the 6 hour list

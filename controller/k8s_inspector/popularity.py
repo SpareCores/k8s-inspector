@@ -61,6 +61,11 @@ class PopularityCache:
             self._left -= 1
             try:
                 ids = self._ids(env, vendor, now)
+            except Exception as e:  # not the SKU's fault: cool down, no negative entry
+                log.warning("popularity: Keeper region lookup for %s failed, no lookups for a while: %s", vendor, e)
+                self._cooldown_since = now
+                return
+            try:
                 self._skus[vendor, sku] = (now, keeper.sku_market(env, vendor, sku, ids))
             except Exception as e:  # RuntimeError, or an unreadable key file: rank with what is cached
                 log.warning("popularity: Keeper lookup for %s/%s failed, no lookups for a while: %s", vendor, sku, e)

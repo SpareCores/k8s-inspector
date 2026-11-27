@@ -1951,3 +1951,31 @@ def test_a_big_sku_keeps_its_wait_timer_when_its_region_changes(kube, keeper_sku
     publish_offered(kube, offered_configmap({"big": spot_entry(regional(need=100, a=64, b=50), spot_available=False)}))
     plan_wet(kube, keeper_skus, quota_waits=waits)  # not big any more: no drain, the timer still goes on
     assert waits[("oci", "big")][0] == since
+
+
+@pytest.mark.offered
+def test_zones_of_all_available_groups_count_not_the_last_group(kube, keeper_skus):
+    keeper_skus["oci"] = {"s": {}}
+    entry = spot_entry(regional(eu_1=128, eu_2=128, eu_3=128))
+    spot = entry["offerings"][0]
+    spot["zones"] = ["eu_1a", "eu_2b"]  # the available group
+    unavailable = {"capacityType": "spot", "zones": ["eu_3c"], "available": False}
+    entry["offerings"].append(unavailable)  # listed last, as SCarpenter lists the unavailable groups
+    publish_offered(kube, offered_configmap({"s": entry}))
+    plan_wet(kube, keeper_skus)
+    assert planned_regions(kube) == {"s": ("eu_1", "eu_2")}
+
+
+@pytest.mark.parametrize(
+    ("zone", "region", "belongs"),
+    [
+        ("us-east-1a", "us-east-1", True),
+        ("europe-west1-b", "europe-west1", True),
+        ("fi-hel1", "fi-hel1", True),
+        ("europe-west10-a", "europe-west1", False),
+        ("us-east-1-bos-1a", "us-east-1", False),
+        ("1", "eastus", False),
+    ],
+)
+def test_a_zone_belongs_to_a_region_by_name(zone, region, belongs):
+    assert planner._in_region(zone, region) is belongs

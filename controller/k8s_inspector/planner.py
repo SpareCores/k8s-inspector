@@ -9,6 +9,7 @@ import base64
 import gzip
 import json
 import logging
+import re
 import threading
 import time
 import zlib
@@ -364,12 +365,24 @@ def _regions(quota: dict) -> dict[str, dict]:
 
 
 def _zones(offerings: list) -> dict[str, list[str]]:
-    """The zone names of each offering group, by capacity type (a group without a list of strings is left out)."""
-    return {
-        o.get("capacityType"): [str(z) for z in o["zones"]]
-        for o in offerings
-        if isinstance(o, dict) and isinstance(o.get("zones"), list)
-    }
+    """The zone names of each capacity type: the union over its available offering groups (a type has several
+    groups, the unavailable ones among them), else over all its groups. A group without a list of zones is left
+    out."""
+    groups: dict[str, list[dict]] = {}
+    for offering in offerings:
+        if isinstance(offering, dict) and isinstance(offering.get("zones"), list):
+            groups.setdefault(offering.get("capacityType"), []).append(offering)
+    result = {}
+    for capacity_type, found in groups.items():
+        used = [o for o in found if o.get("available")] or found
+        result[capacity_type] = sorted({str(zone) for o in used for zone in o["zones"]})
+    return result
+
+
+def _in_region(zone: str, region: str) -> bool:
+    """The zone belongs to the region: it is the region (Alicloud, UpCloud), or the region plus a letter (AWS
+    `us-east-1a`) or a dash and a letter (GCP `europe-west1-b`). `europe-west10-a` and `us-east-1-bos-1a` are not."""
+    return re.fullmatch(f"{re.escape(region)}(-?[a-z])?", zone) is not None
 
 
 def _quotas(offerings: list) -> dict[str, list[dict]]:
@@ -757,7 +770,7 @@ class QuotaPass:
         if regional:
             zones = entry["zones"].get(CapacityType.SPOT if is_spot else CapacityType.ON_DEMAND, [])
             candidates = sorted(set.intersection(*regional))
-            named = [r for r in candidates if any(zone.startswith(r) for zone in zones)]
+            named = [r for r in candidates if any(_in_region(zone, r) for zone in zones)]
             candidates = named or candidates  # zones that carry region names narrow the set; others say nothing
         candidates = candidates or [None]
         busy = {region: self._busy(group, region) for region in candidates}

@@ -356,8 +356,9 @@ A regional bucket also lists `regions: [{region, limit, headroom}]`, the regions
 exact account figures. A list that is absent or damaged is ignored for that entry.
 
 **Placement and pinning.** When an entry of the chosen group has `regions`, the candidate regions are those that every
-such entry lists, narrowed to the regions that the group's `zones` name when any zone starts with a candidate region's name
-(zone names that carry no region name say nothing). A region is out when the run does not fit one of the entries there (its regional `headroom`) or a
+such entry lists, narrowed to the regions that the zones of the capacity type's available offering groups name (all its groups when none is
+available): a zone belongs to a region when it is the region, or the region plus a letter (`us-east-1a`) or a dash and a
+letter (`europe-west1-b`). When no zone names a candidate region (zone names like Azure's `1` say nothing) the set stays. A region is out when the run does not fit one of the entries there (its regional `headroom`) or a
 global entry of the group (`maxHeadroom`), after what is consumed in the cycle, or when another SKU reserves the quota
 there (below). The run is confined to **all** the others: `spec.regions` lists them, and the anchor of every attempt
 requires `topology.kubernetes.io/region In [...]` in its node affinity. Karpenter and SCarpenter pick an available
