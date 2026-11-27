@@ -75,7 +75,7 @@ of every NodeClaim of the attempt:
 
 | Field | Meaning |
 |---|---|
-| `launch_attempts` | list of `{region, zone, capacity_type, instance_type, outcome, code, message}` in the order tried, over all the attempt's NodeClaims, at most 50. `instance_type` is `<vendor>.<type>`. `outcome` is the SCarpenter error class of a failed candidate (`InsufficientCapacity`, `QuotaExceeded`, ...) or `launched` for the one that launched, which is last and has `code` and `message` `null`. `message` is cut to 40 characters |
+| `launch_attempts` | list of `{region, zone, capacity_type, instance_type, outcome, code, message}`: first the failed candidates of all the attempt's NodeClaims, in the order tried (by the time of their Event), at most 50, then the candidate that launched, which is never cut. `instance_type` is `<vendor>.<type>`. `outcome` is the SCarpenter error class of a failed candidate (`InsufficientCapacity`, `QuotaExceeded`, ...) or `launched`, with `code` and `message` `null`. `message` is cut to 40 characters |
 | `launch_attempts_tried` | integer: how many candidates SCarpenter tried in all, the launched one included; can be more than the list holds |
 | `launch_attempts_truncated` | `true` when SCarpenter or the controller cut the list |
 
@@ -90,8 +90,11 @@ of every NodeClaim of the attempt:
 "launch_attempts_truncated": false
 ```
 
-The three fields are all present or all absent: an attempt whose NodeClaims have no Event (an older SCarpenter, an
-Event past its TTL when the controller looked, a Create that made no vendor call) has none.
+The three fields are all present or all absent. SCarpenter publishes an Event only for a Create that made a vendor call,
+so an attempt whose NodeClaims never got that far (no candidate, quota, catalogue not ready), an older SCarpenter, or
+an Event past its TTL when the controller looked leaves them out. A NodeClaim that failed with `Retryable`, `Fatal`,
+`NotFound` or `ImageResolutionFailed` is created again by Karpenter on the same claim: it can carry several Events, all
+in the list, with `launch_attempts_tried` adding up their counts.
 
 ## Spot unavailable attempts
 

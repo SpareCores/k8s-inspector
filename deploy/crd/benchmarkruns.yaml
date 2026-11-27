@@ -140,17 +140,20 @@ spec:
                     node: {type: string}
                     start: {type: string, format: date-time, nullable: true}
                     end: {type: string, format: date-time, nullable: true}
-                    launchAttempts:
-                      type: object
-                      properties:
-                        claims: {type: array, items: {type: string}}
-                        tried: {type: integer}
-                        truncated: {type: boolean}
-                        outcomes:
-                          type: array
-                          items:
-                            type: object
-                            x-kubernetes-preserve-unknown-fields: true
+                    launchEvents:
+                      type: array
+                      items:
+                        type: object
+                        required: [name]
+                        properties:
+                          name: {type: string}
+                          time: {type: string, format: date-time, nullable: true}
+                          tried: {type: integer}
+                          truncated: {type: boolean}
+                          failed:
+                            type: array
+                            items: {type: object, x-kubernetes-preserve-unknown-fields: true}
+                          launched: {type: object, nullable: true, x-kubernetes-preserve-unknown-fields: true}
                     outcome:
                       type: string
                       nullable: true

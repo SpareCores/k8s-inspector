@@ -53,6 +53,7 @@ class FakeKube:
         self.created: list[tuple[str, str]] = []  # (kind, name) in order
         self.deleted: list[tuple[str, str]] = []
         self.node_pods_forbidden = False  # `list_node_pods` raises Forbidden (no RBAC for the cluster-wide list)
+        self.launch_event_lists: list[str] = []  # the claims `list_launch_attempts_events` was asked for
         self.events_forbidden = False  # `list_pod_events` raises Forbidden
         self.foreign_pods: list[dict] = []  # Pods of other namespaces (kube-system ...), seen by `list_node_pods` only
         self.force_deleted: list[str] = []  # Pods deleted with grace period 0
@@ -95,13 +96,14 @@ class FakeKube:
             if e["involvedObject"]["name"] == pod_name and e["involvedObject"].get("uid") == uid
         ]
 
-    def list_launch_attempts_events(self) -> list[dict]:
+    def list_launch_attempts_events(self, claim: str) -> list[dict]:
+        self.launch_event_lists.append(claim)
         if self.events_forbidden:
             raise Forbidden("events")
         return [
             copy.deepcopy(e)
             for e in self._store("event").values()
-            if e.get("reason") == "LaunchAttempts" and e["involvedObject"]["kind"] == "NodeClaim"
+            if e["involvedObject"]["name"] == claim and e.get("reason") == "LaunchAttempts"
         ]
 
     def list_node_pods(self, node_name: str) -> list[dict]:

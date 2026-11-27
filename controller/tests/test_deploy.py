@@ -12,7 +12,7 @@ from k8s_inspector.model import (
     CapacityType,
     DbPhase,
     DbStatus,
-    LaunchAttempts,
+    LaunchEvent,
     LaunchFailure,
     RunPhase,
     RunSpec,
@@ -89,9 +89,7 @@ def test_every_status_key_the_controller_writes_is_in_the_crd_schema():
                 start=NOW,
                 end=NOW,
                 outcome=AttemptOutcome.COMPLETED,
-                launch_attempts=LaunchAttempts(
-                    claims=["nc"], tried=1, truncated=True, outcomes=[{"outcome": "launched"}]
-                ),
+                launch_events=[LaunchEvent("nc.1", NOW, 1, True, [{"outcome": "Fatal"}], {"outcome": "launched"})],
             )
         ],
         launch_failures=[LaunchFailure(node_claim="nc", message="m", time=NOW)],
@@ -104,7 +102,7 @@ def test_every_status_key_the_controller_writes_is_in_the_crd_schema():
     assert unknown_keys(emitted, schema()["status"], "status") == []
     assert emitted["tasks"][0].keys() >= {"errorMsg", "gpuFallback"}  # the sample really sets every optional key
     assert "node" in emitted["attempts"][0]
-    assert "launchAttempts" in emitted["attempts"][0]
+    assert "launchEvents" in emitted["attempts"][0]
     assert emitted["database"].keys() == {
         "phase",
         "since",

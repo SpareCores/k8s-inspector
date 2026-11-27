@@ -51,9 +51,11 @@ The controller sees the Event on its next reconcile, which can be up to the 300 
 
 ## What each launch tried
 
-SCarpenter publishes one `LaunchAttempts` Event on a NodeClaim when its Create ends (type Normal when it launched,
-Warning when it failed). A NodeClaim has no namespace, so the Event is in `default`; it outlives the claim until the
-Event TTL. The message:
+SCarpenter publishes a `LaunchAttempts` Event on a NodeClaim when a Create that made a vendor call ends (type Normal
+when it launched, Warning when it failed). A Create that made none (no candidate, quota, catalogue not ready, a
+NodeClass error) publishes nothing, and neither does an older SCarpenter. A NodeClaim can have several Creates:
+after a `Retryable` or `Fatal` error Karpenter calls Create again on the same claim, and each has its own Event. A
+NodeClaim has no namespace, so the Events are in `default`; they outlive the claim until the Event TTL. The message:
 
 ```
 launch-attempts v1 tried=3 shown=3 [truncated] [launched=<region>|<zone>|<capacityType>|<vendor.type>]
@@ -62,13 +64,17 @@ launch-attempts v1 tried=3 shown=3 [truncated] [launched=<region>|<zone>|<capaci
 
 One line per failed candidate in the order tried; `launched=` is only on a success, and that candidate counts in
 `tried` but has no line. SCarpenter replaces `|` in a message by `/` and cuts it to 40 characters, records at most 50
-candidates per Create and marks a cut with `truncated`. The controller reads the Event of every NodeClaim of the
-attempt (the pending ones and the failed ones it remembers in `status.launchFailures`) and keeps the outcomes in
-`status.attempts[].launchAttempts` (at most 50 outcomes per attempt; `claims` lists the NodeClaims already read).
-They go into the attempt's entry of `run.json` and the [run record](../reference/run-records.md#launch-attempts).
-An Event of another version, an unreadable Event list, or no Event (an older SCarpenter, the TTL passed) leaves the
-attempt without them; nothing else depends on them: the retry rules above use the launch condition and the anchor's
-Events only.
+candidates per Create and marks a cut with `truncated`.
+
+On every pass of an open attempt the controller lists the Events of each of its NodeClaims that exists, and of the
+ones that failed to launch in the last 5 minutes (one field-selected list per claim, in `default`). It also reads
+once more when the node is ready, and never after the attempt ended. It keeps each Event it has not read (by the
+Event's name) in `status.attempts[].launchEvents` (at most 50 failed candidates per attempt, the launched one is
+always kept) and puts them into the attempt's entry of `run.json` and the
+[run record](../reference/run-records.md#launch-attempts). An Event that Kubernetes aggregated counts once, whatever
+its `count`; the `(combined from similar events): ` prefix of such a message is ignored. An Event of another version,
+an API error (logged once per run), or no Event leaves the attempt without them; nothing else depends on them: the
+retry rules above use the launch condition and the anchor's Events only.
 
 ## A node that does not come up
 

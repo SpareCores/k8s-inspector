@@ -122,6 +122,7 @@ EXTRA_ATTEMPTS = 2  # attempts beyond `max_spot_attempts` (the on-demand one plu
 NOT_ELIGIBLE = "SKU is no longer eligible in Keeper"
 ELIGIBILITY_CHECK_INTERVAL = timedelta(minutes=10)  # per run without a node: how often Keeper is asked again
 MAX_DBAAS_LAUNCH_FAILURES = 3  # failed NodeClaims of a DBaaS client in one attempt before the run gives up
+LAUNCH_EVENT_WINDOW = timedelta(minutes=5)  # how long after its failure the Events of a deleted NodeClaim are read
 MAX_LAUNCH_FAILURES = 2  # distinct NodeClaims that failed to launch in one attempt before the run gives up; ICE
 # ones go on while SCarpenter still offers the SKU (`_launch_failures_exhausted`)
 SPOT_FALLBACK_ERRORS = (
@@ -478,6 +479,7 @@ class Runner(DbaasMixin):
         self._known: set[str] = set()  # run names seen, to notice deletions between LISTs
         self._failing: dict[str, tuple[int, datetime]] = {}  # run -> (reconciles failed in a row, since when)
         self._nodes: dict[str, _Node] = {}  # cache per run
+        self._launch_events_failed: set[str] = set()  # runs whose launch attempts could not be listed (logged once)
         self._signed_at: dict[str, datetime] = {}  # when the urls Secret was last signed, per run
         # run -> since when its node has had DiskPressure. In memory: a controller restart restarts the wait.
         self._disk_wait: dict[str, datetime] = {}
@@ -646,6 +648,7 @@ class Runner(DbaasMixin):
     def _forget(self, name: str) -> None:
         """The BenchmarkRun is gone: drop caches and delete the Pods that outlived it."""
         self._nodes.pop(name, None)
+        self._launch_events_failed.discard(name)
         self._signed_at.pop(name, None)
         self._disk_wait.pop(name, None)
         self._eligibility_checked.pop(name, None)
@@ -1094,12 +1097,8 @@ class Runner(DbaasMixin):
                 "end": a.end.isoformat() if a.end else None,
                 "outcome": a.outcome.value if a.outcome else None,
             }
-            if a.launch_attempts:
-                entry |= {
-                    "launch_attempts": a.launch_attempts.outcomes,
-                    "launch_attempts_tried": a.launch_attempts.tried,
-                    "launch_attempts_truncated": a.launch_attempts.truncated,
-                }
+            if a.launch_events:
+                entry |= launch_attempts.summary(a.launch_events)
             entry |= (details or {}).get(a.n, {})
             if a.n == run.status.attempt and a.node and run.status.region:
                 entry |= {"region": run.status.region, "zone": run.status.zone, "price": run.status.price_per_hour}
@@ -1237,7 +1236,7 @@ class Runner(DbaasMixin):
         error = _claim_error(claims)
         events = [] if bound else self._anchor_events(anchor)
         failures = self._record_launch_failures(run, claims, events)
-        run = self._record_launch_attempts(run, [_meta(c)["name"] for c in claims] + [f.node_claim for f in failures])
+        run = self._record_launch_attempts(run, [_meta(c)["name"] for c in claims], failures)
         if error is None and self._launch_failures_exhausted(run, cfg, anchor, failures):
             error = self._launch_error(failures[-1].message)
         reclaims = run.status.spot_reclaims
@@ -1507,34 +1506,42 @@ class Runner(DbaasMixin):
 
         return self._update(run, mutate).status.launch_failures
 
-    def _record_launch_attempts(self, run: BenchmarkRun, claim_names: list[str]) -> BenchmarkRun:
-        """Keep on the attempt what SCarpenter's `LaunchAttempts` Event of each of its NodeClaims says (see
-        `launch_attempts`). The Event outlives the claim, but is published only when the Create ends, so a claim
-        without one is asked for again on the next pass. An API error counts as no Events. Returns the updated run."""
+    def _record_launch_attempts(
+        self, run: BenchmarkRun, live_claims: list[str], failures: list[LaunchFailure]
+    ) -> BenchmarkRun:
+        """Keep on the open attempt what SCarpenter's `LaunchAttempts` Events say (see `launch_attempts`): those of
+        its NodeClaims that exist and of the `failures` of the last `LAUNCH_EVENT_WINDOW`. A claim
+        can have an Event per Create, published when the Create ends and only when it made a vendor call, so they
+        are asked for on every pass, one list per claim, until the attempt ends; what was read is told by the Events'
+        names. An API error counts as no Events (logged once per run). Returns the updated run."""
         attempt = self._attempt(run)
-        known = attempt.launch_attempts.claims if attempt and attempt.launch_attempts else []
-        todo = [name for name in dict.fromkeys(claim_names) if name not in known]
-        if not todo:
+        if attempt is None or attempt.outcome is not None:
             return run
-        try:
-            events = self.kube.list_launch_attempts_events()
-        except Exception:
-            log.warning("listing the launch attempts of run %s failed", run.name, exc_info=True)
-            return run
+        recent = [f.node_claim for f in failures if self._now() - f.time < LAUNCH_EVENT_WINDOW]
+        known = {e.name for e in attempt.launch_events}
         found = []
-        for event in events:
-            name = event["involvedObject"]["name"]
-            parsed = launch_attempts.parse(event.get("message") or "")
-            if name in todo and parsed:
-                found.append((name, parsed))
+        for claim in dict.fromkeys([*live_claims, *recent]):
+            try:
+                events = self.kube.list_launch_attempts_events(claim)
+            except Exception as e:
+                if run.name not in self._launch_events_failed:
+                    self._launch_events_failed.add(run.name)
+                    log.warning("run %s: cannot list the launch attempts of %s: %s", run.name, claim, e)
+                continue
+            for event in events:
+                name = _meta(event)["name"]
+                parsed = launch_attempts.parse(event.get("message") or "")
+                if name not in known and parsed:
+                    found.append(replace(parsed, name=name, time=_event_time(event)))
         if not found:
             return run
 
         def mutate(status: RunStatus) -> None:
             for a in status.attempts:
                 if a.n == status.attempt:
-                    for name, parsed in found:
-                        a.launch_attempts = launch_attempts.merge(a.launch_attempts, name, parsed)
+                    for event in found:
+                        if event.name not in {e.name for e in a.launch_events}:
+                            a.launch_events = launch_attempts.add(a.launch_events, event)
 
         return self._update(run, mutate)
 
@@ -1640,7 +1647,9 @@ class Runner(DbaasMixin):
                     a.capacity_type = facts.capacity_type or a.capacity_type
 
         run = self._update(run, mutate)
-        run = self._record_launch_attempts(run, [facts.node_claim])  # the Event may have come after the last pass
+        run = self._record_launch_attempts(
+            run, [facts.node_claim], run.status.launch_failures
+        )  # once more: the Event may be newer than the last pass
         if (
             facts.capacity_type == CapacityType.SPOT
             and run.spec.database is None
