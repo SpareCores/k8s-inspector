@@ -49,7 +49,7 @@ spec:
                 default: false
               capacity:
                 type: string
-                enum: [SpotFirst, OnDemand]
+                enum: [SpotFirst, OnDemand, SpotUntilExhausted, SpotOnly]
               holdAfter:
                 description: Keep the node after the last step (a duration such as 2h).
                 type: string
@@ -143,7 +143,7 @@ spec:
                     outcome:
                       type: string
                       nullable: true
-                      enum: [Completed, SpotInterrupted, NodeLost, ProvisioningFailed, LaunchFailed, Cancelled, HarnessError]
+                      enum: [Completed, SpotInterrupted, NodeLost, ProvisioningFailed, LaunchFailed, SpotUnavailable, SpotRejected, Cancelled, HarnessError]
               launchFailures:
                 type: array
                 items:

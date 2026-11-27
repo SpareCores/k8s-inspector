@@ -314,3 +314,28 @@ def test_client_region_by_city_is_a_per_vendor_flag_that_is_off_by_default():
     parsed = parse_settings({"dbaas": {"vendors": {"ovh": {"clientRegionByCity": True}, "oci": {}}}})
     assert parsed.dbaas.vendors["ovh"].client_region_by_city is True
     assert parsed.dbaas.vendors["oci"].client_region_by_city is False
+
+
+def test_spot_capacity_modes_and_the_until_exhausted_settings():
+    settings = parse_settings(
+        {
+            "spot": {"patienceDays": 7, "coverage": 90, "slotHours": 6},
+            "vendors": {
+                "a": {"enabled": True, "capacity": "SpotUntilExhausted"},
+                "b": {"enabled": True, "capacity": "SpotOnly"},
+            },
+        }
+    )
+    assert (settings.spot.patience_days, settings.spot.coverage, settings.spot.slot_hours) == (7, 90, 6)
+    assert settings.vendors["a"].capacity == CapacityMode.SPOT_UNTIL_EXHAUSTED
+    assert settings.vendors["b"].capacity == CapacityMode.SPOT_ONLY
+    spot = parse_settings({}).spot
+    assert (spot.patience_days, spot.coverage, spot.slot_hours) == (14, 100, 3)
+
+
+@pytest.mark.parametrize(
+    "key,value", [("coverage", 0), ("coverage", 101), ("slotHours", 0), ("slotHours", 25), ("patienceDays", 0)]
+)
+def test_bad_until_exhausted_settings_are_refused(key, value):
+    with pytest.raises(ValueError):
+        parse_settings({"spot": {key: value}})

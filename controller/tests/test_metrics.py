@@ -11,6 +11,7 @@ from k8s_inspector.model import (
     AttemptOutcome,
     AttemptStatus,
     BenchmarkRun,
+    CapacityMode,
     CapacityType,
     RunPhase,
     RunSpec,
@@ -284,3 +285,56 @@ def test_dbaas_stack_ages_come_from_the_stack_and_the_inventory_clock_starts_wit
     assert 'k8s_inspector_dbaas_oldest_age_seconds{vendor="oci"} 32400' in text
     assert 'k8s_inspector_dbaas_leftover_stack_failures_total{vendor="oci"} 1' in text
     assert f'k8s_inspector_dbaas_inventory_last_success_timestamp_seconds{{vendor="oci"}} {NOW.timestamp():g}' in text
+
+
+def test_spot_try_counter_and_waiting_gauge_and_exhausted_counter():
+    from fakes import Clock, FakeKube
+
+    from k8s_inspector import spot
+
+    settings = Settings(
+        vendors={
+            "oci": VendorSettings(enabled=True, capacity=CapacityMode.SPOT_UNTIL_EXHAUSTED),
+            "aws": VendorSettings(enabled=True),
+        }
+    )
+    kube = FakeKube(Clock(NOW))
+    start = NOW - timedelta(days=15)
+    for i in range(56):  # every slot of the week, 15 days ago: exhausted
+        spot.record_try(kube, "oci", "full", start + timedelta(hours=3 * i), settings)
+    spot.record_try(kube, "oci", "partial", NOW - timedelta(hours=1), settings)  # waiting
+    spot.record_try(kube, "oci", "other", NOW - timedelta(hours=1), settings)  # waiting
+    metrics = Metrics(kube, lambda: settings, clock=lambda: NOW)
+    for result in ("capacity", "unavailable", "unavailable", "quota_busy"):
+        metrics.record_spot_try("oci", result)
+    out = metrics.render()
+    assert 'k8s_inspector_spot_tries_total{result="unavailable",vendor="oci"} 2' in out
+    assert 'k8s_inspector_spot_tries_total{result="capacity",vendor="oci"} 1' in out
+    assert 'k8s_inspector_spot_tries_total{result="quota_busy",vendor="oci"} 1' in out
+    assert 'k8s_inspector_spot_waiting_skus{vendor="oci"} 2' in out
+    assert 'spot_waiting_skus{vendor="aws"}' not in out  # only vendors with a spot-only mode
+    assert 'k8s_inspector_spot_exhausted_total{vendor="oci"} 1' in out
+    assert 'k8s_inspector_spot_exhausted_total{vendor="oci"} 1' in metrics.render()  # counted once
+
+
+def test_spot_only_vendors_never_exhaust():
+    from fakes import Clock, FakeKube
+
+    from k8s_inspector import spot
+
+    settings = Settings(vendors={"oci": VendorSettings(enabled=True, capacity=CapacityMode.SPOT_ONLY)})
+    kube = FakeKube(Clock(NOW))
+    for i in range(56):
+        spot.record_try(kube, "oci", "full", NOW - timedelta(days=15) + timedelta(hours=3 * i), settings)
+    out = Metrics(kube, lambda: settings, clock=lambda: NOW).render()
+    assert 'k8s_inspector_spot_waiting_skus{vendor="oci"} 1' in out
+    assert 'k8s_inspector_spot_exhausted_total{vendor="oci"} 0' in out
+
+
+def test_a_spot_unavailable_attempt_is_counted_as_an_attempt_outcome(runs, metrics):
+    run = make_run("a", RunPhase.FAILED, attempts=[AttemptStatus(1, None, outcome=AttemptOutcome.SPOT_UNAVAILABLE)])
+    runs.append(run)
+    assert (
+        'k8s_inspector_run_attempts_total{capacity_type="none",outcome="spot_unavailable",vendor="oci"} 1'
+        in metrics.render()
+    )

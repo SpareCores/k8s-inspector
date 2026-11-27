@@ -101,6 +101,19 @@ def allows_spot(anchor: dict) -> bool:
     )
 
 
+def is_spot_only(anchor: dict) -> bool:
+    """Whether the anchor Pod may land on a spot node and on no other (`on-demand` is not in its capacity types)."""
+    terms = anchor["spec"]["affinity"]["nodeAffinity"]["requiredDuringSchedulingIgnoredDuringExecution"]
+    values = [
+        value
+        for term in terms["nodeSelectorTerms"]
+        for expression in term["matchExpressions"]
+        if expression["key"] == "karpenter.sh/capacity-type"
+        for value in expression["values"]
+    ]
+    return "spot" in values and "on-demand" not in values
+
+
 def step_pod_name(run_name: str, attempt: int, step: Step) -> str:
     """`<run name>-a<attempt>-<step.name>`; the flush step appends `-flush<n>` via `flush_pod_name`."""
     return f"{anchor_name(run_name, attempt)}-{step.name}"

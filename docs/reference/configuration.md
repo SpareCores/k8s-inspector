@@ -41,7 +41,7 @@ vendors:
     maxInFlight: 2               # 0 pauses the vendor; unlimited: no limit; unset: defaults.maxInFlight
     maxUsdPerHour: 2.0           # checked before a run starts; unset: no cap
     maxNewRunsPerCycle: 10       # autoPlan: the most runs one cycle creates for the vendor (burst cap)
-    capacity: SpotFirst          # SpotFirst (the default) | OnDemand
+    capacity: SpotFirst          # SpotFirst (the default) | OnDemand | SpotUntilExhausted | SpotOnly (see Spot capacity modes)
     publish: false               # true, or a list of SKUs: the publisher pushes these results to sc-inspector-data
     dbaasAutoPlan: false         # autoPlan also creates managed-database runs for this vendor (see DBaaS autoPlan)
     dbaasMaxInFlight: 1          # DBaaS runs in flight; 0 pauses; counted over DBaaS runs only
@@ -55,6 +55,9 @@ spot:
   quarantineDays: 14
   spotMaxTaskMinutes: 240
   quotaReserveAfterMinutes: 60   # autoPlan: a SKU deferred this long for busy spot quota reserves its buckets; 0: never (see Quota-aware planning)
+  patienceDays: 14               # SpotUntilExhausted: a SKU is exhausted when its first counted try is this old ...
+  coverage: 100                  # ... and counted tries fell in this percent of the week's slots (1-100)
+  slotHours: 3                   # a slot is this many UTC hours of a weekday (1-24); 3 gives 56 slots a week
 deadlines:
   provisionCpuMinutes: 60        # until a NodeClaim launches (a launch that keeps failing is ICE)
   provisionGpuHours: 6           # ... for a GPU SKU
@@ -324,6 +327,63 @@ The filter fails open: a ConfigMap that is absent (the vendor is not opted in), 
 without `truncated` counts as complete; the optional `zonesOmitted` field is ignored (nothing reads zones). In a ConfigMap with
 `truncated: true` only entries with `available: false` are skipped; a missing entry proves nothing.
 
+### Spot capacity modes
+
+The vendor's `capacity` decides which capacity types a run's anchor allows ([spot](../explanation/spot.md#spot-capacity-modes)):
+
+| `capacity` | Anchor |
+|---|---|
+| `SpotFirst` (default) | `spot, on-demand`: Karpenter launches on-demand by itself when no spot node can launch |
+| `OnDemand` | `on-demand` |
+| `SpotUntilExhausted` | `spot` only, until the SKU is exhausted; then like `SpotFirst`. Also `spot, on-demand` at once when spot is impossible for the SKU, and `on-demand` after `maxSpotAttempts` interruptions, for quarantined SKUs and for tasks that do not allow spot, as in `SpotFirst` |
+| `SpotOnly` | `spot` only, every attempt |
+
+autoPlan applies the spot-only modes per SKU, from the SKU's entry in the offered-types listing. **Spot is impossible**
+for a SKU when none of its offering groups, available or not, is a spot one (a group SCarpenter marks `NotLaunchable`
+does not count), or its spot group never fits (`maxLimit < need`). An available spot offering without quotas is
+possible, and so is an entry that lists no offering groups (an older SCarpenter says nothing).
+
+- `SpotOnly` does not plan a SKU when spot is impossible, `spot` is not among the entry's `capacityTypes` (spot is
+  unavailable at the moment), its due tasks do not allow spot, it is quarantined, or its spot launch was rejected
+  (below): it never runs on-demand. A running `SpotOnly` attempt also needs `spot` in `capacityTypes` for its ICE
+  launch failures to go on (the usual rule needs only an available entry).
+- `SpotUntilExhausted` plans a SKU only in a slot it has not tried yet (below). Where on-demand is allowed at once, or
+  the SKU is exhausted, it is planned like `SpotFirst` (each such plan logs `... exhausted, on-demand allowed` for an
+  exhausted SKU). A rejected spot launch (`LAUNCH_REJECTED`, an offering the cloud does not support) and
+  `MAX_SPOT_RECLAIMS` lost spot claims send the next attempt to on-demand, as in `SpotFirst`.
+- A `SpotOnly` attempt whose spot launch is rejected for the SKU means spot is impossible for it: the attempt closes
+  `SpotRejected`, the run ends without results (no `-1`, the tasks stay due) and the SKU is not planned under `SpotOnly`
+  for 30 days (the key `rejected--<vendor>.<sku>` of the ConfigMap `k8s-inspector-spot`; a spot node that launches
+  clears it). The controller logs a warning.
+
+A **slot** is `slotHours` UTC hours of one weekday (`(weekday, hour // slotHours)`, 56 a week at 3 hours). A **try** is an
+attempt launched spot-only that found no spot capacity in the regions the run was confined to (those where the spot
+quota fitted) while their spot quota had room: the run ends `SpotUnavailable` ([run records](run-records.md)). It counts
+only with evidence of lack of capacity: the error's `classes:` summary or a launch error names `InsufficientCapacity` or
+`ZoneUnusable` (mixed with rejection classes it still counts). SCarpenter words a spot offering the cloud refuses
+(`classes: Unsupported:3`, also `InvalidOffering`, `Fatal`, `NotFound`) as insufficient capacity too; that is a
+rejection (below), not a try. An
+attempt whose launch was refused for quota, that ended with `no candidate offering had quota headroom`, or whose spot
+quota showed no room for the run's regions when it failed, is not a try (`quota_busy`, the usual launch deferral
+applies), and neither is a provisioning deadline without any evidence. The ConfigMap `k8s-inspector-spot` keeps one
+small value per SKU under `tries--<vendor>.<sku>`: the first and last try, their count and the set of slots they fell
+in (never a list of tries). A value whose last try is older than twice `patienceDays` counts as none and is replaced by
+the next try; a spot node that launches removes the keys. Losing the ConfigMap is harmless: spot is tried again. While
+the ConfigMap cannot be read the planner skips the SKUs of these modes (it is read once per cycle), and a try that
+cannot be written is not counted (the usual launch deferral applies instead), so nothing loops.
+
+- A SKU is **due** for planning in a slot with no try. When every slot of the week has a try, a SKU is due once a day.
+  A SKU that stays unavailable therefore costs one run, one run record and up to the provisioning wait per day
+  under `SpotOnly`, and until its patience is over under `SpotUntilExhausted`.
+- A SKU is **exhausted** (`SpotUntilExhausted` only; `SpotOnly` never is) when its first counted try is at least
+  `patienceDays` old and counted tries fell in at least `coverage` percent of the week's slots. It stays exhausted
+  (its runs may use on-demand) while its value exists: that is until a spot node launches or its last try is older
+  than twice `patienceDays`, after which spot is tried afresh.
+
+Each counted try logs one line, for example `x8i.96xlarge: 41/56 slots tried, spot available <7% (95%)`: the share of
+tries that would find spot is below the bound with 95% confidence (`1 - 0.05^(1/n)` for `n` failed tries). The
+structured `spot_try` line and the metrics are in [monitoring](../explanation/monitoring.md).
+
 ### Quota-aware planning
 
 Each offering group in `offerings[]` of the listing (one per capacity type, available or not) may carry
@@ -343,7 +403,7 @@ SKU's regions), so each SKU is tested against its own value.
 
 For a SKU with due tasks the planner picks the group the run will use and decides:
 
-- A run that may use spot (the vendor is `SpotFirst`, its due tasks allow spot, `spot.spotMaxTaskMinutes`, and the SKU is
+- A run that may use spot (the vendor is not `OnDemand`, its due tasks allow spot, `spot.spotMaxTaskMinutes`, and the SKU is
   not quarantined, [spot](../explanation/spot.md)) uses the spot group. If it is busy the SKU is **deferred**: no run is
   created this cycle, because the run would fall back to on-demand and cost several times as much; the planner logs
   `autoPlan defers <vendor>/<sku>: spot quota busy (bucket B: need N vCPU, headroom H)`. If the spot group has room the run is

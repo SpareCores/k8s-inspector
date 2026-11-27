@@ -8,7 +8,7 @@ from datetime import UTC, datetime, timedelta, timezone
 
 import pytest
 
-from k8s_inspector import crd, keeper, launch, planner, pods, render
+from k8s_inspector import crd, keeper, launch, planner, pods, render, spot
 from k8s_inspector.crd import RunExists, from_dict
 from k8s_inspector.kube import AlreadyExists, NotFound
 from k8s_inspector.model import (
@@ -1979,3 +1979,171 @@ def test_zones_of_all_available_groups_count_not_the_last_group(kube, keeper_sku
 )
 def test_a_zone_belongs_to_a_region_by_name(zone, region, belongs):
     assert planner._in_region(zone, region) is belongs
+
+
+# --------------------------------------------------------------------------- SpotOnly and SpotUntilExhausted
+
+
+def _tries(kube, *ago: timedelta) -> None:
+    now = datetime.now(UTC)
+    for delta in ago:
+        spot.record_try(kube, "oci", "s", now - delta, Settings())
+
+
+@pytest.mark.offered
+def test_spot_only_skips_a_sku_without_a_spot_offering_or_that_never_fits(kube, keeper_skus, caplog):
+    keeper_skus["oci"] = {"s": {}, "no-spot": {}, "never": {}}
+    publish_offered(
+        kube,
+        offered_configmap(
+            {
+                "s": spot_entry(quota()),
+                "no-spot": {
+                    "available": True,
+                    "capacityTypes": ["on-demand"],
+                    "offerings": [group("on-demand", quota())],
+                },
+                "never": spot_entry(quota(need=384, limit=256, headroom=256)),
+            }
+        ),
+    )
+    assert plan_wet(kube, keeper_skus, auto_config(max_in_flight=5, capacity=CapacityMode.SPOT_ONLY)) == ["s"]
+    kube.objects.clear()
+    assert sorted(plan_wet(kube, keeper_skus, auto_config(max_in_flight=5))) == ["never", "no-spot", "s"]
+
+
+@pytest.mark.offered
+def test_spot_only_skips_a_quarantined_sku_and_tasks_that_do_not_allow_spot(kube, keeper_skus):
+    keeper_skus["oci"] = {"s": {}}
+    publish_offered(kube, offered_configmap({"s": spot_entry(quota())}))
+    cfg = auto_config(max_in_flight=5, capacity=CapacityMode.SPOT_ONLY)
+    assert plan_wet(kube, keeper_skus, cfg, all_due=True) == []  # stressnglongrun is due and may not run on spot
+    now = datetime.now(UTC)
+    kube.configmaps["k8s-inspector-spot"] = {
+        "metadata": {"name": "k8s-inspector-spot", "resourceVersion": "1"},
+        "data": {"oci.s": json.dumps([(now - timedelta(days=d)).isoformat() for d in (1, 2)])},
+    }
+    assert plan_wet(kube, keeper_skus, cfg) == []
+
+
+@pytest.mark.offered
+def test_spot_until_exhausted_plans_a_sku_in_a_slot_it_has_not_tried(kube, keeper_skus):
+    keeper_skus["oci"] = {"s": {}}
+    publish_offered(kube, offered_configmap({"s": spot_entry(quota())}))
+    cfg = auto_config(max_in_flight=5, capacity=CapacityMode.SPOT_UNTIL_EXHAUSTED)
+    assert plan_wet(kube, keeper_skus, cfg) == ["s"]  # never tried
+    (run,) = [from_dict(o) for o in kube.objects.values()]
+    assert run.spec.capacity == CapacityMode.SPOT_UNTIL_EXHAUSTED
+
+
+@pytest.mark.offered
+def test_spot_until_exhausted_waits_for_an_untried_slot(kube, keeper_skus):
+    keeper_skus["oci"] = {"s": {}}
+    publish_offered(kube, offered_configmap({"s": spot_entry(quota())}))
+    cfg = auto_config(max_in_flight=5, capacity=CapacityMode.SPOT_UNTIL_EXHAUSTED)
+    _tries(kube, timedelta(0))  # a try in the current slot
+    assert plan_wet(kube, keeper_skus, cfg) == []
+    kube.configmaps.clear()
+    _tries(kube, timedelta(hours=Settings().spot.slot_hours))  # the previous slot
+    assert plan_wet(kube, keeper_skus, cfg) == ["s"]
+
+
+@pytest.mark.offered
+def test_spot_until_exhausted_plans_on_demand_when_spot_is_impossible_or_exhausted(kube, keeper_skus, caplog):
+    keeper_skus["oci"] = {"no-spot": {}}
+    publish_offered(
+        kube,
+        offered_configmap(
+            {"no-spot": {"available": True, "capacityTypes": ["on-demand"], "offerings": [group("on-demand", quota())]}}
+        ),
+    )
+    cfg = auto_config(max_in_flight=5, capacity=CapacityMode.SPOT_UNTIL_EXHAUSTED)
+    assert plan_wet(kube, keeper_skus, cfg) == ["no-spot"]
+    kube.objects.clear()
+    keeper_skus["oci"] = {"s": {}}
+    publish_offered(kube, offered_configmap({"s": spot_entry(quota())}))
+    settings = Settings()
+    _tries(
+        kube, *(timedelta(days=settings.spot.patience_days, hours=3 * i) for i in range(spot.slots_per_week(settings)))
+    )
+    with caplog.at_level("INFO"):
+        assert plan_wet(kube, keeper_skus, cfg) == ["s"]
+    assert "exhausted, on-demand allowed" in caplog.text
+
+
+@pytest.mark.offered
+def test_a_spot_offering_without_quotas_is_possible_but_no_spot_offering_at_all_is_not(kube, keeper_skus):
+    keeper_skus["oci"] = {"no-quota": {}, "none": {}, "launchable": {}}
+    no_quota = {
+        "available": True,
+        "capacityTypes": ["on-demand", "spot"],
+        "offerings": [group("spot"), group("on-demand")],
+    }
+    none = {"available": True, "capacityTypes": ["on-demand"], "offerings": [group("on-demand")]}
+    not_launchable = {
+        "available": True,
+        "capacityTypes": ["on-demand"],
+        "offerings": [{**group("spot", available=False), "reason": "NotLaunchable"}, group("on-demand")],
+    }
+    publish_offered(kube, offered_configmap({"no-quota": no_quota, "none": none, "launchable": not_launchable}))
+    assert plan_wet(kube, keeper_skus, auto_config(max_in_flight=5, capacity=CapacityMode.SPOT_ONLY)) == ["no-quota"]
+
+
+@pytest.mark.offered
+def test_spot_only_needs_spot_among_the_capacity_types_of_the_entry(kube, keeper_skus):
+    cfg = auto_config(capacity=CapacityMode.SPOT_ONLY)
+    publish_offered(kube, offered_configmap({"s1": {"available": True, "capacityTypes": ["on-demand"]}}))
+    assert planner.not_offered(kube, cfg, "oci", ["s1"]) == {"s1": "no spot capacity"}
+    assert planner.is_offered(kube, cfg, "oci", "s1", False)
+    assert not planner.is_offered(kube, cfg, "oci", "s1", False, spot_only=True)
+
+
+@pytest.mark.offered
+def test_spot_until_exhausted_with_no_spot_offering_plans_on_demand_at_once(kube, keeper_skus):
+    keeper_skus["oci"] = {"s": {}}
+    none = {"available": True, "capacityTypes": ["on-demand"], "offerings": [group("on-demand", quota())]}
+    publish_offered(kube, offered_configmap({"s": none}))
+    assert plan_wet(kube, keeper_skus, auto_config(max_in_flight=5, capacity=CapacityMode.SPOT_UNTIL_EXHAUSTED)) == [
+        "s"
+    ]
+
+
+@pytest.mark.offered
+def test_the_spot_modes_skip_a_sku_whose_state_cannot_be_read_and_spot_only_a_rejected_one(
+    kube, keeper_skus, monkeypatch
+):
+    keeper_skus["oci"] = {"s": {}}
+    publish_offered(kube, offered_configmap({"s": spot_entry(quota())}))
+    for mode in (CapacityMode.SPOT_ONLY, CapacityMode.SPOT_UNTIL_EXHAUSTED):
+        original = kube.get
+
+        def broken(kind, name, original=original):
+            if kind == "configmap":
+                raise RuntimeError("api down")
+            return original(kind, name)
+
+        monkeypatch.setattr(kube, "get", broken)
+        assert plan_wet(kube, keeper_skus, auto_config(max_in_flight=5, capacity=mode)) == []
+        monkeypatch.setattr(kube, "get", original)
+    spot.record_rejected(kube, "oci", "s", datetime.now(UTC) - timedelta(days=1))
+    assert plan_wet(kube, keeper_skus, auto_config(max_in_flight=5, capacity=CapacityMode.SPOT_ONLY)) == []
+    # the other modes ignore the marker
+    assert plan_wet(kube, keeper_skus, auto_config(max_in_flight=5, capacity=CapacityMode.SPOT_UNTIL_EXHAUSTED)) == [
+        "s"
+    ]
+
+
+def test_the_spot_state_is_read_once_per_cycle(kube, keeper_skus):
+    keeper_skus["oci"] = {f"s{i}": {} for i in range(5)}
+    publish_offered(kube, offered_configmap({sku: spot_entry(quota()) for sku in keeper_skus["oci"]}))
+    reads = []
+    original = kube.get
+
+    def counting(kind, name):
+        if name == "k8s-inspector-spot":
+            reads.append(name)
+        return original(kind, name)
+
+    kube.get = counting
+    plan_wet(kube, keeper_skus, auto_config(max_in_flight=1, capacity=CapacityMode.SPOT_ONLY))
+    assert len(reads) <= 2  # the cycle's state plus the quarantine check of the one SKU that is decided

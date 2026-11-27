@@ -34,7 +34,7 @@ spec:
   tasks: []                 # empty = every due task; otherwise exactly these
   force: false              # skip Keeper's eligibility check and the vendor limits; launch failures end as -1 results
                             # (a forced DBaaS run also records a NO_OFFERING deferral for vendor+SKU: server runs of the SKU wait 24 h)
-  capacity: SpotFirst       # SpotFirst | OnDemand (default from the vendor setting)
+  capacity: SpotFirst       # SpotFirst | OnDemand | SpotUntilExhausted | SpotOnly (default from the vendor setting)
   holdAfter: 0s             # keep the node after the last step (debugging)
   regions: [eu-central-1]   # server runs: the regions autoPlan confined the run to (absent: any); every attempt's anchor requires one of them
   database: null            # DBaaS runs: {vendor, id, engineVersion, region, vcpus, memoryGib}
@@ -56,7 +56,7 @@ status:
   tasks:
   - {name: geekbench, state: Running, attempt: 1, start: …, end: null, exitCode: null, published: false, commit: null}   # state: Pending | Running | Done; optional: errorMsg, gpuFallback
   attempts:
-  - {n: 1, capacityType: spot, nodeClaim: …, node: …, start: …, end: null, outcome: null}   # Completed | SpotInterrupted | NodeLost | ProvisioningFailed | LaunchFailed | Cancelled | HarnessError
+  - {n: 1, capacityType: spot, nodeClaim: …, node: …, start: …, end: null, outcome: null}   # Completed | SpotInterrupted | NodeLost | ProvisioningFailed | LaunchFailed | SpotUnavailable | SpotRejected | Cancelled | HarnessError
   spotReclaims: 0                # spot claims of the current attempt lost before they were Initialized
   uninitializedClaims: []       # NodeClaims of the current attempt seen launched and not Initialized: [{nodeClaim, launched, capacityType}]
   launchFailures: []             # NodeClaims of the current attempt that failed to launch: [{nodeClaim, message, time}], last 20

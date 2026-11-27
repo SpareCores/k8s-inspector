@@ -34,9 +34,12 @@ Transient API errors (429, 5xx, connection errors, timeouts, a 404 on the `Bench
 |---|---|
 | `k8s_inspector_runs` | vendor, phase |
 | `k8s_inspector_tasks_total` | vendor, task, result (ok, failed, timeout, lost) |
-| `k8s_inspector_run_attempts_total` | vendor, capacity_type (`none`: the attempt never got a node), outcome (completed, interrupted, node_lost, provisioning_failed, launch_failed, cancelled, harness_error) |
+| `k8s_inspector_run_attempts_total` | vendor, capacity_type (`none`: the attempt never got a node), outcome (completed, interrupted, node_lost, provisioning_failed, launch_failed, spot_unavailable, spot_rejected, cancelled, harness_error) |
 | `k8s_inspector_node_age_seconds` | vendor, sku, run |
 | `k8s_inspector_launch_failures_total` | vendor, reason (ICE, QUOTA, DAILY_LIMIT, VENDOR, LAUNCH_REJECTED, BOOT_FAILURE, ANCHOR_FAILED, NO_OFFERING, OTHER): runs that ended because no node could be launched, counted by the controller |
+| `k8s_inspector_spot_tries_total` | vendor, result: spot-only attempts of `SpotUntilExhausted` and `SpotOnly` runs by how they ended: `capacity` (an attempt that allowed spot alone got a spot node), `unavailable` (no spot capacity while the quota had room: a counted try), `quota_busy` (a quota refusal, or an `ICE` while the spot quota showed no room: not a try) |
+| `k8s_inspector_spot_waiting_skus` | vendor: SKUs with counted tries that are not exhausted (waiting for a slot), of vendors in a spot-only mode; derived from the `k8s-inspector-spot` ConfigMap at each scrape |
+| `k8s_inspector_spot_exhausted_total` | vendor: SKUs of `SpotUntilExhausted` vendors that became exhausted ([configuration](../reference/configuration.md#spot-capacity-modes)), counted once per SKU and first try; after a controller restart a SKU that is still exhausted counts again (a counter reset) |
 | `k8s_inspector_launch_deferred_skus` | vendor, reason: SKUs in the launch ConfigMap |
 | `k8s_inspector_launch_blocked` | vendor, reason: those of them whose retry is still ahead (the planner skips them) |
 | `k8s_inspector_launch_paused` | vendor: 1 while the BOOT_FAILURE breaker pauses the vendor's autoPlan ([launch retries](launch-retries.md#vendor-breaker)) |
@@ -58,6 +61,15 @@ The `*_total` and `_sum`/`_count`
 series count what the current process has seen and restart from zero with it.
 
 Logs are structured JSON lines with `run`, `vendor`, `sku`, `task` fields.
+
+Each counted spot try ([spot capacity modes](../reference/configuration.md#spot-capacity-modes)) logs one `spot_try` line
+(`event` `spot_try`) at info level with `vendor`, `sku`, `series`, `family` (`null` when Keeper cannot be asked), `start`
+(the attempt's start, ISO), `result` (`unavailable`), `counted` (`true`), `launch_errors` (the cloud's error messages
+SCarpenter reported for the attempt), `tried` (`{offerings, regions, zones}` SCarpenter tried, from its error summary; `null`
+when the message has none), `quota` (the spot quota entries at that time, as in the [run record](../reference/run-records.md)),
+and `tries`, `slots_tried`, `slots_per_week` (the SKU's coverage so far). A second line gives the coverage in words
+(`x8i.96xlarge: 41/56 slots tried, spot available <7% (95%)`). Attempts that are not tries (`quota_busy`) only show in the
+`k8s_inspector_spot_tries_total` metric.
 
 ## Alerts
 

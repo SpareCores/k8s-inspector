@@ -25,7 +25,7 @@ and per attempt) plus `phase`, with `variant` set as below. It is written with s
 |---|---|
 | `vendor`, `sku` | vendor and SKU of the node the run ran on (for a DBaaS run: of the client node) |
 | `run_id` | the run, `r<YYYYMMDD>t<HHMM>-<hex>` |
-| `phase` | the run's final phase: `Done`, `Failed` or `Cancelled`; `unknown` in a [backfilled](#backfill) record whose attempts do not tell |
+| `phase` | the run's final phase: `Done`, `Failed` or `Cancelled` (a run whose last attempt is `SpotUnavailable` or `SpotRejected` is `Failed`: tell it apart by the attempt outcome, nothing failed); `unknown` in a [backfilled](#backfill) record whose attempts do not tell |
 | `plan` | task names of the run, in order |
 | `variant` | the hardware variant number the run's results were filed under, `null` when none (DBaaS: always). Not `run.json`'s own `variant`, which is the runner's last snapshot: the publisher decides the variant later. Live: the run's `status.variant`; backfilled: the number of the directory holding the run's `timing/<run_id>/` in the tree (`data/<vendor>/<sku>/<N>/timing/<run_id>/`), `null` when there is none |
 | `family`, `series`, `cpu_arch`, `gpu_count`, `vcpus`, `memory_gib` | Keeper's `family` (e.g. `Compute Optimized`), `series` (e.g. `c6a`), `cpu_architecture`, `accelerator_count`, `vcpus` and `memory_amount` of the SKU (the client node for a DBaaS run), read once when the run's first attempt gets its node; `memory_gib` is Keeper's `memory_amount` (MiB) divided by 1024. A value Keeper lacks is `null`; all are absent when Keeper could not be asked, and the publisher and the [re-emit](#re-emit) fill them from Keeper's current data when `vcpus` is absent (a run launched before it existed, or an outage at launch) |
@@ -38,7 +38,7 @@ An attempt:
 | Field | Meaning |
 |---|---|
 | `attempt` | number, from 1 |
-| `capacity_type` | `spot` or `on-demand`; `null` for an attempt that never got a node |
+| `capacity_type` | `spot` or `on-demand`; `null` for an attempt that never got a node (also a `SpotUnavailable` or `SpotRejected` one) |
 | `region`, `zone` | where the node ran; only on an attempt that got a node, absent otherwise |
 | `price` | the node's price per hour in USD as a string, same availability as `region` |
 | `ondemand_price` | USD per hour of the on-demand price of the same SKU in the attempt's region, from Keeper (ACTIVE `ondemand` price rows, the cheapest zone), captured when the attempt gets its node, so it is the price at launch time. `null` when Keeper has no on-demand offer there; absent when Keeper could not be asked |
@@ -49,6 +49,8 @@ An attempt:
 | `api_end`, `machine_start`, `node_registered`, `node_ready` | NodeClaim launched, kernel boot, node registered, node ready; `null` when not reached |
 | `end` | when the attempt ended (ISO, with offset); `null` while open |
 | `outcome` | how the attempt ended, see below; `null` while open |
+| `spot_try` | only on an attempt that ended `SpotUnavailable`: the evidence of the try, see [below](#spot-unavailable-attempts) |
+| `spot_rejected` | only on an attempt that ended `SpotRejected`: `{error, launch_errors}`, the rejection SCarpenter reported and the failed NodeClaims the controller saw (shaped like `error` and `launch_errors` of `spot_try`) |
 
 Attempt `outcome` values:
 
@@ -59,8 +61,33 @@ Attempt `outcome` values:
 | `NodeLost` | the node disappeared for another reason |
 | `ProvisioningFailed` | no node could be provisioned (the run failed) |
 | `LaunchFailed` | the NodeClaim of a spot-allowed attempt failed to launch or boot; on-demand next |
+| `SpotRejected` | a [`SpotOnly`](configuration.md#spot-capacity-modes) attempt's spot launch was rejected for the SKU (an offering the cloud does not support); no task started and the run ended, the SKU is not planned under `SpotOnly` for 30 days. Not a try |
+| `SpotUnavailable` | a spot-only attempt ([`SpotUntilExhausted`, `SpotOnly`](configuration.md#spot-capacity-modes)) found no spot capacity in the regions the run was confined to (where the spot quota fitted) while it had room, with evidence that SCarpenter tried offerings; no task started and the run ended, the SKU is tried again in a later slot. Counts as a try towards the SKU being exhausted |
 | `Cancelled` | an operator cancelled the run |
 | `HarnessError` | the controller gave up on the run |
+
+## Spot unavailable attempts
+
+A run that ends `SpotUnavailable` is a **try** to launch the SKU on spot, one run and one record file per try. It has
+one attempt of that outcome as its last. Earlier attempts can exist: a `SpotInterrupted` one, or `ProvisioningFailed` ones (the controller retries an attempt that never got a usable node, a few times; the try is the attempt that follows them). The last attempt has no node, no `region`, `zone`
+or `price`, and `plan` lists the tasks that were not executed. Nothing else is written for it: no task result, no
+`schedule/` meta, no exit code, so nothing is a benchmark failure and the tasks stay due for Keeper and the planner
+exactly as before the try. The calendar slot of a try is not stored: derive it from the attempt's `api_start` (UTC weekday
+and `hour // 3` with the default `slotHours`).
+
+`api_start` and `end` are the start and end of the try. `spot_try` is:
+
+| Field | Meaning |
+|---|---|
+| `error` | the SCarpenter error that ended the attempt (`SCARPENTER_ICE: <message>`), a string. The message is Karpenter's prefix plus SCarpenter's own text: `insufficient capacity, <Class> (<Code>): <cloud error>; tried N offerings in R regions / Z zones; classes: <Class>:<n>,...; stopped by: <reason>`. Only the last candidate's cloud error is in it |
+| `launch_errors` | `[{node_claim, time, message}]`: the NodeClaims of the attempt that failed to launch and that the controller saw (a `LaunchFailed` condition, or Karpenter's `InsufficientCapacityError` event on the anchor), oldest first; possibly empty. `message` is SCarpenter's launch error of that claim |
+| `tried` | `{offerings, regions, zones}`: how many offerings, regions and zones SCarpenter tried, the largest numbers of its summaries in `error` and `launch_errors` (a try counts only when the error's `classes:` or a launch error names `InsufficientCapacity` or `ZoneUnusable`; a summary of only `Unsupported`, `InvalidOffering`, `Fatal` or `NotFound` is a rejection, not a try); `null` when no message has a summary (an older SCarpenter). The cloud's error per region is not available to the controller today. SCarpenter plans per-candidate launch outcomes; they will be added to `tried` (consumers: ignore keys you do not know) |
+| `regions` | the regions the run was confined to (`RunSpec.regions`, those where the spot quota fitted when it was planned); empty: it was not confined. The try covers these regions, not every region of the vendor |
+| `quota` | the SKU's spot quota entries in SCarpenter's offered-types listing when the attempt ended, each `{bucket, unit, need, maxLimit, maxHeadroom, regions}` (numbers; `regions` is `{<region>: {limit, headroom}}`, empty for a global bucket or when SCarpenter lists none). It is the proof that the quota had room: a try counts only when the entry's headroom is at least `need`, for a regional entry the best headroom among `regions` of the run (all listed regions when it was not confined), else `maxHeadroom`. An empty list: the listing had no quota for the SKU |
+| `quota_at` | when SCarpenter wrote that listing (its `generatedAt`, ISO with offset), `null` when the listing was unusable |
+
+A launch whose `classes:` name only rejections (`Unsupported`, `InvalidOffering`, `Fatal`, `NotFound`; the cloud refuses the offering, so under `SpotOnly` the attempt ends `SpotRejected` and under `SpotUntilExhausted` the next attempt is on-demand), a launch that ended `ICE` while the quota showed no room, one that ended with `no candidate offering had quota headroom`, a provisioning deadline without evidence of tried offerings, and a quota refusal are not tries:
+they are recorded nowhere, like any temporary launch failure ([what is not recorded](#what-is-not-recorded)).
 
 ## When a record is written
 
@@ -71,6 +98,9 @@ The publisher writes the record, in its own commit `k8s-inspector: run records (
 - its SKU (DBaaS: database) is enabled for publishing ([configuration](configuration.md)), the same rule as for
   results.
 
+A `SpotUnavailable` or `SpotRejected` run has no tasks to publish, so its record is written as soon as the run is
+`Failed`, and the run is deleted right after the record is in git (at once when its SKU is not enabled for publishing).
+
 Write once: when the file is already in the tree it is not rewritten. The controller does not delete a finished,
 publishable run (`keepRunHours`) before its record is in git, also after a controller restart. A run whose `run.json`
 is gone or unusable (malformed, or without a safe vendor and SKU) gets no record (logged as an error) and is deleted
@@ -78,7 +108,7 @@ as usual; a storage or rendering error is retried every cycle.
 
 ## What is not recorded
 
-- Runs deleted by the launch deferral (a temporary launch failure such as no capacity: the `BenchmarkRun` is deleted
+- Runs deleted by the launch deferral (a temporary launch failure such as no capacity, except the counted tries of the spot-only modes, which are recorded as `SpotUnavailable`: the `BenchmarkRun` is deleted
   and the SKU waits for its backoff, [launch retries](../explanation/launch-retries.md)), Failed runs whose tasks
   all ended `-1` with a temporary launch reason, and runs deleted because Keeper no longer lists their SKU.
 - Runs of SKUs that are not enabled for publishing.
@@ -91,7 +121,7 @@ as usual; a storage or rendering error is retried every cycle.
 `logs/inspect/<vendor>/` of the enabled vendors (`--since` is capped by the 90-day expiry in practice). It skips runs
 that still exist in the cluster (their record comes when they end) and records git already has, and commits in
 batches of 200. It can be rerun at any time. The phase is derived from the last attempt's `outcome`: `Completed` is
-`Done`, `Cancelled` is `Cancelled`, `ProvisioningFailed` and `HarnessError` are `Failed`, anything else is
+`Done`, `Cancelled` is `Cancelled`, `ProvisioningFailed`, `SpotUnavailable`, `SpotRejected` and `HarnessError` are `Failed`, anything else is
 `unknown`. A run the launch deferral deleted has no `run.json` (skipped) or an open or `NodeLost` last attempt (`unknown`); it is never `Failed`. A malformed `run.json` is skipped with a warning.
 
 Run it in the controller Pod, which has the object storage role, the deploy key and the cluster permissions:
@@ -121,7 +151,7 @@ Definitions, per attempt (`start` is `api_start`):
   task of that attempt that finished (exit code 0 or more) and whose result was kept (published, not discarded); 0
   when it kept none. A task the controller wrote off (`-4`, `-1`) is never kept and does not finish (a `-4` task that was
   running keeps its real start and gets a `task_cost` line, a task that never started has start and end of the same
-  moment). An attempt that ran no task (no node, `ProvisioningFailed`, `LaunchFailed`) has 0,
+  moment). An attempt that ran no task (no node, `ProvisioningFailed`, `LaunchFailed`, `SpotUnavailable`, `SpotRejected`) has 0,
   also when the task files are unknown (a backfill). Task times and
   attempt numbers are the run's `status.tasks`, which hold the latest execution of each task: a task that ran again
   on a later attempt counts there only.
@@ -222,6 +252,15 @@ Values the record lacks (records written before the cost fields) are filled in:
   counterfactual are `null` too. A `Completed` attempt is useful as a whole either way.
 
 ## Queries
+
+Counted spot tries per SKU, ISO weekday (1 is Monday) and 3-hour slot (UTC), from a checkout of sc-inspector-data:
+
+```sh
+jq -r '.vendor as $v | .sku as $s | .attempts[] | select(.outcome == "SpotUnavailable")
+  | (.api_start | fromdateiso8601) as $t
+  | [$v, $s, ($t | strftime("%u")), ($t | strftime("%H") | tonumber / 3 | floor)] | @tsv' \
+  data/*/*/runs/*.json | sort | uniq -c
+```
 
 Spot interruptions per vendor, region and zone, from a checkout of sc-inspector-data:
 
