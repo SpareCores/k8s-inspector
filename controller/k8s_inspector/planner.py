@@ -396,8 +396,8 @@ def _quotas(offerings: list) -> dict[str, list[dict]]:
     regions}]}` (`regions` from `_regions`): merged by bucket over its available offering groups (a type has several
     groups, the unavailable ones among them, each listing only the regions of its own zones), else over all its
     groups, like `_zones`. `regions` is the union of the groups' regions (the values are account-level facts; on a
-    conflict the smaller limit and headroom win); the other numbers should agree, else the largest `need` and the
-    smallest `maxLimit` and `maxHeadroom` win. A group without `quotas` or with a damaged one is left out (no quota
+    conflict the smaller limit and headroom win). `maxLimit` and `maxHeadroom` are the maxima over each group's own
+    regions, so the maxima of the groups are the maxima over the union; `need` should agree, else the largest wins. A group without `quotas` or with a damaged one is left out (no quota
     model: the planner behaves as without this field)."""
     groups: dict[str, list[tuple[bool, list[dict]]]] = {}
     for offering in offerings:
@@ -431,8 +431,8 @@ def _quotas(offerings: list) -> dict[str, list[dict]]:
 def _merge_quota(into: dict, entry: dict) -> None:
     """Fold one group's quota entry of the same bucket into `into` (see `_quotas`)."""
     into["need"] = max(into["need"], entry["need"])
-    into["maxLimit"] = min(into["maxLimit"], entry["maxLimit"])
-    into["maxHeadroom"] = min(into["maxHeadroom"], entry["maxHeadroom"])
+    into["maxLimit"] = max(into["maxLimit"], entry["maxLimit"])
+    into["maxHeadroom"] = max(into["maxHeadroom"], entry["maxHeadroom"])
     for region, values in entry["regions"].items():
         known = into["regions"].get(region)
         into["regions"][region] = (

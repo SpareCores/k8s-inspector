@@ -1840,10 +1840,21 @@ def test_quota_regions_of_two_available_groups_are_united():
     assert spot_regions(regional_group(True, a=64), regional_group(True, b=96)) == {"a": 64, "b": 96}
 
 
-def test_a_region_in_two_groups_keeps_the_smaller_headroom_and_the_entry_the_smaller_maxima():
+def test_a_region_in_two_groups_keeps_the_smaller_headroom_and_the_entry_the_larger_maxima():
     (entry,) = planner._quotas([regional_group(True, a=64, b=96), regional_group(True, a=32)])["spot"]
     assert {name: values["headroom"] for name, values in entry["regions"].items()} == {"a": 32, "b": 96}
-    assert entry["maxHeadroom"] == 32 and entry["maxLimit"] == 256 and entry["need"] == 64
+    assert entry["maxHeadroom"] == 96 and entry["maxLimit"] == 256 and entry["need"] == 64
+
+
+def test_merged_max_limit_is_the_largest_so_an_unavailable_fallback_does_not_never_fit():
+    """All groups unavailable: a group whose limit is 0 in r1 and one whose limit is 100 in r2 (need 16)."""
+    zero = group("spot", {**regional(need=16, r1=0, limit=0)}, available=False)
+    hundred = group("spot", {**regional(need=16, r2=100, limit=100)}, available=False)
+    quotas = planner._quotas([zero, hundred])
+    assert quotas["spot"][0]["maxLimit"] == 100
+    assert not planner._never_fits(quotas["spot"])
+    entry = {"offered_types": {"spot"}, "quotas": quotas}
+    assert spot.spot_impossible(entry) is None
 
 
 def test_quota_regions_of_only_unavailable_groups_are_used_when_nothing_is_available():

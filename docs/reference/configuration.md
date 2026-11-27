@@ -418,7 +418,7 @@ exact account figures. A list that is absent or damaged is ignored for that entr
 A type has several offering groups per capacity type (available and unavailable ones), and each lists only the regions of
 its own zones. The planner reads a capacity type's quota from its available groups, else from all of them, merging the
 entries by bucket: `regions` is the union over the groups (a region in several keeps the smaller limit and headroom), and
-`need` is the largest and `maxLimit` and `maxHeadroom` the smallest among them.
+`need`, `maxLimit` and `maxHeadroom` are the largest among them (each group's maximum is over its own regions).
 
 **Placement and pinning.** When an entry of the chosen group has `regions`, the candidate regions are those that every
 such entry lists, narrowed to the regions that the zones of the capacity type's available offering groups name (all its groups when none is
