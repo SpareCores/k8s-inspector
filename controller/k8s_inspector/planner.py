@@ -392,10 +392,15 @@ def _offered_types(offerings: list) -> set[str]:
 
 
 def _quotas(offerings: list) -> dict[str, list[dict]]:
-    """The quota entries of each offering group, by capacity type: `{capacityType: [{bucket, unit, need, maxLimit,
-    maxHeadroom, regions}]}` (`regions` from `_regions`), whether or not the group is available. A group without
-    `quotas` or with a damaged one is left out (no quota model: the planner behaves as without this field)."""
-    result = {}
+    """The quota entries of each capacity type, `{capacityType: [{bucket, unit, need, maxLimit, maxHeadroom,
+    regions}]}` (`regions` from `_regions`): merged by bucket over its available offering groups (a type has several
+    groups, the unavailable ones among them, each listing only the regions of its own zones), else over all its
+    groups, like `_zones`. `regions` is the union of the groups' regions (the values are account-level facts; on a
+    conflict the smaller limit and headroom win). `maxLimit` and `maxHeadroom` are the maxima over each group's own
+    regions, so the maxima of the groups are the maxima over the union; `need` should agree, else the largest
+    wins. A group without `quotas` or with a damaged one is left out
+    (no quota model: the planner behaves as without this field)."""
+    groups: dict[str, list[tuple[bool, list[dict]]]] = {}
     for offering in offerings:
         try:
             entries = [
@@ -412,8 +417,28 @@ def _quotas(offerings: list) -> dict[str, list[dict]]:
         except KeyError, TypeError, ValueError:
             continue
         if entries:
-            result.setdefault(offering.get("capacityType"), entries)
+            groups.setdefault(offering.get("capacityType"), []).append((bool(offering.get("available")), entries))
+    result = {}
+    for capacity_type, found in groups.items():
+        used = [entries for available, entries in found if available] or [entries for _, entries in found]
+        merged: dict[str, dict] = {}
+        for entries in used:
+            for entry in entries:
+                _merge_quota(merged.setdefault(entry["bucket"], {**entry, "regions": {}}), entry)
+        result[capacity_type] = list(merged.values())
     return result
+
+
+def _merge_quota(into: dict, entry: dict) -> None:
+    """Fold one group's quota entry of the same bucket into `into` (see `_quotas`)."""
+    into["need"] = max(into["need"], entry["need"])
+    into["maxLimit"] = max(into["maxLimit"], entry["maxLimit"])
+    into["maxHeadroom"] = max(into["maxHeadroom"], entry["maxHeadroom"])
+    for region, values in entry["regions"].items():
+        known = into["regions"].get(region)
+        into["regions"][region] = (
+            values if known is None else {k: min(known[k], values[k]) for k in ("limit", "headroom")}
+        )
 
 
 class Offered(NamedTuple):
