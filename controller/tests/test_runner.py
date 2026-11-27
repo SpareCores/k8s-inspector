@@ -3307,3 +3307,55 @@ def test_a_spot_node_of_a_released_attempt_clears_the_tries_but_is_not_counted(h
     h.start(["geekbench"], capacity=CapacityMode.SPOT_UNTIL_EXHAUSTED)
     h.drive(stop=lambda run: run.status.phase == RunPhase.RUNNING)
     assert _tries(h) is None and h.spot_tries == []
+
+
+def _classes_message(classes: str, last: str = "Unsupported (X): shape not supported for spot") -> str:
+    """The error as Karpenter reports it: `insufficient capacity, <Class> (<Code>): <cloud error>; tried ...`."""
+    return (
+        f"insufficient capacity, {last}; tried 3 offerings in 1 regions / 3 zones; "
+        f"classes: {classes}; stopped by: no candidates left"
+    )
+
+
+@pytest.mark.parametrize(
+    "classes,last",
+    [
+        ("Unsupported:3", "Unsupported (X): shape not supported for spot"),
+        ("InvalidOffering:2,Unsupported:1", "InvalidOffering (X): bad offering"),
+        ("Fatal:3", "Fatal (X): 400"),
+    ],
+)
+def test_a_spot_only_attempt_the_cloud_refuses_is_a_rejection_not_a_try(h, classes, last):
+    _spot_listing(h)
+    _spot_only_ice(h, message=_classes_message(classes, last))
+    assert [a.outcome for a in h.run.status.attempts] == [AttemptOutcome.SPOT_REJECTED]
+    assert [(t.state, t.exit_code) for t in h.run.status.tasks] == [(TaskState.PENDING, None)]
+    assert spot.State.load(h.kube).rejected("oci", SPOT_SKU, h.clock.now)
+    assert _tries(h) is None and h.spot_tries == []
+
+
+def test_a_spot_until_exhausted_attempt_the_cloud_refuses_goes_on_demand(h):
+    _spot_listing(h)
+    _spot_only_ice(h, CapacityMode.SPOT_UNTIL_EXHAUSTED, message=_classes_message("Unsupported:3"))
+    assert [a.outcome for a in h.run.status.attempts] == [AttemptOutcome.LAUNCH_FAILED]
+    assert h.run.status.phase == RunPhase.PENDING
+    h.runner.reconcile(h.name)
+    assert _capacity_types(h, 2) == ["on-demand"]
+    assert _tries(h) is None and h.spot_tries == []
+
+
+@pytest.mark.parametrize("classes", ["InsufficientCapacity:2,Unsupported:1", "ZoneUnusable:1,Unsupported:2"])
+def test_capacity_mixed_with_rejections_is_a_try(h, classes):
+    _spot_listing(h)
+    _spot_only_ice(h, message=_classes_message(classes, "InsufficientCapacity (X): none"))
+    assert [a.outcome for a in h.run.status.attempts] == [AttemptOutcome.SPOT_UNAVAILABLE]
+    assert _tries(h).count == 1 and h.spot_tries == [("oci", "unavailable")]
+    assert not spot.State.load(h.kube).rejected("oci", SPOT_SKU, h.clock.now)
+
+
+def test_classes_of_a_summary():
+    assert runner_mod._classes([_classes_message("InsufficientCapacity:2,Unsupported:1"), "no summary"]) == {
+        "InsufficientCapacity",
+        "Unsupported",
+    }
+    assert runner_mod._classes(["insufficient capacity, no candidate offering had quota headroom (2 skipped)"]) == set()

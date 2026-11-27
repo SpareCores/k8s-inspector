@@ -416,3 +416,12 @@ def test_planning_skip_of_spot_until_exhausted():
     # exhausted
     exhausted = spot.State({TRIES: spot._dump_tries(week_of_tries(NOW - timedelta(days=14)), S)})
     assert skip(mode, exhausted) is None
+
+
+def test_the_exhausted_line_is_logged_once_per_state(caplog):
+    spot._announced.clear()
+    state = spot.State({TRIES: spot._dump_tries(week_of_tries(NOW - timedelta(days=14)), S)})
+    with caplog.at_level("INFO"):
+        for _ in range(3):
+            assert skip(CapacityMode.SPOT_UNTIL_EXHAUSTED, state) is None
+    assert caplog.text.count("exhausted, on-demand allowed") == 1

@@ -359,7 +359,10 @@ possible, and so is an entry that lists no offering groups (an older SCarpenter 
 A **slot** is `slotHours` UTC hours of one weekday (`(weekday, hour // slotHours)`, 56 a week at 3 hours). A **try** is an
 attempt launched spot-only that found no spot capacity in the regions the run was confined to (those where the spot
 quota fitted) while their spot quota had room: the run ends `SpotUnavailable` ([run records](run-records.md)). It counts
-only with evidence that SCarpenter tried offerings (`tried N offerings`, N above 0, or a capacity error class). An
+only with evidence of lack of capacity: the error's `classes:` summary or a launch error names `InsufficientCapacity` or
+`ZoneUnusable` (mixed with rejection classes it still counts). SCarpenter words a spot offering the cloud refuses
+(`classes: Unsupported:3`, also `InvalidOffering`, `Fatal`, `NotFound`) as insufficient capacity too; that is a
+rejection (below), not a try. An
 attempt whose launch was refused for quota, that ended with `no candidate offering had quota headroom`, or whose spot
 quota showed no room for the run's regions when it failed, is not a try (`quota_busy`, the usual launch deferral
 applies), and neither is a provisioning deadline without any evidence. The ConfigMap `k8s-inspector-spot` keeps one

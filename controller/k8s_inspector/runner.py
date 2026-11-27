@@ -295,6 +295,9 @@ QUOTA_FACT_KEYS = (
     "regions",
 )  # `regions`: per-region headroom, when SCarpenter lists it
 NO_QUOTA_HEADROOM = "no candidate offering had quota headroom"  # SCarpenter: every candidate was over quota
+CLASSES_SUMMARY = re.compile(r"classes: ([^;]*)")  # `classes: Unsupported:3,InsufficientCapacity:1`
+CAPACITY_CLASSES = ("InsufficientCapacity", "ZoneUnusable")
+REJECTION_CLASSES = ("Unsupported", "InvalidOffering", "Fatal", "NotFound")  # the cloud refuses the offering itself
 TRIED_SUMMARY = re.compile(
     r"tried (\d+) offerings in (\d+) regions / (\d+) zones"
 )  # SCarpenter's summary of a failed Create
@@ -303,6 +306,12 @@ TRIED_SUMMARY = re.compile(
 def _quota_fact(entry: dict) -> dict:
     """A spot quota entry of the offered listing as the run record keeps it."""
     return {k: entry[k] for k in QUOTA_FACT_KEYS if k in entry}
+
+
+def _classes(messages: list[str]) -> set[str]:
+    """The error classes SCarpenter's summaries (`classes: <Class>:<n>,...`) in the messages name."""
+    found = (CLASSES_SUMMARY.search(m) for m in messages)
+    return {part.split(":")[0].strip() for f in found if f for part in f.group(1).split(",")} - {""}
 
 
 def _tried(failures: list[LaunchFailure], message: str) -> dict | None:
@@ -927,11 +936,21 @@ class Runner(DbaasMixin):
         regions = tuple(run.spec.regions)
         messages = [f.message for f in run.status.launch_failures] + [message]
         tried = _tried(run.status.launch_failures, message)
+        classes = _classes(messages)
+        if reason == "ICE" and classes and classes <= set(REJECTION_CLASSES):
+            # SCarpenter words every failed Create as insufficient capacity, but the cloud refused the offering
+            # itself (Unsupported, ...): spot is impossible for the SKU, not short of capacity.
+            if run.spec.capacity == CapacityMode.SPOT_ONLY:
+                return self._spot_rejected(run, live, message)
+            self._retry_on_demand(run, live, message)  # SpotUntilExhausted: on-demand, as for a rejected launch
+            return True
         if reason == "QUOTA" or (reason == "ICE" and (spot.quota_busy(group, regions) or NO_QUOTA_HEADROOM in message)):
             self._spot_try_result(vendor, "quota_busy")
             return False
-        if reason != "ICE" or not (
-            (tried and tried["offerings"]) or any(launch.is_capacity_class(m) for m in messages)
+        if (
+            reason != "ICE"
+            or not ((tried and tried["offerings"]) or any(launch.is_capacity_class(m) for m in messages))
+            or (classes and not classes & set(CAPACITY_CLASSES))
         ):
             return False
         settings = self._cfg().settings

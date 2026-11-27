@@ -343,6 +343,9 @@ def try_due(tries: Tries | None, settings: Settings, now: datetime) -> bool:
 # --------------------------------------------------------------------------- SpotUntilExhausted / SpotOnly: planning
 
 
+_announced: set[tuple[str, str, datetime]] = set()  # exhausted SKUs the planner has logged (this process)
+
+
 def spot_impossible(entry: dict | None) -> str | None:
     """Why spot can never launch the SKU, from its entry in SCarpenter's offered listing (`planner.read_offered`):
     none of its offering groups, available or not, is a spot one (`offered_types`), or the spot limit is below what
@@ -414,6 +417,8 @@ def planning_skip(
         return None
     tries = state.tries(vendor, sku, settings, now)
     if is_exhausted(tries, settings, now):
-        log.info("%s: exhausted, on-demand allowed", describe_tries(sku, tries, settings))
+        if (vendor, sku, tries.first) not in _announced:  # once per SKU state, not every cycle
+            _announced.add((vendor, sku, tries.first))
+            log.info("%s: exhausted, on-demand allowed", describe_tries(sku, tries, settings))
         return None
     return None if try_due(tries, settings, now) else "spot was tried in this slot"
