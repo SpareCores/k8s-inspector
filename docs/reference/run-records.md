@@ -221,6 +221,10 @@ Values the record lacks (records written before the cost fields) are filled in:
   when the run has no `meta.json` there and for a DBaaS run, so its `wasted_usd`, the run's `wasted_usd` and the
   counterfactual are `null` too. A `Completed` attempt is useful as a whole either way.
 
+## Spot stats
+
+The publisher derives `spot/<vendor>.json` from the server run records, see [spot stats](spot-stats.md).
+
 ## Queries
 
 Spot interruptions per vendor, region and zone, from a checkout of sc-inspector-data:

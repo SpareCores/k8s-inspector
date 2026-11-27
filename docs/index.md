@@ -30,6 +30,7 @@ Status: **design**. Pages marked *planned* describe procedures that will exist o
 | [Feature mapping](reference/feature-mapping.md) | every sc-inspector feature and its k8s-inspector equivalent |
 | [Output contract](reference/output-contract.md) | object storage layout and the sc-inspector-data layout sc-crawler reads |
 | [Run records](reference/run-records.md) | the per-run attempt history in sc-inspector-data, incl. spot interruptions |
+| [Spot stats](reference/spot-stats.md) | `spot/<vendor>.json`: spot interruption rates and availability derived from the run records |
 | [Exit codes](reference/exit-codes.md) | `exit_code` values and retry rules |
 | [Tasks](reference/tasks.md) | task definition fields and the task hash |
 | [Kubernetes objects](reference/objects.md) | `BenchmarkRun` schema, labels, annotations, Pod specs |

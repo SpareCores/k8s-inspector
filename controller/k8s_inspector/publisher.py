@@ -56,6 +56,8 @@ Decisions:
   finished, publishable run until its record is written; a run without `run.json` is logged and given up. Runs
   deleted by `_defer_launch` get no record. `backfill_run_records` writes the records of past runs from the
   `run.json` files in object storage.
+- Spot stats (`spot_stats`): after new run records, `spot/<vendor>.json` is regenerated from all server run records in
+  git and committed (own commit) only when its content, `generated_at` aside, changed.
 - `rescan` finds the SKUs of a vendor from the git tree (`data/<vendor>/*`): a SKU never published has to be
   passed with `skus`. A DBaaS run is recognised by `run.json` `database`.
 """
@@ -75,7 +77,7 @@ from datetime import UTC, date, datetime, timedelta
 from functools import partial
 from pathlib import Path
 
-from k8s_inspector import cost, crd, dbaas_bench, keeper, launch, render, tasks
+from k8s_inspector import cost, crd, dbaas_bench, keeper, launch, render, spot_stats, tasks
 from k8s_inspector import storage as storage_keys
 from k8s_inspector import variant as variants
 from k8s_inspector.kube import Kube, NotFound
@@ -248,6 +250,7 @@ class Publisher:
         self._wake = threading.Event()
         self._timing_rendered: dict[str, dict[str, str]] = {}  # DBaaS run name -> the timing files last published
         self._records_written: set[str] = set()  # names of the runs whose record is in git (or given up)
+        self._spot_stats_due = True  # new records (or a fresh start): `spot/<vendor>.json` may have changed
 
     # ------------------------------------------------------------------ public
 
@@ -271,6 +274,7 @@ class Publisher:
             result = self._publish(items, settings)
             self._publish_dbaas_timing(runs, settings)
             self._publish_run_records(settings)
+            self._publish_spot_stats()
             return result
 
     def rescan(self, since_days: int, skus: Iterable[str] = (), settings: Settings | None = None) -> PublishResult:
@@ -534,9 +538,42 @@ class Publisher:
             cone=False,
         )
         self._records_written |= done
+        self._spot_stats_due |= bool(written)
         costed = {run.name: run_json for run, run_json in todo}
         for run in written:  # once per record: a record already in git is not logged again
             cost.log_cost_lines(costed[run.name], spans[run.name])
+
+    def _publish_spot_stats(self) -> None:
+        """`spot/<vendor>.json` from all server run records in git (`spot_stats`), rewritten only when its content
+        changed, in one commit; tried again next cycle after an error. Nothing without new records."""
+        if not self._spot_stats_due:
+            return
+        now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+        def render_all() -> list[str]:
+            records: dict[str, list[dict]] = {}
+            for path in sorted(self._repo.glob("data/*/*/runs/*.json")):
+                records.setdefault(path.parts[-4], []).append(json.loads(path.read_text()))
+            changed = []
+            for vendor, vendor_records in records.items():
+                stats = spot_stats.spot_stats(vendor, vendor_records, now)
+                target = self._repo / "spot" / f"{vendor}.json"
+                if stats and not (target.is_file() and spot_stats.same_content(target.read_text(), stats)):
+                    target.parent.mkdir(exist_ok=True)
+                    target.write_text(spot_stats.render(stats))
+                    changed.append(vendor)
+            return changed
+
+        try:
+            self._commit_pushed(
+                ["/data/*/*/runs/*.json", "/spot/*.json"],
+                render_all,
+                lambda changed: f"k8s-inspector: spot stats ({', '.join(changed)})",
+                cone=False,
+            )
+            self._spot_stats_due = False
+        except Exception:
+            log.exception("cannot publish the spot stats, trying again next cycle")
 
     def backfill_run_records(self, since_days: int, settings: Settings | None = None) -> int:
         """`publish --backfill-runs --since 120d`: write the records of the runs of the last `since_days` days from
@@ -1103,8 +1140,8 @@ class Publisher:
         return sorted(dirs)
 
     def _commit(self, rendered: list[tuple[_Loaded, int | None]], message: str | None = None) -> str | None:
-        """Commit what was rendered (only below data/ and dbaas/); the new SHA, None without changes."""
-        roots = [d for d in ("data", "dbaas") if (self._repo / d).exists()]
+        """Commit what was rendered (only below data/, dbaas/ and spot/); the new SHA, None without changes."""
+        roots = [d for d in ("data", "dbaas", "spot") if (self._repo / d).exists()]
         if not roots:
             return None
         self._git("add", "-A", "--", *roots)

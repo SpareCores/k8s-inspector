@@ -1304,6 +1304,26 @@ def test_run_record_is_written_when_the_run_ended_and_everything_is_published(tm
     assert run.name in pub._records_written
 
 
+def test_spot_stats_are_published_with_new_records_and_only_when_their_content_changed(
+    tmp_path, origin, storage, cluster
+):
+    cluster.add_run(NAMES)
+    doc = json.loads(storage.objects[okey(KEY, "run.json")])
+    doc["attempts"][0] |= {"outcome": "SpotInterrupted", "capacity_type": "spot", "region": "fsn1"}
+    storage.objects[okey(KEY, "run.json")] = json.dumps(doc).encode()
+    pub = make_publisher(tmp_path, origin, storage)
+    pub.publish_once(ENABLED)
+    check = clone(origin, tmp_path)
+    stats = json.loads((check / "spot/hcloud.json").read_text())
+    assert stats["groups"][0]["level"] == "vendor" and stats["groups"][0]["interruptions"] == 1
+    commits = git(check, "log", "--format=%s").splitlines()
+    assert commits[0] == "k8s-inspector: spot stats (hcloud)" and commits[1] == f"k8s-inspector: run records ({RUN_ID})"
+    pub.publish_once(ENABLED)
+    pub._spot_stats_due = True  # a restart: regenerated, content unchanged, nothing committed
+    pub.publish_once(ENABLED)
+    assert git(clone(origin, tmp_path), "log", "--format=%s").splitlines() == commits
+
+
 def test_run_record_waits_for_unpublished_tasks_and_a_run_that_has_not_ended(tmp_path, origin, storage, cluster):
     run = cluster.add_run(NAMES, phase=RunPhase.RUNNING)
     for t in run.status.tasks:
