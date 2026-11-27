@@ -20,6 +20,7 @@ from k8s_inspector.model import (
     RunPhase,
     RunSpec,
     Settings,
+    SpotSettings,
     VendorSettings,
 )
 from k8s_inspector.tasks import all_tasks, get_task, task_hash
@@ -410,7 +411,7 @@ def all_done(**overrides) -> dict[str, dict]:
 def everything_offered(request, monkeypatch):
     """SCarpenter offers every SKU, unless the test is about the listing (`@pytest.mark.offered`)."""
     if not request.node.get_closest_marker("offered"):
-        monkeypatch.setattr(planner, "not_offered", lambda kube, cfg, vendor, skus, now=None: {})
+        monkeypatch.setattr(planner, "not_offered", lambda kube, cfg, vendor, skus, now=None, offered=None: {})
 
 
 @pytest.fixture
@@ -1469,32 +1470,122 @@ def test_on_demand_mode_uses_the_on_demand_group(kube, keeper_skus, caplog):
 
 
 @pytest.mark.offered
-def test_a_spot_busy_sku_may_not_use_the_on_demand_group_of_a_run_that_cannot_use_spot(kube, keeper_skus, monkeypatch):
+def test_a_quarantined_sku_ignores_the_busy_spot_group_and_plans_on_demand(kube, keeper_skus, monkeypatch):
     keeper_skus["oci"] = {"s": {}}
     publish_offered(kube, offered_configmap({"s": spot_entry(quota(headroom=0), spot_available=False)}))
     monkeypatch.setattr(planner.spot, "is_quarantined", lambda *args: True)
     assert plan_wet(kube, keeper_skus) == ["s"]  # on-demand only, and the on-demand group has no quotas
 
 
-@pytest.mark.offered
-def test_a_long_deferred_sku_reserves_its_bucket(kube, keeper_skus, caplog):
+def reserving_listing(kube, keeper_skus, *, holds_bucket=True):
+    """`big` (spot busy: it needs 384 of bucket B, 128 are free) has waited 2 hours; `small` and `other` could run.
+    A run of `mid` holds bucket B when `holds_bucket`. Returns the waits of the vendor, as the controller keeps them."""
     keeper_skus["oci"] = {"big": {}, "small": {}, "other": {}}
-    big = spot_entry(quota(need=384, headroom=128), spot_available=False)
-    small = spot_entry(quota(need=8, headroom=128))
-    other = spot_entry(quota("B2", need=8, headroom=128))
-    publish_offered(kube, offered_configmap({"big": big, "small": small, "other": other}))
-    waits = {}
+    entries = {
+        "big": spot_entry(quota(need=384, headroom=128), spot_available=False),
+        "small": spot_entry(quota(need=8, headroom=128)),
+        "other": spot_entry(quota("B2", need=8, headroom=128)),
+        "mid": spot_entry(quota(need=64, headroom=128)),
+    }
+    publish_offered(kube, offered_configmap(entries))
+    if holds_bucket:
+        pending_run(kube, "mid")
+    return {("oci", "big"): (datetime.now(UTC) - timedelta(hours=2), frozenset({"B"}))}
+
+
+@pytest.mark.offered
+def test_a_long_deferred_sku_reserves_its_bucket_while_own_runs_hold_it(kube, keeper_skus, caplog):
+    waits = reserving_listing(kube, keeper_skus)
+    since = waits["oci", "big"][0]
     with caplog.at_level("INFO"):
-        # first cycle: big starts waiting, the others use the bucket
-        assert sorted(plan_wet(kube, keeper_skus, quota_waits=waits)) == ["other", "small"]
-        assert ("oci", "big") in waits
-        for name in list(kube.objects):  # the runs end
-            del kube.objects[name]
-        # the wait is long enough: the bucket of big is kept free, another bucket is not
-        since, buckets = waits["oci", "big"]
-        waits["oci", "big"] = (since - timedelta(hours=2), buckets)
-        assert plan_wet(kube, keeper_skus, quota_waits=waits) == ["other"]
+        assert plan_wet(kube, keeper_skus, quota_waits=waits) == ["other"]  # another bucket is not reserved
     assert "autoPlan defers oci/small: its quota is reserved for big" in caplog.text
+    assert waits["oci", "big"][0] == since  # still busy: the timer goes on
+
+
+@pytest.mark.offered
+def test_there_is_no_reservation_when_own_runs_do_not_hold_the_bucket(kube, keeper_skus):
+    waits = reserving_listing(kube, keeper_skus, holds_bucket=False)  # others hold it: blocking `small` frees nothing
+    assert sorted(plan_wet(kube, keeper_skus, quota_waits=waits)) == ["other", "small"]
+
+
+@pytest.mark.offered
+def test_quota_reserve_after_minutes_zero_turns_the_reservation_off(kube, keeper_skus):
+    waits = reserving_listing(kube, keeper_skus)
+    settings = Settings(
+        vendors={"oci": VendorSettings(enabled=True, publish=True, max_in_flight=5)},
+        auto_plan=True,
+        spot=SpotSettings(quota_reserve_after_minutes=0),
+    )
+    cfg = Config(EnvConfig(bucket="b", bucket_region="r"), settings)
+    assert sorted(plan_wet(kube, keeper_skus, cfg, quota_waits=waits)) == ["other", "small"]
+
+
+@pytest.mark.offered
+def test_a_reservation_ends_when_its_holder_is_no_longer_a_candidate(kube, keeper_skus):
+    waits = reserving_listing(kube, keeper_skus)
+    keeper_skus["oci"] = {"small": {}}  # Keeper dropped `big`
+    assert plan_wet(kube, keeper_skus, quota_waits=waits) == ["small"]
+    assert waits == {}
+
+
+@pytest.mark.offered
+def test_waits_are_rebuilt_every_cycle(kube, keeper_skus):
+    keeper_skus["oci"] = {"big": {}, "gone": {}}
+    publish_offered(kube, offered_configmap({"big": spot_entry(quota(need=384, headroom=128))}))
+    old = datetime.now(UTC) - timedelta(hours=1)
+    waits = {("oci", "big"): (old, frozenset({"B"})), ("oci", "gone"): (old, frozenset({"B"}))}
+    assert plan_wet(kube, keeper_skus, quota_waits=waits) == []
+    assert waits == {("oci", "big"): (old, frozenset({"B"}))}
+
+
+@pytest.mark.offered
+def test_the_longest_waiter_wins_so_two_holders_do_not_block_each_other(kube, keeper_skus):
+    waits = reserving_listing(kube, keeper_skus)
+    publish_offered(
+        kube, offered_configmap({"small": spot_entry(quota(need=8, headroom=128)), "mid": spot_entry(quota())})
+    )
+    waits["oci", "small"] = (datetime.now(UTC) - timedelta(hours=3), frozenset({"B"}))
+    keeper_skus["oci"] = {"small": {}, "big": {}}
+    assert plan_wet(kube, keeper_skus, quota_waits=waits) == ["small"]
+
+
+@pytest.mark.offered
+def test_each_sku_is_tested_against_its_own_max_headroom(kube, keeper_skus):
+    keeper_skus["oci"] = {"a": {}, "b": {}, "mid": {}}
+    publish_offered(
+        kube,
+        offered_configmap(
+            {
+                "mid": spot_entry(quota(need=64, headroom=100)),
+                "a": spot_entry(quota(need=32, headroom=100)),  # 100 - 64 = 36 left: fits
+                "b": spot_entry(quota(need=32, headroom=70)),  # 70 - 64 = 6 left: busy
+            }
+        ),
+    )
+    pending_run(kube, "mid")
+    assert plan_wet(kube, keeper_skus) == ["a"]
+
+
+@pytest.mark.offered
+def test_a_truncated_listing_ignores_quotas(kube, keeper_skus):
+    keeper_skus["oci"] = {"big": {}}
+    entry = spot_entry(quota(need=384, headroom=128), spot_available=False)
+    publish_offered(kube, offered_configmap({"big": entry}, truncated=True))
+    assert plan_wet(kube, keeper_skus) == ["big"]
+
+
+@pytest.mark.offered
+def test_a_run_that_can_only_use_on_demand_counts_against_the_on_demand_group(kube, keeper_skus):
+    keeper_skus["oci"] = {"new": {}}
+    entries = {
+        "old": spot_entry(quota("SPOT", headroom=100), on_demand_quotas=(quota("OD", need=64, headroom=100),)),
+        "new": spot_entry(quota("OD", need=64, headroom=100)),
+    }
+    publish_offered(kube, offered_configmap(entries))
+    run = pending_run(kube, "old")
+    kube.objects[run.name]["status"] = {"attempts": [{"n": 1, "outcome": "LaunchFailed"}], "attempt": 1}
+    assert plan_wet(kube, keeper_skus) == []  # `old` retries on-demand: bucket OD has 36 left, `new` needs 64
 
 
 @pytest.mark.offered
