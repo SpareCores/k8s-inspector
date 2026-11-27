@@ -3359,3 +3359,120 @@ def test_classes_of_a_summary():
         "Unsupported",
     }
     assert runner_mod._classes(["insufficient capacity, no candidate offering had quota headroom (2 skipped)"]) == set()
+
+
+def _launch_attempts_event(h, claim, message, suffix="1", **times):
+    """What SCarpenter publishes on a NodeClaim when a Create ends (a NodeClaim has no namespace: `default`)."""
+    h.kube.create(
+        "event",
+        {
+            "metadata": {"name": f"{claim}.{suffix}", "namespace": "default"},
+            "involvedObject": {"kind": "NodeClaim", "name": claim},
+            "reason": "LaunchAttempts",
+            "message": message,
+            **times,
+        },
+    )
+
+
+LAUNCH_ATTEMPTS_FAILED = (
+    "launch-attempts v1 tried=2 shown=2\n"
+    "eu-test-1|eu-test-1a|spot|aws.m7i.large|InsufficientCapacity|NoSpot|no spot capacity\n"
+    "eu-test-1|eu-test-1b|spot|aws.m7i.large|QuotaExceeded|Vcpu|vcpu limit"
+)
+LAUNCH_ATTEMPTS_LAUNCHED = "launch-attempts v1 tried=1 shown=1 launched=eu-test-1|eu-test-1a|spot|aws.m7i.large"
+
+
+def test_launch_attempts_of_failed_nodeclaims_reach_the_run_json(h):
+    _provisioning_without_nodes(h, capacity=CapacityMode.ON_DEMAND, force=True)
+    for claim in ("bench-aaaaa", "bench-bbbbb"):
+        _ice_event(h, claim)
+        _launch_attempts_event(h, claim, LAUNCH_ATTEMPTS_FAILED)
+    h.runner.reconcile(h.name)
+    assert h.run.status.phase == RunPhase.FAILED
+    entry = h.storage.run_json["attempts"][0]
+    assert entry["launch_attempts_tried"] == 4
+    assert entry["launch_attempts_truncated"] is False
+    assert [o["outcome"] for o in entry["launch_attempts"]] == ["InsufficientCapacity", "QuotaExceeded"] * 2
+    assert entry["launch_attempts"][0]["zone"] == "eu-test-1a"
+
+
+def test_launch_attempts_of_the_launched_nodeclaim_reach_the_run_json(h):
+    h.start(["geekbench"])
+    h.runner.reconcile(h.name)
+    _launch_attempts_event(h, f"claim-node-{h.name}-a1", LAUNCH_ATTEMPTS_LAUNCHED)
+    h.drive(stop=lambda run: run.status.phase == RunPhase.RUNNING)
+    entry = h.storage.run_json["attempts"][0]
+    assert entry["launch_attempts"] == [
+        {
+            "region": "eu-test-1",
+            "zone": "eu-test-1a",
+            "capacity_type": "spot",
+            "instance_type": "aws.m7i.large",
+            "outcome": "launched",
+            "code": None,
+            "message": None,
+        }
+    ]
+    assert entry["launch_attempts_tried"] == 1
+
+
+def test_a_nodeclaim_with_several_creates_ends_with_the_launched_one(h):
+    _provisioning_without_nodes(h, capacity=CapacityMode.ON_DEMAND, force=True)
+    claim = "bench-aaaaa"
+    _launch_failed(h, claim, "Retryable (X): busy")
+    _launch_attempts_event(h, claim, LAUNCH_ATTEMPTS_FAILED, "1", lastTimestamp=iso(h.clock.now))
+    h.runner.reconcile(h.name)
+    assert [e.name for e in h.run.status.attempts[0].launch_events] == [f"{claim}.1"]
+    h.clock.advance(seconds=30)  # Karpenter called Create again on the same claim: a second Event
+    _launch_attempts_event(h, claim, LAUNCH_ATTEMPTS_LAUNCHED, "2", lastTimestamp=iso(h.clock.now))
+    h.runner.reconcile(h.name)
+    h.runner.reconcile(h.name)  # nothing is read twice
+    events = h.run.status.attempts[0].launch_events
+    assert [e.name for e in events] == [f"{claim}.1", f"{claim}.2"]
+    assert events[1].launched["outcome"] == "launched"
+
+
+def test_launch_attempts_are_listed_per_nodeclaim_for_the_remembered_failures(h):
+    _provisioning_without_nodes(h, capacity=CapacityMode.ON_DEMAND, force=True)
+    _ice_event(h, "bench-aaaaa", lastTimestamp=iso(h.clock.now))
+    h.runner.reconcile(h.name)
+    assert set(h.kube.launch_event_lists) == {"bench-aaaaa"}  # asked for that claim only, never cluster-wide
+    h.clock.advance(minutes=20)  # a slow pass: the claim is long gone, its Event is still read
+    _launch_attempts_event(h, "bench-aaaaa", LAUNCH_ATTEMPTS_FAILED)
+    h.runner.reconcile(h.name)
+    assert [e.name for e in h.run.status.attempts[0].launch_events] == ["bench-aaaaa.1"]
+
+
+def test_no_launch_attempts_are_listed_after_the_attempt_ends(h):
+    _provisioning_without_nodes(h, capacity=CapacityMode.ON_DEMAND, force=True)
+    for claim in ("bench-aaaaa", "bench-bbbbb"):
+        _ice_event(h, claim)
+    h.runner.reconcile(h.name)
+    assert h.run.status.phase == RunPhase.FAILED
+    asked = len(h.kube.launch_event_lists)
+    h.runner.reconcile(h.name)
+    assert len(h.kube.launch_event_lists) == asked
+
+
+def test_run_json_has_no_launch_attempts_without_an_event(h):
+    h.start(["geekbench"])
+    h.drive(stop=lambda run: run.status.phase == RunPhase.PUBLISHING)
+    entry = h.storage.run_json["attempts"][0]
+    assert not {"launch_attempts", "launch_attempts_tried", "launch_attempts_truncated"} & entry.keys()
+
+
+def test_an_unreadable_launch_attempts_event_changes_nothing(h, caplog):
+    _provisioning_without_nodes(h, capacity=CapacityMode.ON_DEMAND, force=True)
+    h.cluster.fail_launch(
+        h.kube.get("pod", f"{h.name}-a1"), "Fatal (X): no", name="bench-aaaaa", status="Unknown", reason="LaunchFailed"
+    )
+    _launch_attempts_event(h, "bench-aaaaa", LAUNCH_ATTEMPTS_FAILED.replace("v1", "v2"))
+    h.runner.reconcile(h.name)
+    assert h.run.status.phase == RunPhase.PROVISIONING
+    assert h.run.status.attempts[0].launch_events == []
+    h.kube.events_forbidden = True  # no RBAC: the same, warned about once
+    h.runner.reconcile(h.name)
+    h.runner.reconcile(h.name)
+    assert h.run.status.attempts[0].launch_events == []
+    assert len([r for r in caplog.records if "cannot list the launch attempts" in r.message]) == 1

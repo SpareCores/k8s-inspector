@@ -44,6 +44,32 @@ subjects:
   name: k8s-inspector
   namespace: inspector
 ---
+# SCarpenter's LaunchAttempts Events of NodeClaims (kube.list_launch_attempts_events). A NodeClaim has no namespace,
+# so Kubernetes puts the Events of it in `default`.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: k8s-inspector-nodeclaim-events
+  namespace: default
+rules:
+- apiGroups: [""]
+  resources: [events]
+  verbs: [list]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: k8s-inspector-nodeclaim-events
+  namespace: default
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: k8s-inspector-nodeclaim-events
+subjects:
+- kind: ServiceAccount
+  name: k8s-inspector
+  namespace: inspector
+---
 # SCarpenter's offered-types ConfigMaps (planner.not_offered), named scarpenter-offered-<benchClass>-<vendor>. Only
 # these are readable; the node bootstrap and credential ConfigMaps of the namespace are not. A non-default benchClass
 # or a new SCarpenter vendor needs this list updated.

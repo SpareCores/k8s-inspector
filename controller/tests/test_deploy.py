@@ -12,6 +12,7 @@ from k8s_inspector.model import (
     CapacityType,
     DbPhase,
     DbStatus,
+    LaunchEvent,
     LaunchFailure,
     RunPhase,
     RunSpec,
@@ -88,6 +89,7 @@ def test_every_status_key_the_controller_writes_is_in_the_crd_schema():
                 start=NOW,
                 end=NOW,
                 outcome=AttemptOutcome.COMPLETED,
+                launch_events=[LaunchEvent("nc.1", NOW, 1, True, [{"outcome": "Fatal"}], {"outcome": "launched"})],
             )
         ],
         launch_failures=[LaunchFailure(node_claim="nc", message="m", time=NOW)],
@@ -100,6 +102,7 @@ def test_every_status_key_the_controller_writes_is_in_the_crd_schema():
     assert unknown_keys(emitted, schema()["status"], "status") == []
     assert emitted["tasks"][0].keys() >= {"errorMsg", "gpuFallback"}  # the sample really sets every optional key
     assert "node" in emitted["attempts"][0]
+    assert "launchEvents" in emitted["attempts"][0]
     assert emitted["database"].keys() == {
         "phase",
         "since",
@@ -167,3 +170,9 @@ def test_the_dbaas_provisioner_runs_with_a_serviceaccount_that_has_no_role():
     rbac = (base / "controller" / "rbac.yaml").read_text()
     assert "k8s-inspector-dbaas" not in rbac  # no Role or binding: the Jobs do not call the Kubernetes API
     assert "controller/dbaas-serviceaccount.yaml" in (base / "kustomization.yaml").read_text()
+
+
+def test_rbac_lists_the_nodeclaim_events_in_default():
+    docs = yaml.safe_load_all((CRD_PATH.parents[1] / "controller" / "rbac.yaml").read_text())
+    role = next(d for d in docs if d["kind"] == "Role" and d["metadata"]["namespace"] == "default")
+    assert role["rules"] == [{"apiGroups": [""], "resources": ["events"], "verbs": ["list"]}]
