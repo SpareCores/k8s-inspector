@@ -15,8 +15,9 @@ import zlib
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from typing import NamedTuple
 
-from k8s_inspector import crd, keeper, launch, pods, publisher, render, tasks
+from k8s_inspector import crd, keeper, launch, pods, publisher, render, spot, tasks
 from k8s_inspector.kube import Kube, NotFound
 from k8s_inspector.model import (
     BenchmarkRun,
@@ -336,14 +337,43 @@ def _until(offerings: list) -> datetime | None:
     return max(untils, default=None)
 
 
-def read_offered(
-    kube: Kube, cfg: Config, vendor: str, now: datetime | None = None
-) -> tuple[dict[str, dict], bool] | None:
+def _quotas(offerings: list) -> dict[str, list[dict]]:
+    """The quota entries of each offering group, by capacity type: `{capacityType: [{bucket, unit, need, maxLimit,
+    maxHeadroom}]}`, whether or not the group is available. A group without `quotas` or with a damaged one is left
+    out (no quota model: the planner behaves as without this field)."""
+    result = {}
+    for offering in offerings:
+        try:
+            entries = [
+                {
+                    "bucket": str(q["bucket"]),
+                    "unit": str(q.get("unit", "units")),
+                    "need": float(q["need"]),
+                    "maxLimit": float(q["maxLimit"]),
+                    "maxHeadroom": float(q["maxHeadroom"]),
+                }
+                for q in offering["quotas"]
+            ]
+        except KeyError, TypeError, ValueError:
+            continue
+        if entries:
+            result.setdefault(offering.get("capacityType"), entries)
+    return result
+
+
+class Offered(NamedTuple):
+    entries: dict[str, dict]  # {apiReference: entry}
+    truncated: bool
+    generated_at: datetime  # when SCarpenter wrote the listing (`generatedAt`)
+
+
+def read_offered(kube: Kube, cfg: Config, vendor: str, now: datetime | None = None) -> Offered | None:
     """The usable content of SCarpenter's offered-types ConfigMap `scarpenter-offered-<benchClass>-<vendor>` in
     `SCARPENTER_NAMESPACE` (gzipped JSON in `binaryData["types.json.gz"]`, else plain `data["types.json"]`; the
-    optional `zonesOmitted` field is ignored, nothing reads zones): `({apiReference: entry}, truncated)`, where
-    an entry is `{available, capacityTypes, reason, until}` and `until` is the latest of its unavailable offerings
-    (`offerings[].until`, else None). Entries without an `apiReference` are ignored; of two with the same one the
+    optional `zonesOmitted` field is ignored, nothing reads zones): `Offered(entries, truncated, generated_at)` with `entries` = `{apiReference: entry}`, where
+    an entry is `{available, capacityTypes, reason, until, quotas}`, `until` is the latest of its unavailable offerings
+    (`offerings[].until`, else None) and `quotas` the quota entries of its offering groups (`_quotas`). Entries without
+    an `apiReference` are ignored; of two with the same one the
     available wins and `until` is the latest of both. `now` (default the current time) judges staleness.
 
     None (the reason is logged; it means neither "offered" nor "not offered") when the ConfigMap is absent,
@@ -379,6 +409,7 @@ def read_offered(
                     "available": available,
                     "capacityTypes": capacity_types,
                     "reason": entry.get("reason", "unavailable"),
+                    "quotas": _quotas(offerings),
                 }
             old["until"] = max(untils, default=None)
     except NotFound:
@@ -392,7 +423,7 @@ def read_offered(
             "offered types of vendor %s unusable: ConfigMap %s is stale (generated %s)", vendor, name, generated
         )
         return None
-    return entries, truncated
+    return Offered(entries, truncated, generated)
 
 
 def offered_until(kube: Kube, cfg: Config, vendor: str, sku: str, now: datetime | None = None) -> datetime | None:
@@ -428,7 +459,7 @@ def not_offered(
     offered = read_offered(kube, cfg, vendor, now)
     if offered is None:
         return None
-    entries, truncated = offered
+    entries, truncated, _ = offered
     if truncated:
         log.warning(
             "offered types of vendor %s are truncated: autoPlan skips only SKUs it lists as unavailable", vendor
@@ -450,6 +481,106 @@ def not_offered(
     return skipped
 
 
+# --------------------------------------------------------------------------- quota-aware planning
+
+SPOT_BUSY = "spot quota busy"
+ON_DEMAND_BUSY = "on-demand quota busy"
+
+# SKUs of a vendor deferred for a busy spot quota, kept across cycles by the controller (a restart resets them):
+# (vendor, sku) -> (deferred since, the quota buckets the SKU needs)
+QuotaWaits = dict[tuple[str, str], tuple[datetime, frozenset[str]]]
+
+
+def _busy_reason(quotas: list[dict], headroom: dict[str, float]) -> str | None:
+    """Why one instance does not fit the quota entries right now, else None. Busy means the limit is large enough
+    but `headroom` (the remaining headroom per bucket, initialised from `maxHeadroom`) is not. The caller has
+    checked `_never_fits` first."""
+    for q in quotas:
+        room = headroom.setdefault(q["bucket"], q["maxHeadroom"])
+        if q["need"] > room:
+            return f"bucket {q['bucket']}: need {q['need']:g} {q['unit']}, headroom {room:g}"
+    return None
+
+
+def _never_fits(quotas: list[dict]) -> bool:
+    """The limit of an entry is below what one instance needs: waiting does not help."""
+    return any(q["maxLimit"] < q["need"] for q in quotas)
+
+
+def spot_capable(kube: Kube, cfg: Config, vendor: str, sku: str, task_names: list[str], now: datetime) -> bool:
+    """A new run of these tasks may use spot (`spot.capacity_for_next_attempt` without attempts): the vendor is not
+    `OnDemand`, the tasks allow spot (`tasks.allows_spot`) and the SKU is not quarantined (`spot.is_quarantined`)."""
+    settings = cfg.settings
+    return (
+        settings.vendors[vendor].capacity != CapacityMode.ON_DEMAND
+        and tasks.allows_spot([tasks.get_task(name) for name in task_names], settings.spot.spot_max_task_minutes)
+        and not spot.is_quarantined(kube, vendor, sku, settings, now)
+    )
+
+
+def quota_decision(entry: dict, spot_ok: bool, headroom: dict[str, float]) -> tuple[list[dict], str | None]:
+    """`(quota entries one new run of the SKU consumes, reason to defer it or None)`; `headroom` is the remaining
+    headroom per bucket of the pass. A run that may use spot and finds the spot group (`entry["quotas"]`) with room
+    consumes it; a busy spot group defers the SKU. Otherwise (no spot, the spot group never fits or has no quotas)
+    the on-demand group decides the same way, and a group without quotas or that never fits changes nothing (a run
+    that may use spot and has an available spot offering without quotas is planned as before)."""
+    groups = entry["quotas"]
+    if spot_ok:
+        spot_group = groups.get(CapacityType.SPOT)
+        if spot_group and not _never_fits(spot_group):
+            if why := _busy_reason(spot_group, headroom):
+                return [], f"{SPOT_BUSY} ({why})"
+            return spot_group, None
+        if not spot_group and CapacityType.SPOT in entry["capacityTypes"]:
+            return [], None
+    on_demand = groups.get(CapacityType.ON_DEMAND, [])
+    if _never_fits(on_demand):
+        return [], None
+    if why := _busy_reason(on_demand, headroom):
+        return [], f"{ON_DEMAND_BUSY} ({why})"
+    return on_demand, None
+
+
+def own_quota_use(
+    kube: Kube, cfg: Config, vendor: str, runs: list[BenchmarkRun], offered: Offered, now: datetime
+) -> list[dict]:
+    """The quota entries consumed by the vendor's server runs that the listing's `maxHeadroom` does not reflect yet.
+    SCarpenter's headroom is `limit - used - reserved` as of `generated_at` (and refreshed at most every 10 minutes),
+    and `reserved` starts with a launch, so it misses a run created after `generated_at` and an anchor that has not
+    produced a NodeClaim. Counted: runs in phase Pending, Provisioning or Running that were created after
+    `generated_at`, or have neither a NodeClaim nor a node. A run with a NodeClaim that is older than the listing is
+    in `reserved` or `used` already. A run counts with its spot group when it may use spot and the SKU has one, else
+    with its on-demand group."""
+    claimed = {pods.claim_run(c) for c in kube.list("nodeclaim", labels={pods.NODEPOOL_LABEL: cfg.settings.bench_pool})}
+    used = []
+    for run in runs:
+        if not (
+            run.spec.vendor == vendor
+            and run.spec.database is None
+            and run.status.phase in (RunPhase.PENDING, RunPhase.PROVISIONING, RunPhase.RUNNING)
+            and run.spec.sku in offered.entries
+        ):
+            continue
+        unlaunched = run.name not in claimed and not run.status.node
+        if not (unlaunched or run.created > offered.generated_at):
+            continue
+        groups = offered.entries[run.spec.sku]["quotas"]
+        if groups.get(CapacityType.SPOT) and spot_capable(kube, cfg, vendor, run.spec.sku, run.spec.tasks, now):
+            used += groups[CapacityType.SPOT]
+        else:
+            used += groups.get(CapacityType.ON_DEMAND, [])
+    return used
+
+
+def reserved_by(waits: QuotaWaits, vendor: str, sku: str, buckets: frozenset[str], limit: timedelta, now: datetime):
+    """The other SKU of `vendor` deferred longer than `limit` that needs one of `buckets`, else None: its quota
+    is kept free for it (the anti-starvation rule)."""
+    for (wait_vendor, wait_sku), (since, wait_buckets) in sorted(waits.items()):
+        if wait_vendor == vendor and wait_sku != sku and now - since > limit and wait_buckets & buckets:
+            return wait_sku
+    return None
+
+
 def start_order(vendor: str, sku: str) -> tuple[int, str]:
     """Legacy `lib.instance_start_order_key`: crc32 of `vendor/sku` mixes the sizes (price order would exhaust the
     quota of a new vendor on the small SKUs first); the SKU name breaks ties."""
@@ -466,6 +597,7 @@ def plan_cycle(
     variant_reader: VariantReader | None = None,
     first_seen_reader: FirstSeenReader | None = None,
     on_vendor_skipped: Callable[[str, str], None] | None = None,
+    quota_waits: QuotaWaits | None = None,
 ) -> list[PlannedRun]:
     """One autoPlan cycle. For each enabled vendor with autoPlan whose results are published (`publish`; without it
     git would never record them and the SKU would be run again and again) and that is below its caps
@@ -525,7 +657,9 @@ def plan_cycle(
         log.exception("autoPlan skips the cycle: Keeper is not reachable")
         return []
 
-    now = datetime.now(UTC).replace(tzinfo=None)
+    aware_now = datetime.now(UTC)
+    now = aware_now.replace(tzinfo=None)
+    quota_waits = {} if quota_waits is None else quota_waits
     planned = []
     for vendor in candidates:
         try:
@@ -555,6 +689,11 @@ def plan_cycle(
             log.info(
                 "autoPlan skips %d SKUs of vendor %s not offered by SCarpenter, e.g. %s", len(skipped), vendor, examples
             )
+        offered = read_offered(kube, cfg, vendor) if skus else None
+        entries = offered.entries if offered else {}
+        headroom: dict[str, float] = {}  # remaining quota headroom per bucket in this cycle
+        for q in own_quota_use(kube, cfg, vendor, runs, offered, aware_now) if offered else []:
+            headroom[q["bucket"]] = headroom.setdefault(q["bucket"], q["maxHeadroom"]) - q["need"]
         bad_names = [sku for sku in skus if not pods.is_label_value(sku)]
         if bad_names:
             log.warning(
@@ -596,6 +735,26 @@ def plan_cycle(
                 continue
             if all(tasks.get_task(name).gpu for name in due):  # nothing due, or only GPU tasks
                 continue
+            since, _ = quota_waits.pop((vendor, sku), (aware_now, frozenset()))
+            consumed, deferred = [], None
+            if sku in entries:
+                spot_ok = spot_capable(kube, cfg, vendor, sku, list(due), aware_now)
+                consumed, deferred = quota_decision(entries[sku], spot_ok, headroom)
+            buckets = frozenset(q["bucket"] for q in consumed)
+            if deferred:
+                log.info("autoPlan defers %s/%s: %s", vendor, sku, deferred)
+                if SPOT_BUSY in deferred:  # only a spot-busy SKU starves; an on-demand one is `available` false anyway
+                    quota_waits[vendor, sku] = (
+                        since,
+                        frozenset(q["bucket"] for q in entries[sku]["quotas"][CapacityType.SPOT]),
+                    )
+                continue
+            limit = timedelta(minutes=settings.spot.quota_reserve_after_minutes)
+            if holder := reserved_by(quota_waits, vendor, sku, buckets, limit, aware_now):
+                log.info(
+                    "autoPlan defers %s/%s: its quota is reserved for %s, deferred over %s", vendor, sku, holder, limit
+                )
+                continue
             if not dry_run:
                 try:
                     check_vendor_budget(kube, cfg, vendor, runs)
@@ -606,6 +765,8 @@ def plan_cycle(
                     runs.append(_create_run(kube, cfg, vendor, sku, list(due)))
                 except crd.RunExists:
                     continue
+            for q in consumed:
+                headroom[q["bucket"]] -= q["need"]
             reason = ", ".join(f"{name}: {why}" for name, why in due.items())
             planned.append(PlannedRun(vendor, sku, tuple(due), reason))
             if dry_run:
@@ -626,6 +787,7 @@ def run_forever(
     """Every `planner.interval_minutes`: `plan_cycle`; exceptions are logged, never fatal. `cfg_provider` is a
     zero-argument callable returning the current `Config`. `keeper_cache` is shared with the runner."""
     keeper_cache = keeper_cache or KeeperCache()
+    quota_waits: QuotaWaits = {}
     while not stop.is_set():
         interval_minutes = 5
         try:
@@ -639,6 +801,7 @@ def run_forever(
                 variant_reader=variant_reader,
                 first_seen_reader=first_seen_reader,
                 on_vendor_skipped=on_vendor_skipped,
+                quota_waits=quota_waits,
             ):
                 log.info("planned run", extra={"vendor": planned.vendor, "sku": planned.sku, "reason": planned.reason})
         except Exception:

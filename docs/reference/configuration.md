@@ -53,6 +53,7 @@ spot:
   interruptionsToQuarantine: 2
   quarantineDays: 14
   spotMaxTaskMinutes: 240
+  quotaReserveAfterMinutes: 60   # autoPlan: a SKU deferred this long for busy spot quota reserves its quota buckets (see Quota-aware planning)
 deadlines:
   provisionCpuMinutes: 60        # until a NodeClaim launches (a launch that keeps failing is ICE)
   provisionGpuHours: 6           # ... for a GPU SKU
@@ -213,6 +214,7 @@ it is due and the vendor has room. Per vendor:
    in git; nothing is kept in the cluster.
    A SKU waiting in the launch ConfigMap (`next` ahead) or unavailable in SCarpenter's offered-types ConfigMap is
    skipped ([launch retries](../explanation/launch-retries.md), [Offered types](#offered-types)).
+   A SKU whose quota is busy is deferred to a later cycle ([Quota-aware planning](#quota-aware-planning)).
 5. The first SKU in that order with at least one due task gets a run with exactly those tasks (not forced:
    Keeper's rules were applied). Then the caps are checked again; below them the next SKU follows.
 
@@ -279,6 +281,51 @@ The filter fails open: a ConfigMap that is absent (the vendor is not opted in), 
 (`generatedAt` older than 30 minutes) or holds a corrupt gzip filters nothing, and the cycle logs why. A ConfigMap
 without `truncated` counts as complete; the optional `zonesOmitted` field is ignored (nothing reads zones). In a ConfigMap with
 `truncated: true` only entries with `available: false` are skipped; a missing entry proves nothing.
+
+### Quota-aware planning
+
+Each offering group in `offerings[]` of the listing (one per capacity type, available or not) may carry
+`quotas: [{bucket, unit, need, maxLimit, maxHeadroom}]`: the quota buckets one instance of the type consumes (`need`
+is SCarpenter's number, the planner does not compute vCPUs) and the largest limit and the largest current headroom
+(limit - used - reserved) among the group's regions and zones. A group without the field, or with a damaged one, has no
+quota model and the planner behaves as without this section; so does a listing that is missing, stale or truncated
+(see above). Per entry, **busy** means `maxLimit >= need > headroom` and **never fits** means `maxLimit < need`; a
+group never fits when any entry does, else it is busy when any entry is.
+
+For a SKU with due tasks the planner picks the group the run will use and decides:
+
+- A run that may use spot (the vendor is `SpotFirst`, its due tasks allow spot, `spot.spotMaxTaskMinutes`, and the SKU is
+  not quarantined, [spot](../explanation/spot.md)) uses the spot group. If it is busy the SKU is **deferred**: no run is
+  created this cycle, because the run would fall back to on-demand and cost several times as much; the planner logs
+  `autoPlan defers <vendor>/<sku>: spot quota busy (bucket B: need N vCPU, headroom H)`. If the spot group has room the run is
+  planned. If it never fits, or the SKU has no spot quotas, the on-demand group decides.
+- Any other run (`OnDemand` vendor, on-demand-only tasks, quarantined SKU) uses the on-demand group: busy means
+  deferred, a group that never fits or has no quotas changes nothing.
+
+`maxLimit` is published promptly, so "never fits" is exact. `maxHeadroom` is only a hint: SCarpenter refreshes it when
+availability or a limit changes and at least every 10 minutes, so it can be that old (the listing's `generatedAt`), it
+leaves out regions whose quota data is unknown or stale, and a bucket that is global to the vendor shares its headroom
+across regions. SCarpenter's quota gate decides at launch.
+
+Headroom is counted per bucket over one cycle, starting from the listing's `maxHeadroom`. Every run planned in the
+cycle subtracts its `need` (so several runs in one cycle cannot overshoot a quota), and so does every server run of the
+vendor that the listing does not reflect yet: a run in phase Pending, Provisioning or Running that was created after
+the listing's `generatedAt` (a run planned in an earlier cycle since then), or that has neither a NodeClaim nor a node
+(SCarpenter's `reserved` ledger starts with a launch, so an anchor without a NodeClaim is not in it). A run with a
+NodeClaim that is older than `generatedAt` is in `reserved` or `used` already and is not subtracted again; a run counts
+with its spot group when it may use spot and the SKU has one, else with its on-demand group. A NodeClaim created
+shortly before `generatedAt` may not be in `reserved` yet, so the headroom can still be over-stated.
+
+A deferred SKU would starve behind smaller SKUs that keep taking the bucket. The controller remembers since when each
+SKU is deferred for a busy spot quota (in memory; a restart resets it). A SKU deferred for longer than
+`spot.quotaReserveAfterMinutes` (default 60) **reserves** its buckets: other SKUs of the vendor that would consume one
+of them are deferred until it is planned or no longer due (`autoPlan defers <vendor>/<sku>: its quota is reserved for
+<sku>`).
+
+Residual race: a run planned while spot fit can still end on on-demand when Karpenter finds spot full at launch time
+(another consumer took the quota in between); the planner does not prevent it.
+
+The listing only carries `quotas` from the SCarpenter release that adds the field; before that nothing here applies.
 
 ## CLI
 
