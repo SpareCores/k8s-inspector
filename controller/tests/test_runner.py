@@ -3161,6 +3161,7 @@ def test_a_spot_only_attempt_without_capacity_ends_as_a_try_with_no_task_results
     assert f"{SPOT_SKU}: 1/56 slots tried, spot available <95% (95%)" in caplog.text
     (record,) = [r for r in caplog.records if r.getMessage() == "spot_try"]
     assert (record.vendor, record.sku, record.counted, record.tries) == ("oci", SPOT_SKU, True, 1)
+    assert record.run == h.run.spec.run_id
 
 
 def test_the_run_json_of_a_try_has_the_errors_the_tried_counts_the_regions_and_the_quota(h):
@@ -3299,6 +3300,23 @@ def test_a_spot_node_clears_the_tries_and_counts_capacity_only_for_a_spot_only_a
     h.drive(stop=lambda run: run.status.phase == RunPhase.RUNNING)
     assert _tries(h) is None
     assert h.spot_tries == [("oci", "capacity")]
+
+
+def test_the_run_json_keeps_the_first_spot_try_the_node_cleared(h):
+    _spot_listing(h)
+    spot.record_try(h.kube, "oci", SPOT_SKU, START - timedelta(days=1), h.cfg.settings)
+    h.start(["geekbench"], capacity=CapacityMode.SPOT_UNTIL_EXHAUSTED)
+    h.drive(stop=lambda run: run.status.phase == RunPhase.RUNNING)
+    assert _tries(h) is None
+    doc = json.loads(h.storage.read_bytes(run_json_key(h.run_key())))
+    assert doc["first_spot_try"] == (START - timedelta(days=1)).isoformat()
+
+
+def test_the_run_json_has_no_first_spot_try_without_earlier_tries(h):
+    _spot_listing(h)
+    h.start(["geekbench"], capacity=CapacityMode.SPOT_UNTIL_EXHAUSTED)
+    h.drive(stop=lambda run: run.status.phase == RunPhase.RUNNING)
+    assert "first_spot_try" not in json.loads(h.storage.read_bytes(run_json_key(h.run_key())))
 
 
 def test_a_spot_node_of_a_released_attempt_clears_the_tries_but_is_not_counted(h):

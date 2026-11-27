@@ -979,6 +979,7 @@ class Runner(DbaasMixin):
             "spot_try",
             extra={
                 "event": "spot_try",
+                "run": run.spec.run_id,
                 "vendor": vendor,
                 "sku": sku,
                 "series": facts.get("series"),
@@ -1073,11 +1074,18 @@ class Runner(DbaasMixin):
 
     # ----------------------------------------------------------------------- run.json
 
-    def _write_run_json(self, run: BenchmarkRun, nd: _Node | None, details: dict[int, dict] | None = None) -> None:
+    def _write_run_json(
+        self,
+        run: BenchmarkRun,
+        nd: _Node | None,
+        details: dict[int, dict] | None = None,
+        first_spot_try: datetime | None = None,
+    ) -> None:
         """`run.json`: plan, per-attempt facts (timings, lscpu output, region/zone/price) and the `timing` of
         the latest attempt the publisher turns into timing files. Earlier content is kept, so a restarted
         controller does not lose what the NodeClaim of an earlier attempt said. `details` are extra fields of
-        attempts, by attempt number (`spot_try` of a `SpotUnavailable` one)."""
+        attempts, by attempt number (`spot_try` of a `SpotUnavailable` one). `first_spot_try` is the SKU's first counted
+        spot try (`spot.Tries.first`) when the run got its node; the first one written stays."""
         key = crd.run_key(run)
         raw = self.storage.read_bytes(run_json_key(key))
         prior = json.loads(raw) if raw else {}
@@ -1137,6 +1145,9 @@ class Runner(DbaasMixin):
             "database": run.spec.database,
         }
         doc |= {k: prior[k] for k in SERVER_FACTS if k in prior} or server_facts
+        first = prior.get("first_spot_try") or (first_spot_try.isoformat() if first_spot_try else None)
+        if first:
+            doc["first_spot_try"] = first
         self.storage.write_run_json(key, doc)
 
     def _keeper_cost_data(self, run: BenchmarkRun) -> tuple[dict, dict]:
@@ -1648,6 +1659,13 @@ class Runner(DbaasMixin):
         run = self._record_launch_attempts(
             run, [facts.node_claim], run.status.launch_failures
         )  # once more: the Event may be newer than the last pass
+        first_spot_try = None  # read before a spot launch clears the tries
+        if run.spec.database is None and run.spec.capacity in (
+            CapacityMode.SPOT_UNTIL_EXHAUSTED,
+            CapacityMode.SPOT_ONLY,
+        ):
+            tries = spot.State.load(self.kube).tries(run.spec.vendor, run.spec.sku, self._cfg().settings, self._now())
+            first_spot_try = tries.first if tries else None
         if (
             facts.capacity_type == CapacityType.SPOT
             and run.spec.database is None
@@ -1656,7 +1674,7 @@ class Runner(DbaasMixin):
             spot.clear_tries(self.kube, run.spec.vendor, run.spec.sku)  # spot is there: the tries start over
             if pods.is_spot_only(anchor):  # a try of its own: the attempt could only land on spot
                 self._spot_try_result(run.spec.vendor, "capacity")
-        self._write_run_json(run, nd)
+        self._write_run_json(run, nd, first_spot_try=first_spot_try)
         self._heartbeat(run)
         self._running(run, cfg, live)
 
