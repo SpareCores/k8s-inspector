@@ -31,6 +31,7 @@ and per attempt) plus `phase`, with `variant` set as below. It is written with s
 | `family`, `series`, `cpu_arch`, `gpu_count`, `vcpus`, `memory_gib` | Keeper's `family` (e.g. `Compute Optimized`), `series` (e.g. `c6a`), `cpu_architecture`, `accelerator_count`, `vcpus` and `memory_amount` of the SKU (the client node for a DBaaS run), read once when the run's first attempt gets its node; `memory_gib` is Keeper's `memory_amount` (MiB) divided by 1024. A value Keeper lacks is `null`; all are absent when Keeper could not be asked, and the publisher and the [re-emit](#re-emit) fill them from Keeper's current data when `vcpus` is absent (a run launched before it existed, or an outage at launch) |
 | `database` | `null` for a server run; for DBaaS the database object (`vendor`, `id`, `engineVersion`, `region`, `vcpus`, `memoryGib`, `usdPerHour`) |
 | `timing` | the latest attempt's `api_start`, `api_end`, `machine_start`, `node_registered`, `node_ready` (ISO UTC; only those known) |
+| `first_spot_try` | ISO UTC time of the SKU's first counted [spot try](../explanation/monitoring.md#what-k8s-inspector-exposes) (`SpotUntilExhausted`, `SpotOnly`), written only when the run's node is a spot node, which clears the SKU's tries; absent otherwise (an on-demand run, also after exhaustion, counts from its own first attempt: the exhaustion wait shows in the `spot_try` lines and `k8s_inspector_spot_exhausted_total`). Spot tries end runs of their own, so this ties the run to the tries before it. The controller keeps it in the run's status until `run.json` is written |
 | `attempts[]` | one entry per node the run used, oldest first |
 
 An attempt:
@@ -44,6 +45,7 @@ An attempt:
 | `ondemand_price` | USD per hour of the on-demand price of the same SKU in the attempt's region, from Keeper (ACTIVE `ondemand` price rows, the cheapest zone), captured when the attempt gets its node, so it is the price at launch time. `null` when Keeper has no on-demand offer there; absent when Keeper could not be asked |
 | `ondemand_price_reason` | why `ondemand_price` is `null`: `no_ondemand_offer` (Keeper has no on-demand price of the SKU in that region), `region_not_in_keeper` (the node's region is not a Keeper region of the vendor), `keeper_unknown_sku`, `keeper_unreachable`. Keeper is asked once per attempt: these `null`s are not retried live, the [re-emit](#re-emit) fills the last two later |
 | `duration_s`, `useful_s`, `setup_s`, `task_s`, `cost_usd`, `wasted_usd` | what the attempt cost and how much of it was useful, see [Cost log lines](#cost-log-lines); written into the record, not into `run.json` |
+| `first_try_at`, `capacity_wait_s` | when the run first tried to get a machine and how many seconds passed until this attempt got its node, see [Cost log lines](#cost-log-lines); written into the record, not into `run.json` |
 | `node`, `node_claim` | names of the Kubernetes node and its NodeClaim; `null` without a node |
 | `api_start` | the attempt's anchor Pod was created (the start of the attempt) |
 | `api_end`, `machine_start`, `node_registered`, `node_ready` | NodeClaim launched, kernel boot, node registered, node ready; `null` when not reached |
@@ -173,6 +175,12 @@ again, also after a controller restart.
 Definitions, per attempt (`start` is `api_start`):
 
 - `duration_s`: `end` minus `start`.
+- `first_try_at`: the run's first try to get a machine, the same for all attempts of the run: the earlier of the run's
+  `first_spot_try` and its first attempt's `start`. `null` without either.
+- `capacity_wait_s`: seconds until the attempt got its node, from the end of the latest earlier attempt that had a
+  node (an interrupted spot attempt), else from `first_try_at`: `api_end` (the NodeClaim launched, which is when the
+  cloud gave the capacity), else `machine_start`, else `node_registered`. `null` for an attempt that never got a node.
+  Attempts without a node in between do not reset the start.
 - `price`: the node's price per hour as a number (`null` for an attempt that never got a node).
 - `cost_usd` = `duration_s` / 3600 × `price`; 0 for an attempt without a node (it has no `region`, `zone`, `price` or
   `ondemand_price` either, and does not set `final_region`) or without an `end`. An attempt without a node also wastes
@@ -201,6 +209,7 @@ Definitions, per attempt (`start` is `api_start`):
 | `node`, `nodeclaim` | the attempt's `node` and `node_claim` names (`null` without a node) |
 | `region`, `zone`, `capacity_type`, `outcome` | as in the attempt (`null` when absent) |
 | `start`, `end` | the attempt's `api_start` and `end` |
+| `first_try_at`, `capacity_wait_s` | as defined above (ISO time with offset; `null` when unknown) |
 | `duration_s`, `useful_s`, `setup_s`, `task_s`, `price`, `ondemand_price`, `cost_usd`, `wasted_usd` | as defined above; `ondemand_price` is the attempt's |
 | `ondemand_price_source` | `launch`: captured when the attempt got its node; `current`: Keeper's price when the record or the backfill was written, for an attempt launched without one (an older controller, or Keeper unreachable); after one failed Keeper call a pass does not ask again, and the remaining attempts keep `ondemand_price_reason: keeper_unreachable`; an attempt that got a node always has `ondemand_price` or an `ondemand_price_reason` |
 | `start_hour_utc`, `start_weekday_utc` | hour `0`-`23` and weekday `Mon`-`Sun` of `start`, UTC |

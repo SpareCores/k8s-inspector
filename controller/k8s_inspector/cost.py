@@ -110,10 +110,42 @@ def attempt_costs(attempt: dict, spans: list[Span] | None) -> dict:
     }
 
 
+def first_try(run_json: dict) -> datetime | None:
+    """When the run first tried to get a machine: the earliest of the SKU's first counted spot try
+    (`first_spot_try`, set when the run got a node after such tries) and the `api_start` of the run's attempts."""
+    times = [parse_time(run_json.get("first_spot_try"))] + [
+        parse_time(a.get("api_start")) for a in run_json["attempts"]
+    ]
+    return min((t for t in times if t), default=None)
+
+
+def capacity_wait(attempt: dict, first: datetime | None, since: datetime | None = None) -> dict:
+    """`first_try_at` and `capacity_wait_s` of one attempt: the seconds from `since` (the end of the latest earlier
+    attempt that had a node; `first` when there is none) until the cloud gave it its node, which is when its
+    NodeClaim launched (`api_end`; `machine_start`, then `node_registered` when that is missing). Null for an
+    attempt without a node."""
+    got = next(
+        (parse_time(attempt[k]) for k in ("api_end", "machine_start", "node_registered") if attempt.get(k)), None
+    )
+    wait = _seconds(since or first, got) if has_node(attempt) else None
+    return {
+        "first_try_at": first.isoformat() if first else None,
+        "capacity_wait_s": None if wait is None else max(wait, 0.0),
+    }
+
+
 def add_costs(run_json: dict, spans: list[Span] | None) -> dict:
-    """A copy of the run record (or `run.json`) whose attempts carry the cost fields of `attempt_costs`."""
+    """A copy of the run record (or `run.json`) whose attempts carry the cost fields of `attempt_costs` and the
+    capacity fields of `capacity_wait`."""
     record = dict(run_json)
-    record["attempts"] = [{**a, **attempt_costs(a, spans)} for a in run_json.get("attempts") or []]
+    first = first_try(run_json) if run_json.get("attempts") else None
+    attempts = []
+    since = None  # the end of the latest attempt with a node so far
+    for a in run_json.get("attempts") or []:
+        attempts.append({**a, **attempt_costs(a, spans), **capacity_wait(a, first, since)})
+        if has_node(a):
+            since = parse_time(a.get("end")) or since
+    record["attempts"] = attempts
     return record
 
 
@@ -227,6 +259,8 @@ def log_cost_lines(record: dict, spans: list[Span] | None = None, *, backfill: b
                 "outcome": a.get("outcome"),
                 "start": a.get("api_start"),
                 "end": a.get("end"),
+                "first_try_at": a["first_try_at"],
+                "capacity_wait_s": a["capacity_wait_s"],
                 "duration_s": a["duration_s"],
                 "useful_s": a["useful_s"],
                 "setup_s": a["setup_s"],

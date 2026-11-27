@@ -63,13 +63,18 @@ series count what the current process has seen and restart from zero with it.
 Logs are structured JSON lines with `run`, `vendor`, `sku`, `task` fields.
 
 Each counted spot try ([spot capacity modes](../reference/configuration.md#spot-capacity-modes)) logs one `spot_try` line
-(`event` `spot_try`) at info level with `vendor`, `sku`, `series`, `family` (`null` when Keeper cannot be asked), `start`
+(`event` `spot_try`) at info level with `run` (the run id), `vendor`, `sku`, `series`, `family` (`null` when Keeper cannot be asked), `start`
 (the attempt's start, ISO), `result` (`unavailable`), `counted` (`true`), `launch_errors` (the cloud's error messages
 SCarpenter reported for the attempt), `tried` (`{offerings, regions, zones}` SCarpenter tried, from its error summary; `null`
 when the message has none), `quota` (the spot quota entries at that time, as in the [run record](../reference/run-records.md)),
 and `tries`, `slots_tried`, `slots_per_week` (the SKU's coverage so far). A second line gives the coverage in words
 (`x8i.96xlarge: 41/56 slots tried, spot available <7% (95%)`). Attempts that are not tries (`quota_busy`) only show in the
 `k8s_inspector_spot_tries_total` metric.
+
+The `run_attempt_cost` line of each attempt carries `first_try_at` and `capacity_wait_s`: when the run first tried to get
+a machine and how long the attempt waited for its node ([definitions](../reference/run-records.md#cost-log-lines)). The
+`spot_try` and cost lines use `run` = the run id; other log lines use `run` = the BenchmarkRun name. A counted try ends
+its own run, so the run that finally got the node has no `spot_try` lines.
 
 ## Alerts
 

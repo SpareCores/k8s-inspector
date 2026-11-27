@@ -236,6 +236,7 @@ def _status_from_dict(d: dict) -> RunStatus:
             UninitializedClaim(c["nodeClaim"], _parse_time(c.get("launched")), c.get("capacityType"))
             for c in d.get("uninitializedClaims") or []
         ],
+        first_spot_try=_parse_time(d.get("firstSpotTry")),
         spot_reclaims=d.get("spotReclaims", 0),
         conditions=list(d.get("conditions") or []),
         database=_database_from_dict(d.get("database")),
@@ -343,6 +344,7 @@ def status_to_dict(status: RunStatus) -> dict:
             {"nodeClaim": c.node_claim, "launched": _format_time(c.launched), "capacityType": c.capacity_type}
             for c in status.uninitialized_claims
         ],
+        "firstSpotTry": _format_time(status.first_spot_try),
         "spotReclaims": status.spot_reclaims,
         "conditions": status.conditions,
         "database": _database_to_dict(status.database),

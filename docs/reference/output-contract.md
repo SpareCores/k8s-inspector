@@ -48,7 +48,8 @@ entries are kept.
                "end": "…", "outcome": "SpotInterrupted", "region": "…", "zone": "…", "price": "0.0337", "ondemand_price": 0.0791}]}
 ```
 
-`timing` repeats the latest attempt's timings. `api_start` of an attempt is the creation of its anchor. Each attempt's
+`timing` repeats the latest attempt's timings. `first_spot_try` (ISO UTC) is also there when the run's spot node cleared the
+SKU's [spot tries](run-records.md). `api_start` of an attempt is the creation of its anchor. Each attempt's
 `lscpu_stdout` is what picks the [variant](#sc-inspector-data) of the tasks that ran in it. `family`, `series`, `cpu_arch`,
 `gpu_count`, `vcpus`, `memory_gib` and the attempt's `ondemand_price` come from Keeper ([run records](run-records.md)).
 An attempt that ended `SpotUnavailable` also has `spot_try` ([run records](run-records.md#spot-unavailable-attempts)).

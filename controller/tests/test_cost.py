@@ -233,6 +233,60 @@ def test_log_lines_carry_the_documented_fields(caplog):
     json.dumps({k: v for k, v in lines[3].items() if k in run_fields})
 
 
+def test_a_first_try_launch_waits_only_for_its_own_node():
+    launched = attempt(1, "2026-11-26T08:00:00Z", "2026-11-26T09:00:00+00:00", "Completed", "on-demand", "1.0", "r1",
+                       api_end="2026-11-26T08:01:30Z", machine_start="2026-11-26T08:02:00Z")  # fmt: skip
+    (a,) = cost.add_costs({"attempts": [launched]}, [])["attempts"]
+    assert (a["first_try_at"], a["capacity_wait_s"]) == ("2026-11-26T08:00:00+00:00", 90.0)
+
+
+def test_a_launch_after_failed_attempts_and_spot_tries_waits_from_the_first_try():
+    failed = {"attempt": 1, "api_start": "2026-11-26T08:00:00Z", "end": "2026-11-26T08:10:00+00:00",
+              "outcome": "LaunchFailed", "capacity_type": "spot"}  # fmt: skip
+    launched = attempt(2, "2026-11-26T08:10:00Z", "2026-11-26T09:00:00+00:00", "Completed", "on-demand", "1.0", "r1",
+                       machine_start="2026-11-26T08:12:00Z")  # no api_end: machine_start counts  # fmt: skip
+    record = {"attempts": [failed, launched]}
+    a1, a2 = cost.add_costs(record, [])["attempts"]
+    assert (a1["capacity_wait_s"], a2["capacity_wait_s"]) == (None, 720.0)
+    # the SKU's counted spot tries began two days before the run's own first attempt
+    a1, a2 = cost.add_costs(record | {"first_spot_try": "2026-11-24T08:00:00+00:00"}, [])["attempts"]
+    assert a2["first_try_at"] == "2026-11-24T08:00:00+00:00" and a2["capacity_wait_s"] == 2 * 86400 + 720.0
+
+
+def test_an_attempt_after_an_interrupted_one_waits_from_its_end_not_from_the_first_try():
+    first = attempt(1, "2026-11-26T08:00:00Z", "2026-11-26T09:00:00+00:00", "SpotInterrupted", "spot", "1.0", "r1",
+                    api_end="2026-11-26T08:01:00Z")  # fmt: skip
+    nothing = {"attempt": 2, "api_start": "2026-11-26T09:00:00Z", "end": "2026-11-26T09:05:00+00:00",
+               "outcome": "ProvisioningFailed", "capacity_type": None}  # fmt: skip
+    third = attempt(3, "2026-11-26T09:05:00Z", "2026-11-26T10:00:00+00:00", "Completed", "on-demand", "1.0", "r1",
+                    api_end="2026-11-26T09:08:00Z")  # fmt: skip
+    a1, a2, a3 = cost.add_costs({"attempts": [first, nothing, third]}, [])["attempts"]
+    assert (a1["capacity_wait_s"], a2["capacity_wait_s"], a3["capacity_wait_s"]) == (60.0, None, 480.0)
+    assert {a["first_try_at"] for a in (a1, a2, a3)} == {"2026-11-26T08:00:00+00:00"}
+
+
+def test_an_attempt_without_a_node_has_a_first_try_but_no_wait():
+    only = {"attempt": 1, "api_start": "2026-11-26T08:00:00Z", "end": "2026-11-26T08:05:00+00:00",
+            "outcome": "ProvisioningFailed", "capacity_type": None}  # fmt: skip
+    (a,) = cost.add_costs({"attempts": [only]}, [])["attempts"]
+    assert (a["first_try_at"], a["capacity_wait_s"]) == ("2026-11-26T08:00:00+00:00", None)
+
+
+def test_the_attempt_line_carries_first_try_and_capacity_wait(caplog):
+    run = c6a() | {"first_spot_try": "2026-11-26T08:00:00+00:00"}
+    run["attempts"][2]["api_end"] = "2026-11-26T09:13:30Z"
+    record = cost.add_costs(run, SPANS)
+    with caplog.at_level(logging.INFO, logger="k8s_inspector.cost"):
+        cost.log_cost_lines(record)
+    lines = [r.__dict__ for r in caplog.records if r.event == "run_attempt_cost"]
+    assert {line["first_try_at"] for line in lines} == {"2026-11-26T08:00:00+00:00"}
+    assert [line["capacity_wait_s"] for line in lines] == [
+        None,
+        None,
+        42.0,
+    ]  # attempt 3 waited from the end of attempt 2
+
+
 def test_backfill_lines_say_so(caplog):
     with caplog.at_level(logging.INFO, logger="k8s_inspector.cost"):
         cost.log_cost_lines(cost.add_costs(c6a(), SPANS), backfill=True)
