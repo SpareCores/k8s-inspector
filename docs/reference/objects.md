@@ -58,6 +58,7 @@ status:
   attempts:
   - {n: 1, capacityType: spot, nodeClaim: …, node: …, start: …, end: null, outcome: null, launchEvents: [{name, time, tried, truncated, failed: [...], launched}]}   # Completed | SpotInterrupted | NodeLost | ProvisioningFailed | LaunchFailed | SpotUnavailable | SpotRejected | Cancelled | HarnessError
   spotReclaims: 0                # spot claims of the current attempt lost before they were Initialized
+  firstSpotTry: …                 # spot modes: the SKU's first counted spot try, kept when the spot node cleared the tries
   uninitializedClaims: []       # NodeClaims of the current attempt seen launched and not Initialized: [{nodeClaim, launched, capacityType}]
   launchFailures: []             # NodeClaims of the current attempt that failed to launch: [{nodeClaim, message, time}], last 20
   conditions: []

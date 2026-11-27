@@ -253,6 +253,18 @@ def test_a_launch_after_failed_attempts_and_spot_tries_waits_from_the_first_try(
     assert a2["first_try_at"] == "2026-11-24T08:00:00+00:00" and a2["capacity_wait_s"] == 2 * 86400 + 720.0
 
 
+def test_an_attempt_after_an_interrupted_one_waits_from_its_end_not_from_the_first_try():
+    first = attempt(1, "2026-11-26T08:00:00Z", "2026-11-26T09:00:00+00:00", "SpotInterrupted", "spot", "1.0", "r1",
+                    api_end="2026-11-26T08:01:00Z")  # fmt: skip
+    nothing = {"attempt": 2, "api_start": "2026-11-26T09:00:00Z", "end": "2026-11-26T09:05:00+00:00",
+               "outcome": "ProvisioningFailed", "capacity_type": None}  # fmt: skip
+    third = attempt(3, "2026-11-26T09:05:00Z", "2026-11-26T10:00:00+00:00", "Completed", "on-demand", "1.0", "r1",
+                    api_end="2026-11-26T09:08:00Z")  # fmt: skip
+    a1, a2, a3 = cost.add_costs({"attempts": [first, nothing, third]}, [])["attempts"]
+    assert (a1["capacity_wait_s"], a2["capacity_wait_s"], a3["capacity_wait_s"]) == (60.0, None, 480.0)
+    assert {a["first_try_at"] for a in (a1, a2, a3)} == {"2026-11-26T08:00:00+00:00"}
+
+
 def test_an_attempt_without_a_node_has_a_first_try_but_no_wait():
     only = {"attempt": 1, "api_start": "2026-11-26T08:00:00Z", "end": "2026-11-26T08:05:00+00:00",
             "outcome": "ProvisioningFailed", "capacity_type": None}  # fmt: skip
@@ -268,7 +280,11 @@ def test_the_attempt_line_carries_first_try_and_capacity_wait(caplog):
         cost.log_cost_lines(record)
     lines = [r.__dict__ for r in caplog.records if r.event == "run_attempt_cost"]
     assert {line["first_try_at"] for line in lines} == {"2026-11-26T08:00:00+00:00"}
-    assert [line["capacity_wait_s"] for line in lines] == [None, None, 4410.0]  # only attempt 3 has a launch time
+    assert [line["capacity_wait_s"] for line in lines] == [
+        None,
+        None,
+        42.0,
+    ]  # attempt 3 waited from the end of attempt 2
 
 
 def test_backfill_lines_say_so(caplog):

@@ -3310,6 +3310,17 @@ def test_the_run_json_keeps_the_first_spot_try_the_node_cleared(h):
     assert _tries(h) is None
     doc = json.loads(h.storage.read_bytes(run_json_key(h.run_key())))
     assert doc["first_spot_try"] == (START - timedelta(days=1)).isoformat()
+    assert h.run.status.first_spot_try == START - timedelta(days=1)  # in the status, so a failed write loses nothing
+
+
+def test_an_on_demand_run_has_no_first_spot_try_although_the_sku_has_tries(h):
+    _spot_listing(h)
+    spot.record_try(h.kube, "oci", SPOT_SKU, START - timedelta(days=1), h.cfg.settings)
+    h.start(["geekbench"], capacity=CapacityMode.ON_DEMAND)
+    h.drive(stop=lambda run: run.status.phase == RunPhase.RUNNING)
+    assert h.run.status.first_spot_try is None
+    assert "first_spot_try" not in json.loads(h.storage.read_bytes(run_json_key(h.run_key())))
+    assert _tries(h) is not None  # an on-demand node leaves the tries alone
 
 
 def test_the_run_json_has_no_first_spot_try_without_earlier_tries(h):

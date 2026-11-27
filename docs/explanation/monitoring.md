@@ -71,9 +71,10 @@ and `tries`, `slots_tried`, `slots_per_week` (the SKU's coverage so far). A seco
 (`x8i.96xlarge: 41/56 slots tried, spot available <7% (95%)`). Attempts that are not tries (`quota_busy`) only show in the
 `k8s_inspector_spot_tries_total` metric.
 
-The `run_attempt_cost` line of each attempt carries `first_try_at` and `capacity_wait_s`: how long the run, with the SKU's
-counted spot tries before it, tried before the attempt got its node ([definitions](../reference/run-records.md#cost-log-lines)).
-Its `run` is the `run` of the `spot_try` lines of that run.
+The `run_attempt_cost` line of each attempt carries `first_try_at` and `capacity_wait_s`: when the run first tried to get
+a machine and how long the attempt waited for its node ([definitions](../reference/run-records.md#cost-log-lines)). The
+`spot_try` and cost lines use `run` = the run id; other log lines use `run` = the BenchmarkRun name. A counted try ends
+its own run, so the run that finally got the node has no `spot_try` lines.
 
 ## Alerts
 

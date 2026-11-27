@@ -119,14 +119,15 @@ def first_try(run_json: dict) -> datetime | None:
     return min((t for t in times if t), default=None)
 
 
-def capacity_wait(attempt: dict, first: datetime | None) -> dict:
-    """`first_try_at` and `capacity_wait_s` of one attempt: the seconds from `first` until the cloud gave it its
-    node, which is when its NodeClaim launched (`api_end`; `machine_start`, then `node_registered` when that is
-    missing). Null for an attempt without a node."""
+def capacity_wait(attempt: dict, first: datetime | None, since: datetime | None = None) -> dict:
+    """`first_try_at` and `capacity_wait_s` of one attempt: the seconds from `since` (the end of the latest earlier
+    attempt that had a node; `first` when there is none) until the cloud gave it its node, which is when its
+    NodeClaim launched (`api_end`; `machine_start`, then `node_registered` when that is missing). Null for an
+    attempt without a node."""
     got = next(
         (parse_time(attempt[k]) for k in ("api_end", "machine_start", "node_registered") if attempt.get(k)), None
     )
-    wait = _seconds(first, got) if has_node(attempt) else None
+    wait = _seconds(since or first, got) if has_node(attempt) else None
     return {
         "first_try_at": first.isoformat() if first else None,
         "capacity_wait_s": None if wait is None else max(wait, 0.0),
@@ -138,9 +139,13 @@ def add_costs(run_json: dict, spans: list[Span] | None) -> dict:
     capacity fields of `capacity_wait`."""
     record = dict(run_json)
     first = first_try(run_json) if run_json.get("attempts") else None
-    record["attempts"] = [
-        {**a, **attempt_costs(a, spans), **capacity_wait(a, first)} for a in run_json.get("attempts") or []
-    ]
+    attempts = []
+    since = None  # the end of the latest attempt with a node so far
+    for a in run_json.get("attempts") or []:
+        attempts.append({**a, **attempt_costs(a, spans), **capacity_wait(a, first, since)})
+        if has_node(a):
+            since = parse_time(a.get("end")) or since
+    record["attempts"] = attempts
     return record
 
 

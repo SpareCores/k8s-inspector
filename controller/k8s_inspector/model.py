@@ -334,6 +334,7 @@ class RunStatus:
     attempts: list[AttemptStatus] = field(default_factory=list)
     launch_failures: list[LaunchFailure] = field(default_factory=list)  # of the current attempt, last 20
     uninitialized_claims: list[UninitializedClaim] = field(default_factory=list)  # of the current attempt
+    first_spot_try: datetime | None = None  # the SKU's first counted spot try, kept when a spot node clears the tries
     spot_reclaims: int = 0  # spot claims of the current attempt reclaimed or gone before they were Initialized
     conditions: list[dict] = field(default_factory=list)
     database: DbStatus | None = None  # DBaaS runs
