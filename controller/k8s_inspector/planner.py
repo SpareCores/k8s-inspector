@@ -370,8 +370,8 @@ class Offered(NamedTuple):
 def read_offered(kube: Kube, cfg: Config, vendor: str, now: datetime | None = None) -> Offered | None:
     """The usable content of SCarpenter's offered-types ConfigMap `scarpenter-offered-<benchClass>-<vendor>` in
     `SCARPENTER_NAMESPACE` (gzipped JSON in `binaryData["types.json.gz"]`, else plain `data["types.json"]`; the
-    optional `zonesOmitted` field is ignored, nothing reads zones): `Offered(entries, truncated, generated_at)` with `entries` = `{apiReference: entry}`, where
-    an entry is `{available, capacityTypes, reason, until, quotas}`, `until` is the latest of its unavailable offerings
+    optional `zonesOmitted` field is ignored, nothing reads zones): `Offered(entries, truncated, generated_at)`, `entries` being
+    `{apiReference: entry}`, where an entry is `{available, capacityTypes, reason, until, quotas}`, `until` is the latest of its unavailable offerings
     (`offerings[].until`, else None) and `quotas` the quota entries of its offering groups (`_quotas`). Entries without
     an `apiReference` are ignored; of two with the same one the
     available wins and `until` is the latest of both. `now` (default the current time) judges staleness.
