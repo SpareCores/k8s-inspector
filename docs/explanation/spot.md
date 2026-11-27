@@ -59,8 +59,8 @@ classification exact and the flush complete.
    with 26 h) are never planned on spot; a run that contains one is on-demand.
 8. **A busy spot quota defers the run.** When SCarpenter's listing says the spot quota of a SKU is held by other
    instances (but would fit), autoPlan does not create the run, so that it does not start on-demand; it waits for the
-   quota and, after `quotaReserveAfterMinutes`, keeps the bucket free for the SKU
-   ([quota-aware planning](../reference/configuration.md#quota-aware-planning)).
+   quota and, if it is big (needs more than half of a limit) and waits longer than `quotaReserveAfterMinutes`, keeps
+   the bucket free for the SKU in one region so the runs in flight drain ([quota-aware planning](../reference/configuration.md#quota-aware-planning)).
 9. **Statistics are recorded.** `status.attempts` lists each attempt's node, the capacity type of that node (none for an
    attempt that never got one), duration and outcome.
    `meta.json` gets `capacity_type` and `spot_attempts`; the controller exports interruption counts per vendor and SKU

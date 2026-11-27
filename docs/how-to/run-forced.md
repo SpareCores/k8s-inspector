@@ -10,6 +10,7 @@ toward both limits, so autoPlan waits for them.
 It is for operators: to rerun a SKU or a task now, or to run a SKU Keeper blocks. The controller picks SKUs itself when `autoPlan` is on for the
 vendor ([autoPlan](../reference/configuration.md#autoplan));
 a forced run of such a SKU takes the SKU's lease like any other run, so autoPlan does not start it twice.
+A forced run is not confined to regions (it has no `spec.regions`), so autoPlan's quota accounting counts it against every region of a regional bucket.
 
 ## Before you start
 

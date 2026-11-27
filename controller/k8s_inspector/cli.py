@@ -27,7 +27,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from k8s_inspector import config as config_loader
-from k8s_inspector import crd, dbaas_plan, dbaas_sweep, planner
+from k8s_inspector import crd, dbaas_plan, dbaas_sweep, planner, popularity
 from k8s_inspector.kube import Kube, NotFound, TransientApiError, call_with_retries
 from k8s_inspector.log import setup_logging
 from k8s_inspector.metrics import PORT as METRICS_PORT
@@ -246,6 +246,7 @@ def serve(kube: Kube, provider: ConfigProvider, stop: threading.Event, metrics_p
             publisher.read_first_seen,
             keeper_cache,
             metrics.record_vendor_skipped,
+            popularity.PopularityCache(),
         ),
         "dbaas-planner": lambda: dbaas_plan.run_forever(kube, provider, publisher.read_dbaas_metas, stop),
         "dbaas-sweeper": lambda: dbaas_sweep.run_forever(

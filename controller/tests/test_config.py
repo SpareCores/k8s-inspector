@@ -6,7 +6,7 @@ import yaml
 
 from k8s_inspector.config import SETTINGS_KEY, load_config, load_env, load_settings, parse_settings
 from k8s_inspector.kube import NotFound
-from k8s_inspector.model import CapacityMode, Settings, VendorSettings
+from k8s_inspector.model import UNLIMITED, CapacityMode, Settings, VendorSettings
 
 DOCS_CONFIGURATION = Path(__file__).parents[2] / "docs" / "reference" / "configuration.md"
 
@@ -207,6 +207,26 @@ def test_max_in_flight_global_default_and_vendor_override():
     assert settings.defaults.max_in_flight == 4
     assert settings.vendors["aws"].max_in_flight is None  # falls back to defaults.maxInFlight
     assert settings.vendors["oci"].max_in_flight == 0  # pauses the vendor
+
+
+def test_max_in_flight_may_be_unset_and_the_burst_cap_has_a_default():
+    settings = parse_settings({"defaults": {"maxInFlight": "unlimited"}, "vendors": {"aws": {"enabled": True}}})
+    assert settings.defaults.max_in_flight == UNLIMITED
+    vendor = parse_settings({"vendors": {"aws": {"enabled": True, "maxInFlight": "unlimited"}}}).vendors["aws"]
+    assert vendor.max_in_flight == UNLIMITED
+    assert (
+        parse_settings({"vendors": {"aws": {"enabled": True, "maxInFlight": None}}}).vendors["aws"].max_in_flight
+        is None
+    )  # inherits
+    with pytest.raises(ValueError, match="defaults.maxInFlight"):
+        parse_settings({"defaults": {"maxInFlight": "many"}})
+    with pytest.raises(ValueError, match="defaults.maxInFlight"):
+        parse_settings({"defaults": {"maxInFlight": None}})
+    assert settings.vendors["aws"].max_new_runs_per_cycle == 10
+    capped = parse_settings({"vendors": {"aws": {"enabled": True, "maxNewRunsPerCycle": 3}}})
+    assert capped.vendors["aws"].max_new_runs_per_cycle == 3
+    with pytest.raises(ValueError, match="maxNewRunsPerCycle"):
+        parse_settings({"vendors": {"aws": {"enabled": True, "maxNewRunsPerCycle": 0}}})
 
 
 # --------------------------------------------------------------------------- DBaaS

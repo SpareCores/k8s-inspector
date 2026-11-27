@@ -231,6 +231,12 @@ def render_anchor(
                                         "operator": "In",
                                         "values": [c.value for c in capacity],
                                     },
+                                    # a server run the planner confined: only these regions, for every attempt
+                                    *(
+                                        [{"key": REGION_LABEL, "operator": "In", "values": list(spec.regions)}]
+                                        if spec.regions and not spec.database
+                                        else []
+                                    ),
                                     # a DBaaS client: any small x86_64 type, the cheapest offered one is launched
                                     *(dbaas_client.requirements(spec.database.get("client")) if spec.database else []),
                                 ]

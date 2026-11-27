@@ -15,6 +15,7 @@ import yaml
 
 from k8s_inspector.kube import Kube, NotFound
 from k8s_inspector.model import (
+    UNLIMITED,
     CapacityMode,
     Config,
     DbaasSettings,
@@ -95,6 +96,11 @@ def _pos_int(value: Any, path: str) -> int:
     return value
 
 
+def _max_in_flight(value: Any, path: str) -> int | float:
+    """A non-negative integer, or `unlimited`."""
+    return UNLIMITED if value == "unlimited" else _nonneg_int(value, path)
+
+
 def _nonneg_float(value: Any, path: str) -> float:
     if isinstance(value, bool) or not isinstance(value, int | float) or value < 0:
         raise _fail(path, "a non-negative number", value)
@@ -137,7 +143,7 @@ def _optional(check: Callable[[Any, str], Any]) -> Callable[[Any, str], Any]:
 
 # camelCase key -> (dataclass field, check). One table per section.
 _PLANNER = {"intervalMinutes": ("planner_interval_minutes", _pos_int), "autoPlan": ("auto_plan", _bool)}
-_DEFAULTS = {"maxInFlight": ("max_in_flight", _nonneg_int)}
+_DEFAULTS = {"maxInFlight": ("max_in_flight", _max_in_flight)}
 _SPOT = {
     "maxSpotAttempts": ("max_spot_attempts", _pos_int),
     "maxLostMinutes": ("max_lost_minutes", _nonneg_int),
@@ -172,8 +178,9 @@ _UPLOADS = {
 _VENDOR = {
     "enabled": ("enabled", _bool),
     "autoPlan": ("auto_plan", _optional(_bool)),
-    "maxInFlight": ("max_in_flight", _optional(_nonneg_int)),
+    "maxInFlight": ("max_in_flight", _optional(_max_in_flight)),
     "maxUsdPerHour": ("max_usd_per_hour", _optional(_nonneg_float)),
+    "maxNewRunsPerCycle": ("max_new_runs_per_cycle", _pos_int),
     "capacity": ("capacity", _capacity),
     "publish": ("publish", _publish),
     "dbaasAutoPlan": ("dbaas_auto_plan", _bool),
