@@ -26,7 +26,9 @@ Phases:
   A NodeClaim capacity/quota error, 2 distinct NodeClaims of the attempt that failed to launch
   (`LaunchFailed`, kept in `status.launchFailures`) or the provisioning deadline: the reason comes from the class
   SCarpenter put in the NodeClaim message (`launch.reason_of_class`). A temporary reason (`launch.TEMPORARY`)
-  deletes the run without a record (`_defer_launch`); otherwise remaining tasks end `-1 SCARPENTER_*`, Failed.
+  deletes the run without a record (`_defer_launch`); otherwise remaining tasks end `-1 SCARPENTER_*`, Failed. An ICE
+  of a spot-only attempt (`SpotUntilExhausted`, `SpotOnly`) is a try instead (`_spot_unavailable`): attempt
+  `SpotUnavailable`, tasks left Pending, Failed.
 - Running: no step in flight -> prechecks (`-3`), vLLM ladder failures, next step (`steps.probe_step` first,
   which always contains `lscpu`, then `steps.next_step`): sign URLs into the Secret, heartbeat, create the Pod.
   Step Pod finished -> `pods.classify`, `storage.finish_task`, a `flush` Pod (max 2) while uploads are
@@ -83,6 +85,7 @@ from k8s_inspector.model import (
     AttemptOutcome,
     AttemptStatus,
     BenchmarkRun,
+    CapacityMode,
     CapacityType,
     Config,
     DbPhase,
@@ -283,6 +286,36 @@ def _claim_error(claims: list[dict]) -> str | None:
     return None
 
 
+QUOTA_FACT_KEYS = (
+    "bucket",
+    "unit",
+    "need",
+    "maxLimit",
+    "maxHeadroom",
+    "regions",
+)  # `regions`: per-region headroom, when SCarpenter lists it
+NO_QUOTA_HEADROOM = "no candidate offering had quota headroom"  # SCarpenter: every candidate was over quota
+TRIED_SUMMARY = re.compile(
+    r"tried (\d+) offerings in (\d+) regions / (\d+) zones"
+)  # SCarpenter's summary of a failed Create
+
+
+def _quota_fact(entry: dict) -> dict:
+    """A spot quota entry of the offered listing as the run record keeps it."""
+    return {k: entry[k] for k in QUOTA_FACT_KEYS if k in entry}
+
+
+def _tried(failures: list[LaunchFailure], message: str) -> dict | None:
+    """`{offerings, regions, zones}` of the attempt's most thorough failed launch, from SCarpenter's summary in the
+    messages (`tried N offerings in R regions / Z zones`); None when no message has it."""
+    found = [TRIED_SUMMARY.search(m) for m in [*(f.message for f in failures), message]]
+    counts = [tuple(int(n) for n in f.groups()) for f in found if f]
+    if not counts:
+        return None
+    offerings, regions, zones = max(counts)
+    return {"offerings": offerings, "regions": regions, "zones": zones}
+
+
 def _is_true(claim: dict, kind: str) -> bool:
     return any(
         c.get("type") == kind and c.get("status") == "True" for c in claim.get("status", {}).get("conditions") or []
@@ -413,13 +446,15 @@ class Runner(DbaasMixin):
         on_launch_failure: Callable[[str, str], None] | None = None,
         keeper_cache: planner.KeeperCache | None = None,
         on_leftover_stack_failure: Callable[[str], None] | None = None,
+        on_spot_try: Callable[[str, str], None] | None = None,
     ) -> None:
         """`cfg_provider`: zero-argument callable returning the current `Config` (settings are re-read from the
         ConfigMap every cycle, so a callable is passed instead of a snapshot). `clock` (tests) returns the
         current UTC time. `on_launch_failure(vendor, reason)` is called
         for each run that ends because no node could be launched, `on_leftover_stack_failure(vendor)` for each that gave
-        up destroying a stack an earlier run left (metrics). `keeper_cache` is the planner's, so both see the same
-        Keeper answer (`_drop_if_ineligible`)."""
+        up destroying a stack an earlier run left, `on_spot_try(vendor, result)` for each spot-only attempt that ended
+        `capacity` (got a spot node), `unavailable` (no spot capacity, counted) or `quota_busy` (metrics).
+        `keeper_cache` is the planner's, so both see the same Keeper answer (`_drop_if_ineligible`)."""
         self.kube = kube
         self.storage = storage
         self.namespace = namespace
@@ -427,6 +462,7 @@ class Runner(DbaasMixin):
         self._clock = clock or (lambda: datetime.now(UTC))
         self._on_launch_failure = on_launch_failure
         self._on_leftover_stack_failure = on_leftover_stack_failure
+        self._on_spot_try = on_spot_try
         self._queue: queue.Queue[str] = queue.Queue()
         self._lock = threading.Lock()
         self._queued: set[str] = set()
@@ -851,9 +887,136 @@ class Runner(DbaasMixin):
             region = pods.client_region(run.spec.database)
             run = self._update(run, lambda status: setattr(status, "region", region))
             message = f"DBAAS_CLIENT_FAILED: {message}"
-        elif self._defer_launch(run, message):
+        elif self._spot_unavailable(run, live, message) or self._defer_launch(run, message):
             return
         self._end_run(run, ExitCode.NO_NODE, message, AttemptOutcome.PROVISIONING_FAILED)
+
+    def _offered_entry(self, run: BenchmarkRun) -> dict | None:
+        """The run's SKU in SCarpenter's offered listing; None when the listing is unusable or lacks the SKU."""
+        offered = planner.read_offered(self.kube, self._cfg(), run.spec.vendor, self._now())
+        return offered.entries.get(run.spec.sku) if offered else None
+
+    def _spot_only_attempt(self, run: BenchmarkRun, live: dict[str, dict]) -> bool:
+        """The failed attempt of a non-forced server run had an anchor that allows spot alone, and no task has a
+        result yet: it can end without results (`_end_without_results`)."""
+        anchor = live.get(pods.anchor_name(run.name, run.status.attempt))
+        return (
+            not run.spec.force
+            and anchor is not None
+            and pods.is_spot_only(anchor)
+            and not any(t.state == TaskState.DONE for t in run.status.tasks)
+        )
+
+    def _spot_unavailable(self, run: BenchmarkRun, live: dict[str, dict], message: str) -> bool:
+        """A spot-only attempt (`SpotUntilExhausted` before the SKU is exhausted, `SpotOnly`) that ended without a node
+        for lack of capacity found no spot capacity in the regions the run was confined to. When SCarpenter's error
+        is evidence of that (it tried offerings, or names a capacity class) and the spot quota had room, that is a
+        counted try (`spot.record_try`): the attempt closes `SpotUnavailable`, the run ends Failed with every task
+        still Pending (nothing ran, so no task result is published and Keeper still sees the tasks as due) and the
+        publisher writes only the run record. A `QuotaExceeded` launch, an `ICE` without a candidate that had quota
+        headroom, or while the quota shows no room, is `quota_busy`, and an `ICE` with no evidence at all (the
+        provisioning deadline) is nothing: neither is a try, the normal launch deferral applies. A try that cannot be
+        counted (the ConfigMap cannot be written) is no try either. True when the run ended."""
+        vendor, sku = run.spec.vendor, run.spec.sku
+        reason = launch.reason_of_error(message)
+        if not self._spot_only_attempt(run, live):
+            return False
+        offered = planner.read_offered(self.kube, self._cfg(), vendor, self._now())
+        entry = offered.entries.get(sku) if offered else None
+        group = (entry["quotas"].get(CapacityType.SPOT) or []) if entry else []
+        regions = tuple(run.spec.regions)
+        messages = [f.message for f in run.status.launch_failures] + [message]
+        tried = _tried(run.status.launch_failures, message)
+        if reason == "QUOTA" or (reason == "ICE" and (spot.quota_busy(group, regions) or NO_QUOTA_HEADROOM in message)):
+            self._spot_try_result(vendor, "quota_busy")
+            return False
+        if reason != "ICE" or not (
+            (tried and tried["offerings"]) or any(launch.is_capacity_class(m) for m in messages)
+        ):
+            return False
+        settings = self._cfg().settings
+        attempt = self._attempt(run)
+        tries = spot.record_try(self.kube, vendor, sku, attempt.start or self._now(), settings)
+        if tries is None:
+            return False
+        errors = [
+            {"node_claim": f.node_claim, "time": f.time.isoformat(), "message": f.message}
+            for f in run.status.launch_failures
+        ]
+        details = {
+            "spot_try": {
+                "error": message,
+                "launch_errors": errors,
+                "tried": tried,
+                "regions": list(regions),
+                "quota": [_quota_fact(q) for q in group],
+                "quota_at": offered.generated_at.isoformat() if offered else None,
+            }
+        }
+        facts, _ = self._keeper_cost_data(run)
+        log.info(
+            "spot_try",
+            extra={
+                "event": "spot_try",
+                "vendor": vendor,
+                "sku": sku,
+                "series": facts.get("series"),
+                "family": facts.get("family"),
+                "start": attempt.start.isoformat() if attempt.start else None,
+                "result": "unavailable",
+                "counted": True,
+                "launch_errors": [e["message"] for e in errors] or [message],
+                "tried": tried,
+                "regions": list(regions),
+                "quota": details["spot_try"]["quota"],
+                "slots_tried": len(tries.slots),
+                "slots_per_week": spot.slots_per_week(settings),
+                "tries": tries.count,
+            },
+        )
+        log.info(spot.describe_tries(sku, tries, settings))
+        self._spot_try_result(vendor, "unavailable")
+        self._end_without_results(run, AttemptOutcome.SPOT_UNAVAILABLE, details)
+        return True
+
+    def _spot_rejected(self, run: BenchmarkRun, live: dict[str, dict], message: str) -> bool:
+        """A `SpotOnly` attempt whose spot launch was rejected for the SKU (`LAUNCH_REJECTED`: an offering the cloud
+        does not support) means spot is impossible for the SKU: the spot ConfigMap remembers it for
+        `spot.REJECTED_TTL` and `SpotOnly` does not plan the SKU meanwhile. The attempt closes `SpotRejected` and the
+        run ends without results like a try, so no `-1` is recorded and the tasks stay due. False (the usual
+        failure) for a forced run or one with results, or when the marker cannot be written."""
+        if not self._spot_only_attempt(run, live) or not spot.record_rejected(
+            self.kube, run.spec.vendor, run.spec.sku, self._now()
+        ):
+            return False
+        log.warning("run %s: %s: spot is impossible for %s/%s, not planned for %s", run.name, message,
+                    run.spec.vendor, run.spec.sku, spot.REJECTED_TTL)  # fmt: skip
+        self._delete_run_claims(run, live)
+        failures = [
+            {"node_claim": f.node_claim, "time": f.time.isoformat(), "message": f.message}
+            for f in run.status.launch_failures
+        ]
+        self._end_without_results(
+            run, AttemptOutcome.SPOT_REJECTED, {"spot_rejected": {"error": message, "launch_errors": failures}}
+        )
+        return True
+
+    def _end_without_results(self, run: BenchmarkRun, outcome: AttemptOutcome, details: dict) -> None:
+        """Close the attempt with `outcome` and end the run Failed with its tasks Pending: no task result, nothing to
+        publish but the run record. `details` go into the attempt's entry of `run.json`."""
+
+        def mutate(status: RunStatus) -> None:
+            self._close_attempt(status, outcome)
+            status.phase = RunPhase.FAILED
+            status.current_step = status.step = status.node = None
+
+        run = self._update(run, mutate)
+        self._write_run_json(run, self._nodes.pop(run.name, None), {run.status.attempt: details})
+        self._delete_secret(run)
+
+    def _spot_try_result(self, vendor: str, result: str) -> None:
+        if self._on_spot_try:
+            self._on_spot_try(vendor, result)
 
     def _defer_launch(self, run: BenchmarkRun, message: str) -> bool:
         """Count a launch failure and remember when the SKU may be launched again (`launch`). A temporary one
@@ -889,10 +1052,11 @@ class Runner(DbaasMixin):
 
     # ----------------------------------------------------------------------- run.json
 
-    def _write_run_json(self, run: BenchmarkRun, nd: _Node | None) -> None:
+    def _write_run_json(self, run: BenchmarkRun, nd: _Node | None, details: dict[int, dict] | None = None) -> None:
         """`run.json`: plan, per-attempt facts (timings, lscpu output, region/zone/price) and the `timing` of
         the latest attempt the publisher turns into timing files. Earlier content is kept, so a restarted
-        controller does not lose what the NodeClaim of an earlier attempt said."""
+        controller does not lose what the NodeClaim of an earlier attempt said. `details` are extra fields of
+        attempts, by attempt number (`spot_try` of a `SpotUnavailable` one)."""
         key = crd.run_key(run)
         raw = self.storage.read_bytes(run_json_key(key))
         prior = json.loads(raw) if raw else {}
@@ -911,6 +1075,7 @@ class Runner(DbaasMixin):
                 "end": a.end.isoformat() if a.end else None,
                 "outcome": a.outcome.value if a.outcome else None,
             }
+            entry |= (details or {}).get(a.n, {})
             if a.n == run.status.attempt and a.node and run.status.region:
                 entry |= {"region": run.status.region, "zone": run.status.zone, "price": run.status.price_per_hour}
                 if "ondemand_price" not in entry:
@@ -980,7 +1145,14 @@ class Runner(DbaasMixin):
         now = self._now()
         server = run.spec.database is None  # a DBaaS client has no SKU of its own
         quarantined = server and spot.is_quarantined(self.kube, run.spec.vendor, run.spec.sku, settings, now)
-        capacity = spot.capacity_for_next_attempt(run, selected, settings, quarantined)
+        released = (
+            server
+            and run.spec.capacity == CapacityMode.SPOT_UNTIL_EXHAUSTED
+            and spot.spot_released(
+                spot.State.load(self.kube), run.spec.vendor, run.spec.sku, self._offered_entry(run), settings, now
+            )
+        )
+        capacity = spot.capacity_for_next_attempt(run, selected, settings, quarantined, released)
         if server and not pods.is_label_value(run.spec.sku):
             return self._end_run(run, ExitCode.HARNESS_ERROR, SKU_NOT_SELECTABLE, AttemptOutcome.HARNESS_ERROR)
         anchor = pods.render_anchor(
@@ -1045,7 +1217,8 @@ class Runner(DbaasMixin):
         reclaims = run.status.spot_reclaims
         if error is None and not bound:
             error, reclaims = self._boot_error(run, cfg, claims)
-        if error is None and not bound and reclaims >= MAX_SPOT_RECLAIMS and pods.allows_spot(anchor):
+        spot_only = run.spec.capacity == CapacityMode.SPOT_ONLY  # never goes on-demand
+        if error is None and not bound and reclaims >= MAX_SPOT_RECLAIMS and pods.allows_spot(anchor) and not spot_only:
             # Spot claims keep getting reclaimed (or deleted by SCarpenter's GPU check) before they are up: the
             # next attempt is on-demand only, where a lost claim ends the run as BOOT_FAILURE.
             return self._retry_on_demand(run, live, f"{reclaims} spot nodes were lost before they were Ready")
@@ -1090,8 +1263,11 @@ class Runner(DbaasMixin):
         if error is None:
             return
         if error.startswith(SPOT_FALLBACK_ERRORS) and pods.allows_spot(anchor):
-            # The next attempt (`spot.capacity_for_next_attempt`) is on-demand only.
-            return self._retry_on_demand(run, live, error)
+            if spot_only:
+                if self._spot_rejected(run, live, error):
+                    return
+            else:  # the next attempt (`spot.capacity_for_next_attempt`) is on-demand only
+                return self._retry_on_demand(run, live, error)
         self._fail_run(run, live, error)
 
     def _launch_failures_exhausted(
@@ -1111,7 +1287,10 @@ class Runner(DbaasMixin):
         if len(failures) >= MAX_ICE_LAUNCH_FAILURES:
             return True
         on_demand_only = not pods.allows_spot(anchor)
-        return not planner.is_offered(self.kube, cfg, run.spec.vendor, run.spec.sku, on_demand_only, self._now())
+        spot_only = pods.is_spot_only(anchor)
+        return not planner.is_offered(
+            self.kube, cfg, run.spec.vendor, run.spec.sku, on_demand_only, self._now(), spot_only=spot_only
+        )
 
     def _not_offered(self, run: BenchmarkRun, cfg: Config) -> bool:
         """SCarpenter's offered-types listing is readable and does not offer the SKU. An unreadable or stale
@@ -1404,6 +1583,14 @@ class Runner(DbaasMixin):
                     a.capacity_type = facts.capacity_type or a.capacity_type
 
         run = self._update(run, mutate)
+        if (
+            facts.capacity_type == CapacityType.SPOT
+            and run.spec.database is None
+            and run.spec.capacity in (CapacityMode.SPOT_UNTIL_EXHAUSTED, CapacityMode.SPOT_ONLY)
+        ):
+            spot.clear_tries(self.kube, run.spec.vendor, run.spec.sku)  # spot is there: the tries start over
+            if pods.is_spot_only(anchor):  # a try of its own: the attempt could only land on spot
+                self._spot_try_result(run.spec.vendor, "capacity")
         self._write_run_json(run, nd)
         self._heartbeat(run)
         self._running(run, cfg, live)

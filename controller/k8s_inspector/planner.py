@@ -385,6 +385,12 @@ def _in_region(zone: str, region: str) -> bool:
     return re.fullmatch(f"{re.escape(region)}(-?[a-z])?", zone) is not None
 
 
+def _offered_types(offerings: list) -> set[str]:
+    """The capacity types of the entry's offering groups, available or not, except a group SCarpenter marks
+    `NotLaunchable` (it can never launch). Empty when the entry lists no group (an older SCarpenter)."""
+    return {o.get("capacityType") for o in offerings if isinstance(o, dict) and o.get("reason") != "NotLaunchable"}
+
+
 def _quotas(offerings: list) -> dict[str, list[dict]]:
     """The quota entries of each offering group, by capacity type: `{capacityType: [{bucket, unit, need, maxLimit,
     maxHeadroom, regions}]}` (`regions` from `_regions`), whether or not the group is available. A group without
@@ -422,7 +428,8 @@ def read_offered(kube: Kube, cfg: Config, vendor: str, now: datetime | None = No
     optional `zonesOmitted` field is ignored, nothing reads zones): `Offered(entries, truncated, generated_at)`.
     `entries` is `{apiReference: entry}`; an entry is `{available, capacityTypes, reason, until, quotas}`.
     `until` is the latest of its unavailable offerings (`offerings[].until`, else None) and `quotas` the quota
-    entries of its offering groups (`_quotas`). Entries without an `apiReference` are ignored; of two with the
+    entries of its offering groups (`_quotas`), `offered_types` the capacity types of its offering groups
+    (`_offered_types`). Entries without an `apiReference` are ignored; of two with the
     same one the available wins and `until` is the latest of both. `now` (default the current time) judges
     staleness.
 
@@ -461,6 +468,7 @@ def read_offered(kube: Kube, cfg: Config, vendor: str, now: datetime | None = No
                     "reason": entry.get("reason", "unavailable"),
                     "quotas": _quotas(offerings),
                     "zones": _zones(offerings),
+                    "offered_types": _offered_types(offerings),
                 }
             old["until"] = max(untils, default=None)
     except NotFound:
@@ -484,14 +492,23 @@ def offered_until(kube: Kube, cfg: Config, vendor: str, sku: str, now: datetime 
 
 
 def is_offered(
-    kube: Kube, cfg: Config, vendor: str, sku: str, on_demand_only: bool, now: datetime | None = None
+    kube: Kube,
+    cfg: Config,
+    vendor: str,
+    sku: str,
+    on_demand_only: bool,
+    now: datetime | None = None,
+    spot_only: bool = False,
 ) -> bool:
-    """SCarpenter lists the SKU as available (with `on-demand` among its capacity types when `on_demand_only`).
-    False when the listing cannot be read or the SKU is not in it."""
+    """SCarpenter lists the SKU as available (with `on-demand` among its capacity types when `on_demand_only`, with
+    `spot` when `spot_only`). False when the listing cannot be read or the SKU is not in it."""
     offered = read_offered(kube, cfg, vendor, now)
     entry = offered[0].get(sku) if offered else None
     return bool(
-        entry and entry["available"] and (not on_demand_only or CapacityType.ON_DEMAND in entry["capacityTypes"])
+        entry
+        and entry["available"]
+        and (not on_demand_only or CapacityType.ON_DEMAND in entry["capacityTypes"])
+        and (not spot_only or CapacityType.SPOT in entry["capacityTypes"])
     )
 
 
@@ -514,7 +531,7 @@ def not_offered(
     vendor's capacity mode, with the reason. A SKU is not offered when its entry is missing, `available` is false
     (whatever its offerings' `until`: SCarpenter rewrites the listing when a mark expires) or it has no capacity
     type, or when the mode is OnDemand and `on-demand` is not in its `capacityTypes` (SpotFirst takes either
-    type).
+    type), or SpotOnly and `spot` is not.
 
     Fails closed: None when `read_offered` returns nothing (the listing is missing, unreadable or stale), because
     then nothing is known about the SKUs. In a truncated list a missing entry proves nothing, so only entries with
@@ -529,7 +546,8 @@ def not_offered(
         log.warning(
             "offered types of vendor %s are truncated: autoPlan skips only SKUs it lists as unavailable", vendor
         )
-    on_demand_only = cfg.settings.vendors[vendor].capacity == CapacityMode.ON_DEMAND
+    mode = cfg.settings.vendors[vendor].capacity
+    on_demand_only = mode == CapacityMode.ON_DEMAND
     skipped = {}
     for sku in skus:
         if sku not in entries:
@@ -543,6 +561,8 @@ def not_offered(
             skipped[sku] = "no capacity types"
         elif on_demand_only and CapacityType.ON_DEMAND not in entry["capacityTypes"]:
             skipped[sku] = f"no {CapacityType.ON_DEMAND} capacity"
+        elif mode == CapacityMode.SPOT_ONLY and CapacityType.SPOT not in entry["capacityTypes"]:
+            skipped[sku] = f"no {CapacityType.SPOT} capacity"
     return skipped
 
 
@@ -974,6 +994,8 @@ def plan_cycle(
                 "autoPlan skips %d SKUs of vendor %s whose names are not label values, e.g. %s",
                 len(bad_names), vendor, bad_names[0],
             )  # fmt: skip
+        spot_modes = (CapacityMode.SPOT_ONLY, CapacityMode.SPOT_UNTIL_EXHAUSTED)
+        spot_state = spot.State.load(kube) if settings.vendors[vendor].capacity in spot_modes else None  # once a cycle
         ready: dict[str, dict[str, str]] = {}  # SKUs with due tasks, in start order: {sku: {task: why}}
         for sku in skus:
             if crd.run_name(vendor, sku) in leased or not publisher.publish_allowed(settings, vendor, sku):
@@ -987,7 +1009,9 @@ def plan_cycle(
                 newest.get(sku, (None, frozenset())), first_seen_reader, now,
             )  # fmt: skip
             if due and not all(tasks.get_task(name).gpu for name in due):  # nothing due, or only GPU tasks
-                ready[sku] = due
+                entry = offered.entries.get(sku) if offered else None
+                if not spot.planning_skip(spot_state, settings, vendor, sku, list(due), entry, aware_now):
+                    ready[sku] = due  # SpotOnly / SpotUntilExhausted: not skipped for spot
         scores: dict[str, popularity.Score] = {}
         markets: dict[str, dict | None] = {}
         if popularity_cache and ready:

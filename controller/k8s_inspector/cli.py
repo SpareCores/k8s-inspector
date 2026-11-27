@@ -210,6 +210,7 @@ def serve(kube: Kube, provider: ConfigProvider, stop: threading.Event, metrics_p
         on_launch_failure=metrics.record_launch_failure,
         keeper_cache=keeper_cache,
         on_leftover_stack_failure=metrics.record_dbaas_leftover_failure,
+        on_spot_try=metrics.record_spot_try,
     )
     publisher = _MeteredPublisher(
         kube,

@@ -72,8 +72,31 @@ Worst case per run: two lost tasks plus two extra node boots, then the rest on-d
 attempt counter lives in the run object, and a run that exhausts its budgets either completes on-demand or ends with
 `-4` per remaining task, which counts towards the usual cap of three before `-5` ([exit codes](../reference/exit-codes.md)).
 
+## Spot capacity modes
+
+`SpotFirst` lets Karpenter fall back to on-demand inside the same attempt whenever no spot node can launch (spot
+quota busy, no capacity, no spot market), so a run can start on-demand without any spot attempt having failed. Two more
+vendor settings keep a run on spot ([configuration](../reference/configuration.md#spot-capacity-modes)):
+
+- `SpotOnly`: the anchor allows `spot` only, on every attempt. SKUs that cannot run on spot are not planned. An
+  attempt that finds no spot capacity ends the run without results and the SKU is tried again in a later slot.
+- `SpotUntilExhausted`: the same, until the SKU is exhausted: `patienceDays` (14) have passed since its first try
+  and its tries covered `coverage` percent (100) of the week's `slotHours` (3) hour slots, so that time-of-week
+  patterns of spot availability were given a chance. Then it behaves like `SpotFirst`. On-demand is allowed at once
+  when spot is impossible for the SKU (no spot offering, or the spot quota can never fit one instance) and after
+  `maxSpotAttempts` interruptions.
+
+A **try** is a spot-only attempt launched while the spot quota had room that found no spot capacity in any region or
+zone. It ends the run as `SpotUnavailable`: no task started, so no task result or `-1` is written, nothing is published
+for the tasks and Keeper still sees them as due; the only trace is the attempt in the run's
+[record](../reference/run-records.md). A rejected spot launch under `SpotOnly` ends the run the same way (`SpotRejected`) and keeps the SKU out of planning for
+30 days; under `SpotUntilExhausted` it sends the next attempt to on-demand, as in `SpotFirst`. A busy spot quota is not a try (autoPlan waits for quota, item 8 above), nor is a
+quota refusal at launch. After a try the planner offers the SKU again only in a slot it has not tried, so tries spread
+over the week. A spot node that launches clears the SKU's tries. A quarantined SKU is not planned under `SpotOnly`
+(it never runs on-demand); under `SpotUntilExhausted` it starts on-demand as in `SpotFirst`.
+
 ## Per-vendor policy
 
-Spot is a per-vendor setting ([configuration](../reference/configuration.md)): `SpotFirst` or `OnDemand`. The initial
+Spot is a per-vendor setting ([configuration](../reference/configuration.md)): `SpotFirst`, `OnDemand`, `SpotUntilExhausted` or `SpotOnly`. The initial
 policy: `SpotFirst` for OCI (to exercise the strategy in the first phase, where interruptions are cheap), AWS and GCP;
 `OnDemand` elsewhere until a vendor's spot lane in SCarpenter is proven (decision K20).

@@ -54,7 +54,8 @@ Decisions:
   record is pushed; `emit_cost_logs` logs them again for the records in git).
   Write once: an existing file is never rewritten. `delete_expired_runs` keeps a
   finished, publishable run until its record is written; a run without `run.json` is logged and given up. Runs
-  deleted by `_defer_launch` get no record. `backfill_run_records` writes the records of past runs from the
+  deleted by `_defer_launch` get no record. A run that ended `SpotUnavailable` has no tasks to publish: its record
+  is written at once and the run is deleted after it. `backfill_run_records` writes the records of past runs from the
   `run.json` files in object storage.
 - `rescan` finds the SKUs of a vendor from the git tree (`data/<vendor>/*`): a SKU never published has to be
   passed with `skus`. A DBaaS run is recognised by `run.json` `database`.
@@ -197,6 +198,13 @@ def _all_published(run: BenchmarkRun) -> bool:
     return bool(tasks_) and all(t.state == TaskState.DONE and t.published for t in tasks_)
 
 
+def _spot_unavailable(run: BenchmarkRun) -> bool:
+    """The run ended because its spot-only attempt found no spot capacity (`SpotUnavailable`) or had its spot launch
+    rejected (`SpotRejected`): no task ran, nothing is published, only the run record is."""
+    attempts = run.status.attempts
+    return bool(attempts) and attempts[-1].outcome in (AttemptOutcome.SPOT_UNAVAILABLE, AttemptOutcome.SPOT_REJECTED)
+
+
 def _finished_at(run: BenchmarkRun) -> datetime:
     """When the run's last task ended (the run's creation when none did)."""
     ends = [_utc(t.end) for t in run.status.tasks if t.end]
@@ -320,7 +328,9 @@ class Publisher:
         """Delete BenchmarkRuns whose tasks are all published, `publish.keep_run_hours` after the last one,
         and finished runs that will never be published (SKU not allowed, see `publish_allowed`) that long
         after their last task ended: deleting a run frees its SKU lease. Without the ConfigMap the allowlist is
-        the default (nothing allowed), so unpublished runs are kept then. Returns how many."""
+        the default (nothing allowed), so unpublished runs are kept then. A run that ended `SpotUnavailable` has
+        nothing but its record: it is deleted as soon as that is in git, or at once when its SKU is not enabled for
+        publishing (no record will come). Returns how many."""
         keep = timedelta(hours=settings.publish.keep_run_hours)
         now = datetime.now(UTC)
         deleted = 0
@@ -330,6 +340,13 @@ class Publisher:
                 if run.name not in self._records_written and self._record_due(run, settings):
                     continue  # the run's record is not in git yet
                 since, why = published_at, "published"
+            elif _spot_unavailable(run) and (
+                run.name in self._records_written or (settings.from_configmap and not _publishable(settings, run))
+            ):
+                crd.delete_run(self._kube, run.name)  # nothing else is published: the record was the last step
+                log.info("deleted spot unavailable run %s", run.name)
+                deleted += 1
+                continue
             elif settings.from_configmap and run.status.phase in DONE_PHASES and not _publishable(settings, run):
                 since, why = _finished_at(run), "never to be published"
             else:
@@ -477,7 +494,8 @@ class Publisher:
     @staticmethod
     def _record_due(run: BenchmarkRun, settings: Settings) -> bool:
         """The run ended, everything of it is published and its record is not written yet."""
-        return run.status.phase in TERMINAL_PHASES and _publishable(settings, run) and _all_published(run)
+        done = _all_published(run) or _spot_unavailable(run)
+        return run.status.phase in TERMINAL_PHASES and _publishable(settings, run) and done
 
     def _publish_run_records(self, settings: Settings) -> None:
         """`runs/<run_id>.json` of the runs that ended and whose tasks are all published (see the module docstring).
@@ -1159,7 +1177,12 @@ def _phase_of(run_json: dict) -> str:
         return RunPhase.DONE.value
     if outcome == AttemptOutcome.CANCELLED:
         return RunPhase.CANCELLED.value
-    if outcome in (AttemptOutcome.PROVISIONING_FAILED, AttemptOutcome.HARNESS_ERROR):
+    if outcome in (
+        AttemptOutcome.PROVISIONING_FAILED,
+        AttemptOutcome.HARNESS_ERROR,
+        AttemptOutcome.SPOT_UNAVAILABLE,
+        AttemptOutcome.SPOT_REJECTED,
+    ):
         return RunPhase.FAILED.value
     return "unknown"
 

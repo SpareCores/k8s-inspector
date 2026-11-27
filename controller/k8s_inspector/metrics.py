@@ -34,9 +34,9 @@ from collections.abc import Callable
 from datetime import UTC, datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from k8s_inspector import crd, launch
+from k8s_inspector import crd, launch, spot
 from k8s_inspector.kube import Kube
-from k8s_inspector.model import AttemptOutcome, DbPhase, ExitCode, RunPhase, Settings, TaskState
+from k8s_inspector.model import AttemptOutcome, CapacityMode, DbPhase, ExitCode, RunPhase, Settings, TaskState
 from k8s_inspector.planner import ACTIVE_PHASES, spend_per_hour
 from k8s_inspector.publisher import publish_allowed
 
@@ -51,6 +51,8 @@ _ATTEMPT_LABEL = {
     AttemptOutcome.NODE_LOST: "node_lost",
     AttemptOutcome.PROVISIONING_FAILED: "provisioning_failed",
     AttemptOutcome.LAUNCH_FAILED: "launch_failed",
+    AttemptOutcome.SPOT_UNAVAILABLE: "spot_unavailable",
+    AttemptOutcome.SPOT_REJECTED: "spot_rejected",
     AttemptOutcome.CANCELLED: "cancelled",
     AttemptOutcome.HARNESS_ERROR: "harness_error",
 }
@@ -126,6 +128,12 @@ class Metrics:
         reason = reason if reason in LAUNCH_REASONS else "OTHER"
         with self._lock:
             self._counters["launch_failures_total"][_labels(vendor=vendor, reason=reason)] += 1
+
+    def record_spot_try(self, vendor: str, result: str) -> None:
+        """A spot-only attempt ended: `capacity` (got a spot node), `unavailable` (no capacity, a counted try) or
+        `quota_busy` (the spot quota had no room, not a try)."""
+        with self._lock:
+            self._counters["spot_tries_total"][_labels(vendor=vendor, result=result)] += 1
 
     def record_vendor_skipped(self, vendor: str, reason: str) -> None:
         """A planner cycle skipped the vendor (`planner.OFFERED_UNUSABLE`)."""
@@ -231,6 +239,22 @@ class Metrics:
                     deferred[key] += 1
                     blocked[key] += launch.is_waiting(entry, now)
 
+        state = spot.State.load(self._kube)  # once per scrape
+        waiting: dict[str, int] = {}  # vendor -> SKUs with counted tries and not exhausted: waiting for a slot
+        for vendor, vendor_settings in settings.vendors.items():
+            mode = vendor_settings.capacity
+            if mode not in (CapacityMode.SPOT_UNTIL_EXHAUSTED, CapacityMode.SPOT_ONLY):
+                continue
+            waiting[vendor] = 0
+            self._counters["spot_exhausted_total"][_labels(vendor=vendor)] += 0  # the series exists from the start
+            for sku, tries in state.tries_of_vendor(vendor, settings, now).items():
+                if mode == CapacityMode.SPOT_UNTIL_EXHAUSTED and spot.is_exhausted(tries, settings, now):
+                    if (vendor, sku, tries.first) not in self._seen:  # the first try identifies the exhaustion
+                        self._seen.add((vendor, sku, tries.first))
+                        self._counters["spot_exhausted_total"][_labels(vendor=vendor)] += 1
+                else:
+                    waiting[vendor] += 1
+
         lines = [f"# TYPE {PREFIX}runs gauge"]
         lines += [_line("runs", _labels(vendor=v, phase=p), n) for (v, p), n in sorted(phases.items())]
         lines.append(f"# TYPE {PREFIX}spend_usd_per_hour gauge")
@@ -289,6 +313,8 @@ class Metrics:
         for name, counts in (("launch_deferred_skus", deferred), ("launch_blocked", blocked)):
             lines.append(f"# TYPE {PREFIX}{name} gauge")
             lines += [_line(name, _labels(vendor=v, reason=r), n) for (v, r), n in sorted(counts.items())]
+        lines.append(f"# TYPE {PREFIX}spot_waiting_skus gauge")
+        lines += [_line("spot_waiting_skus", _labels(vendor=v), n) for v, n in sorted(waiting.items())]
         self._gauges = lines
 
 

@@ -14,6 +14,8 @@ from k8s_inspector import crd, keeper, launch, publisher
 from k8s_inspector import storage as storage_keys
 from k8s_inspector.kube import NotFound
 from k8s_inspector.model import (
+    AttemptOutcome,
+    AttemptStatus,
     BenchmarkRun,
     DbPhase,
     DbStatus,
@@ -1667,3 +1669,48 @@ def test_tasks_written_off_by_the_controller_are_not_finished_spans(cluster):
     spans = publisher._task_spans(run)
     assert [(s.attempt, s.kept) for s in spans if s.finished] == [(1, True)]
     assert [(s.task, s.exit_code) for s in spans] == [("lscpu", 0), ("geekbench", -4), ("openssl", -1)]
+
+
+def test_a_spot_unavailable_run_gets_its_record_and_is_then_deleted(tmp_path, origin, storage, cluster):
+    run = cluster.add_run(NAMES, phase=RunPhase.FAILED)
+    for t in run.status.tasks:  # nothing ran
+        t.state, t.attempt, t.start, t.end, t.exit_code = TaskState.PENDING, None, None, None, None
+    run.status.attempts = [AttemptStatus(1, None, outcome=AttemptOutcome.SPOT_UNAVAILABLE)]
+    doc = json.loads(storage.objects[okey(KEY, "run.json")])
+    doc["attempts"][0] |= {"outcome": "SpotUnavailable", "capacity_type": None, "spot_try": {"launch_errors": []}}
+    storage.objects[okey(KEY, "run.json")] = json.dumps(doc).encode()
+    pub = make_publisher(tmp_path, origin, storage)
+    assert pub.publish_once(ENABLED).run_ids == ()  # no task result is published
+    record = run_record(origin, tmp_path)
+    assert record["phase"] == "Failed" and record["attempts"][0]["outcome"] == "SpotUnavailable"
+    assert "schedule" not in git(clone(origin, tmp_path), "ls-tree", "-r", "--name-only", "HEAD")
+    assert run.name in pub._records_written
+    assert pub.delete_expired_runs(ENABLED) == 1 and run.name not in cluster.runs
+
+
+def _without_results(cluster, outcome=AttemptOutcome.SPOT_UNAVAILABLE):
+    run = cluster.add_run(NAMES, phase=RunPhase.FAILED)
+    for t in run.status.tasks:  # nothing ran
+        t.state, t.attempt, t.start, t.end, t.exit_code = TaskState.PENDING, None, None, None, None
+    run.status.attempts = [AttemptStatus(1, None, outcome=outcome)]
+    return run
+
+
+def test_a_spot_unavailable_run_of_a_sku_not_enabled_for_publishing_is_deleted_at_once(
+    tmp_path, origin, storage, cluster
+):
+    run = _without_results(cluster)
+    pub = make_publisher(tmp_path, origin, storage)
+    disabled = replace(ENABLED, from_configmap=True, vendors={"hcloud": VendorSettings(enabled=True, publish=False)})
+    assert pub.delete_expired_runs(disabled) == 1 and run.name not in cluster.runs  # no record will ever come
+
+
+def test_a_spot_rejected_run_gets_its_record_like_a_spot_unavailable_one(tmp_path, origin, storage, cluster):
+    _without_results(cluster, AttemptOutcome.SPOT_REJECTED)
+    doc = json.loads(storage.objects[okey(KEY, "run.json")])
+    doc["attempts"][0] |= {"outcome": "SpotRejected", "capacity_type": None}
+    storage.objects[okey(KEY, "run.json")] = json.dumps(doc).encode()
+    pub = make_publisher(tmp_path, origin, storage)
+    pub.publish_once(ENABLED)
+    assert run_record(origin, tmp_path)["attempts"][0]["outcome"] == "SpotRejected"
+    assert pub.delete_expired_runs(ENABLED) == 1

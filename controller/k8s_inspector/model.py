@@ -21,8 +21,12 @@ from enum import IntEnum, StrEnum
 class CapacityMode(StrEnum):
     """`spec.capacity` and the per-vendor setting."""
 
-    SPOT_FIRST = "SpotFirst"
+    SPOT_FIRST = "SpotFirst"  # spot preferred, Karpenter falls back to on-demand by itself
     ON_DEMAND = "OnDemand"
+    SPOT_UNTIL_EXHAUSTED = (
+        "SpotUntilExhausted"  # spot only until the SKU is exhausted (`spot.is_exhausted`), then SpotFirst
+    )
+    SPOT_ONLY = "SpotOnly"  # never on-demand
 
 
 class CapacityType(StrEnum):
@@ -78,6 +82,10 @@ class AttemptOutcome(StrEnum):
     NODE_LOST = "NodeLost"
     PROVISIONING_FAILED = "ProvisioningFailed"
     LAUNCH_FAILED = "LaunchFailed"  # a NodeClaim of a spot-allowed attempt failed to launch or boot: on-demand next
+    # A spot-only attempt found no spot capacity: no tasks ran, the SKU is tried later.
+    SPOT_UNAVAILABLE = "SpotUnavailable"
+    # A SpotOnly attempt's spot launch was rejected for the SKU: no tasks ran, spot is not planned for it for a while.
+    SPOT_REJECTED = "SpotRejected"
     CANCELLED = "Cancelled"
     HARNESS_ERROR = "HarnessError"  # the controller gave up on the run
 
@@ -511,6 +519,9 @@ class SpotSettings:
     quarantine_days: int = 14
     spot_max_task_minutes: int = 240
     quota_reserve_after_minutes: int = 60  # a SKU deferred this long as spot-quota-busy reserves its buckets; 0: never
+    patience_days: int = 14  # SpotUntilExhausted: a SKU is exhausted when its first counted try is this old ...
+    coverage: int = 100  # ... and counted tries fell in this percent of the week's slots
+    slot_hours: int = 3  # a slot is this many UTC hours of a weekday
 
 
 @dataclass(frozen=True)

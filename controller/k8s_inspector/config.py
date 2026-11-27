@@ -120,6 +120,18 @@ def _capacity(value: Any, path: str) -> CapacityMode:
         raise _fail(path, " or ".join(m.value for m in CapacityMode), value) from None
 
 
+def _percent(value: Any, path: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= 100:
+        raise _fail(path, "a percentage from 1 to 100", value)
+    return value
+
+
+def _slot_hours(value: Any, path: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= 24:
+        raise _fail(path, "a number of hours from 1 to 24", value)
+    return value
+
+
 def _version(value: Any, path: str) -> str:
     """A PostgreSQL major version; YAML reads `18` as a number."""
     if isinstance(value, bool) or not isinstance(value, int | float | str) or not str(value).strip():
@@ -151,6 +163,9 @@ _SPOT = {
     "quarantineDays": ("quarantine_days", _nonneg_int),
     "spotMaxTaskMinutes": ("spot_max_task_minutes", _pos_int),
     "quotaReserveAfterMinutes": ("quota_reserve_after_minutes", _nonneg_int),
+    "patienceDays": ("patience_days", _pos_int),
+    "coverage": ("coverage", _percent),
+    "slotHours": ("slot_hours", _slot_hours),
 }
 _DEADLINES = {
     "provisionCpuMinutes": ("provision_cpu_minutes", _pos_int),

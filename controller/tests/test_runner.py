@@ -38,7 +38,7 @@ from k8s_inspector.model import (
     VendorSettings,
 )
 from k8s_inspector.runner import CPU_REFUSALS_ANNOTATION, RELAUNCH_ANNOTATION, SKU_NOT_SELECTABLE, Runner
-from k8s_inspector.storage import Storage, object_key, render_urls_json
+from k8s_inspector.storage import Storage, object_key, render_urls_json, run_json_key
 
 START = datetime(2026, 11, 20, 10, 0, tzinfo=UTC)
 LSCPU = json.dumps(
@@ -60,6 +60,7 @@ class Harness:
         self.cluster = Cluster(self.kube, self.clock)
         self.cfg = cfg or make_config()
         self.failures: list[tuple[str, str]] = []  # (vendor, reason) of `on_launch_failure`
+        self.spot_tries: list[tuple[str, str]] = []  # (vendor, result) of `on_spot_try`
         self.runner = self.new_runner()
         self.name = ""
 
@@ -71,6 +72,7 @@ class Harness:
             "inspector",
             clock=self.clock,
             on_launch_failure=lambda vendor, reason: self.failures.append((vendor, reason)),
+            on_spot_try=lambda vendor, result: self.spot_tries.append((vendor, result)),
         )
 
     def entry(self, sku: str = "VM.Standard.E5.Flex.2-16") -> dict:
@@ -3035,3 +3037,273 @@ def test_an_unreachable_keeper_keeps_the_run(h, monkeypatch):
     h.clock.advance(minutes=11)
     h.runner.reconcile(h.name)
     assert h.run.status.phase == RunPhase.PROVISIONING
+
+
+# --------------------------------------------------------------------------- SpotOnly and SpotUntilExhausted
+
+SPOT_SKU = "VM.Standard.E5.Flex.2-16"
+ICE_MESSAGE = (
+    "insufficient capacity, every launch attempt failed (3 attempts), the last: InsufficientCapacity (X): none; "
+    "tried 3 offerings in 2 regions / 3 zones; classes: InsufficientCapacity:3; stopped by: no candidates left"
+)
+
+
+def _spot_listing(h, *, headroom: float = 128, need: float = 64, regions=None, offered=("spot", "on-demand")) -> None:
+    """SCarpenter's listing for the SKU: a spot group with one quota entry (`regions`: its per-region facts as
+    SCarpenter lists them) and an on-demand group; `offered` are the groups that exist."""
+    quota = {"bucket": "B", "unit": "vCPU", "need": need, "maxLimit": 384, "maxHeadroom": headroom}
+    if regions:
+        quota["regions"] = regions
+    groups = {
+        "spot": {"capacityType": "spot", "zones": ["z1"], "available": True, "quotas": [quota]},
+        "on-demand": {
+            "capacityType": "on-demand",
+            "zones": ["z1"],
+            "available": True,
+            "quotas": [{**quota, "bucket": "OD"}],
+        },
+    }
+    entry = {
+        "apiReference": SPOT_SKU,
+        "available": True,
+        "capacityTypes": list(offered),
+        "offerings": [groups[t] for t in offered],
+    }
+    document = {"generatedAt": h.clock.now.isoformat(), "types": {"oci.x": entry}}
+    h.kube.objects["configmap/scarpenter-system"] = {
+        "scarpenter-offered-bench-oci": {
+            "metadata": {"name": "scarpenter-offered-bench-oci"},
+            "data": {"types.json": json.dumps(document)},
+        }
+    }
+
+
+def _capacity_types(h, attempt=1) -> list[str]:
+    anchor = h.kube.get("pod", f"{h.name}-a{attempt}")
+    terms = anchor["spec"]["affinity"]["nodeAffinity"]["requiredDuringSchedulingIgnoredDuringExecution"]
+    (expression,) = [
+        e for t in terms["nodeSelectorTerms"] for e in t["matchExpressions"] if e["key"] == "karpenter.sh/capacity-type"
+    ]
+    return expression["values"]
+
+
+def _spot_only_ice(h, mode=CapacityMode.SPOT_ONLY, message=ICE_MESSAGE, **spec):
+    h.cluster.provision_enabled = False
+    h.start(["geekbench"], capacity=mode, **spec)
+    h.runner.reconcile(h.name)
+    h.cluster.fail_launch(h.kube.get("pod", f"{h.name}-a1"), message)
+    h.runner.reconcile(h.name)
+
+
+def _tries(h):
+    return spot.State.load(h.kube).tries("oci", SPOT_SKU, h.cfg.settings, h.clock.now)
+
+
+@pytest.mark.parametrize("mode", [CapacityMode.SPOT_ONLY, CapacityMode.SPOT_UNTIL_EXHAUSTED])
+def test_the_anchor_of_a_spot_only_attempt_allows_spot_alone(h, mode):
+    h.cluster.provision_enabled = False
+    h.start(["geekbench"], capacity=mode)
+    h.runner.reconcile(h.name)
+    assert _capacity_types(h) == ["spot"]
+
+
+def test_spot_until_exhausted_allows_on_demand_when_there_is_no_spot_offering(h):
+    _spot_listing(h, offered=("on-demand",))
+    h.cluster.provision_enabled = False
+    h.start(["geekbench"], capacity=CapacityMode.SPOT_UNTIL_EXHAUSTED)
+    h.runner.reconcile(h.name)
+    assert _capacity_types(h) == ["spot", "on-demand"]
+
+
+def test_a_spot_offering_without_quotas_keeps_spot_only(h):
+    _spot_listing(h)
+    document = json.loads(
+        h.kube.objects["configmap/scarpenter-system"]["scarpenter-offered-bench-oci"]["data"]["types.json"]
+    )
+    del document["types"]["oci.x"]["offerings"][0]["quotas"]
+    h.kube.objects["configmap/scarpenter-system"]["scarpenter-offered-bench-oci"]["data"]["types.json"] = json.dumps(
+        document
+    )
+    h.cluster.provision_enabled = False
+    h.start(["geekbench"], capacity=CapacityMode.SPOT_UNTIL_EXHAUSTED)
+    h.runner.reconcile(h.name)
+    assert _capacity_types(h) == ["spot"]
+
+
+def test_spot_until_exhausted_allows_on_demand_once_the_sku_is_exhausted(h):
+    _spot_listing(h)
+    settings = h.cfg.settings
+    for i in range(spot.slots_per_week(settings)):
+        spot.record_try(
+            h.kube, "oci", SPOT_SKU, h.clock.now - timedelta(days=settings.spot.patience_days, hours=3 * i), settings
+        )
+    h.cluster.provision_enabled = False
+    h.start(["geekbench"], capacity=CapacityMode.SPOT_UNTIL_EXHAUSTED)
+    h.runner.reconcile(h.name)
+    assert _capacity_types(h) == ["spot", "on-demand"]
+
+
+def test_a_spot_only_attempt_without_capacity_ends_as_a_try_with_no_task_results(h, caplog):
+    _spot_listing(h)
+    with caplog.at_level("INFO"):
+        _spot_only_ice(h)
+    run = h.run
+    assert run.status.phase == RunPhase.FAILED
+    assert [(a.n, a.outcome, a.capacity_type) for a in run.status.attempts] == [
+        (1, AttemptOutcome.SPOT_UNAVAILABLE, None)
+    ]
+    assert [(t.state, t.exit_code) for t in run.status.tasks] == [(TaskState.PENDING, None)]  # nothing ran
+    assert h.storage.status == {}  # no task result
+    assert launch.read(h.kube, "oci") == {}  # not a launch failure: the slot rule paces the retries
+    assert h.failures == [] and h.spot_tries == [("oci", "unavailable")]
+    tries = _tries(h)
+    assert (tries.count, tries.first) == (1, START)
+    assert f"{SPOT_SKU}: 1/56 slots tried, spot available <95% (95%)" in caplog.text
+    (record,) = [r for r in caplog.records if r.getMessage() == "spot_try"]
+    assert (record.vendor, record.sku, record.counted, record.tries) == ("oci", SPOT_SKU, True, 1)
+
+
+def test_the_run_json_of_a_try_has_the_errors_the_tried_counts_the_regions_and_the_quota(h):
+    regions = [{"region": "r1", "limit": 100, "headroom": 90}, {"region": "r2", "limit": 100, "headroom": 70}]
+    _spot_listing(h, regions=regions)
+    _spot_only_ice(h, regions=["r1", "r2"])
+    doc = json.loads(h.storage.read_bytes(run_json_key(h.run_key())))
+    (attempt,) = doc["attempts"]
+    assert attempt["outcome"] == "SpotUnavailable" and attempt["capacity_type"] is None and attempt["node"] is None
+    assert attempt["api_start"] and attempt["end"]
+    assert not {"slot", "region", "zone"} & attempt.keys()
+    tried = attempt["spot_try"]
+    assert tried["tried"] == {"offerings": 3, "regions": 2, "zones": 3}
+    assert "InsufficientCapacity (X): none" in tried["error"] and tried["launch_errors"] == []
+    assert tried["regions"] == ["r1", "r2"]  # the regions the run was confined to
+    assert tried["quota"] == [
+        {
+            "bucket": "B",
+            "unit": "vCPU",
+            "need": 64.0,
+            "maxLimit": 384.0,
+            "maxHeadroom": 128.0,
+            "regions": {"r1": {"limit": 100.0, "headroom": 90.0}, "r2": {"limit": 100.0, "headroom": 70.0}},
+        }
+    ]
+    assert tried["quota_at"] == START.isoformat()
+    assert doc["plan"] == ["geekbench"]
+
+
+def test_an_ice_while_the_spot_quota_is_busy_is_not_a_try(h):
+    _spot_listing(h, headroom=10)
+    _spot_only_ice(h)
+    assert h.kube.list("benchmarkrun") == []  # the normal launch deferral
+    assert _tries(h) is None
+    assert h.spot_tries == [("oci", "quota_busy")]
+
+
+def test_the_quota_check_uses_the_headroom_of_the_regions_the_run_is_confined_to(h):
+    regions = [{"region": "r1", "limit": 100, "headroom": 10}, {"region": "r2", "limit": 100, "headroom": 90}]
+    _spot_listing(h, regions=regions)  # the global maxHeadroom (128) fits, but r1 is the run's only region
+    _spot_only_ice(h, regions=["r1"])
+    assert _tries(h) is None and h.spot_tries == [("oci", "quota_busy")]
+
+
+def test_an_ice_without_a_candidate_that_had_quota_is_quota_busy_not_a_try(h):
+    _spot_listing(h)
+    message = (
+        "insufficient capacity, no candidate offering had quota headroom (2 skipped); "
+        "tried 0 offerings in 0 regions / 0 zones"
+    )
+    _spot_only_ice(h, message=message)
+    assert _tries(h) is None and h.spot_tries == [("oci", "quota_busy")]
+    assert h.kube.list("benchmarkrun") == []
+
+
+def test_the_provisioning_deadline_without_evidence_is_no_try_at_all(h):
+    _spot_listing(h)
+    h.cluster.provision_enabled = False
+    h.start(["geekbench"], capacity=CapacityMode.SPOT_ONLY)
+    h.runner.reconcile(h.name)
+    h.clock.advance(minutes=61)
+    h.runner.reconcile(h.name)
+    assert _tries(h) is None and h.spot_tries == []
+    assert h.entry()["reason"] == "ICE"  # the usual deferral
+
+
+def test_a_try_that_cannot_be_counted_is_no_try(h, monkeypatch):
+    _spot_listing(h)
+    monkeypatch.setattr(spot, "record_try", lambda *args: None)  # the ConfigMap cannot be written
+    _spot_only_ice(h)
+    assert h.spot_tries == [] and h.entry()["reason"] == "ICE"
+
+
+def test_a_quota_refusal_of_a_spot_only_attempt_is_not_a_try(h):
+    _spot_listing(h)
+    h.cluster.provision_enabled = False
+    h.start(["geekbench"], capacity=CapacityMode.SPOT_ONLY)
+    h.runner.reconcile(h.name)
+    h.cluster.fail_launch(h.kube.get("pod", f"{h.name}-a1"), "QuotaExceeded (X): vCPU limit")
+    h.runner.reconcile(h.name)
+    assert _tries(h) is None and h.spot_tries == [("oci", "quota_busy")]
+    assert h.entry()["reason"] == "QUOTA"
+
+
+def test_a_spot_first_ice_is_no_try(h):
+    _spot_listing(h)
+    h.cluster.provision_enabled = False
+    h.start(["geekbench"])
+    h.runner.reconcile(h.name)
+    h.cluster.fail_launch(h.kube.get("pod", f"{h.name}-a1"), "InsufficientCapacity (X): none")
+    h.runner.reconcile(h.name)
+    assert h.spot_tries == [] and h.entry()["reason"] == "ICE"
+
+
+def test_a_forced_spot_only_run_records_its_ice_as_before(h):
+    _spot_listing(h)
+    _spot_only_ice(h, force=True)
+    assert h.codes()["geekbench"][1].startswith("SCARPENTER_ICE") and _tries(h) is None
+
+
+def _rejected(h, mode):
+    _spot_listing(h)
+    h.cluster.provision_enabled = False
+    h.start(["geekbench"], capacity=mode)
+    h.runner.reconcile(h.name)
+    _launch_failed(h, "bench-aaaaa", "Fatal (X): first")
+    _launch_failed(h, "bench-bbbbb", "Fatal (X): second")
+    h.runner.reconcile(h.name)
+
+
+def test_a_rejected_spot_only_launch_marks_spot_impossible_and_leaves_the_tasks_due(h):
+    _rejected(h, CapacityMode.SPOT_ONLY)
+    assert h.run.status.phase == RunPhase.FAILED
+    assert [a.outcome for a in h.run.status.attempts] == [AttemptOutcome.SPOT_REJECTED]
+    assert [(t.state, t.exit_code) for t in h.run.status.tasks] == [(TaskState.PENDING, None)]  # no -1
+    assert h.storage.status == {} and launch.read(h.kube, "oci") == {}
+    assert spot.State.load(h.kube).rejected("oci", SPOT_SKU, h.clock.now)
+    doc = json.loads(h.storage.read_bytes(run_json_key(h.run_key())))
+    assert doc["attempts"][0]["outcome"] == "SpotRejected"
+    assert "Fatal" in doc["attempts"][0]["spot_rejected"]["error"]
+
+
+def test_a_rejected_spot_launch_of_spot_until_exhausted_goes_on_demand_like_spot_first(h):
+    _rejected(h, CapacityMode.SPOT_UNTIL_EXHAUSTED)
+    assert [a.outcome for a in h.run.status.attempts] == [AttemptOutcome.LAUNCH_FAILED]
+    assert h.run.status.phase == RunPhase.PENDING
+    h.runner.reconcile(h.name)
+    assert _capacity_types(h, 2) == ["on-demand"]
+    assert not spot.State.load(h.kube).rejected("oci", SPOT_SKU, h.clock.now)
+
+
+def test_a_spot_node_clears_the_tries_and_counts_capacity_only_for_a_spot_only_attempt(h):
+    _spot_listing(h)
+    spot.record_try(h.kube, "oci", SPOT_SKU, START - timedelta(days=1), h.cfg.settings)
+    h.start(["geekbench"], capacity=CapacityMode.SPOT_UNTIL_EXHAUSTED)
+    h.drive(stop=lambda run: run.status.phase == RunPhase.RUNNING)
+    assert _tries(h) is None
+    assert h.spot_tries == [("oci", "capacity")]
+
+
+def test_a_spot_node_of_a_released_attempt_clears_the_tries_but_is_not_counted(h):
+    _spot_listing(h, offered=("on-demand",))  # no spot offering: [spot, on-demand] at once
+    spot.record_try(h.kube, "oci", SPOT_SKU, START - timedelta(days=1), h.cfg.settings)
+    h.start(["geekbench"], capacity=CapacityMode.SPOT_UNTIL_EXHAUSTED)
+    h.drive(stop=lambda run: run.status.phase == RunPhase.RUNNING)
+    assert _tries(h) is None and h.spot_tries == []
