@@ -209,6 +209,16 @@ def test_max_in_flight_global_default_and_vendor_override():
     assert settings.vendors["oci"].max_in_flight == 0  # pauses the vendor
 
 
+def test_max_in_flight_may_be_unset_and_the_burst_cap_has_a_default():
+    settings = parse_settings({"defaults": {"maxInFlight": None}, "vendors": {"aws": {"enabled": True}}})
+    assert settings.defaults.max_in_flight is None  # unbounded
+    assert settings.vendors["aws"].max_new_runs_per_cycle == 10
+    capped = parse_settings({"vendors": {"aws": {"enabled": True, "maxNewRunsPerCycle": 3}}})
+    assert capped.vendors["aws"].max_new_runs_per_cycle == 3
+    with pytest.raises(ValueError, match="maxNewRunsPerCycle"):
+        parse_settings({"vendors": {"aws": {"enabled": True, "maxNewRunsPerCycle": 0}}})
+
+
 # --------------------------------------------------------------------------- DBaaS
 
 

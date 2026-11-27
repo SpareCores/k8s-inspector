@@ -1490,7 +1490,7 @@ def reserving_listing(kube, keeper_skus, *, holds_bucket=True):
     publish_offered(kube, offered_configmap(entries))
     if holds_bucket:
         pending_run(kube, "mid")
-    return {("oci", "big"): (datetime.now(UTC) - timedelta(hours=2), frozenset({"B"}))}
+    return {("oci", "big"): (datetime.now(UTC) - timedelta(hours=2), frozenset({("B", None)}))}
 
 
 @pytest.mark.offered
@@ -1534,9 +1534,9 @@ def test_waits_are_rebuilt_every_cycle(kube, keeper_skus):
     keeper_skus["oci"] = {"big": {}, "gone": {}}
     publish_offered(kube, offered_configmap({"big": spot_entry(quota(need=384, headroom=128))}))
     old = datetime.now(UTC) - timedelta(hours=1)
-    waits = {("oci", "big"): (old, frozenset({"B"})), ("oci", "gone"): (old, frozenset({"B"}))}
+    waits = {("oci", "big"): (old, frozenset({("B", None)})), ("oci", "gone"): (old, frozenset({("B", None)}))}
     assert plan_wet(kube, keeper_skus, quota_waits=waits) == []
-    assert waits == {("oci", "big"): (old, frozenset({"B"}))}
+    assert waits == {("oci", "big"): (old, frozenset({("B", None)}))}
 
 
 @pytest.mark.offered
@@ -1545,7 +1545,7 @@ def test_the_longest_waiter_wins_so_two_holders_do_not_block_each_other(kube, ke
     publish_offered(
         kube, offered_configmap({"small": spot_entry(quota(need=8, headroom=128)), "mid": spot_entry(quota())})
     )
-    waits["oci", "small"] = (datetime.now(UTC) - timedelta(hours=3), frozenset({"B"}))
+    waits["oci", "small"] = (datetime.now(UTC) - timedelta(hours=3), frozenset({("B", None)}))
     keeper_skus["oci"] = {"small": {}, "big": {}}
     assert plan_wet(kube, keeper_skus, quota_waits=waits) == ["small"]
 
@@ -1593,7 +1593,7 @@ def test_the_reservation_waits_for_quotaReserveAfterMinutes(kube, keeper_skus):
     keeper_skus["oci"] = {"big": {}, "small": {}}
     big = spot_entry(quota(need=384, headroom=128), spot_available=False)
     publish_offered(kube, offered_configmap({"big": big, "small": spot_entry(quota(need=8, headroom=128))}))
-    waits = {("oci", "big"): (datetime.now(UTC) - timedelta(minutes=30), frozenset({"B"}))}
+    waits = {("oci", "big"): (datetime.now(UTC) - timedelta(minutes=30), frozenset({("B", None)}))}
     assert plan_wet(kube, keeper_skus, quota_waits=waits) == ["small"]
 
 
@@ -1601,7 +1601,7 @@ def test_the_reservation_waits_for_quotaReserveAfterMinutes(kube, keeper_skus):
 def test_a_sku_that_gets_planned_stops_waiting(kube, keeper_skus):
     keeper_skus["oci"] = {"big": {}}
     publish_offered(kube, offered_configmap({"big": spot_entry(quota(need=64, headroom=128))}))
-    waits = {("oci", "big"): (datetime.now(UTC) - timedelta(hours=3), frozenset({"B"}))}
+    waits = {("oci", "big"): (datetime.now(UTC) - timedelta(hours=3), frozenset({("B", None)}))}
     assert plan_wet(kube, keeper_skus, quota_waits=waits) == ["big"]
     assert waits == {}
 
@@ -1633,7 +1633,7 @@ def test_waits_of_skus_after_the_vendor_cap_are_kept(kube, keeper_skus):
     fits = spot_entry(quota("B2", need=8, headroom=128))
     busy = spot_entry(quota("B", need=384, headroom=128))
     publish_offered(kube, offered_configmap({first: fits, second: fits, third: busy}))
-    wait = (datetime.now(UTC) - timedelta(minutes=50), frozenset({"B"}))
+    wait = (datetime.now(UTC) - timedelta(minutes=50), frozenset({("B", None)}))
     waits = {("oci", third): wait}
     cfg = auto_config(max_in_flight=1)
     assert plan_wet(kube, keeper_skus, cfg, quota_waits=waits) == [first]  # the cap stops the loop before `third`
@@ -1664,3 +1664,229 @@ def test_a_spot_run_without_spot_quotas_consumes_nothing_known(kube, keeper_skus
     )
     pending_run(kube, "old")  # spot offered without quotas: counts nothing, like a new run of that kind
     assert plan_wet(kube, keeper_skus) == ["new"]
+
+
+# --------------------------------------------------------------------------- packing: order, fill, regions
+
+
+def market(series="s", price=1.0, regions=5, accelerators=0, spot=None, vcpus=4):
+    """What `keeper.sku_market` returns: `regions` regions with an on-demand price (`spot`: {region: price})."""
+    return {
+        "series": series,
+        "accelerators": accelerators,
+        "memory_generation": "DDR4",
+        "vcpus": vcpus,
+        "memory_gib": 16,
+        "ondemand": {f"r{i}": price for i in range(regions)},
+        "spot": spot or {},
+    }
+
+
+class Markets(dict):
+    calls: list
+
+
+@pytest.fixture
+def markets(monkeypatch):
+    """`keeper.sku_market` answers with this dict ({sku: market}); the calls are kept in `markets.calls`."""
+    data = Markets()
+    data_calls = []
+    monkeypatch.setattr(keeper, "region_ids", lambda env, vendor: {})
+    monkeypatch.setattr(keeper, "sku_market", lambda env, vendor, sku, ids: data_calls.append(sku) or data.get(sku))
+    data.calls = data_calls
+    return data
+
+
+def test_the_popularity_order_replaces_crc32(kube, keeper_skus, markets):
+    keeper_skus["oci"] = {"gpu": {}, "narrow": {}, "wide": {}}
+    markets.update(
+        gpu=market("g", regions=30, accelerators=1), narrow=market("n", regions=5), wide=market("w", regions=9)
+    )
+    cache = popularity_cache()
+    assert plan_wet(kube, keeper_skus, popularity_cache=cache) == ["wide", "narrow", "gpu"]
+
+
+def popularity_cache():
+    from k8s_inspector import popularity
+
+    return popularity.PopularityCache()
+
+
+def test_without_popularity_data_the_order_is_crc32_and_planning_goes_on(kube, keeper_skus, markets, monkeypatch):
+    keeper_skus["oci"] = {"a": {}, "b": {}, "c": {}}
+
+    def down(*a):
+        raise RuntimeError("keeper HTTP 503")
+
+    monkeypatch.setattr(keeper, "sku_market", down)
+    assert plan_wet(kube, keeper_skus, popularity_cache=popularity_cache()) == list(order("a", "b", "c"))
+
+
+def test_the_cache_is_warmed_a_few_skus_per_cycle(kube, keeper_skus, markets):
+    from k8s_inspector import popularity
+
+    keeper_skus["oci"] = {f"s{i}": {} for i in range(popularity.LOOKUPS_PER_CYCLE + 5)}
+    cache = popularity_cache()
+    plan(kube, auto_config(max_in_flight=0), {}, popularity_cache=cache, dry_run=True)
+    assert markets.calls == []  # a paused vendor is not even looked at
+    plan(kube, auto_config(max_in_flight=None), {}, popularity_cache=cache, dry_run=True)
+    assert len(markets.calls) == popularity.LOOKUPS_PER_CYCLE
+    plan(kube, auto_config(max_in_flight=None), {}, popularity_cache=cache, dry_run=True)
+    assert len(markets.calls) == popularity.LOOKUPS_PER_CYCLE + 5  # nothing is asked twice within a day
+
+
+def test_a_sku_that_does_not_fit_the_usd_budget_is_skipped_and_cheaper_ones_fill_it(kube, keeper_skus, markets, caplog):
+    keeper_skus["oci"] = {"dear": {}, "cheap": {}, "mid": {}}
+    markets.update(dear=market("w", price=5, regions=9), cheap=market("n", price=0.3), mid=market("m", price=0.5))
+    cfg = auto_config(max_in_flight=5, max_usd_per_hour=1.0)
+    with caplog.at_level("INFO"):
+        planned = plan_wet(kube, keeper_skus, cfg, popularity_cache=popularity_cache())
+    assert planned == ["cheap", "mid"]  # as wide as each other: crc32 of the series; "dear" fits neither time
+    assert "autoPlan skips oci/dear: its node costs about 5 USD/hour, 1 are left under maxUsdPerHour" in caplog.text
+
+
+def test_max_in_flight_stops_the_cycle_when_the_slots_are_full(kube, keeper_skus):
+    keeper_skus["oci"] = {name: {} for name in "abcd"}
+    assert len(plan_wet(kube, keeper_skus, auto_config(max_in_flight=3))) == 3
+
+
+def test_an_unset_max_in_flight_is_unbounded_up_to_the_burst_cap(kube, keeper_skus):
+    keeper_skus["oci"] = {f"s{i}": {} for i in range(12)}
+    cfg = Config(
+        EnvConfig(bucket="b", bucket_region="r"),
+        Settings(
+            auto_plan=True,
+            vendors={"oci": VendorSettings(enabled=True, publish=True)},
+            defaults=Defaults(max_in_flight=None),
+        ),
+    )
+    assert len(plan_wet(kube, keeper_skus, cfg)) == 10  # maxNewRunsPerCycle defaults to 10
+    assert len(plan_wet(kube, keeper_skus, cfg)) == 2  # the other two; the first ten hold their runs
+
+
+def test_max_new_runs_per_cycle_is_a_burst_cap_per_vendor(kube, keeper_skus, caplog):
+    keeper_skus["oci"] = {f"s{i}": {} for i in range(6)}
+    with caplog.at_level("INFO"):
+        assert len(plan_wet(kube, keeper_skus, auto_config(max_in_flight=None, max_new_runs_per_cycle=2))) == 2
+    assert "its maxNewRunsPerCycle" in caplog.text
+
+
+def regional(bucket="B", need=64, limit=256, **regions):
+    """A quota entry with `regions` ({region: headroom}); the entry's own headroom is the best region's."""
+    return {
+        "bucket": bucket,
+        "unit": "vCPU",
+        "need": need,
+        "maxLimit": limit,
+        "maxHeadroom": max(regions.values()),
+        "regions": [{"region": name, "limit": limit, "headroom": room} for name, room in regions.items()],
+    }
+
+
+def planned_regions(kube):
+    return {from_dict(o).spec.sku: from_dict(o).spec.region for o in kube.objects.values()}
+
+
+@pytest.mark.offered
+def test_a_run_is_pinned_to_the_cheapest_region_where_it_fits(kube, keeper_skus, markets):
+    keeper_skus["oci"] = {"s": {}}
+    markets["s"] = market(spot={"cheap": 0.1, "mid": 0.2, "dear": 0.3})
+    entry = spot_entry(regional(cheap=32, mid=128, dear=512))  # `cheap` has no room for 64 vCPU
+    publish_offered(kube, offered_configmap({"s": entry}))
+    assert plan_wet(kube, keeper_skus, popularity_cache=popularity_cache()) == ["s"]
+    assert planned_regions(kube) == {"s": "mid"}
+
+
+@pytest.mark.offered
+def test_regional_consumption_is_counted_per_region_within_a_cycle(kube, keeper_skus, markets):
+    keeper_skus["oci"] = {"a": {}, "b": {}, "c": {}, "d": {}}
+    for sku in "abcd":
+        markets[sku] = market(series=sku, spot={"x": 0.1, "y": 0.2})
+    entry = spot_entry(regional(x=128, y=64))
+    publish_offered(kube, offered_configmap({sku: entry for sku in "abcd"}))
+    assert len(plan_wet(kube, keeper_skus, popularity_cache=popularity_cache())) == 3  # x: 2 runs, y: 1 run
+    regions = sorted(planned_regions(kube).values())
+    assert regions == ["x", "x", "y"]
+
+
+@pytest.mark.offered
+def test_a_global_bucket_is_checked_account_wide_next_to_a_regional_one(kube, keeper_skus, markets):
+    keeper_skus["oci"] = {"a": {}, "b": {}}
+    markets.update(a=market("a", spot={"x": 0.1}), b=market("b", spot={"x": 0.1}))
+    global_bucket = {"bucket": "TOTAL", "unit": "vCPU", "need": 64, "maxLimit": 128, "maxHeadroom": 100}
+    entry = spot_entry(regional(x=512), global_bucket)  # the account has room for one run only
+    publish_offered(kube, offered_configmap({"a": entry, "b": entry}))
+    assert len(plan_wet(kube, keeper_skus, popularity_cache=popularity_cache())) == 1
+
+
+@pytest.mark.offered
+def test_without_regions_the_max_headroom_decides_and_nothing_is_pinned(kube, keeper_skus, markets):
+    keeper_skus["oci"] = {"s": {}}
+    markets["s"] = market(spot={"cheap": 0.1})
+    publish_offered(kube, offered_configmap({"s": spot_entry(quota(need=64, headroom=128))}))
+    assert plan_wet(kube, keeper_skus, popularity_cache=popularity_cache()) == ["s"]
+    assert planned_regions(kube) == {"s": None}
+
+
+@pytest.mark.offered
+def test_a_sku_that_fits_no_region_is_deferred_as_busy(kube, keeper_skus, markets, caplog):
+    keeper_skus["oci"] = {"s": {}}
+    publish_offered(kube, offered_configmap({"s": spot_entry(regional(x=32, y=16), spot_available=False)}))
+    with caplog.at_level("INFO"):
+        assert plan_wet(kube, keeper_skus) == []
+    assert "autoPlan defers oci/s: spot quota busy (bucket B: need 64 vCPU, headroom 32 in x (and 1 more regions))" in (
+        caplog.text
+    )
+
+
+def drain_listing(kube, keeper_skus, markets):
+    """`big` needs 200 of 256 vCPU in each region; a run of `mid` holds 64 of region `b`, where spot is cheaper."""
+    keeper_skus["oci"] = {"big": {}, "small": {}}
+    markets["small"] = market(spot={"a": 0.5, "b": 0.1})
+    entries = {
+        "big": spot_entry(regional(need=200, a=128, b=128), spot_available=False),
+        "small": spot_entry(regional(need=8, a=128, b=128)),
+        "mid": spot_entry(regional(need=64, a=128, b=128)),
+    }
+    publish_offered(kube, offered_configmap(entries))
+    planner._create_run(kube, auto_config(), "oci", "mid", [SPOT_TASK], region="b")
+
+
+@pytest.mark.offered
+def test_a_big_sku_waiting_for_quota_asks_to_drain_the_region_its_own_runs_hold(kube, keeper_skus, markets):
+    drain_listing(kube, keeper_skus, markets)
+    waits = {}
+    assert plan_wet(kube, keeper_skus, quota_waits=waits, popularity_cache=popularity_cache()) == ["small"]
+    ((_, (since, keys)),) = waits.items()
+    assert keys == frozenset({("B", "b")})  # `small` is not big: it never waits
+
+
+@pytest.mark.offered
+def test_a_drained_region_takes_no_other_run_while_the_others_keep_filling(kube, keeper_skus, markets, caplog):
+    drain_listing(kube, keeper_skus, markets)
+    waits = {("oci", "big"): (datetime.now(UTC) - timedelta(hours=2), frozenset({("B", "b")}))}
+    assert plan_wet(kube, keeper_skus, quota_waits=waits, popularity_cache=popularity_cache()) == ["small"]
+    assert planned_regions(kube)["small"] == "a"  # `b` is cheaper, but reserved for `big`
+
+
+@pytest.mark.offered
+def test_the_drain_ends_when_own_runs_no_longer_hold_the_region(kube, keeper_skus, markets):
+    drain_listing(kube, keeper_skus, markets)
+    kube.set_status(next(iter(kube.objects)), phase="Done")
+    waits = {("oci", "big"): (datetime.now(UTC) - timedelta(hours=2), frozenset({("B", "b")}))}
+    plan_wet(kube, keeper_skus, quota_waits=waits, popularity_cache=popularity_cache())
+    assert planned_regions(kube)["small"] == "b"
+
+
+@pytest.mark.offered
+def test_quota_reserve_after_minutes_zero_turns_the_drain_off(kube, keeper_skus, markets):
+    drain_listing(kube, keeper_skus, markets)
+    waits = {("oci", "big"): (datetime.now(UTC) - timedelta(hours=2), frozenset({("B", "b")}))}
+    settings = Settings(
+        vendors={"oci": VendorSettings(enabled=True, publish=True, max_in_flight=5)},
+        auto_plan=True,
+        spot=SpotSettings(quota_reserve_after_minutes=0),
+    )
+    cfg = Config(EnvConfig(bucket="b", bucket_region="r"), settings)
+    plan_wet(kube, keeper_skus, cfg, quota_waits=waits, popularity_cache=popularity_cache())
+    assert planned_regions(kube)["small"] == "b"

@@ -54,6 +54,9 @@ spec:
                 description: Keep the node after the last step (a duration such as 2h).
                 type: string
                 default: 0s
+              region:
+                description: Server runs only. The region the planner placed the run in; every attempt's anchor selects it (`topology.kubernetes.io/region`). Absent - any region.
+                type: string
               database:
                 description: DBaaS runs only (their `sku` is the database id). `vendor` and `id` are Keeper's, `region` is the database's region and `clientRegion` the client node's (default `region`; another region of the same city when the vendor's database and server regions differ).
                 type: object

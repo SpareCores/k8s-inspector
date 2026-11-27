@@ -13,11 +13,11 @@ import threading
 import time
 import zlib
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import NamedTuple
 
-from k8s_inspector import crd, keeper, launch, pods, publisher, render, spot, tasks
+from k8s_inspector import crd, keeper, launch, pods, popularity, publisher, render, spot, tasks
 from k8s_inspector.kube import Kube, NotFound
 from k8s_inspector.model import (
     BenchmarkRun,
@@ -45,6 +45,8 @@ class PlannedRun:
     sku: str
     tasks: tuple[str, ...]  # due task names
     reason: str  # for logs and `plan --dry-run`
+    region: str | None = None  # the region the run is pinned to (`RunSpec.region`), None: any
+    score: str = ""  # the popularity components that ranked the SKU (`popularity.rank`), for logs
 
 
 def spend_per_hour(runs: list[BenchmarkRun]) -> float:
@@ -86,13 +88,17 @@ def live_nodeclaims(kube: Kube, cfg: Config, vendor: str) -> int:
     return sum(1 for claim in claims if pods.claim_vendor(claim) == vendor)
 
 
-def check_vendor_budget(kube: Kube, cfg: Config, vendor: str, runs: list[BenchmarkRun]) -> None:
-    """Raise `ValueError` when one more run of `vendor` would pass `maxInFlight` (0 pauses the vendor), or when
-    `maxUsdPerHour` is set and the holding runs already cost the cap, or one of them has no price (a run still in
-    Pending or Provisioning: wait; a run with a node: unknown spend, refused, with a warning). In flight =
-    max(`holding_runs`, live bench NodeClaims), a lower bound ("at least"): leftover NodeClaims without a holding
-    run add to the count but not to the spend. Used by `force_run` (without `force`) and autoPlan. Not atomic: two
-    concurrent callers can both pass the check."""
+def check_vendor_budget(
+    kube: Kube, cfg: Config, vendor: str, runs: list[BenchmarkRun], estimates: dict[str, float] | None = None
+) -> float | None:
+    """Raise `ValueError` when one more run of `vendor` would pass `maxInFlight` (0 pauses the vendor; unset: no
+    limit), or when `maxUsdPerHour` is set and the holding runs already cost the cap, or one of them has no price (a
+    run still in Pending or Provisioning: wait; a run with a node: unknown spend, refused, with a warning). In
+    flight = max(`holding_runs`, live bench NodeClaims), a lower bound ("at least"): leftover NodeClaims without a
+    holding run add to the count but not to the spend. `estimates` ({run name: USD/hour}) are the planner's
+    estimates for runs it created in this cycle: such a run counts with its estimate instead of being waited for.
+    Returns what is left under `maxUsdPerHour` (None without a cap). Used by `force_run` (without `force`) and
+    autoPlan. Not atomic: two concurrent callers can both pass the check."""
     settings = cfg.settings
     vendor_settings = settings.vendors[vendor]
     limit = vendor_settings.max_in_flight
@@ -107,11 +113,12 @@ def check_vendor_budget(kube: Kube, cfg: Config, vendor: str, runs: list[Benchma
     in_flight = max(
         len(active), live_nodeclaims(kube, cfg, vendor) - client_nodes
     )  # a DBaaS client is not a server run
-    if in_flight >= limit:
+    if limit is not None and in_flight >= limit:
         raise ValueError(f"vendor {vendor} is at its maxInFlight limit ({in_flight} of {limit} instances in flight)")
     cap = vendor_settings.max_usd_per_hour
     if cap is None:
-        return
+        return None
+    estimates = estimates or {}
     unpriced = [r for r in active if not r.status.price_per_hour]
     for run in unpriced:
         if run.status.node:
@@ -123,13 +130,15 @@ def check_vendor_budget(kube: Kube, cfg: Config, vendor: str, runs: list[Benchma
             f"vendor {vendor} has maxUsdPerHour {cap}: the node of {', '.join(no_price)} has no price annotation "
             f"{PRICE_ANNOTATION} (the operator must check SCarpenter), so the spend is unknown"
         )
-    if no_node_yet:
+    if waiting := [name for name in no_node_yet if name not in estimates]:
         raise ValueError(
-            f"vendor {vendor} has maxUsdPerHour {cap}: wait until {', '.join(no_node_yet)} has a price "
+            f"vendor {vendor} has maxUsdPerHour {cap}: wait until {', '.join(waiting)} has a price "
             "before starting a run"
         )
-    if spend_per_hour(active) >= cap:
+    spend = spend_per_hour(active) + sum(estimates[name] for name in no_node_yet)
+    if spend >= cap:
         raise ValueError(f"vendor {vendor} is at its maxUsdPerHour cap ({cap} USD/hour)")
+    return cap - spend
 
 
 def force_run(
@@ -179,6 +188,7 @@ def _create_run(
     force: bool = False,
     capacity: CapacityMode | None = None,
     hold_after: timedelta = timedelta(0),
+    region: str | None = None,
 ) -> BenchmarkRun:
     spec = RunSpec(
         vendor=vendor,
@@ -188,9 +198,13 @@ def _create_run(
         force=force,
         capacity=capacity or cfg.settings.vendors[vendor].capacity,
         hold_after=hold_after,
+        region=region,
     )
     run = crd.create_run(kube, spec)
-    log.info("created run", extra={"run": run.name, "vendor": vendor, "sku": sku, "tasks": ",".join(names)})
+    log.info(
+        "created run",
+        extra={"run": run.name, "vendor": vendor, "sku": sku, "tasks": ",".join(names), "region": region},
+    )
     return run
 
 
@@ -337,10 +351,22 @@ def _until(offerings: list) -> datetime | None:
     return max(untils, default=None)
 
 
+def _regions(quota: dict) -> dict[str, dict]:
+    """`{region: {limit, headroom}}` of a quota entry's `regions`; empty when absent (a global bucket, or unknown)
+    or damaged (the entry then counts as without regions: its `maxHeadroom` decides)."""
+    try:
+        return {
+            str(r["region"]): {"limit": float(r["limit"]), "headroom": float(r["headroom"])}
+            for r in quota.get("regions") or []
+        }
+    except KeyError, TypeError, ValueError:
+        return {}
+
+
 def _quotas(offerings: list) -> dict[str, list[dict]]:
     """The quota entries of each offering group, by capacity type: `{capacityType: [{bucket, unit, need, maxLimit,
-    maxHeadroom}]}`, whether or not the group is available. A group without `quotas` or with a damaged one is left
-    out (no quota model: the planner behaves as without this field)."""
+    maxHeadroom, regions}]}` (`regions` from `_regions`), whether or not the group is available. A group without
+    `quotas` or with a damaged one is left out (no quota model: the planner behaves as without this field)."""
     result = {}
     for offering in offerings:
         try:
@@ -351,6 +377,7 @@ def _quotas(offerings: list) -> dict[str, list[dict]]:
                     "need": float(q["need"]),
                     "maxLimit": float(q["maxLimit"]),
                     "maxHeadroom": float(q["maxHeadroom"]),
+                    "regions": _regions(q),
                 }
                 for q in offering["quotas"]
             ]
@@ -502,9 +529,12 @@ SPOT_BUSY = "spot quota busy"
 ON_DEMAND_BUSY = "on-demand quota busy"
 IN_FLIGHT = (RunPhase.PENDING, RunPhase.PROVISIONING, RunPhase.RUNNING)  # phases of a run that holds or takes quota
 
-# The SKUs of each vendor deferred for a busy spot quota, kept across cycles by the controller (a restart resets
-# them): (vendor, sku) -> (deferred since, the spot quota buckets the SKU needs). Rebuilt every cycle.
-QuotaWaits = dict[tuple[str, str], tuple[datetime, frozenset[str]]]
+# One quota bucket in one region (None: the bucket as a whole, for a global bucket or a SKU without region facts).
+QuotaKey = tuple[str, str | None]
+
+# The big SKUs of each vendor deferred for a busy spot quota, kept across cycles by the controller (a restart resets
+# them): (vendor, sku) -> (deferred since, the quota keys they ask to drain). Rebuilt every cycle.
+QuotaWaits = dict[tuple[str, str], tuple[datetime, frozenset[QuotaKey]]]
 
 
 def _never_fits(quotas: list[dict]) -> bool:
@@ -539,23 +569,61 @@ def _group(entry: dict, spot_ok: bool) -> list[dict]:
     return [] if _never_fits(on_demand) else on_demand
 
 
+@dataclass
+class Decision:
+    """What `QuotaPass.decide` says about one SKU."""
+
+    quotas: list[dict] = field(default_factory=list)  # the quota entries the run consumes
+    region: str | None = None  # where to pin the run, None: nowhere
+    price: float | None = None  # estimated USD/hour of its node (Keeper), None: unknown
+    deferred: str | None = None  # why the SKU waits for a later cycle
+    reserved: bool = False  # deferred because another SKU's reservation holds the quota
+    wait_keys: frozenset[QuotaKey] | None = None  # a big SKU deferred for busy spot quota: the buckets to drain
+
+
+def _key(quota: dict, region: str | None) -> QuotaKey:
+    """The consumption key of a quota entry: per region when SCarpenter lists the region for it, else per bucket."""
+    return quota["bucket"], region if region in quota["regions"] else None
+
+
+def _limit(quota: dict, region: str | None) -> float:
+    return quota["regions"][region]["limit"] if region in quota["regions"] else quota["maxLimit"]
+
+
 class QuotaPass:
     """The quota view of one vendor in one cycle. `entries` are the SKUs of the listing with `quotas`; a missing or
-    truncated listing has none, so nothing here applies (a truncated one proves nothing about quota). Per bucket:
+    truncated listing has none, so nothing here applies (a truncated one proves nothing about quota). A quota entry
+    with `regions` is per region; one without (a global bucket, or unknown regions) is judged by `maxHeadroom`
+    against everything consumed in the bucket. Per bucket and region (`QuotaKey`):
 
-    - `consumed`: quota of the vendor's own runs that the listing's `maxHeadroom` does not show, plus the runs
+    - `consumed`: quota of the vendor's own runs that the listing's headroom does not show, plus the runs
       planned in this cycle. SCarpenter's headroom is `limit - used - reserved` as of the listing's `generatedAt`,
       and `reserved` starts with a launch, so it misses a run created after `generatedAt` and an anchor without a
       NodeClaim (or node) yet. A run with a NodeClaim that is older than `generatedAt` is in `reserved` or `used`
       already and is not counted again (a NodeClaim created just before `generatedAt` may not be in `reserved` yet).
-    - `held`: the buckets that the vendor's own runs in flight consume. A reservation (`reserved_for`) only matters
-      for these: when others hold the quota, keeping SKUs back frees nothing."""
+      A run without a region (not pinned) counts under region None, against every region.
+    - `held`: the keys that the vendor's own runs in flight consume. A reservation only matters for these: when
+      others hold the quota, keeping SKUs back frees nothing.
+    - `reserved`: the held keys that a SKU deferred longer than `limit` (the anti-starvation rule, `waits`) keeps for
+      itself: no other run is placed there until the runs in flight drain. The longest waiter wins a key."""
 
-    def __init__(self, kube: Kube, cfg: Config, vendor: str, runs: list[BenchmarkRun], offered: Offered | None, now):
+    def __init__(
+        self,
+        kube: Kube,
+        cfg: Config,
+        vendor: str,
+        runs: list[BenchmarkRun],
+        offered: Offered | None,
+        now,
+        waits: dict[str, tuple[datetime, frozenset[QuotaKey]]] | None = None,
+    ):
         self.kube, self.cfg, self.vendor, self.now = kube, cfg, vendor, now
         self.entries = {}
-        self.consumed: dict[str, float] = {}
-        self.held: set[str] = set()
+        self.consumed: dict[QuotaKey, float] = {}
+        self.held: set[QuotaKey] = set()
+        self.waits = waits or {}
+        self.limit = timedelta(minutes=cfg.settings.spot.quota_reserve_after_minutes)
+        self.reserved: dict[QuotaKey, tuple[datetime, str]] = {}  # key -> (waiting since, the SKU that reserves it)
         if offered is None or offered.truncated:
             return
         self.entries = {sku: entry for sku, entry in offered.entries.items() if entry["quotas"]}
@@ -570,9 +638,14 @@ class QuotaPass:
             quotas = self._run_quotas(run)
             unseen = (run.name not in claimed and not run.status.node) or run.created > offered.generated_at
             if unseen:
-                self.consume(quotas)
+                self.consume(quotas, run.spec.region)
             else:
-                self.held.update(q["bucket"] for q in quotas)
+                self.held.update(_key(q, run.spec.region) for q in quotas)
+        if self.limit:
+            for holder, (since, keys) in sorted(self.waits.items(), key=lambda item: (item[1][0], item[0])):
+                if now - since > self.limit:
+                    for key in keys & self.held:
+                        self.reserved.setdefault(key, (since, holder))  # the longest waiter comes first
 
     def _run_quotas(self, run: BenchmarkRun) -> list[dict]:
         """The quota entries the run consumes with the capacity it will really use (`spot.capacity_for_next_attempt`:
@@ -594,56 +667,139 @@ class QuotaPass:
             spot_ok = spot.capacity_for_next_attempt(run, selected, settings, quarantined)[0] == CapacityType.SPOT
         return _group(entry, spot_ok)
 
-    def consume(self, quotas: list[dict]) -> None:
+    def consume(self, quotas: list[dict], region: str | None = None) -> None:
         for q in quotas:
-            self.consumed[q["bucket"]] = self.consumed.get(q["bucket"], 0) + q["need"]
-            self.held.add(q["bucket"])
+            key = _key(q, region)
+            self.consumed[key] = self.consumed.get(key, 0) + q["need"]
+            self.held.add(key)
 
-    def _busy(self, quotas: list[dict]) -> str | None:
-        """Why one more instance does not fit the entries (each against its own `maxHeadroom` minus the bucket's
-        `consumed`), else None."""
+    def _room(self, quota: dict, region: str | None) -> float:
+        """What is left of the entry for one more run in `region`: its regional headroom minus what is consumed
+        there (and by runs without a region), else `maxHeadroom` minus everything consumed in the bucket."""
+        bucket = quota["bucket"]
+        if region in quota["regions"]:
+            used = self.consumed.get((bucket, region), 0) + self.consumed.get((bucket, None), 0)
+            return quota["regions"][region]["headroom"] - used
+        return quota["maxHeadroom"] - sum(v for (b, _), v in self.consumed.items() if b == bucket)
+
+    def _busy(self, quotas: list[dict], region: str | None) -> str | None:
+        """Why one more instance in `region` does not fit the entries, else None."""
         for q in quotas:
-            room = q["maxHeadroom"] - self.consumed.get(q["bucket"], 0)
+            room = self._room(q, region)
             if q["need"] > room:
-                return f"bucket {q['bucket']}: need {q['need']:g} {q['unit']}, headroom {room:g}"
+                where = f" in {region}" if region in q["regions"] else ""
+                return f"bucket {q['bucket']}: need {q['need']:g} {q['unit']}, headroom {room:g}{where}"
         return None
 
-    def decide(self, sku: str, task_names: list[str]) -> tuple[list[dict], str | None, bool]:
-        """`(quota entries one new run of the SKU consumes, reason to defer it or None, deferred for a busy spot
-        quota)`. The run consumes `_group` of the SKU. With room it is planned; busy, the SKU is deferred (a spot run
-        would fall back to on-demand and cost several times as much). A group that never fits or has no quotas
-        changes nothing."""
+    def _holder(self, sku: str, quotas: list[dict], region: str | None) -> str | None:
+        """The SKU whose reservation keeps `sku` out of `region`, else None. Only a SKU that has waited longer than
+        `sku` itself reserves against it, so two holders cannot block each other."""
+        mine = self.waits[sku][0] if sku in self.waits else self.now
+        for q in quotas:
+            since, holder = self.reserved.get(_key(q, region), (mine, sku))
+            if holder != sku and since < mine:
+                return holder
+        return None
+
+    def _wait_keys(self, sku: str, quotas: list[dict], candidates: list[str | None]) -> frozenset[QuotaKey] | None:
+        """The keys a SKU deferred for busy spot quota asks to drain, in ONE region: the one it chose before while
+        that is still a candidate, else the one with the most room among those where the vendor's own runs hold the
+        quota (only those drain), else the most room anywhere. None unless the SKU is big there (it needs more
+        than half of an entry's limit): the others fit as soon as a few runs end."""
+        old = {key[1] for key in self.waits[sku][1]} if sku in self.waits else set()
+        held = [r for r in candidates if any(_key(q, r) in self.held for q in quotas)]  # only these can drain
+        pool = [r for r in candidates if r in old] or held or candidates
+        region = max(pool, key=lambda r: min(self._room(q, r) - q["need"] for q in quotas))
+        if not any(q["need"] > _limit(q, region) / 2 for q in quotas):
+            return None
+        return frozenset(_key(q, region) for q in quotas)
+
+    def decide(self, sku: str, task_names: list[str], market: dict | None = None) -> Decision:
+        """Where and whether one new run of the SKU goes. The run consumes `_group` of the SKU. Without quota entries
+        nothing is known and it is planned unpinned. Otherwise every region the entries list (all regional entries
+        must list it) is a candidate, or just no region when no entry has `regions`; a region where the run does not
+        fit, or that another SKU reserves, is out, and of the rest the cheapest one by Keeper's price for the capacity
+        type (`market`, `popularity.rank`'s data; no price: last) is chosen. With no candidate the SKU is deferred
+        (busy spot quota: it would fall back to on-demand and cost several times as much). A group that never fits or
+        has no quotas changes nothing."""
         entry = self.entries.get(sku)
         if entry is None:
-            return [], None, False
+            return Decision(price=_cheapest(market, "ondemand"))
         spot_ok = spot_capable(self.kube, self.cfg, self.vendor, sku, task_names, self.now)
         group = _group(entry, spot_ok)
-        if why := self._busy(group):
-            is_spot = group is entry["quotas"].get(CapacityType.SPOT)
-            return [], f"{SPOT_BUSY if is_spot else ON_DEMAND_BUSY} ({why})", is_spot
-        return group, None, False
+        is_spot = bool(group) and group is entry["quotas"].get(CapacityType.SPOT)
+        prices = (market or {}).get("spot" if is_spot else "ondemand", {})
+        regional = [set(q["regions"]) for q in group if q["regions"]]
+        candidates: list[str | None] = sorted(set.intersection(*regional)) if regional else []
+        candidates = candidates or [None]
+        busy = {region: self._busy(group, region) for region in candidates}
+        fitting = [region for region in candidates if not busy[region]]
+        if not fitting:
+            why = busy[candidates[0]] + (f" (and {len(candidates) - 1} more regions)" if len(candidates) > 1 else "")
+            keys = self._wait_keys(sku, group, candidates) if is_spot else None
+            return Decision(deferred=f"{SPOT_BUSY if is_spot else ON_DEMAND_BUSY} ({why})", wait_keys=keys)
+        free = [region for region in fitting if not self._holder(sku, group, region)]
+        if not free:
+            holder = self._holder(sku, group, fitting[0])
+            return Decision(deferred=f"its quota is reserved for {holder}, deferred over {self.limit}", reserved=True)
+        region = min(free, key=lambda r: (prices.get(r) is None, prices.get(r) or 0, r or ""))
+        price = prices.get(region) if region else (min(prices.values()) if prices else None)
+        return Decision(group, region, price)
 
-    def reserved_for(
-        self, waits: dict[str, tuple[datetime, frozenset[str]]], sku: str, buckets: frozenset[str], limit: timedelta
-    ) -> str | None:
-        """The SKU whose reservation keeps `sku` back, else None (the anti-starvation rule). `waits` are the vendor's
-        SKUs deferred for a busy spot quota in the last cycle, with since when. A SKU deferred longer than `limit`
-        reserves its buckets as long as the vendor's own runs in flight consume them (`held`); `sku` is kept back
-        when it would consume one and the holder has waited longer than `sku` itself (the longest waiter wins, so
-        two holders cannot block each other). `limit` 0 turns the reservation off."""
-        if not limit:
-            return None
-        mine = waits[sku][0] if sku in waits else self.now
-        for other, (since, other_buckets) in sorted(waits.items(), key=lambda item: (item[1][0], item[0])):
-            if other != sku and since < mine and self.now - since > limit and other_buckets & buckets & self.held:
-                return other
-        return None
+
+def _cheapest(market: dict | None, allocation: str) -> float | None:
+    prices = (market or {}).get(allocation)
+    return min(prices.values()) if prices else None
 
 
 def start_order(vendor: str, sku: str) -> tuple[int, str]:
     """Legacy `lib.instance_start_order_key`: crc32 of `vendor/sku` mixes the sizes (price order would exhaust the
     quota of a new vendor on the small SKUs first); the SKU name breaks ties."""
     return zlib.crc32(f"{vendor}/{sku}".encode()), sku
+
+
+def _due_tasks(
+    vendor: str,
+    sku: str,
+    server_tasks: list[TaskDef],
+    blocked: dict[str, list[str]],
+    metas: dict[str, dict | None],
+    newest: tuple[int | None, frozenset[str]],
+    first_seen_reader: FirstSeenReader | None,
+    now: datetime,
+) -> dict[str, str] | None:
+    """`{task name: why it is due}` of a SKU whose `schedule/<task>/meta.json` are `metas`, `blocked` the Keeper
+    reasons by task and `newest` its newest variant and the tasks that variant has (`NEW_VARIANT`); empty when
+    nothing is due, None when a meta is damaged (the SKU is skipped)."""
+    no_gpu = GPU_PROBE_TASK in blocked
+    variant, present = newest
+    first_seen, first_seen_read = None, False  # read at most once, and only when a task needs it
+    due = {}
+    for task in server_tasks:
+        if task.name in blocked or (task.gpu and no_gpu):
+            continue
+        meta = metas.get(task.name)
+        try:
+            reason = due_reason(task, meta, now)
+            if not reason and variant is not None and task.name not in present:
+                if not first_seen_read:
+                    first_seen, first_seen_read = _read_first_seen(first_seen_reader, vendor, sku, variant), True
+                if first_seen:
+                    reason = fill_reason(task, meta, first_seen, now)
+        except AttributeError, TypeError, ValueError:  # a damaged meta.json field: unreadable, skip the SKU
+            log.warning("autoPlan skips %s/%s: damaged schedule/%s/meta.json", vendor, sku, task.name)
+            return None
+        if reason:
+            due[task.name] = reason
+    return due
+
+
+def _started_skus(vendor: str, runs: list[BenchmarkRun], metas: dict[str, dict[str, dict | None]]) -> set[str]:
+    """The SKUs with a BenchmarkRun, or with a result that k8s-inspector wrote (a `run_id` in a meta), which marks
+    their series as started (`popularity.rank`)."""
+    from_runs = {r.spec.sku for r in runs if r.spec.vendor == vendor and r.spec.database is None}
+    from_results = {sku for sku, found in metas.items() if any(m and m.get("run_id") for m in found.values())}
+    return from_runs | from_results
 
 
 def plan_cycle(
@@ -657,13 +813,17 @@ def plan_cycle(
     first_seen_reader: FirstSeenReader | None = None,
     on_vendor_skipped: Callable[[str, str], None] | None = None,
     quota_waits: QuotaWaits | None = None,
+    popularity_cache: popularity.PopularityCache | None = None,
 ) -> list[PlannedRun]:
     """One autoPlan cycle. For each enabled vendor with autoPlan whose results are published (`publish`; without it
     git would never record them and the SKU would be run again and again) and that is below its caps
-    (`check_vendor_budget`): take the vendor's ACTIVE SKUs from Keeper in `start_order`, skip those that already
+    (`check_vendor_budget`): take the vendor's ACTIVE SKUs from Keeper in popularity order (`popularity.rank`;
+    crc32 `start_order` without `popularity_cache` or data), skip those that already
     have a BenchmarkRun (the lease) and those whose names are no label values (the anchor could not select them),
-    and create a run (not forced) for the first SKU with due tasks (`due_reason` on the git schedule metas) that
-    Keeper does not block, until the caps are reached: usually one run per vendor and cycle. GPU tasks are dropped
+    and create a run (not forced) for each SKU with due tasks (`due_reason` on the git schedule metas) that
+    Keeper does not block and that fits (a SKU that does not fit is skipped, the next is tried), until `maxInFlight`,
+    `maxUsdPerHour` or `maxNewRunsPerCycle` stops the cycle. A SKU whose quota entries list `regions` is pinned to the
+    cheapest region that fits (`QuotaPass.decide`; `RunSpec.region`). GPU tasks are dropped
     for a SKU whose `nvidia_smi` Keeper blocks (no GPU); a SKU with only GPU tasks due is not planned. A vendor
     whose publishing is stalled (`publisher.publishing_stalled`) is skipped: new runs would only pile up
     unpublished. A vendor that is `launch.paused` (BOOT_FAILURE on several SKUs, no node ready since) is skipped
@@ -752,83 +912,87 @@ def plan_cycle(
             log.info(
                 "autoPlan skips %d SKUs of vendor %s not offered by SCarpenter, e.g. %s", len(skipped), vendor, examples
             )
-        quota = QuotaPass(kube, cfg, vendor, runs, offered, aware_now)
         old_waits = {sku: wait for (v, sku), wait in quota_waits.items() if v == vendor and sku in skus}
-        new_waits: dict[str, tuple[datetime, frozenset[str]]] = {}  # the waits of this cycle replace the old ones
+        quota = QuotaPass(kube, cfg, vendor, runs, offered, aware_now, old_waits)
+        new_waits: dict[str, tuple[datetime, frozenset[QuotaKey]]] = {}  # the waits of this cycle replace the old ones
         bad_names = [sku for sku in skus if not pods.is_label_value(sku)]
         if bad_names:
             log.warning(
                 "autoPlan skips %d SKUs of vendor %s whose names are not label values, e.g. %s",
                 len(bad_names), vendor, bad_names[0],
             )  # fmt: skip
-        unreached: list[str] = []  # SKUs after a `break`: they keep their waits
-        for i, sku in enumerate(skus):
+        ready: dict[str, dict[str, str]] = {}  # SKUs with due tasks, in start order: {sku: {task: why}}
+        for sku in skus:
             if crd.run_name(vendor, sku) in leased or not publisher.publish_allowed(settings, vendor, sku):
                 continue
             if sku in bad_names or sku in skipped or sku in waiting:
                 continue
             if None in metas.get(sku, {}).values():  # unreadable meta.json: the publisher logged which
                 continue
-            no_gpu = GPU_PROBE_TASK in blocked[vendor][sku]
-            variant, present = newest.get(sku, (None, frozenset()))
-            first_seen, first_seen_read = None, False  # read at most once, and only when a task needs it
-            due = {}
-            for task in server_tasks:
-                if task.name in blocked[vendor][sku] or (task.gpu and no_gpu):
-                    continue
-                meta = metas.get(sku, {}).get(task.name)
-                try:
-                    reason = due_reason(task, meta, now)
-                    if not reason and variant is not None and task.name not in present:
-                        if not first_seen_read:
-                            first_seen, first_seen_read = (
-                                _read_first_seen(first_seen_reader, vendor, sku, variant),
-                                True,
-                            )
-                        if first_seen:
-                            reason = fill_reason(task, meta, first_seen, now)
-                except AttributeError, TypeError, ValueError:  # a damaged meta.json field: unreadable, skip the SKU
-                    log.warning("autoPlan skips %s/%s: damaged schedule/%s/meta.json", vendor, sku, task.name)
-                    due = None
-                    break
-                if reason:
-                    due[task.name] = reason
-            if due is None:
-                continue
-            if all(tasks.get_task(name).gpu for name in due):  # nothing due, or only GPU tasks
-                continue
-            quotas, deferred, spot_busy = quota.decide(sku, list(due))
-            if deferred:
-                log.info("autoPlan defers %s/%s: %s", vendor, sku, deferred)
-                if spot_busy:
+            due = _due_tasks(
+                vendor, sku, server_tasks, blocked[vendor][sku], metas.get(sku, {}),
+                newest.get(sku, (None, frozenset())), first_seen_reader, now,
+            )  # fmt: skip
+            if due and not all(tasks.get_task(name).gpu for name in due):  # nothing due, or only GPU tasks
+                ready[sku] = due
+        scores: dict[str, popularity.Score] = {}
+        if popularity_cache and ready:
+            popularity_cache.warm(cfg.env, vendor, list(ready))
+            markets = popularity_cache.markets(vendor)
+            scores = popularity.rank(vendor, list(ready), markets, _started_skus(vendor, runs, metas))
+            ready = dict(sorted(ready.items(), key=lambda item: scores[item[0]].key))
+        order = list(ready)
+        unreached: list[str] = []  # SKUs after a `break`: they keep their waits
+        estimates: dict[str, float] = {}  # price estimates of the runs created in this cycle
+        created = 0
+        room: float | None = None  # USD/hour left under maxUsdPerHour
+        try:
+            room = check_vendor_budget(kube, cfg, vendor, runs)
+        except ValueError as e:
+            log.info("autoPlan stops for vendor %s: %s", vendor, e)
+            order, unreached = [], list(ready)
+        for i, sku in enumerate(order):
+            due = ready[sku]
+            market = popularity_cache.markets(vendor).get(sku) if popularity_cache else None
+            decision = quota.decide(sku, list(due), market)
+            if decision.deferred:
+                log.info("autoPlan defers %s/%s: %s", vendor, sku, decision.deferred)
+                if decision.wait_keys:
                     since = old_waits[sku][0] if sku in old_waits else aware_now
-                    new_waits[sku] = (since, frozenset(q["bucket"] for q in quota.entries[sku]["quotas"]["spot"]))
-                continue
-            limit = timedelta(minutes=settings.spot.quota_reserve_after_minutes)
-            buckets = frozenset(q["bucket"] for q in quotas)
-            if holder := quota.reserved_for(old_waits, sku, buckets, limit):
-                log.info(
-                    "autoPlan defers %s/%s: its quota is reserved for %s, deferred over %s", vendor, sku, holder, limit
-                )
-                if sku in old_waits:  # still waiting: its timer goes on
+                    new_waits[sku] = (since, decision.wait_keys)
+                elif decision.reserved and sku in old_waits:  # still waiting: its timer goes on
                     new_waits[sku] = old_waits[sku]
+                continue
+            if room is not None and decision.price is not None and decision.price > room:
+                log.info(
+                    "autoPlan skips %s/%s: its node costs about %g USD/hour, %g are left under maxUsdPerHour",
+                    vendor, sku, decision.price, room,
+                )  # fmt: skip
                 continue
             if not dry_run:
                 try:
-                    check_vendor_budget(kube, cfg, vendor, runs)
-                except ValueError as e:
-                    log.info("autoPlan stops for vendor %s: %s", vendor, e)
-                    unreached = skus[i + 1 :]
-                    break
-                try:
-                    runs.append(_create_run(kube, cfg, vendor, sku, list(due)))
+                    run = _create_run(kube, cfg, vendor, sku, list(due), region=decision.region)
                 except crd.RunExists:
                     continue
-            quota.consume(quotas)
+                runs.append(run)
+                created += 1
+                estimates[run.name] = decision.price or 0.0
+            quota.consume(decision.quotas, decision.region)
             reason = ", ".join(f"{name}: {why}" for name, why in due.items())
-            planned.append(PlannedRun(vendor, sku, tuple(due), reason))
+            score = scores[sku].note if sku in scores else ""
+            planned.append(PlannedRun(vendor, sku, tuple(due), reason, decision.region, score))
             if dry_run:
-                unreached = skus[i + 1 :]
+                unreached = order[i + 1 :]
+                break
+            if created >= settings.vendors[vendor].max_new_runs_per_cycle:
+                log.info("autoPlan stops for vendor %s: %d new runs, its maxNewRunsPerCycle", vendor, created)
+                unreached = order[i + 1 :]
+                break
+            try:
+                room = check_vendor_budget(kube, cfg, vendor, runs, estimates)
+            except ValueError as e:
+                log.info("autoPlan stops for vendor %s: %s", vendor, e)
+                unreached = order[i + 1 :]
                 break
         new_waits.update({sku: old_waits[sku] for sku in unreached if sku in old_waits})
         for key in [key for key in quota_waits if key[0] == vendor]:
@@ -846,6 +1010,7 @@ def run_forever(
     first_seen_reader: FirstSeenReader | None = None,
     keeper_cache: KeeperCache | None = None,
     on_vendor_skipped: Callable[[str, str], None] | None = None,
+    popularity_cache: popularity.PopularityCache | None = None,
 ) -> None:
     """Every `planner.interval_minutes`: `plan_cycle`; exceptions are logged, never fatal. `cfg_provider` is a
     zero-argument callable returning the current `Config`. `keeper_cache` is shared with the runner."""
@@ -865,8 +1030,18 @@ def run_forever(
                 first_seen_reader=first_seen_reader,
                 on_vendor_skipped=on_vendor_skipped,
                 quota_waits=quota_waits,
+                popularity_cache=popularity_cache,
             ):
-                log.info("planned run", extra={"vendor": planned.vendor, "sku": planned.sku, "reason": planned.reason})
+                log.info(
+                    "planned run",
+                    extra={
+                        "vendor": planned.vendor,
+                        "sku": planned.sku,
+                        "reason": planned.reason,
+                        "region": planned.region,
+                        "score": planned.score,
+                    },
+                )
         except Exception:
             log.exception("planning cycle failed")
         stop.wait(interval_minutes * 60)

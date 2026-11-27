@@ -96,6 +96,17 @@ def test_a_dbaas_anchor_names_the_band_or_the_operators_client(run, cfg):
     assert anchor()[1][1:] == dbaas_client.requirements("c1")
 
 
+def test_a_server_run_pinned_by_the_planner_selects_its_region(run, cfg):
+    owner = OwnerRef("inspector.sparecores.com/v1alpha1", "BenchmarkRun", run.name, "u")
+    selector = lambda: pods.render_anchor(  # noqa: E731
+        run, 1, cfg, capacity=[CapacityType.ON_DEMAND], deadline_seconds=100, owner=owner
+    )["spec"]["nodeSelector"]
+    assert "topology.kubernetes.io/region" not in selector()
+    run.spec.region = "eu-1"
+    assert selector()["topology.kubernetes.io/region"] == "eu-1"
+    assert selector()["scarpenter.sparecores.com/api-reference"] == run.spec.sku  # still its own SKU
+
+
 def test_anchor(run, cfg):
     owner = OwnerRef("inspector.sparecores.com/v1alpha1", "BenchmarkRun", run.name, "u")
     pod = pods.render_anchor(

@@ -151,6 +151,14 @@ def test_run_key_uses_creation_day_utc():
 # --------------------------------------------------------------------------- manifest and parsing
 
 
+def test_the_planned_region_round_trips_and_is_left_out_when_unset():
+    assert "region" not in crd.to_manifest(spec(), "inspector")["spec"]
+    manifest = crd.to_manifest(spec(region="eu-1"), "inspector")
+    assert manifest["spec"]["region"] == "eu-1"
+    manifest["metadata"] |= {"uid": "u", "resourceVersion": "1", "creationTimestamp": "2026-11-20T09:30:00Z"}
+    assert crd.from_dict(manifest).spec.region == "eu-1"
+
+
 def test_manifest_shape():
     manifest = crd.to_manifest(
         spec(tasks=["lscpu"], force=True, capacity=CapacityMode.ON_DEMAND, hold_after=timedelta(hours=2)), "inspector"
