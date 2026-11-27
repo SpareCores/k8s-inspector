@@ -7,10 +7,10 @@ Legend: **P** planner, **R** run loop, **C** classification, **Pub** publisher, 
 
 | sc-inspector | k8s-inspector |
 |---|---|
-| `start` (GitHub Actions cron every 15 min, vendor matrix, `--limit 8`) | **P** every 5 min in the controller ([autoPlan](configuration.md#autoplan)); per-vendor `maxInFlight` (default 2; 1 = one instance at a time) and `$/h` caps |
+| `start` (GitHub Actions cron every 15 min, vendor matrix, `--limit 8`) | **P** every 5 min in the controller ([autoPlan](configuration.md#autoplan)); per-vendor `maxInFlight` (default 2; 1 = one instance at a time; `unlimited` allowed), `$/h` caps and a per-cycle burst cap (`maxNewRunsPerCycle`) |
 | `--start-only`, `--force` (`--exclude` unused) | CLI `run <vendor> <sku> [--tasks] [--force]`; creates a `BenchmarkRun` |
 | vendor skiplist in `start.yml` | `vendors.<v>.enabled` / `maxInFlight: 0` |
-| `available_servers` from sc-data, crc32 order | **P** ACTIVE servers of the vendor from Keeper's bulk endpoint (no price or region filter: SCarpenter answers `-1 NO_OFFERING`); crc32 order unchanged |
+| `available_servers` from sc-data, crc32 order | **P** ACTIVE servers of the vendor from Keeper's bulk endpoint (no price or region filter: SCarpenter answers `-1 NO_OFFERING`); ranked by popularity from Keeper data (series region breadth, price where breadth means nothing, accelerators last; crc32 for ties and without data), a SKU that does not fit is skipped, and where SCarpenter lists regional quota the run is confined to the regions that fit ([order and packing](configuration.md#order-and-packing)) |
 | Keeper bulk block reasons, fail closed | **P** unchanged; the per-task re-check on the VM is dropped |
 | `always_run` / `start_with_instance` | the probe step is in every attempt; `timing` is publisher output |
 | 2 h `WAIT_SINCE_LAST_START`, boot placeholder commits as a lease | — replaced by the `BenchmarkRun` lease ([state model](../explanation/state.md)) |

@@ -12,6 +12,7 @@ from k8s_inspector import crd, keeper, launch, planner, pods, render
 from k8s_inspector.crd import RunExists, from_dict
 from k8s_inspector.kube import AlreadyExists, NotFound
 from k8s_inspector.model import (
+    UNLIMITED,
     CapacityMode,
     Config,
     Defaults,
@@ -1729,9 +1730,9 @@ def test_the_cache_is_warmed_a_few_skus_per_cycle(kube, keeper_skus, markets):
     cache = popularity_cache()
     plan(kube, auto_config(max_in_flight=0), {}, popularity_cache=cache, dry_run=True)
     assert markets.calls == []  # a paused vendor is not even looked at
-    plan(kube, auto_config(max_in_flight=None), {}, popularity_cache=cache, dry_run=True)
+    plan(kube, auto_config(max_in_flight=UNLIMITED), {}, popularity_cache=cache, dry_run=True)
     assert len(markets.calls) == popularity.LOOKUPS_PER_CYCLE
-    plan(kube, auto_config(max_in_flight=None), {}, popularity_cache=cache, dry_run=True)
+    plan(kube, auto_config(max_in_flight=UNLIMITED), {}, popularity_cache=cache, dry_run=True)
     assert len(markets.calls) == popularity.LOOKUPS_PER_CYCLE + 5  # nothing is asked twice within a day
 
 
@@ -1757,7 +1758,7 @@ def test_an_unset_max_in_flight_is_unbounded_up_to_the_burst_cap(kube, keeper_sk
         Settings(
             auto_plan=True,
             vendors={"oci": VendorSettings(enabled=True, publish=True)},
-            defaults=Defaults(max_in_flight=None),
+            defaults=Defaults(max_in_flight=UNLIMITED),
         ),
     )
     assert len(plan_wet(kube, keeper_skus, cfg)) == 10  # maxNewRunsPerCycle defaults to 10
@@ -1767,7 +1768,7 @@ def test_an_unset_max_in_flight_is_unbounded_up_to_the_burst_cap(kube, keeper_sk
 def test_max_new_runs_per_cycle_is_a_burst_cap_per_vendor(kube, keeper_skus, caplog):
     keeper_skus["oci"] = {f"s{i}": {} for i in range(6)}
     with caplog.at_level("INFO"):
-        assert len(plan_wet(kube, keeper_skus, auto_config(max_in_flight=None, max_new_runs_per_cycle=2))) == 2
+        assert len(plan_wet(kube, keeper_skus, auto_config(max_in_flight=UNLIMITED, max_new_runs_per_cycle=2))) == 2
     assert "its maxNewRunsPerCycle" in caplog.text
 
 
@@ -1784,17 +1785,17 @@ def regional(bucket="B", need=64, limit=256, **regions):
 
 
 def planned_regions(kube):
-    return {from_dict(o).spec.sku: from_dict(o).spec.region for o in kube.objects.values()}
+    return {from_dict(o).spec.sku: tuple(from_dict(o).spec.regions) for o in kube.objects.values()}
 
 
 @pytest.mark.offered
-def test_a_run_is_pinned_to_the_cheapest_region_where_it_fits(kube, keeper_skus, markets):
+def test_a_run_is_confined_to_the_regions_where_it_fits(kube, keeper_skus, markets):
     keeper_skus["oci"] = {"s": {}}
     markets["s"] = market(spot={"cheap": 0.1, "mid": 0.2, "dear": 0.3})
     entry = spot_entry(regional(cheap=32, mid=128, dear=512))  # `cheap` has no room for 64 vCPU
     publish_offered(kube, offered_configmap({"s": entry}))
     assert plan_wet(kube, keeper_skus, popularity_cache=popularity_cache()) == ["s"]
-    assert planned_regions(kube) == {"s": "mid"}
+    assert planned_regions(kube) == {"s": ("dear", "mid")}  # the set where it fits; Karpenter picks within it
 
 
 @pytest.mark.offered
@@ -1806,7 +1807,7 @@ def test_regional_consumption_is_counted_per_region_within_a_cycle(kube, keeper_
     publish_offered(kube, offered_configmap({sku: entry for sku in "abcd"}))
     assert len(plan_wet(kube, keeper_skus, popularity_cache=popularity_cache())) == 3  # x: 2 runs, y: 1 run
     regions = sorted(planned_regions(kube).values())
-    assert regions == ["x", "x", "y"]
+    assert regions == [("x", "y"), ("x", "y"), ("y",)]  # both runs count against x, the cheaper: then only y is left
 
 
 @pytest.mark.offered
@@ -1825,7 +1826,7 @@ def test_without_regions_the_max_headroom_decides_and_nothing_is_pinned(kube, ke
     markets["s"] = market(spot={"cheap": 0.1})
     publish_offered(kube, offered_configmap({"s": spot_entry(quota(need=64, headroom=128))}))
     assert plan_wet(kube, keeper_skus, popularity_cache=popularity_cache()) == ["s"]
-    assert planned_regions(kube) == {"s": None}
+    assert planned_regions(kube) == {"s": ()}
 
 
 @pytest.mark.offered
@@ -1849,7 +1850,7 @@ def drain_listing(kube, keeper_skus, markets):
         "mid": spot_entry(regional(need=64, a=128, b=128)),
     }
     publish_offered(kube, offered_configmap(entries))
-    planner._create_run(kube, auto_config(), "oci", "mid", [SPOT_TASK], region="b")
+    planner._create_run(kube, auto_config(), "oci", "mid", [SPOT_TASK], regions=("b",))
 
 
 @pytest.mark.offered
@@ -1866,7 +1867,7 @@ def test_a_drained_region_takes_no_other_run_while_the_others_keep_filling(kube,
     drain_listing(kube, keeper_skus, markets)
     waits = {("oci", "big"): (datetime.now(UTC) - timedelta(hours=2), frozenset({("B", "b")}))}
     assert plan_wet(kube, keeper_skus, quota_waits=waits, popularity_cache=popularity_cache()) == ["small"]
-    assert planned_regions(kube)["small"] == "a"  # `b` is cheaper, but reserved for `big`
+    assert planned_regions(kube)["small"] == ("a",)  # `b` is cheaper, but reserved for `big`
 
 
 @pytest.mark.offered
@@ -1875,7 +1876,7 @@ def test_the_drain_ends_when_own_runs_no_longer_hold_the_region(kube, keeper_sku
     kube.set_status(next(iter(kube.objects)), phase="Done")
     waits = {("oci", "big"): (datetime.now(UTC) - timedelta(hours=2), frozenset({("B", "b")}))}
     plan_wet(kube, keeper_skus, quota_waits=waits, popularity_cache=popularity_cache())
-    assert planned_regions(kube)["small"] == "b"
+    assert planned_regions(kube)["small"] == ("a", "b")
 
 
 @pytest.mark.offered
@@ -1889,4 +1890,64 @@ def test_quota_reserve_after_minutes_zero_turns_the_drain_off(kube, keeper_skus,
     )
     cfg = Config(EnvConfig(bucket="b", bucket_region="r"), settings)
     plan_wet(kube, keeper_skus, cfg, quota_waits=waits, popularity_cache=popularity_cache())
-    assert planned_regions(kube)["small"] == "b"
+    assert planned_regions(kube)["small"] == ("a", "b")
+
+
+def test_unknown_prices_under_a_usd_cap_stop_the_cycle_after_one_run(kube, keeper_skus, caplog):
+    keeper_skus["oci"] = {"a": {}, "b": {}, "c": {}}
+    with caplog.at_level("INFO"):
+        assert len(plan_wet(kube, keeper_skus, auto_config(max_in_flight=5, max_usd_per_hour=100.0))) == 1
+    assert "no price estimate for" in caplog.text
+    assert len(plan_wet(kube, keeper_skus, auto_config(max_in_flight=5))) == 2  # no cap: prices do not matter
+
+
+@pytest.mark.offered
+def test_a_spot_run_is_budgeted_at_the_dearer_of_spot_and_on_demand(kube, keeper_skus, markets):
+    keeper_skus["oci"] = {"s": {}}
+    markets["s"] = {**market(), "ondemand": {"x": 2.0}, "spot": {"x": 0.1}}
+    publish_offered(kube, offered_configmap({"s": spot_entry(regional(x=512))}))
+    cfg = auto_config(max_in_flight=5, max_usd_per_hour=1.0)
+    assert plan_wet(kube, keeper_skus, cfg, popularity_cache=popularity_cache()) == []  # spot may fall back: 2 > 1
+
+
+@pytest.mark.offered
+def test_without_prices_the_run_is_confined_to_every_fitting_region(kube, keeper_skus, markets):
+    keeper_skus["oci"] = {"s": {}}
+    publish_offered(kube, offered_configmap({"s": spot_entry(regional(b=128, a=128, c=8))}))
+    assert plan_wet(kube, keeper_skus, popularity_cache=popularity_cache()) == ["s"]
+    assert planned_regions(kube) == {"s": ("a", "b")}  # not the first region alone
+
+
+@pytest.mark.offered
+def test_a_region_whose_offering_is_unavailable_cannot_starve_the_sku(kube, keeper_skus, markets):
+    keeper_skus["oci"] = {"s": {}}
+    markets["s"] = market(spot={"ice": 0.1, "ok": 0.2})
+    publish_offered(kube, offered_configmap({"s": spot_entry(regional(ice=128, ok=128))}))
+    plan_wet(kube, keeper_skus, popularity_cache=popularity_cache())
+    assert planned_regions(kube) == {"s": ("ice", "ok")}  # the cheapest region is not the only one the anchor accepts
+
+
+@pytest.mark.offered
+def test_zones_that_name_regions_narrow_the_set(kube, keeper_skus):
+    keeper_skus["oci"] = {"s": {}}
+    entry = spot_entry(regional(eu_1=128, eu_2=128))
+    entry["offerings"][0]["zones"] = ["eu_2-a"]  # only eu_2 has a zone
+    publish_offered(kube, offered_configmap({"s": entry}))
+    plan_wet(kube, keeper_skus)
+    assert planned_regions(kube) == {"s": ("eu_2",)}
+
+
+@pytest.mark.offered
+def test_a_big_sku_keeps_its_wait_timer_when_its_region_changes(kube, keeper_skus):
+    keeper_skus["oci"] = {"big": {}}
+    since = datetime.now(UTC) - timedelta(hours=2)
+    waits = {("oci", "big"): (since, frozenset({("B", "gone")}))}  # it waited for a region that left the listing
+    publish_offered(
+        kube, offered_configmap({"big": spot_entry(regional(need=200, a=128, b=100), spot_available=False)})
+    )
+    assert plan_wet(kube, keeper_skus, quota_waits=waits) == []
+    ((_, (kept, keys)),) = waits.items()
+    assert kept == since and keys == frozenset({("B", "a")})
+    publish_offered(kube, offered_configmap({"big": spot_entry(regional(need=100, a=64, b=50), spot_available=False)}))
+    plan_wet(kube, keeper_skus, quota_waits=waits)  # not big any more: no drain, the timer still goes on
+    assert waits[("oci", "big")][0] == since

@@ -24,7 +24,7 @@ and any agent would disturb the measurements.
 
 ## Transient API errors
 
-Transient API errors (429, 5xx, connection errors, timeouts, a 404 on the `BenchmarkRun` resource before the CRD is established) never stop a controller thread: the runner's initial LIST, resync and watches retry with exponential backoff (1 s to 60 s, jittered, `Retry-After` honoured) and log at warning level, the planner and publisher log the failed cycle and run the next one; only a fatal configuration error (such as a missing bucket) ends `serve`.
+Transient API errors (429, 5xx, connection errors, timeouts, a 404 on the `BenchmarkRun` resource before the CRD is established) never stop a controller thread: the runner's initial LIST, resync and watches retry with exponential backoff (1 s to 60 s, jittered, `Retry-After` honoured) and log at warning level, the planner and publisher log the failed cycle and run the next one (the planner logs each run it creates as `planned run` with its `vendor`, `sku`, `reason`, `regions` and the popularity `score`, and every SKU it skips or defers as `autoPlan skips ...` / `autoPlan defers ...`); only a fatal configuration error (such as a missing bucket) ends `serve`.
 
 ## What k8s-inspector exposes
 

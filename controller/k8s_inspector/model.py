@@ -10,6 +10,7 @@ Conventions:
 - `object key` always means the full S3 key; `urls key` means `<key>/<file>` as in urls.json.
 """
 
+import math
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from enum import IntEnum, StrEnum
@@ -220,7 +221,7 @@ class RunSpec:
     capacity: CapacityMode = CapacityMode.SPOT_FIRST
     hold_after: timedelta = timedelta(0)
     database: dict | None = None  # DBaaS: {vendor, id, engineVersion, region, client}
-    region: str | None = None  # a server run pinned to this region by the planner; None: any region
+    regions: list[str] = field(default_factory=list)  # a server run the planner confined to these regions; empty: any
 
 
 @dataclass
@@ -478,11 +479,14 @@ class EnvConfig:
     )
 
 
+UNLIMITED = math.inf  # `maxInFlight: unlimited`
+
+
 @dataclass(frozen=True)
 class VendorSettings:
     enabled: bool = False
     auto_plan: bool | None = None  # None: inherit planner.autoPlan
-    max_in_flight: int | None = None  # None: defaults.maxInFlight; 0 pauses
+    max_in_flight: int | float | None = None  # None: defaults.maxInFlight; 0 pauses; UNLIMITED: no limit
     max_usd_per_hour: float | None = None
     max_new_runs_per_cycle: int = 10  # burst cap: runs one planning cycle creates for the vendor
     capacity: CapacityMode = CapacityMode.SPOT_FIRST  # same default as `RunSpec` and `crd.from_dict`
@@ -496,7 +500,7 @@ class VendorSettings:
 
 @dataclass(frozen=True)
 class Defaults:
-    max_in_flight: int | None = 2  # None: unbounded
+    max_in_flight: int | float = 2  # UNLIMITED: no limit
 
 
 @dataclass(frozen=True)

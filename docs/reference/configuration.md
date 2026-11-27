@@ -38,7 +38,7 @@ vendors:
   oci:
     enabled: true
     autoPlan: false              # per-vendor override; needs publish
-    maxInFlight: 2               # 0 pauses the vendor; unset: defaults.maxInFlight
+    maxInFlight: 2               # 0 pauses the vendor; unlimited: no limit; unset: defaults.maxInFlight
     maxUsdPerHour: 2.0           # checked before a run starts; unset: no cap
     maxNewRunsPerCycle: 10       # autoPlan: the most runs one cycle creates for the vendor (burst cap)
     capacity: SpotFirst          # SpotFirst (the default) | OnDemand
@@ -47,7 +47,7 @@ vendors:
     dbaasMaxInFlight: 1          # DBaaS runs in flight; 0 pauses; counted over DBaaS runs only
     # dbaasMaxUsdPerHour: 3.0   # database + client price of the DBaaS runs in flight; unset (the default): no cap
 defaults:
-  maxInFlight: 2                 # conservative default for every vendor without its own maxInFlight; null: unbounded
+  maxInFlight: 2                 # conservative default for every vendor without its own maxInFlight; unlimited: no limit
 spot:
   maxSpotAttempts: 2
   maxLostMinutes: 60
@@ -240,28 +240,31 @@ checkout (without the popularity cache of `serve`, so it orders by crc32); with 
    (a SKU of it has a `BenchmarkRun`, or a result with a `run_id` in git), the series itself (its SKUs stay together),
    the smaller SKU (vCPUs, then memory), then crc32 of `<vendor>/<sku>`.
 
-The log line `planned run` carries the components (`score`) and the `region`. A SKU without Keeper data is not blocked:
+The log line `planned run` carries the components (`score`) and the `regions` the run is confined to. A SKU without Keeper data is not blocked:
 it follows the ranked ones, in crc32 order, and a cycle without any data (Keeper down, a cold cache) is the crc32 order
 of earlier releases.
 
 **Keeper load.** The data is one `/v2/server/<vendor>/<sku>` and one `/server/<vendor>/<sku>/prices` call per SKU, plus
 one `/regions` call per vendor, kept for 24 hours (stale data is used until the SKU is asked again). Only SKUs that have a
-due task are asked, in crc32 order, at most 20 per vendor and cycle, one call at a time; the first failure ends the
-round. A cold cache over a vendor with hundreds of due SKUs is therefore ranked partly and filled in over a few hours.
+due task are asked, in crc32 order, one call at a time, at most 40 SKUs per cycle over all vendors together. The first
+failure starts a 10-minute cooldown in which no vendor asks Keeper, and the SKU it happened on is not asked again for 6
+hours. A cold cache over vendors with hundreds of due SKUs is therefore ranked partly and filled in over several hours.
 The breadth of a series is the maximum over the SKUs asked so far. There is never a bulk or unbounded price query.
 
 **Fill, not stop.** The cycle goes through the ranked SKUs and *skips* one that does not fit instead of stopping: a SKU
 deferred for quota, or whose node (Keeper's price for the capacity type and region it would use) costs more than what is
 left under `maxUsdPerHour`, leaves room for smaller ones behind it. A run planned in the cycle counts with that price
 estimate until it has a real price annotation, so the budget fits several runs in one cycle; runs of earlier cycles
-without a price still make the cap wait. A SKU with an unknown price is not skipped for cost. `maxInFlight` and
-`maxUsdPerHour` are both optional: unset `maxUsdPerHour` is no cap, `defaults.maxInFlight: null` is no limit, and neither
-requires the other (the operator is responsible for what an unbounded vendor costs). A vendor's own `maxInFlight` unset
-inherits the default, so a vendor cannot be made unbounded under a numeric default. `maxNewRunsPerCycle` (default 10)
-bounds the runs one cycle creates per vendor. With `--dry-run` the first SKU of a vendor is returned.
+without a price still make the cap wait. A run that may use spot is estimated at the dearer of its spot and on-demand
+price, because spot falls back to on-demand. With `maxUsdPerHour` set, a run created without any price estimate (Keeper
+has no price) ends the cycle for the vendor: the next run waits until it has a real price. `maxInFlight` and
+`maxUsdPerHour` are both optional: unset `maxUsdPerHour` is no cap, `maxInFlight: unlimited` is no limit, and neither
+requires the other (the operator is responsible for what an unbounded vendor costs). `maxInFlight: unlimited` works
+under `defaults` and under a vendor; a vendor's `maxInFlight` unset (or `null`) inherits the default. `maxNewRunsPerCycle`
+(default 10) bounds the runs one cycle creates per vendor. With `--dry-run` the first SKU of a vendor is returned.
 
-**Regions.** See [Quota-aware planning](#quota-aware-planning): where SCarpenter lists regional quota, the run is pinned
-to a region.
+**Regions.** See [Quota-aware planning](#quota-aware-planning): where SCarpenter lists regional quota, the run is
+confined to the regions where it fits.
 
 ### DBaaS autoPlan
 
@@ -353,20 +356,25 @@ A regional bucket also lists `regions: [{region, limit, headroom}]`, the regions
 exact account figures. A list that is absent or damaged is ignored for that entry.
 
 **Placement and pinning.** When an entry of the chosen group has `regions`, the candidate regions are those that every
-such entry lists. A region is out when the run does not fit one of the entries there (its regional `headroom`) or a
+such entry lists, narrowed to the regions that the group's `zones` name when any zone starts with a candidate region's name
+(zone names that carry no region name say nothing). A region is out when the run does not fit one of the entries there (its regional `headroom`) or a
 global entry of the group (`maxHeadroom`), after what is consumed in the cycle, or when another SKU reserves the quota
-there (below). Of the others the planner takes the cheapest by Keeper's price for the capacity type the group stands
-for (the spot price for the spot group, else on-demand; a region without a price comes last), and creates the run with
-`spec.region` set; the anchor of every attempt then selects `topology.kubernetes.io/region`, as a DBaaS client does.
+there (below). The run is confined to **all** the others: `spec.regions` lists them, and the anchor of every attempt
+requires `topology.kubernetes.io/region In [...]` in its node affinity. Karpenter and SCarpenter pick an available
+offering among them, so a region with an ICE mark or a daily limit does not starve the SKU. The quota accounting counts
+the run against one expected landing region: the cheapest of them by Keeper's price for the capacity type the group stands
+for (the spot price for the spot group, else on-demand), and without any price the one with the most room.
 With no candidate left the SKU is deferred as busy (`autoPlan defers <vendor>/<sku>: spot quota busy (bucket B: need N
 vCPU, headroom H in <region> (and K more regions))`). Without `regions` (an older SCarpenter, a global bucket, unknown
-regions) nothing is pinned and the headroom is `maxHeadroom` minus everything consumed in the bucket, as before. The
-choice is made once, when the run is created: the region stays for all attempts of the run (a spot interruption or an
-on-demand fall-back after a failed launch is retried in the same region). A run that ends without a node (no
-offering, launch rejected) is final for its attempt like any run and the next planning cycle chooses a region again.
+regions) the run is not confined and the headroom is `maxHeadroom` minus everything consumed in the bucket, as before. The
+set is chosen once, when the run is created, and stays for all attempts of the run (a spot interruption or an on-demand
+fall-back after a failed launch is retried within the same set). A run that ends without a node is final like any run,
+and the SKU's next run (after the launch backoff) gets a set computed from the listing of that time.
 
 The headroom of a SKU's bucket is its `maxHeadroom` (a regional entry: the region's `headroom`) minus what the vendor's own runs consume that the listing does not
-show yet, per bucket and region (a run without `spec.region` counts against every region of a regional bucket). That is every run planned in the cycle (so several runs in one cycle cannot overshoot a quota), and every
+show yet, per bucket and region. A run counts in the region of its node, else in its only region; an unconfined run (a forced
+run, a run created before regions were planned, a SKU without region data) and one confined to several regions that has
+no node yet count against every region of a regional bucket, and such a run does not start a drain. That is every run planned in the cycle (so several runs in one cycle cannot overshoot a quota), and every
 server or DBaaS client run in phase Pending, Provisioning or Running that was created after the listing's `generatedAt`
 (planned in an earlier cycle since then) or that has neither a NodeClaim nor a node (SCarpenter's `reserved` ledger
 starts with a launch, so an anchor without a NodeClaim is not in it). A run with a NodeClaim that is older than
@@ -377,9 +385,10 @@ failed launch counts against the on-demand group). A run that may use spot count
 fall-back to on-demand when spot fills before the launch is not planned for. A DBaaS client run counts, with the
 on-demand group, once its client SKU is known. Nothing of this is read when no SKU of the listing has `quotas`.
 
-A big SKU would starve behind smaller SKUs that keep taking the bucket. A SKU is **big** when its `need` is more than
+A big SKU would starve behind smaller SKUs that keep taking the bucket. A SKU is **big** in a region when its `need` is more than
 half of an entry's limit (the region's `limit`, else `maxLimit`). The controller remembers since when each big SKU is
-deferred for a busy spot quota, with the bucket keys it asks to drain (in memory; a restart resets it), and rebuilds that
+deferred for a busy spot quota (in memory; a restart resets it), with the bucket keys it asks to drain (none while it is
+not big in the region it chose; its waiting time does not depend on the region), and rebuilds that
 memory every cycle: a SKU that
 is not deferred as spot-busy again (planned, no longer due, leased, no longer listed by Keeper, not offered) is
 forgotten, and one that is held back by another SKU's reservation keeps its time, as do the SKUs after the point where a cap (`maxInFlight`, `maxUsdPerHour`, `maxNewRunsPerCycle`) stopped the cycle. A big SKU deferred for longer than
@@ -414,7 +423,7 @@ Every command logs JSON lines on stderr.
 
 The bench NodePool has no `limits`: the goal is to benchmark every instance type of every vendor, so there is no pool-level
 size or total bound. The cap on started and running instances of a vendor is `vendors.<v>.maxInFlight`
-(default `defaults.maxInFlight`, 2; 0 pauses the vendor; `defaults.maxInFlight: null` is no limit). The count is the larger of the runs that hold or are
+(default `defaults.maxInFlight`, 2; 0 pauses the vendor; `unlimited` is no limit). The count is the larger of the runs that hold or are
 acquiring a node (Pending, Provisioning, Running, Releasing, and a Failed or Cancelled run until its anchor Pod is
 deleted) and the live NodeClaims of the vendor in the bench NodePool (NodeClaims carry the vendor in `spec.requirements` from creation and as the label `scarpenter.sparecores.com/vendor` after launch; anchors select the SKU by `scarpenter.sparecores.com/api-reference`, so SKUs whose names are not valid label values are refused; an instance can outlive its anchor). This is a
 lower bound ("at least" that many instances); leftover NodeClaims without a holding run count as instances but do

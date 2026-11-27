@@ -219,8 +219,6 @@ def render_anchor(
                 RUN_NODE_LABEL: run.name,  # a node of its own: no other run's Pod schedules there
                 # A DBaaS client sits in its own region (the database's, unless `clientRegion` names another).
                 **({REGION_LABEL: client_region(spec.database)} if spec.database else {API_REFERENCE_LABEL: spec.sku}),
-                # A server run the planner placed stays in that region (all its attempts).
-                **({REGION_LABEL: spec.region} if spec.region and not spec.database else {}),
             },
             "affinity": {
                 "nodeAffinity": {
@@ -233,6 +231,12 @@ def render_anchor(
                                         "operator": "In",
                                         "values": [c.value for c in capacity],
                                     },
+                                    # a server run the planner confined: only these regions, for every attempt
+                                    *(
+                                        [{"key": REGION_LABEL, "operator": "In", "values": list(spec.regions)}]
+                                        if spec.regions and not spec.database
+                                        else []
+                                    ),
                                     # a DBaaS client: any small x86_64 type, the cheapest offered one is launched
                                     *(dbaas_client.requirements(spec.database.get("client")) if spec.database else []),
                                 ]

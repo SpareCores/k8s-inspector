@@ -28,7 +28,8 @@ ends with the reason of the last one.
 Every failed launch of the attempt's NodeClaims counts toward `MAX_LAUNCH_FAILURES` (2 distinct claims). When all of
 them name the class `InsufficientCapacity` or `ZoneUnusable`, the run goes on instead, as long as SCarpenter's offered-types ConfigMap lists the SKU as available
 (with `on-demand` among its capacity types when the attempt is on-demand only). SCarpenter tries the other regions
-and zones itself, and the controller never pins one. The pre-launch budget (`provisionCpuMinutes`,
+and zones itself. The controller confines a run only to the set of regions where its quota fits
+([quota-aware planning](../reference/configuration.md#quota-aware-planning)), never to one region. The pre-launch budget (`provisionCpuMinutes`,
 `provisionGpuHours`) still ends the run, as does `MAX_ICE_LAUNCH_FAILURES` (20 claims). If the ConfigMap cannot be
 read, the cap of 2 applies to `ICE` too. A claim that hit InsufficientCapacity is deleted by Karpenter before any condition is visible, so the
 controller reads it from the `InsufficientCapacityError` Event on the anchor Pod (`NodeClaim <name> nominated for this

@@ -18,33 +18,54 @@ from k8s_inspector.model import EnvConfig
 log = logging.getLogger(__name__)
 
 CACHE_SECONDS = 24 * 3600
-LOOKUPS_PER_CYCLE = 20  # SKUs asked per vendor and cycle, two Keeper calls each
+FAILURE_SECONDS = 6 * 3600  # a SKU Keeper failed for is not asked again this long
+COOLDOWN_SECONDS = 10 * 60  # after a Keeper failure no vendor asks for this long
+LOOKUPS_PER_CYCLE = 40  # SKUs asked per planning cycle over all vendors, two Keeper calls each
 PRICE_ORDER_MAX_REGIONS = 3  # a vendor with this few priced regions has no region breadth to rank by
 
 
 class PopularityCache:
     """`keeper.sku_market` of each SKU, and the region ids of each vendor, kept for `CACHE_SECONDS`. Stale data is
-    used until the SKU is asked again."""
+    used until the SKU is asked again. A cycle (`begin_cycle`) asks about `lookups_per_cycle` SKUs at most, over all
+    vendors. A failure starts a cooldown for every vendor, and the SKU it happened on is not asked again for
+    `FAILURE_SECONDS`."""
 
-    def __init__(self) -> None:
+    def __init__(self, lookups_per_cycle: int = LOOKUPS_PER_CYCLE) -> None:
         self._skus: dict[tuple[str, str], tuple[float, dict | None]] = {}  # (vendor, sku) -> (asked, market)
+        self._failed: dict[tuple[str, str], float] = {}  # (vendor, sku) -> when Keeper failed for it
         self._region_ids: dict[str, tuple[float, dict[str, str]]] = {}
+        self._cooldown_since = -COOLDOWN_SECONDS
+        self._lookups_per_cycle = lookups_per_cycle
+        self._left = lookups_per_cycle
+
+    def begin_cycle(self) -> None:
+        self._left = self._lookups_per_cycle
 
     def markets(self, vendor: str) -> dict[str, dict | None]:
         """`{sku: market}` of the vendor's SKUs asked so far; None for a SKU Keeper does not know."""
         return {sku: market for (v, sku), (_, market) in self._skus.items() if v == vendor}
 
-    def warm(self, env: EnvConfig, vendor: str, skus: list[str], limit: int = LOOKUPS_PER_CYCLE) -> None:
-        """Ask Keeper about the first `limit` of `skus` that have no fresh data, one after the other. The first
-        failure ends the round (Keeper is down or struggling: no further calls this cycle)."""
+    def warm(self, env: EnvConfig, vendor: str, skus: list[str]) -> None:
+        """Ask Keeper about the first of `skus` that have no fresh data, one after the other, while the cycle's budget
+        lasts. The first failure ends the round for every vendor until the cooldown is over."""
         now = time.monotonic()
-        due = [sku for sku in skus if now - self._skus.get((vendor, sku), (-CACHE_SECONDS, None))[0] >= CACHE_SECONDS]
-        try:
-            for sku in due[:limit]:
+        if now - self._cooldown_since < COOLDOWN_SECONDS:
+            return
+        due = [
+            sku
+            for sku in skus
+            if now - self._skus.get((vendor, sku), (-CACHE_SECONDS, None))[0] >= CACHE_SECONDS
+            and now - self._failed.get((vendor, sku), -FAILURE_SECONDS) >= FAILURE_SECONDS
+        ]
+        for sku in due[: self._left]:
+            self._left -= 1
+            try:
                 ids = self._ids(env, vendor, now)
                 self._skus[vendor, sku] = (now, keeper.sku_market(env, vendor, sku, ids))
-        except Exception as e:  # RuntimeError, or an unreadable key file: rank with what is cached
-            log.warning("popularity: Keeper lookup for vendor %s failed, ranking with cached data: %s", vendor, e)
+            except Exception as e:  # RuntimeError, or an unreadable key file: rank with what is cached
+                log.warning("popularity: Keeper lookup for %s/%s failed, no lookups for a while: %s", vendor, sku, e)
+                self._failed[vendor, sku] = self._cooldown_since = now
+                return
 
     def _ids(self, env: EnvConfig, vendor: str, now: float) -> dict[str, str]:
         asked, ids = self._region_ids.get(vendor, (-CACHE_SECONDS, {}))

@@ -19,7 +19,7 @@ Consequences:
 
 - **Hourly vendors** (Hetzner, UpCloud, Vultr, possibly OVHcloud US): stopping a VM does not stop billing there, so
   keep `maxInFlight` and `maxUsdPerHour` low. The planner does not batch work: a SKU with due tasks starts as soon as
-  the vendor has room ([autoPlan](configuration.md#autoplan)).
+  the vendor has room (it fills the room with whichever ranked SKUs fit, up to `maxNewRunsPerCycle` per cycle) ([autoPlan](configuration.md#autoplan)).
 - **Spot**: only where the table says yes, per the [spot strategy](../explanation/spot.md).
 - **DBaaS**: run only where the managed database exists; hourly database billing makes a failed attempt cost an hour
   ([DBaaS](../explanation/dbaas.md)).

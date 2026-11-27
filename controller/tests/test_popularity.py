@@ -92,14 +92,24 @@ def calls(monkeypatch):
     return seen
 
 
-def test_warm_asks_a_few_skus_per_round_and_keeps_the_answers(calls):
-    cache = popularity.PopularityCache()
+def test_warm_asks_a_few_skus_per_cycle_and_keeps_the_answers(calls):
+    cache = popularity.PopularityCache(lookups_per_cycle=2)
     skus = [f"s{i}" for i in range(5)]
-    cache.warm(ENV, "v", skus, limit=2)
+    cache.warm(ENV, "v", skus)
     assert calls == ["regions", "s0", "s1"]  # region ids once per vendor
-    cache.warm(ENV, "v", skus, limit=2)
+    cache.warm(ENV, "v", skus)
+    assert calls == ["regions", "s0", "s1"]  # the cycle's budget is spent
+    cache.begin_cycle()
+    cache.warm(ENV, "v", skus)
     assert calls == ["regions", "s0", "s1", "s2", "s3"]
     assert set(cache.markets("v")) == {"s0", "s1", "s2", "s3"}
+
+
+def test_the_cycle_budget_is_shared_by_all_vendors(calls):
+    cache = popularity.PopularityCache(lookups_per_cycle=3)
+    cache.warm(ENV, "v", ["a", "b"])
+    cache.warm(ENV, "w", ["c", "d"])
+    assert calls == ["regions", "a", "b", "regions", "c"]
 
 
 def test_warm_refreshes_after_a_day(calls, monkeypatch):
@@ -111,21 +121,50 @@ def test_warm_refreshes_after_a_day(calls, monkeypatch):
     assert calls == ["regions", "a", "regions", "a"]
 
 
-def test_a_keeper_failure_ends_the_round_and_keeps_what_is_cached(monkeypatch, caplog):
+def failing(monkeypatch, bad):
+    seen = []
     monkeypatch.setattr(keeper, "region_ids", lambda env, vendor: {})
-    answers = iter([market("a"), RuntimeError("keeper HTTP 503")])
 
     def sku_market(env, vendor, sku, ids):
-        answer = next(answers)
-        if isinstance(answer, Exception):
-            raise answer
-        return answer
+        seen.append(sku)
+        if sku in bad:
+            raise RuntimeError("keeper HTTP 503")
+        return market(sku)
 
     monkeypatch.setattr(keeper, "sku_market", sku_market)
+    return seen
+
+
+def test_a_keeper_failure_stops_every_vendor_until_the_cooldown_is_over(monkeypatch, caplog):
+    seen = failing(monkeypatch, {"b"})
+    clock = [1000.0]
+    monkeypatch.setattr(popularity.time, "monotonic", lambda: clock[0])
     cache = popularity.PopularityCache()
     cache.warm(ENV, "v", ["a", "b", "c"])
-    assert set(cache.markets("v")) == {"a"}  # "c" was not even tried
+    assert seen == ["a", "b"] and set(cache.markets("v")) == {"a"}  # "c" was not even tried
     assert "503" in caplog.text
+    cache.begin_cycle()
+    cache.warm(ENV, "w", ["x"])  # another vendor: cooling down too
+    assert seen == ["a", "b"]
+    clock[0] += popularity.COOLDOWN_SECONDS + 1
+    cache.warm(ENV, "w", ["x"])
+    assert seen == ["a", "b", "x"]
+
+
+def test_a_sku_that_fails_is_not_asked_again_for_a_while_and_does_not_block_the_rest(monkeypatch):
+    seen = failing(monkeypatch, {"bad"})
+    clock = [1000.0]
+    monkeypatch.setattr(popularity.time, "monotonic", lambda: clock[0])
+    cache = popularity.PopularityCache()
+    cache.warm(ENV, "v", ["bad", "good"])
+    clock[0] += popularity.COOLDOWN_SECONDS + 1
+    cache.begin_cycle()
+    cache.warm(ENV, "v", ["bad", "good"])
+    assert seen == ["bad", "good"]  # the second round skips "bad" (negative cache) and reaches "good"
+    clock[0] += popularity.FAILURE_SECONDS
+    cache.begin_cycle()
+    cache.warm(ENV, "v", ["bad"])
+    assert seen == ["bad", "good", "bad"]
 
 
 def test_an_unknown_sku_is_remembered_as_unknown(monkeypatch):

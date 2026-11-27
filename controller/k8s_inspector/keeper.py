@@ -124,10 +124,15 @@ def server_facts(env: EnvConfig, vendor: str, sku: str) -> dict | None:
     `/v2/server/<vendor>/<sku>` fields `family`, `series`, `cpu_architecture`, `accelerator_count`, `vcpus` and
     `memory_amount` (MiB, converted to GiB). A field Keeper lacks is None. None when Keeper does not know the SKU;
     `RuntimeError` when it cannot be reached."""
-    path = f"/v2/server/{urllib.parse.quote(vendor, safe='')}/{urllib.parse.quote(sku, safe='')}"
-    data = _get(f"{_base(env)}{path}", _read_key(env))
-    if data is None:
-        return None
+    data = _get(
+        f"{_base(env)}/v2/server/{urllib.parse.quote(vendor, safe='')}/{urllib.parse.quote(sku, safe='')}",
+        _read_key(env),
+    )
+    return _facts(data) if data is not None else None
+
+
+def _facts(data: dict) -> dict:
+    """`server_facts` of a `/v2/server` record."""
     count = data.get("accelerator_count")
     memory_mib = data.get("memory_amount")
     return {
@@ -191,12 +196,12 @@ def sku_market(env: EnvConfig, vendor: str, sku: str, ids: dict[str, str]) -> di
         region = names.get(str(row.get("region_id")))
         if row.get("status") == "active" and by_region is not None and region and row.get("price") is not None:
             by_region[region] = min(float(row["price"]), by_region.get(region, float("inf")))
-    memory_mib = server.get("memory_amount")
+    facts = _facts(server)
     return {
-        "series": server.get("series"),
-        "accelerators": int(server.get("accelerator_count") or 0),
+        "series": facts["series"],
+        "accelerators": facts["gpu_count"] or 0,
         "memory_generation": server.get("memory_generation"),
-        "vcpus": server.get("vcpus"),
-        "memory_gib": memory_mib / 1024 if memory_mib is not None else None,
+        "vcpus": facts["vcpus"],
+        "memory_gib": facts["memory_gib"],
         **prices,
     }

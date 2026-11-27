@@ -45,7 +45,7 @@ class PlannedRun:
     sku: str
     tasks: tuple[str, ...]  # due task names
     reason: str  # for logs and `plan --dry-run`
-    region: str | None = None  # the region the run is pinned to (`RunSpec.region`), None: any
+    regions: tuple[str, ...] = ()  # the regions the run is confined to (`RunSpec.regions`), empty: any
     score: str = ""  # the popularity components that ranked the SKU (`popularity.rank`), for logs
 
 
@@ -113,7 +113,7 @@ def check_vendor_budget(
     in_flight = max(
         len(active), live_nodeclaims(kube, cfg, vendor) - client_nodes
     )  # a DBaaS client is not a server run
-    if limit is not None and in_flight >= limit:
+    if in_flight >= limit:
         raise ValueError(f"vendor {vendor} is at its maxInFlight limit ({in_flight} of {limit} instances in flight)")
     cap = vendor_settings.max_usd_per_hour
     if cap is None:
@@ -188,7 +188,7 @@ def _create_run(
     force: bool = False,
     capacity: CapacityMode | None = None,
     hold_after: timedelta = timedelta(0),
-    region: str | None = None,
+    regions: tuple[str, ...] = (),
 ) -> BenchmarkRun:
     spec = RunSpec(
         vendor=vendor,
@@ -198,12 +198,12 @@ def _create_run(
         force=force,
         capacity=capacity or cfg.settings.vendors[vendor].capacity,
         hold_after=hold_after,
-        region=region,
+        regions=list(regions),
     )
     run = crd.create_run(kube, spec)
     log.info(
         "created run",
-        extra={"run": run.name, "vendor": vendor, "sku": sku, "tasks": ",".join(names), "region": region},
+        extra={"run": run.name, "vendor": vendor, "sku": sku, "tasks": ",".join(names), "regions": ",".join(regions)},
     )
     return run
 
@@ -363,6 +363,15 @@ def _regions(quota: dict) -> dict[str, dict]:
         return {}
 
 
+def _zones(offerings: list) -> dict[str, list[str]]:
+    """The zone names of each offering group, by capacity type (a group without a list of strings is left out)."""
+    return {
+        o.get("capacityType"): [str(z) for z in o["zones"]]
+        for o in offerings
+        if isinstance(o, dict) and isinstance(o.get("zones"), list)
+    }
+
+
 def _quotas(offerings: list) -> dict[str, list[dict]]:
     """The quota entries of each offering group, by capacity type: `{capacityType: [{bucket, unit, need, maxLimit,
     maxHeadroom, regions}]}` (`regions` from `_regions`), whether or not the group is available. A group without
@@ -438,6 +447,7 @@ def read_offered(kube: Kube, cfg: Config, vendor: str, now: datetime | None = No
                     "capacityTypes": capacity_types,
                     "reason": entry.get("reason", "unavailable"),
                     "quotas": _quotas(offerings),
+                    "zones": _zones(offerings),
                 }
             old["until"] = max(untils, default=None)
     except NotFound:
@@ -574,16 +584,22 @@ class Decision:
     """What `QuotaPass.decide` says about one SKU."""
 
     quotas: list[dict] = field(default_factory=list)  # the quota entries the run consumes
-    region: str | None = None  # where to pin the run, None: nowhere
+    regions: tuple[str, ...] = ()  # the regions the run may land in (its pin), empty: any
+    region: str | None = None  # where it is expected to land, for the quota accounting; None: unknown
     price: float | None = None  # estimated USD/hour of its node (Keeper), None: unknown
     deferred: str | None = None  # why the SKU waits for a later cycle
     reserved: bool = False  # deferred because another SKU's reservation holds the quota
-    wait_keys: frozenset[QuotaKey] | None = None  # a big SKU deferred for busy spot quota: the buckets to drain
+    wait_keys: frozenset[QuotaKey] | None = None  # deferred for busy spot quota: the buckets to drain (a big SKU's)
 
 
 def _key(quota: dict, region: str | None) -> QuotaKey:
     """The consumption key of a quota entry: per region when SCarpenter lists the region for it, else per bucket."""
     return quota["bucket"], region if region in quota["regions"] else None
+
+
+def _landing(run: BenchmarkRun) -> str | None:
+    """The region a run holds quota in: its node's, else the only region it may land in, else unknown."""
+    return run.status.region or (run.spec.regions[0] if len(run.spec.regions) == 1 else None)
 
 
 def _limit(quota: dict, region: str | None) -> float:
@@ -601,7 +617,8 @@ class QuotaPass:
       and `reserved` starts with a launch, so it misses a run created after `generatedAt` and an anchor without a
       NodeClaim (or node) yet. A run with a NodeClaim that is older than `generatedAt` is in `reserved` or `used`
       already and is not counted again (a NodeClaim created just before `generatedAt` may not be in `reserved` yet).
-      A run without a region (not pinned) counts under region None, against every region.
+      A run whose region is not known (its node has none yet and it is confined to several regions, or to none)
+      counts under region None, against every region.
     - `held`: the keys that the vendor's own runs in flight consume. A reservation only matters for these: when
       others hold the quota, keeping SKUs back frees nothing.
     - `reserved`: the held keys that a SKU deferred longer than `limit` (the anti-starvation rule, `waits`) keeps for
@@ -638,9 +655,9 @@ class QuotaPass:
             quotas = self._run_quotas(run)
             unseen = (run.name not in claimed and not run.status.node) or run.created > offered.generated_at
             if unseen:
-                self.consume(quotas, run.spec.region)
+                self.consume(quotas, _landing(run))
             else:
-                self.held.update(_key(q, run.spec.region) for q in quotas)
+                self.held.update(_key(q, _landing(run)) for q in quotas)
         if self.limit:
             for holder, (since, keys) in sorted(self.waits.items(), key=lambda item: (item[1][0], item[0])):
                 if now - since > self.limit:
@@ -701,36 +718,47 @@ class QuotaPass:
                 return holder
         return None
 
-    def _wait_keys(self, sku: str, quotas: list[dict], candidates: list[str | None]) -> frozenset[QuotaKey] | None:
+    def _wait_keys(self, sku: str, quotas: list[dict], candidates: list[str | None]) -> frozenset[QuotaKey]:
         """The keys a SKU deferred for busy spot quota asks to drain, in ONE region: the one it chose before while
         that is still a candidate, else the one with the most room among those where the vendor's own runs hold the
-        quota (only those drain), else the most room anywhere. None unless the SKU is big there (it needs more
+        quota (only those drain), else the most room anywhere. Empty unless the SKU is big there (it needs more
         than half of an entry's limit): the others fit as soon as a few runs end."""
         old = {key[1] for key in self.waits[sku][1]} if sku in self.waits else set()
         held = [r for r in candidates if any(_key(q, r) in self.held for q in quotas)]  # only these can drain
         pool = [r for r in candidates if r in old] or held or candidates
-        region = max(pool, key=lambda r: min(self._room(q, r) - q["need"] for q in quotas))
+        region = max(pool, key=lambda r: self._margin(quotas, r))
         if not any(q["need"] > _limit(q, region) / 2 for q in quotas):
-            return None
+            return frozenset()
         return frozenset(_key(q, region) for q in quotas)
+
+    def _margin(self, quotas: list[dict], region: str | None) -> float:
+        """How much room is left in `region` after one more run (the least of the entries)."""
+        return min((self._room(q, region) - q["need"] for q in quotas), default=0)
 
     def decide(self, sku: str, task_names: list[str], market: dict | None = None) -> Decision:
         """Where and whether one new run of the SKU goes. The run consumes `_group` of the SKU. Without quota entries
-        nothing is known and it is planned unpinned. Otherwise every region the entries list (all regional entries
-        must list it) is a candidate, or just no region when no entry has `regions`; a region where the run does not
-        fit, or that another SKU reserves, is out, and of the rest the cheapest one by Keeper's price for the capacity
-        type (`market`, `popularity.rank`'s data; no price: last) is chosen. With no candidate the SKU is deferred
-        (busy spot quota: it would fall back to on-demand and cost several times as much). A group that never fits or
-        has no quotas changes nothing."""
+        nothing is known and it is planned unconfined. Otherwise every region the entries list (all regional entries
+        must list it, and the group's zones when they name regions) is a candidate, or just no region when no entry
+        has `regions`. A region where the run does not fit, or that another SKU reserves, is out. The run is confined
+        to all the others (Karpenter picks an available offering among them, so a region with an unavailable offering
+        does not starve it) and counts against the cheapest of them by Keeper's price for the capacity type
+        (`market`, `popularity.rank`'s data), else the one with the most room. With no candidate the SKU is deferred
+        (busy spot quota: it would fall back to on-demand and cost several times as much). A group that never fits
+        or has no quotas changes nothing."""
         entry = self.entries.get(sku)
         if entry is None:
-            return Decision(price=_cheapest(market, "ondemand"))
+            return Decision(price=_estimate(market, None, False))
         spot_ok = spot_capable(self.kube, self.cfg, self.vendor, sku, task_names, self.now)
         group = _group(entry, spot_ok)
         is_spot = bool(group) and group is entry["quotas"].get(CapacityType.SPOT)
         prices = (market or {}).get("spot" if is_spot else "ondemand", {})
         regional = [set(q["regions"]) for q in group if q["regions"]]
-        candidates: list[str | None] = sorted(set.intersection(*regional)) if regional else []
+        candidates: list[str | None] = []
+        if regional:
+            zones = entry["zones"].get(CapacityType.SPOT if is_spot else CapacityType.ON_DEMAND, [])
+            candidates = sorted(set.intersection(*regional))
+            named = [r for r in candidates if any(zone.startswith(r) for zone in zones)]
+            candidates = named or candidates  # zones that carry region names narrow the set; others say nothing
         candidates = candidates or [None]
         busy = {region: self._busy(group, region) for region in candidates}
         fitting = [region for region in candidates if not busy[region]]
@@ -742,14 +770,24 @@ class QuotaPass:
         if not free:
             holder = self._holder(sku, group, fitting[0])
             return Decision(deferred=f"its quota is reserved for {holder}, deferred over {self.limit}", reserved=True)
-        region = min(free, key=lambda r: (prices.get(r) is None, prices.get(r) or 0, r or ""))
-        price = prices.get(region) if region else (min(prices.values()) if prices else None)
-        return Decision(group, region, price)
+        priced = [r for r in free if prices.get(r) is not None]
+        region = (
+            min(priced, key=lambda r: (prices[r], r))
+            if priced
+            else max(free, key=lambda r: (self._margin(group, r), r or ""))
+        )
+        regions = tuple(r for r in free if r is not None)
+        return Decision(group, regions, region, _estimate(market, region, is_spot))
 
 
-def _cheapest(market: dict | None, allocation: str) -> float | None:
-    prices = (market or {}).get(allocation)
-    return min(prices.values()) if prices else None
+def _estimate(market: dict | None, region: str | None, spot: bool) -> float | None:
+    """USD/hour to budget for a node in `region` (None: the cheapest region): the dearer of its spot and on-demand
+    price for a run that may use spot, because spot can fall back to on-demand; None when Keeper has no price."""
+    found = []
+    for allocation in ("spot", "ondemand") if spot else ("ondemand",):
+        by_region = (market or {}).get(allocation, {})
+        found.append(by_region.get(region) if region else min(by_region.values(), default=None))
+    return max((price for price in found if price is not None), default=None)
 
 
 def start_order(vendor: str, sku: str) -> tuple[int, str]:
@@ -822,8 +860,8 @@ def plan_cycle(
     have a BenchmarkRun (the lease) and those whose names are no label values (the anchor could not select them),
     and create a run (not forced) for each SKU with due tasks (`due_reason` on the git schedule metas) that
     Keeper does not block and that fits (a SKU that does not fit is skipped, the next is tried), until `maxInFlight`,
-    `maxUsdPerHour` or `maxNewRunsPerCycle` stops the cycle. A SKU whose quota entries list `regions` is pinned to the
-    cheapest region that fits (`QuotaPass.decide`; `RunSpec.region`). GPU tasks are dropped
+    `maxUsdPerHour` or `maxNewRunsPerCycle` stops the cycle. A SKU whose quota entries list `regions` is confined to the
+    regions where it fits (`QuotaPass.decide`; `RunSpec.regions`). GPU tasks are dropped
     for a SKU whose `nvidia_smi` Keeper blocks (no GPU); a SKU with only GPU tasks due is not planned. A vendor
     whose publishing is stalled (`publisher.publishing_stalled`) is skipped: new runs would only pile up
     unpublished. A vendor that is `launch.paused` (BOOT_FAILURE on several SKUs, no node ready since) is skipped
@@ -882,6 +920,8 @@ def plan_cycle(
     aware_now = datetime.now(UTC)
     now = aware_now.replace(tzinfo=None)
     quota_waits = {} if quota_waits is None else quota_waits
+    if popularity_cache:
+        popularity_cache.begin_cycle()
     planned = []
     for vendor in candidates:
         try:
@@ -936,6 +976,7 @@ def plan_cycle(
             if due and not all(tasks.get_task(name).gpu for name in due):  # nothing due, or only GPU tasks
                 ready[sku] = due
         scores: dict[str, popularity.Score] = {}
+        markets: dict[str, dict | None] = {}
         if popularity_cache and ready:
             popularity_cache.warm(cfg.env, vendor, list(ready))
             markets = popularity_cache.markets(vendor)
@@ -953,11 +994,11 @@ def plan_cycle(
             order, unreached = [], list(ready)
         for i, sku in enumerate(order):
             due = ready[sku]
-            market = popularity_cache.markets(vendor).get(sku) if popularity_cache else None
+            market = markets.get(sku)
             decision = quota.decide(sku, list(due), market)
             if decision.deferred:
                 log.info("autoPlan defers %s/%s: %s", vendor, sku, decision.deferred)
-                if decision.wait_keys:
+                if decision.wait_keys is not None:
                     since = old_waits[sku][0] if sku in old_waits else aware_now
                     new_waits[sku] = (since, decision.wait_keys)
                 elif decision.reserved and sku in old_waits:  # still waiting: its timer goes on
@@ -971,7 +1012,7 @@ def plan_cycle(
                 continue
             if not dry_run:
                 try:
-                    run = _create_run(kube, cfg, vendor, sku, list(due), region=decision.region)
+                    run = _create_run(kube, cfg, vendor, sku, list(due), regions=decision.regions)
                 except crd.RunExists:
                     continue
                 runs.append(run)
@@ -980,12 +1021,16 @@ def plan_cycle(
             quota.consume(decision.quotas, decision.region)
             reason = ", ".join(f"{name}: {why}" for name, why in due.items())
             score = scores[sku].note if sku in scores else ""
-            planned.append(PlannedRun(vendor, sku, tuple(due), reason, decision.region, score))
+            planned.append(PlannedRun(vendor, sku, tuple(due), reason, decision.regions, score))
             if dry_run:
                 unreached = order[i + 1 :]
                 break
             if created >= settings.vendors[vendor].max_new_runs_per_cycle:
                 log.info("autoPlan stops for vendor %s: %d new runs, its maxNewRunsPerCycle", vendor, created)
+                unreached = order[i + 1 :]
+                break
+            if room is not None and decision.price is None:  # the spend of this run is unknown: wait for its price
+                log.info("autoPlan stops for vendor %s: no price estimate for %s under maxUsdPerHour", vendor, sku)
                 unreached = order[i + 1 :]
                 break
             try:
@@ -1038,7 +1083,7 @@ def run_forever(
                         "vendor": planned.vendor,
                         "sku": planned.sku,
                         "reason": planned.reason,
-                        "region": planned.region,
+                        "regions": ",".join(planned.regions),
                         "score": planned.score,
                     },
                 )

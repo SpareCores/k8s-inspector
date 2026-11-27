@@ -129,8 +129,8 @@ def to_manifest(spec: RunSpec, namespace: str) -> dict:
     }
     if spec.database is not None:
         spec_dict["database"] = spec.database
-    if spec.region is not None:
-        spec_dict["region"] = spec.region
+    if spec.regions:
+        spec_dict["regions"] = list(spec.regions)
     metadata = {
         "name": name,
         "namespace": namespace,
@@ -248,7 +248,7 @@ def from_dict(obj: dict) -> BenchmarkRun:
             capacity=CapacityMode(spec.get("capacity", CapacityMode.SPOT_FIRST)),
             hold_after=_parse_duration(spec.get("holdAfter", "0s")),
             database=spec.get("database"),
-            region=spec.get("region"),
+            regions=list(spec.get("regions") or []),
         ),
         status=_status_from_dict(obj.get("status") or {}),
         cancel_requested=(meta.get("annotations") or {}).get(ANNOTATION_CANCEL) == "true",

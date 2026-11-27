@@ -36,7 +36,7 @@ spec:
                             # (a forced DBaaS run also records a NO_OFFERING deferral for vendor+SKU: server runs of the SKU wait 24 h)
   capacity: SpotFirst       # SpotFirst | OnDemand (default from the vendor setting)
   holdAfter: 0s             # keep the node after the last step (debugging)
-  region: eu-central-1      # server runs: the region autoPlan placed the run in (absent: any); all attempts stay there
+  regions: [eu-central-1]   # server runs: the regions autoPlan confined the run to (absent: any); every attempt's anchor requires one of them
   database: null            # DBaaS runs: {vendor, id, engineVersion, region, vcpus, memoryGib}
 status:
   phase: Running            # Pending | Provisioning | Running | Releasing | Publishing | Done | Failed | Cancelled
