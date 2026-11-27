@@ -79,7 +79,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 
-from k8s_inspector import crd, keeper, launch, planner, pods, render, spot, steps, tasks, variant
+from k8s_inspector import crd, keeper, launch, launch_attempts, planner, pods, render, spot, steps, tasks, variant
 from k8s_inspector.kube import AlreadyExists, Forbidden, Kube, NotFound, backoff_delay, retry_until_ok
 from k8s_inspector.model import (
     AttemptOutcome,
@@ -1094,6 +1094,12 @@ class Runner(DbaasMixin):
                 "end": a.end.isoformat() if a.end else None,
                 "outcome": a.outcome.value if a.outcome else None,
             }
+            if a.launch_attempts:
+                entry |= {
+                    "launch_attempts": a.launch_attempts.outcomes,
+                    "launch_attempts_tried": a.launch_attempts.tried,
+                    "launch_attempts_truncated": a.launch_attempts.truncated,
+                }
             entry |= (details or {}).get(a.n, {})
             if a.n == run.status.attempt and a.node and run.status.region:
                 entry |= {"region": run.status.region, "zone": run.status.zone, "price": run.status.price_per_hour}
@@ -1231,6 +1237,7 @@ class Runner(DbaasMixin):
         error = _claim_error(claims)
         events = [] if bound else self._anchor_events(anchor)
         failures = self._record_launch_failures(run, claims, events)
+        run = self._record_launch_attempts(run, [_meta(c)["name"] for c in claims] + [f.node_claim for f in failures])
         if error is None and self._launch_failures_exhausted(run, cfg, anchor, failures):
             error = self._launch_error(failures[-1].message)
         reclaims = run.status.spot_reclaims
@@ -1500,6 +1507,37 @@ class Runner(DbaasMixin):
 
         return self._update(run, mutate).status.launch_failures
 
+    def _record_launch_attempts(self, run: BenchmarkRun, claim_names: list[str]) -> BenchmarkRun:
+        """Keep on the attempt what SCarpenter's `LaunchAttempts` Event of each of its NodeClaims says (see
+        `launch_attempts`). The Event outlives the claim, but is published only when the Create ends, so a claim
+        without one is asked for again on the next pass. An API error counts as no Events. Returns the updated run."""
+        attempt = self._attempt(run)
+        known = attempt.launch_attempts.claims if attempt and attempt.launch_attempts else []
+        todo = [name for name in dict.fromkeys(claim_names) if name not in known]
+        if not todo:
+            return run
+        try:
+            events = self.kube.list_launch_attempts_events()
+        except Exception:
+            log.warning("listing the launch attempts of run %s failed", run.name, exc_info=True)
+            return run
+        found = []
+        for event in events:
+            name = event["involvedObject"]["name"]
+            parsed = launch_attempts.parse(event.get("message") or "")
+            if name in todo and parsed:
+                found.append((name, parsed))
+        if not found:
+            return run
+
+        def mutate(status: RunStatus) -> None:
+            for a in status.attempts:
+                if a.n == status.attempt:
+                    for name, parsed in found:
+                        a.launch_attempts = launch_attempts.merge(a.launch_attempts, name, parsed)
+
+        return self._update(run, mutate)
+
     def _ice_events(self, events: list[dict]) -> list[LaunchFailure]:
         """The NodeClaims Karpenter reports in the anchor's `InsufficientCapacityError` Events (`NodeClaim <name>
         nominated for this pod failed to launch: <message>`)."""
@@ -1602,6 +1640,7 @@ class Runner(DbaasMixin):
                     a.capacity_type = facts.capacity_type or a.capacity_type
 
         run = self._update(run, mutate)
+        run = self._record_launch_attempts(run, [facts.node_claim])  # the Event may have come after the last pass
         if (
             facts.capacity_type == CapacityType.SPOT
             and run.spec.database is None

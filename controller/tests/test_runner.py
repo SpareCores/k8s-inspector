@@ -3359,3 +3359,80 @@ def test_classes_of_a_summary():
         "Unsupported",
     }
     assert runner_mod._classes(["insufficient capacity, no candidate offering had quota headroom (2 skipped)"]) == set()
+
+
+def _launch_attempts_event(h, claim, message):
+    """What SCarpenter publishes on a NodeClaim when its Create ends (a NodeClaim has no namespace: `default`)."""
+    h.kube.create(
+        "event",
+        {
+            "metadata": {"name": f"launch-attempts-{claim}", "namespace": "default"},
+            "involvedObject": {"kind": "NodeClaim", "name": claim},
+            "reason": "LaunchAttempts",
+            "message": message,
+        },
+    )
+
+
+LAUNCH_ATTEMPTS_FAILED = (
+    "launch-attempts v1 tried=2 shown=2\n"
+    "eu-test-1|eu-test-1a|spot|aws.m7i.large|InsufficientCapacity|NoSpot|no spot capacity\n"
+    "eu-test-1|eu-test-1b|spot|aws.m7i.large|QuotaExceeded|Vcpu|vcpu limit"
+)
+
+
+def test_launch_attempts_of_failed_nodeclaims_reach_the_run_json(h):
+    _provisioning_without_nodes(h, capacity=CapacityMode.ON_DEMAND, force=True)
+    for claim in ("bench-aaaaa", "bench-bbbbb"):
+        _ice_event(h, claim)
+        _launch_attempts_event(h, claim, LAUNCH_ATTEMPTS_FAILED)
+    h.runner.reconcile(h.name)
+    assert h.run.status.phase == RunPhase.FAILED
+    entry = h.storage.run_json["attempts"][0]
+    assert entry["launch_attempts_tried"] == 4
+    assert entry["launch_attempts_truncated"] is False
+    assert [o["outcome"] for o in entry["launch_attempts"]] == ["InsufficientCapacity", "QuotaExceeded"] * 2
+    assert entry["launch_attempts"][0]["zone"] == "eu-test-1a"
+    assert h.run.status.attempts[0].launch_attempts.claims == ["bench-aaaaa", "bench-bbbbb"]
+
+
+def test_launch_attempts_of_the_launched_nodeclaim_reach_the_run_json(h):
+    h.start(["geekbench"])
+    h.runner.reconcile(h.name)
+    claim = f"claim-node-{h.name}-a1"
+    _launch_attempts_event(
+        h, claim, "launch-attempts v1 tried=1 shown=1 launched=eu-test-1|eu-test-1a|spot|aws.m7i.large"
+    )
+    h.drive(stop=lambda run: run.status.phase == RunPhase.RUNNING)
+    entry = h.storage.run_json["attempts"][0]
+    assert entry["launch_attempts"] == [
+        {
+            "region": "eu-test-1",
+            "zone": "eu-test-1a",
+            "capacity_type": "spot",
+            "instance_type": "aws.m7i.large",
+            "outcome": "launched",
+            "code": None,
+            "message": None,
+        }
+    ]
+    assert entry["launch_attempts_tried"] == 1
+
+
+def test_run_json_has_no_launch_attempts_without_an_event(h):
+    h.start(["geekbench"])
+    h.drive(stop=lambda run: run.status.phase == RunPhase.PUBLISHING)
+    entry = h.storage.run_json["attempts"][0]
+    assert not {"launch_attempts", "launch_attempts_tried", "launch_attempts_truncated"} & entry.keys()
+
+
+def test_an_unreadable_launch_attempts_event_changes_nothing(h):
+    _provisioning_without_nodes(h, capacity=CapacityMode.ON_DEMAND, force=True)
+    _ice_event(h, "bench-aaaaa")
+    _launch_attempts_event(h, "bench-aaaaa", LAUNCH_ATTEMPTS_FAILED.replace("v1", "v2"))
+    h.runner.reconcile(h.name)
+    assert h.run.status.phase == RunPhase.PROVISIONING
+    assert h.run.status.attempts[0].launch_attempts is None
+    h.kube.events_forbidden = True  # no RBAC: the same
+    h.runner.reconcile(h.name)
+    assert h.run.status.attempts[0].launch_attempts is None

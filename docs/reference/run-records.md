@@ -49,6 +49,7 @@ An attempt:
 | `api_end`, `machine_start`, `node_registered`, `node_ready` | NodeClaim launched, kernel boot, node registered, node ready; `null` when not reached |
 | `end` | when the attempt ended (ISO, with offset); `null` while open |
 | `outcome` | how the attempt ended, see below; `null` while open |
+| `launch_attempts`, `launch_attempts_tried`, `launch_attempts_truncated` | how the candidate offerings of the attempt's NodeClaims ended, see [below](#launch-attempts); absent when SCarpenter published no `LaunchAttempts` Event for them |
 | `spot_try` | only on an attempt that ended `SpotUnavailable`: the evidence of the try, see [below](#spot-unavailable-attempts) |
 | `spot_rejected` | only on an attempt that ended `SpotRejected`: `{error, launch_errors}`, the rejection SCarpenter reported and the failed NodeClaims the controller saw (shaped like `error` and `launch_errors` of `spot_try`) |
 
@@ -66,6 +67,32 @@ Attempt `outcome` values:
 | `Cancelled` | an operator cancelled the run |
 | `HarnessError` | the controller gave up on the run |
 
+## Launch attempts
+
+SCarpenter tries several candidate offerings (region, zone, capacity type, instance type) for each NodeClaim it
+launches ([launch retries](../explanation/launch-retries.md#what-each-launch-tried)). The controller keeps its report
+of every NodeClaim of the attempt:
+
+| Field | Meaning |
+|---|---|
+| `launch_attempts` | list of `{region, zone, capacity_type, instance_type, outcome, code, message}` in the order tried, over all the attempt's NodeClaims, at most 50. `instance_type` is `<vendor>.<type>`. `outcome` is the SCarpenter error class of a failed candidate (`InsufficientCapacity`, `QuotaExceeded`, ...) or `launched` for the one that launched, which is last and has `code` and `message` `null`. `message` is cut to 40 characters |
+| `launch_attempts_tried` | integer: how many candidates SCarpenter tried in all, the launched one included; can be more than the list holds |
+| `launch_attempts_truncated` | `true` when SCarpenter or the controller cut the list |
+
+```json
+"launch_attempts": [
+  {"region": "us-east-1", "zone": "us-east-1a", "capacity_type": "spot", "instance_type": "aws.m7i.large",
+   "outcome": "InsufficientCapacity", "code": "SpotMaxPriceTooLow", "message": "no spot capacity"},
+  {"region": "us-east-1", "zone": "us-east-1c", "capacity_type": "spot", "instance_type": "aws.m7i.large",
+   "outcome": "launched", "code": null, "message": null}
+],
+"launch_attempts_tried": 2,
+"launch_attempts_truncated": false
+```
+
+The three fields are all present or all absent: an attempt whose NodeClaims have no Event (an older SCarpenter, an
+Event past its TTL when the controller looked, a Create that made no vendor call) has none.
+
 ## Spot unavailable attempts
 
 A run that ends `SpotUnavailable` is a **try** to launch the SKU on spot, one run and one record file per try. It has
@@ -81,7 +108,7 @@ and `hour // 3` with the default `slotHours`).
 |---|---|
 | `error` | the SCarpenter error that ended the attempt (`SCARPENTER_ICE: <message>`), a string. The message is Karpenter's prefix plus SCarpenter's own text: `insufficient capacity, <Class> (<Code>): <cloud error>; tried N offerings in R regions / Z zones; classes: <Class>:<n>,...; stopped by: <reason>`. Only the last candidate's cloud error is in it |
 | `launch_errors` | `[{node_claim, time, message}]`: the NodeClaims of the attempt that failed to launch and that the controller saw (a `LaunchFailed` condition, or Karpenter's `InsufficientCapacityError` event on the anchor), oldest first; possibly empty. `message` is SCarpenter's launch error of that claim |
-| `tried` | `{offerings, regions, zones}`: how many offerings, regions and zones SCarpenter tried, the largest numbers of its summaries in `error` and `launch_errors` (a try counts only when the error's `classes:` or a launch error names `InsufficientCapacity` or `ZoneUnusable`; a summary of only `Unsupported`, `InvalidOffering`, `Fatal` or `NotFound` is a rejection, not a try); `null` when no message has a summary (an older SCarpenter). The cloud's error per region is not available to the controller today. SCarpenter plans per-candidate launch outcomes; they will be added to `tried` (consumers: ignore keys you do not know) |
+| `tried` | `{offerings, regions, zones}`: how many offerings, regions and zones SCarpenter tried, the largest numbers of its summaries in `error` and `launch_errors` (a try counts only when the error's `classes:` or a launch error names `InsufficientCapacity` or `ZoneUnusable`; a summary of only `Unsupported`, `InvalidOffering`, `Fatal` or `NotFound` is a rejection, not a try); `null` when no message has a summary (an older SCarpenter). The cloud's error per candidate is in the attempt's [`launch_attempts`](#launch-attempts) |
 | `regions` | the regions the run was confined to (`RunSpec.regions`, those where the spot quota fitted when it was planned); empty: it was not confined. The try covers these regions, not every region of the vendor |
 | `quota` | the SKU's spot quota entries in SCarpenter's offered-types listing when the attempt ended, each `{bucket, unit, need, maxLimit, maxHeadroom, regions}` (numbers; `regions` is `{<region>: {limit, headroom}}`, empty for a global bucket or when SCarpenter lists none). It is the proof that the quota had room: a try counts only when the entry's headroom is at least `need`, for a regional entry the best headroom among `regions` of the run (all listed regions when it was not confined), else `maxHeadroom`. An empty list: the listing had no quota for the SKU |
 | `quota_at` | when SCarpenter wrote that listing (its `generatedAt`, ISO with offset), `null` when the listing was unusable |

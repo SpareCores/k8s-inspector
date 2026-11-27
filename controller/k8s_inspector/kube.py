@@ -210,6 +210,15 @@ class Kube:
         except ApiError as e:
             raise _translate(e) from e
 
+    def list_launch_attempts_events(self) -> list[dict]:
+        """SCarpenter's `LaunchAttempts` Events of NodeClaims. A NodeClaim has no namespace, so its Events are in
+        `default`."""
+        fields = {"reason": "LaunchAttempts", "involvedObject.kind": "NodeClaim"}
+        try:
+            return [e.to_dict() for e in self._client.list(core_v1.Event, namespace="default", fields=fields)]
+        except ApiError as e:
+            raise _translate(e) from e
+
     def list_node_pods(self, node_name: str) -> list[dict]:
         """Every Pod of every namespace that is bound to the node (`spec.nodeName` field selector)."""
         try:

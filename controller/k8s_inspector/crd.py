@@ -20,6 +20,7 @@ from k8s_inspector.model import (
     CapacityType,
     DbPhase,
     DbStatus,
+    LaunchAttempts,
     LaunchFailure,
     RunKey,
     RunPhase,
@@ -166,6 +167,18 @@ def _attempt_from_dict(d: dict) -> AttemptStatus:
         start=_parse_time(d.get("start")),
         end=_parse_time(d.get("end")),
         outcome=AttemptOutcome(outcome) if outcome else None,
+        launch_attempts=_launch_attempts_from_dict(d.get("launchAttempts")),
+    )
+
+
+def _launch_attempts_from_dict(d: dict | None) -> LaunchAttempts | None:
+    if not d:
+        return None
+    return LaunchAttempts(
+        claims=list(d.get("claims") or []),
+        tried=d.get("tried", 0),
+        truncated=bool(d.get("truncated", False)),
+        outcomes=list(d.get("outcomes") or []),
     )
 
 
@@ -288,6 +301,14 @@ def _attempt_to_dict(attempt: AttemptStatus) -> dict:
         d["nodeClaim"] = attempt.node_claim
     if attempt.node is not None:
         d["node"] = attempt.node
+    if attempt.launch_attempts is not None:
+        la = attempt.launch_attempts
+        d["launchAttempts"] = {
+            "claims": la.claims,
+            "tried": la.tried,
+            "truncated": la.truncated,
+            "outcomes": la.outcomes,
+        }
     return d
 
 

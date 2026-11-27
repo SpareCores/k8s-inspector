@@ -249,6 +249,18 @@ class TaskStatus:
 
 
 @dataclass
+class LaunchAttempts:
+    """`status.attempts[].launchAttempts`: what SCarpenter's `LaunchAttempts` Events say about the attempt's
+    NodeClaims. `outcomes` are `{region, zone, capacity_type, instance_type, outcome, code, message}` (`outcome` is
+    `launched` or the error class; `code` and `message` are None for `launched`), in the order tried."""
+
+    claims: list[str] = field(default_factory=list)  # the NodeClaims whose Event is in here
+    tried: int = 0
+    truncated: bool = False
+    outcomes: list[dict] = field(default_factory=list)
+
+
+@dataclass
 class AttemptStatus:
     """`status.attempts[]`."""
 
@@ -259,6 +271,7 @@ class AttemptStatus:
     start: datetime | None = None
     end: datetime | None = None
     outcome: AttemptOutcome | None = None
+    launch_attempts: LaunchAttempts | None = None  # None: no Event seen (older SCarpenter, or its TTL passed)
 
 
 @dataclass

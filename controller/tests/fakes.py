@@ -95,6 +95,15 @@ class FakeKube:
             if e["involvedObject"]["name"] == pod_name and e["involvedObject"].get("uid") == uid
         ]
 
+    def list_launch_attempts_events(self) -> list[dict]:
+        if self.events_forbidden:
+            raise Forbidden("events")
+        return [
+            copy.deepcopy(e)
+            for e in self._store("event").values()
+            if e.get("reason") == "LaunchAttempts" and e["involvedObject"]["kind"] == "NodeClaim"
+        ]
+
     def list_node_pods(self, node_name: str) -> list[dict]:
         """The Pods bound to the node: stored ones plus `foreign_pods` (other namespaces, written by tests)."""
         if self.node_pods_forbidden:
