@@ -122,7 +122,6 @@ EXTRA_ATTEMPTS = 2  # attempts beyond `max_spot_attempts` (the on-demand one plu
 NOT_ELIGIBLE = "SKU is no longer eligible in Keeper"
 ELIGIBILITY_CHECK_INTERVAL = timedelta(minutes=10)  # per run without a node: how often Keeper is asked again
 MAX_DBAAS_LAUNCH_FAILURES = 3  # failed NodeClaims of a DBaaS client in one attempt before the run gives up
-LAUNCH_EVENT_WINDOW = timedelta(minutes=5)  # how long after its failure the Events of a deleted NodeClaim are read
 MAX_LAUNCH_FAILURES = 2  # distinct NodeClaims that failed to launch in one attempt before the run gives up; ICE
 # ones go on while SCarpenter still offers the SKU (`_launch_failures_exhausted`)
 SPOT_FALLBACK_ERRORS = (
@@ -1510,17 +1509,16 @@ class Runner(DbaasMixin):
         self, run: BenchmarkRun, live_claims: list[str], failures: list[LaunchFailure]
     ) -> BenchmarkRun:
         """Keep on the open attempt what SCarpenter's `LaunchAttempts` Events say (see `launch_attempts`): those of
-        its NodeClaims that exist and of the `failures` of the last `LAUNCH_EVENT_WINDOW`. A claim
+        its NodeClaims that exist and of the remembered `failures` (at most `MAX_LAUNCH_FAILURES_KEPT`). A claim
         can have an Event per Create, published when the Create ends and only when it made a vendor call, so they
         are asked for on every pass, one list per claim, until the attempt ends; what was read is told by the Events'
         names. An API error counts as no Events (logged once per run). Returns the updated run."""
         attempt = self._attempt(run)
         if attempt is None or attempt.outcome is not None:
             return run
-        recent = [f.node_claim for f in failures if self._now() - f.time < LAUNCH_EVENT_WINDOW]
         known = {e.name for e in attempt.launch_events}
         found = []
-        for claim in dict.fromkeys([*live_claims, *recent]):
+        for claim in dict.fromkeys([*live_claims, *(f.node_claim for f in failures)]):
             try:
                 events = self.kube.list_launch_attempts_events(claim)
             except Exception as e:

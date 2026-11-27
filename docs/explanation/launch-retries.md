@@ -66,8 +66,7 @@ One line per failed candidate in the order tried; `launched=` is only on a succe
 `tried` but has no line. SCarpenter replaces `|` in a message by `/` and cuts it to 40 characters, records at most 50
 candidates per Create and marks a cut with `truncated`.
 
-On every pass of an open attempt the controller lists the Events of each of its NodeClaims that exists, and of the
-ones that failed to launch in the last 5 minutes (one field-selected list per claim, in `default`). It also reads
+On every pass of an open attempt the controller lists the Events of each of its NodeClaims that exists and of the ones it remembers as failed to launch (`status.launchFailures`, at most 20; one field-selected list per claim, in `default`). It also reads
 once more when the node is ready, and never after the attempt ended. It keeps each Event it has not read (by the
 Event's name) in `status.attempts[].launchEvents` (at most 50 failed candidates per attempt, the launched one is
 always kept) and puts them into the attempt's entry of `run.json` and the

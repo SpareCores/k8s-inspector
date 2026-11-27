@@ -3433,20 +3433,15 @@ def test_a_nodeclaim_with_several_creates_ends_with_the_launched_one(h):
     assert events[1].launched["outcome"] == "launched"
 
 
-def test_launch_attempts_are_listed_per_nodeclaim_until_the_attempt_or_the_window_ends(h):
+def test_launch_attempts_are_listed_per_nodeclaim_for_the_remembered_failures(h):
     _provisioning_without_nodes(h, capacity=CapacityMode.ON_DEMAND, force=True)
-    h.cluster.fail_launch(
-        h.kube.get("pod", f"{h.name}-a1"), "Fatal (X): no", name="bench-aaaaa", status="Unknown", reason="LaunchFailed"
-    )
+    _ice_event(h, "bench-aaaaa", lastTimestamp=iso(h.clock.now))
     h.runner.reconcile(h.name)
     assert set(h.kube.launch_event_lists) == {"bench-aaaaa"}  # asked for that claim only, never cluster-wide
-    h.kube.delete("nodeclaim", "bench-aaaaa")
+    h.clock.advance(minutes=20)  # a slow pass: the claim is long gone, its Event is still read
+    _launch_attempts_event(h, "bench-aaaaa", LAUNCH_ATTEMPTS_FAILED)
     h.runner.reconcile(h.name)
-    assert h.kube.launch_event_lists[-1] == "bench-aaaaa"  # gone, but failed a moment ago
-    h.clock.advance(minutes=6)
-    asked = len(h.kube.launch_event_lists)
-    h.runner.reconcile(h.name)
-    assert len(h.kube.launch_event_lists) == asked  # the window has passed
+    assert [e.name for e in h.run.status.attempts[0].launch_events] == ["bench-aaaaa.1"]
 
 
 def test_no_launch_attempts_are_listed_after_the_attempt_ends(h):
