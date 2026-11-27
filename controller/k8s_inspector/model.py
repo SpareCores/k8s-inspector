@@ -504,6 +504,7 @@ class SpotSettings:
     interruptions_to_quarantine: int = 2
     quarantine_days: int = 14
     spot_max_task_minutes: int = 240
+    quota_reserve_after_minutes: int = 60  # a SKU deferred this long as spot-quota-busy reserves its buckets; 0: never
 
 
 @dataclass(frozen=True)
