@@ -397,8 +397,9 @@ def _quotas(offerings: list) -> dict[str, list[dict]]:
     groups, the unavailable ones among them, each listing only the regions of its own zones), else over all its
     groups, like `_zones`. `regions` is the union of the groups' regions (the values are account-level facts; on a
     conflict the smaller limit and headroom win). `maxLimit` and `maxHeadroom` are the maxima over each group's own
-    regions, so the maxima of the groups are the maxima over the union; `need` should agree, else the largest wins. A group without `quotas` or with a damaged one is left out (no quota
-    model: the planner behaves as without this field)."""
+    regions, so the maxima of the groups are the maxima over the union; `need` should agree, else the largest
+    wins. A group without `quotas` or with a damaged one is left out
+    (no quota model: the planner behaves as without this field)."""
     groups: dict[str, list[tuple[bool, list[dict]]]] = {}
     for offering in offerings:
         try:
