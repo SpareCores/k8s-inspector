@@ -608,7 +608,10 @@ class Publisher:
         what the record lacks, or has only as a null from a Keeper that could not be asked at launch. What Keeper
         cannot tell stays missing (logged as null); an attempt that got a node always ends with a price or a reason.
         After the first `RuntimeError` Keeper is not asked again (`down` is shared by the records of one pass): the
-        attempts keep the reason `keeper_unreachable` and are filled by a later pass."""
+        attempts keep the reason `keeper_unreachable` and are filled by a later pass. A record without a server (a
+        DBaaS run that failed before its client node existed has a null `sku`) has nothing to ask Keeper about."""
+        if not record.get("vendor") or not record.get("sku"):
+            return
         sku = (record["vendor"], record["sku"])
         try:
             if down:

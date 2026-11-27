@@ -1618,6 +1618,32 @@ def test_a_record_with_family_but_no_vcpus_gets_only_the_missing_facts(tmp_path,
     assert (record["family"], record["series"], record["vcpus"], record["memory_gib"]) == ("launch", "s", 8, 16.0)
 
 
+def test_a_record_without_a_server_is_left_alone_by_keeper(tmp_path, origin, monkeypatch):
+    def fail(*args):
+        raise AssertionError("Keeper must not be asked")
+
+    monkeypatch.setattr(keeper, "server_facts", fail)
+    monkeypatch.setattr(keeper, "ondemand_prices", fail)
+    record = {"vendor": "aws", "sku": None, "attempts": [{"region": "us-east-1"}]}
+    make_publisher(tmp_path, origin, FakeStorage())._fill_from_keeper(record, {}, {}, set())
+    assert record == {"vendor": "aws", "sku": None, "attempts": [{"region": "us-east-1"}]}
+
+
+def test_a_dbaas_run_without_a_client_node_does_not_stop_the_publish_cycle(
+    tmp_path, origin, storage, cluster, monkeypatch
+):
+    monkeypatch.setattr(keeper, "server_facts", lambda env, vendor, sku: {"vcpus": 2} if sku else 1 / 0)
+    run = cluster.add_run(["lscpu"], phase=RunPhase.FAILED)
+    run.status.tasks[0].published = True
+    doc = json.loads(storage.objects[okey(KEY, "run.json")])
+    doc |= {"sku": None, "database": {"vendor": "hcloud", "id": "db1", "engineVersion": "16", "region": "fsn1"}}
+    storage.objects[okey(KEY, "run.json")] = json.dumps(doc).encode()
+    pub = make_publisher(tmp_path, origin, storage)
+    pub.publish_once(ENABLED)
+    assert run.name in pub._records_written
+    assert run_record(origin, tmp_path, "dbaas/hcloud/db1/runs")["sku"] is None
+
+
 def test_emit_cost_logs_leaves_unknown_useful_time_null(tmp_path, origin, caplog):
     today = datetime.now(UTC)
     day = f"{today:%Y-%m-%d}"
