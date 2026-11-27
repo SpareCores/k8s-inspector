@@ -317,14 +317,14 @@ starts with a launch, so an anchor without a NodeClaim is not in it). A run with
 `generatedAt` is in `reserved` or `used` already and is not counted again; a NodeClaim created just before
 `generatedAt` may not be in `reserved` yet, so the headroom can be over-stated. A run counts with the capacity it will
 use (`spot.capacity_for_next_attempt`: its tasks, attempts and the SKU's quarantine, so an on-demand-only run after a
-failed launch counts against the on-demand group). A run that may use spot counts against the spot group only: the
+failed launch counts against the on-demand group). A run that may use spot counts against the spot group only (a spot offering without quotas counts nothing, for planned and counted runs alike): the
 fall-back to on-demand when spot fills before the launch is not planned for. A DBaaS client run counts, with the
 on-demand group, once its client SKU is known. Nothing of this is read when no SKU of the listing has `quotas`.
 
 A deferred SKU would starve behind smaller SKUs that keep taking the bucket. The controller remembers since when each
 SKU is deferred for a busy spot quota (in memory; a restart resets it) and rebuilds that memory every cycle: a SKU that
 is not deferred as spot-busy again (planned, no longer due, leased, no longer listed by Keeper, not offered) is
-forgotten, and one that is held back by another SKU's reservation keeps its time. A SKU deferred for longer than
+forgotten, and one that is held back by another SKU's reservation keeps its time, as do the SKUs after the point where a cap (`maxInFlight`, `maxUsdPerHour`) stopped the cycle. A SKU deferred for longer than
 `spot.quotaReserveAfterMinutes` (default 60; `0` turns the reservation off) **reserves** its buckets: other SKUs of the
 vendor that would consume one of them are deferred (`autoPlan defers <vendor>/<sku>: its quota is reserved for <sku>`)
 until it is planned or stops waiting. The reservation applies only to buckets that the vendor's own runs in flight

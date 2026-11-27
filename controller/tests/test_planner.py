@@ -1624,3 +1624,43 @@ def test_runs_created_after_the_listing_count_even_with_a_nodeclaim(kube, keeper
     created = (datetime.now(UTC) - timedelta(minutes=2)).strftime("%Y-%m-%dT%H:%M:%SZ")
     kube.objects[run.name]["metadata"]["creationTimestamp"] = created
     assert plan_wet(kube, keeper_skus) == []
+
+
+@pytest.mark.offered
+def test_waits_of_skus_after_the_vendor_cap_are_kept(kube, keeper_skus):
+    first, second, third = order("x", "y", "z")
+    keeper_skus["oci"] = {first: {}, second: {}, third: {}}
+    fits = spot_entry(quota("B2", need=8, headroom=128))
+    busy = spot_entry(quota("B", need=384, headroom=128))
+    publish_offered(kube, offered_configmap({first: fits, second: fits, third: busy}))
+    wait = (datetime.now(UTC) - timedelta(minutes=50), frozenset({"B"}))
+    waits = {("oci", third): wait}
+    cfg = auto_config(max_in_flight=1)
+    assert plan_wet(kube, keeper_skus, cfg, quota_waits=waits) == [first]  # the cap stops the loop before `third`
+    assert waits == {("oci", third): wait}
+
+
+@pytest.mark.offered
+def test_the_listing_is_read_once_per_cycle(kube, keeper_skus, monkeypatch):
+    keeper_skus["oci"] = {"s": {}}
+    publish_offered(kube, offered_configmap({"s": OFFERED}))
+    reads = []
+    original = planner.read_offered
+    monkeypatch.setattr(planner, "read_offered", lambda *args, **kw: reads.append(1) or original(*args, **kw))
+    plan_wet(kube, keeper_skus)
+    assert len(reads) == 1
+    kube.foreign_configmaps.clear()  # unusable listing: still one read
+    reads.clear()
+    plan_wet(kube, keeper_skus)
+    assert len(reads) == 1
+
+
+@pytest.mark.offered
+def test_a_spot_run_without_spot_quotas_consumes_nothing_known(kube, keeper_skus):
+    keeper_skus["oci"] = {"new": {}}
+    od = (quota("OD", need=64, headroom=100),)
+    publish_offered(
+        kube, offered_configmap({"old": spot_entry(on_demand_quotas=od), "new": spot_entry(on_demand_quotas=od)})
+    )
+    pending_run(kube, "old")  # spot offered without quotas: counts nothing, like a new run of that kind
+    assert plan_wet(kube, keeper_skus) == ["new"]
