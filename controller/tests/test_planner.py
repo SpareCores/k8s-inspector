@@ -1820,6 +1820,57 @@ def test_a_global_bucket_is_checked_account_wide_next_to_a_regional_one(kube, ke
     assert len(plan_wet(kube, keeper_skus, popularity_cache=popularity_cache())) == 1
 
 
+def regional_group(available, **regions):
+    offering = group("spot", regional(**regions), available=available)
+    offering["zones"] = [f"{name}-a" for name in regions]
+    return offering
+
+
+def spot_regions(*offerings):
+    (quota_entry,) = planner._quotas(list(offerings))["spot"]
+    return {name: values["headroom"] for name, values in quota_entry["regions"].items()}
+
+
+def test_quota_regions_are_the_available_groups_not_the_unavailable_ones():
+    available, unavailable = regional_group(True, a=64, b=96), regional_group(False, c=32)
+    assert spot_regions(unavailable, available) == {"a": 64, "b": 96}  # `c` is only in the unavailable group
+
+
+def test_quota_regions_of_two_available_groups_are_united():
+    assert spot_regions(regional_group(True, a=64), regional_group(True, b=96)) == {"a": 64, "b": 96}
+
+
+def test_a_region_in_two_groups_keeps_the_smaller_headroom_and_the_entry_the_smaller_maxima():
+    (entry,) = planner._quotas([regional_group(True, a=64, b=96), regional_group(True, a=32)])["spot"]
+    assert {name: values["headroom"] for name, values in entry["regions"].items()} == {"a": 32, "b": 96}
+    assert entry["maxHeadroom"] == 32 and entry["maxLimit"] == 256 and entry["need"] == 64
+
+
+def test_quota_regions_of_only_unavailable_groups_are_used_when_nothing_is_available():
+    assert spot_regions(regional_group(False, a=64), regional_group(False, b=96)) == {"a": 64, "b": 96}
+
+
+def test_quotas_without_regions_in_any_group_fall_back_to_the_max_headroom():
+    (entry,) = planner._quotas([group("spot", quota(headroom=96)), group("spot", quota(headroom=64), available=False)])[
+        "spot"
+    ]
+    assert entry["regions"] == {} and entry["maxHeadroom"] == 96
+
+
+@pytest.mark.offered
+def test_a_region_only_an_unavailable_group_lists_is_not_used(kube, keeper_skus, markets):
+    keeper_skus["oci"] = {"s": {}}
+    markets["s"] = market(spot={"x": 0.1, "y": 0.2})
+    entry = {
+        "available": True,
+        "capacityTypes": ["spot"],
+        "offerings": [regional_group(False, x=512), regional_group(True, y=128)],
+    }
+    publish_offered(kube, offered_configmap({"s": entry}))
+    assert plan_wet(kube, keeper_skus, popularity_cache=popularity_cache()) == ["s"]
+    assert planned_regions(kube) == {"s": ("y",)}  # `x` is not in the available group, its room does not count
+
+
 @pytest.mark.offered
 def test_without_regions_the_max_headroom_decides_and_nothing_is_pinned(kube, keeper_skus, markets):
     keeper_skus["oci"] = {"s": {}}

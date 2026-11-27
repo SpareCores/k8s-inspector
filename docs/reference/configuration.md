@@ -415,6 +415,11 @@ A regional bucket also lists `regions: [{region, limit, headroom}]`, the regions
 `maxHeadroom`); a global (account-wide) bucket has no `regions` list, because `maxLimit` and `maxHeadroom` are already the
 exact account figures. A list that is absent or damaged is ignored for that entry.
 
+A type has several offering groups per capacity type (available and unavailable ones), and each lists only the regions of
+its own zones. The planner reads a capacity type's quota from its available groups, else from all of them, merging the
+entries by bucket: `regions` is the union over the groups (a region in several keeps the smaller limit and headroom), and
+`need` is the largest and `maxLimit` and `maxHeadroom` the smallest among them.
+
 **Placement and pinning.** When an entry of the chosen group has `regions`, the candidate regions are those that every
 such entry lists, narrowed to the regions that the zones of the capacity type's available offering groups name (all its groups when none is
 available): a zone belongs to a region when it is the region, or the region plus a letter (`us-east-1a`) or a dash and a
