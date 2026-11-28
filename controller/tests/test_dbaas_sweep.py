@@ -404,15 +404,15 @@ def test_a_failed_inventory_drops_the_last_result_and_the_metric_tells_the_last_
     metrics.record_dbaas_inventory({"aws": good}, {"aws": good.at})
     text = metrics.render()
     assert (
-        f'k8s_inspector_dbaas_inventory_last_success_timestamp_seconds{{vendor="aws"}} {good.at.timestamp():g}' in text
+        f'k8s_inspector_dbaas_inventory_last_success_timestamp_seconds{{vendor="aws"}} {good.at.timestamp()!r}' in text
     )
     assert (
-        f'k8s_inspector_dbaas_inventory_last_success_timestamp_seconds{{vendor="oci"}} {NOW.timestamp():g}' in text
+        f'k8s_inspector_dbaas_inventory_last_success_timestamp_seconds{{vendor="oci"}} {NOW.timestamp()!r}' in text
     )  # never worked: the process start
     metrics.record_dbaas_inventory({}, {"aws": good.at})  # the latest one failed: no stale count
     text = metrics.render()
     assert "dbaas_tagged_databases{" not in text
-    assert f'timestamp_seconds{{vendor="aws"}} {good.at.timestamp():g}' in text
+    assert f'timestamp_seconds{{vendor="aws"}} {good.at.timestamp()!r}' in text
 
 
 def test_the_metrics_export_the_tagged_databases_and_the_age_of_the_oldest(kube):
