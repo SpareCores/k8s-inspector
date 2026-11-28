@@ -54,7 +54,6 @@ spot:
   interruptionsToQuarantine: 2
   quarantineDays: 14
   spotMaxTaskMinutes: 240
-  quotaReserveAfterMinutes: 60   # autoPlan: a SKU deferred this long for busy spot quota reserves its buckets; 0: never (see Quota-aware planning)
   patienceDays: 14               # SpotUntilExhausted: a SKU is exhausted when its first counted try is this old ...
   coverage: 100                  # ... and counted tries fell in this percent of the week's slots (1-100)
   slotHours: 3                   # a slot is this many UTC hours of a weekday (1-24); 3 gives 56 slots a week
@@ -424,8 +423,7 @@ entries by bucket: `regions` is the union over the groups (a region in several k
 such entry lists, narrowed to the regions that the zones of the capacity type's available offering groups name (all its groups when none is
 available): a zone belongs to a region when it is the region, or the region plus a letter (`us-east-1a`) or a dash and a
 letter (`europe-west1-b`). When no zone names a candidate region (zone names like Azure's `1` say nothing) the set stays. A region is out when the run does not fit one of the entries there (its regional `headroom`) or a
-global entry of the group (`maxHeadroom`), after what is consumed in the cycle, or when another SKU reserves the quota
-there (below). The run is confined to **all** the others: `spec.regions` lists them, and the anchor of every attempt
+global entry of the group (`maxHeadroom`), after what is consumed in the cycle. The run is confined to **all** the others: `spec.regions` lists them, and the anchor of every attempt
 requires `topology.kubernetes.io/region In [...]` in its node affinity. Karpenter and SCarpenter pick an available
 offering among them, so a region with an ICE mark or a daily limit does not starve the SKU. The quota accounting counts
 the run against one expected landing region: the cheapest of them by Keeper's price for the capacity type the group stands
@@ -440,7 +438,7 @@ and the SKU's next run (after the launch backoff) gets a set computed from the l
 The headroom of a SKU's bucket is its `maxHeadroom` (a regional entry: the region's `headroom`) minus what the vendor's own runs consume that the listing does not
 show yet, per bucket and region. A run counts in the region of its node, else in its only region; an unconfined run (a forced
 run, a run created before regions were planned, a SKU without region data) and one confined to several regions that has
-no node yet count against every region of a regional bucket, and such a run does not start a drain. That is every run planned in the cycle (so several runs in one cycle cannot overshoot a quota), and every
+no node yet count against every region of a regional bucket. That is every run planned in the cycle (so several runs in one cycle cannot overshoot a quota), and every
 server or DBaaS client run in phase Pending, Provisioning or Running that was created after the listing's `generatedAt`
 (planned in an earlier cycle since then) or that has neither a NodeClaim nor a node (SCarpenter's `reserved` ledger
 starts with a launch, so an anchor without a NodeClaim is not in it). A run with a NodeClaim that is older than
@@ -451,21 +449,8 @@ failed launch counts against the on-demand group). A run that may use spot count
 fall-back to on-demand when spot fills before the launch is not planned for. A DBaaS client run counts, with the
 on-demand group, once its client SKU is known. Nothing of this is read when no SKU of the listing has `quotas`.
 
-A big SKU would starve behind smaller SKUs that keep taking the bucket. A SKU is **big** in a region when its `need` is more than
-half of an entry's limit (the region's `limit`, else `maxLimit`). The controller remembers since when each big SKU is
-deferred for a busy spot quota (in memory; a restart resets it), with the bucket keys it asks to drain (none while it is
-not big in the region it chose; its waiting time does not depend on the region), and rebuilds that
-memory every cycle: a SKU that
-is not deferred as spot-busy again (planned, no longer due, leased, no longer listed by Keeper, not offered) is
-forgotten, and one that is held back by another SKU's reservation keeps its time, as do the SKUs after the point where a cap (`maxInFlight`, `maxUsdPerHour`, `maxNewRunsPerCycle`) stopped the cycle. A big SKU deferred for longer than
-`spot.quotaReserveAfterMinutes` (default 60; `0` turns the reservation off) **reserves** its buckets in ONE region (**drain**):
-the region it chose when it started waiting, kept while it stays a candidate. That is the region with the most room among
-those where the vendor's own runs hold the bucket, so the runs in flight can drain. No other run that would consume the
-bucket is placed in that region (the other regions keep filling), and a SKU that fits nowhere else is deferred (`autoPlan
-defers <vendor>/<sku>: its quota is reserved for <sku>`) until the big SKU is planned or stops waiting. The reservation
-applies only while the vendor's own runs in flight consume the bucket in that region: when other tenants or instances
-hold the quota, keeping SKUs back would free nothing. Without `regions` the bucket as a whole is reserved, as before. Of
-two reserving SKUs the longer waiter wins.
+A SKU that does not fit the headroom in this cycle is skipped and the others are planned. It stays due, so it comes
+back every cycle and is planned once enough quota is free (nothing is kept across cycles: no reservation).
 
 Residual race: a run planned while spot fit can still end on on-demand when Karpenter finds spot full at launch time
 (another consumer took the quota in between); the planner does not prevent it.

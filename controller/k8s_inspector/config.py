@@ -162,7 +162,6 @@ _SPOT = {
     "interruptionsToQuarantine": ("interruptions_to_quarantine", _pos_int),
     "quarantineDays": ("quarantine_days", _nonneg_int),
     "spotMaxTaskMinutes": ("spot_max_task_minutes", _pos_int),
-    "quotaReserveAfterMinutes": ("quota_reserve_after_minutes", _nonneg_int),
     "patienceDays": ("patience_days", _pos_int),
     "coverage": ("coverage", _percent),
     "slotHours": ("slot_hours", _slot_hours),
