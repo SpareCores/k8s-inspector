@@ -6,7 +6,7 @@ from datetime import UTC, datetime, timedelta
 import pytest
 
 from k8s_inspector import crd
-from k8s_inspector.metrics import Metrics, make_server, task_result
+from k8s_inspector.metrics import Metrics, _line, make_server, task_result
 from k8s_inspector.model import (
     AttemptOutcome,
     AttemptStatus,
@@ -133,8 +133,8 @@ def test_backlog_lag_spend_and_node_age(runs, metrics):
     runs.append(make_run("b", RunPhase.PUBLISHING, [done("lscpu", 0)], vendor="aws"))  # aws does not publish
     text = metrics.render()
 
-    assert "k8s_inspector_publish_backlog 1\n" in text
-    assert "k8s_inspector_publish_lag_seconds 5400\n" in text
+    assert "k8s_inspector_publish_backlog 1.0\n" in text
+    assert "k8s_inspector_publish_lag_seconds 5400.0\n" in text
     assert 'k8s_inspector_spend_usd_per_hour{vendor="oci"} 0.25' in text
     assert 'k8s_inspector_spend_usd_per_hour{vendor="aws"} 0' in text
     assert 'k8s_inspector_node_age_seconds{run="oci-a",sku="a",vendor="oci"} 2700' in text
@@ -145,13 +145,13 @@ def test_backlog_counts_only_skus_that_may_be_published(runs):
     runs.append(make_run("a", RunPhase.PUBLISHING, [done("lscpu", 0)]))
     runs.append(make_run("b", RunPhase.PUBLISHING, [done("lscpu", 0), done("openssl", 0)]))
     text = Metrics(None, lambda: listed, clock=lambda: NOW).render()
-    assert "k8s_inspector_publish_backlog 1\n" in text
+    assert "k8s_inspector_publish_backlog 1.0\n" in text
 
 
 def test_unpublishable_tasks_counter(runs, metrics):
-    assert "k8s_inspector_unpublishable_tasks_total 0\n" in metrics.render()
+    assert "k8s_inspector_unpublishable_tasks_total 0.0\n" in metrics.render()
     metrics.record_unpublishable(2)
-    assert "k8s_inspector_unpublishable_tasks_total 2\n" in metrics.render()
+    assert "k8s_inspector_unpublishable_tasks_total 2.0\n" in metrics.render()
 
 
 def test_last_publish_timestamp_starts_at_process_start(runs, metrics):
@@ -284,7 +284,7 @@ def test_dbaas_stack_ages_come_from_the_stack_and_the_inventory_clock_starts_wit
     assert 'k8s_inspector_dbaas_instances{vendor="oci"} 1' in text
     assert 'k8s_inspector_dbaas_oldest_age_seconds{vendor="oci"} 32400' in text
     assert 'k8s_inspector_dbaas_leftover_stack_failures_total{vendor="oci"} 1' in text
-    assert f'k8s_inspector_dbaas_inventory_last_success_timestamp_seconds{{vendor="oci"}} {NOW.timestamp():g}' in text
+    assert f'k8s_inspector_dbaas_inventory_last_success_timestamp_seconds{{vendor="oci"}} {NOW.timestamp()!r}' in text
 
 
 def test_spot_try_counter_and_waiting_gauge_and_exhausted_counter():
@@ -338,3 +338,11 @@ def test_a_spot_unavailable_attempt_is_counted_as_an_attempt_outcome(runs, metri
         'k8s_inspector_run_attempts_total{capacity_type="none",outcome="spot_unavailable",vendor="oci"} 1'
         in metrics.render()
     )
+
+
+def test_values_render_at_full_precision():
+    """`:g` rounded a Unix timestamp to 10,000 s steps; the rendered line must round-trip exactly."""
+    timestamp = 1795864252.5
+    line = _line("last_publish_timestamp_seconds", (), timestamp)
+    assert float(line.split()[-1]) == timestamp
+    assert _line("runs", (("vendor", "oci"),), 3) == 'k8s_inspector_runs{vendor="oci"} 3.0'

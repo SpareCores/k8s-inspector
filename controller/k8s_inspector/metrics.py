@@ -83,7 +83,7 @@ def _escape(value: str) -> str:
 
 def _line(name: str, labels: Labels, value: float) -> str:
     rendered = ",".join(f'{k}="{_escape(v)}"' for k, v in labels)
-    return f"{PREFIX}{name}{{{rendered}}} {value:g}" if rendered else f"{PREFIX}{name} {value:g}"
+    return f"{PREFIX}{name}{{{rendered}}} {float(value)!r}" if rendered else f"{PREFIX}{name} {float(value)!r}"
 
 
 class Metrics:
