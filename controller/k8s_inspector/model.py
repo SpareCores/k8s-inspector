@@ -534,7 +534,6 @@ class SpotSettings:
     interruptions_to_quarantine: int = 2
     quarantine_days: int = 14
     spot_max_task_minutes: int = 240
-    quota_reserve_after_minutes: int = 60  # a SKU deferred this long as spot-quota-busy reserves its buckets; 0: never
     patience_days: int = 14  # SpotUntilExhausted: a SKU is exhausted when its first counted try is this old ...
     coverage: int = 100  # ... and counted tries fell in this percent of the week's slots
     slot_hours: int = 3  # a slot is this many UTC hours of a weekday
