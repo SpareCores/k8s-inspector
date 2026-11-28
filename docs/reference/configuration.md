@@ -450,7 +450,7 @@ fall-back to on-demand when spot fills before the launch is not planned for. A D
 on-demand group, once its client SKU is known. Nothing of this is read when no SKU of the listing has `quotas`.
 
 A SKU that does not fit the headroom in this cycle is skipped and the others are planned. It stays due, so it comes
-back every cycle and is planned once enough quota is free (nothing is kept across cycles: no reservation).
+back every cycle and is planned once enough quota is free.
 
 Residual race: a run planned while spot fit can still end on on-demand when Karpenter finds spot full at launch time
 (another consumer took the quota in between); the planner does not prevent it.

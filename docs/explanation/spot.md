@@ -58,8 +58,8 @@ classification exact and the flush complete.
 7. **Long tasks run on-demand.** Tasks whose timeout exceeds `spotMaxTaskMinutes` (default 240, so `stressnglongrun`
    with 26 h) are never planned on spot; a run that contains one is on-demand.
 8. **A busy spot quota defers the run.** When SCarpenter's listing says the spot quota of a SKU is held by other
-   instances (but would fit), autoPlan does not create the run, so that it does not start on-demand; it waits for the
-   quota; it stays due, and the SKUs that fit are planned meanwhile ([quota-aware planning](../reference/configuration.md#quota-aware-planning)).
+   instances (but would fit), autoPlan does not create the run, so that it does not start on-demand; it stays due and
+   waits for the quota; the SKUs that fit are planned meanwhile ([quota-aware planning](../reference/configuration.md#quota-aware-planning)).
 9. **Statistics are recorded.** `status.attempts` lists each attempt's node, the capacity type of that node (none for an
    attempt that never got one), duration and outcome.
    `meta.json` gets `capacity_type` and `spot_attempts`; the controller exports interruption counts per vendor and SKU

@@ -1478,24 +1478,21 @@ def test_a_quarantined_sku_ignores_the_busy_spot_group_and_plans_on_demand(kube,
 
 
 @pytest.mark.offered
-def test_a_sku_without_headroom_is_skipped_and_the_others_are_planned(kube, keeper_skus, caplog):
-    keeper_skus["oci"] = {"big": {}, "small": {}}
+def test_a_sku_without_headroom_is_skipped_until_the_quota_is_free(kube, keeper_skus, caplog):
+    first, big, last = order("first", "big", "last")
+    keeper_skus["oci"] = {first: {}, big: {}, last: {}}
     entries = {
-        "big": spot_entry(quota(need=384, headroom=128), spot_available=False),
-        "small": spot_entry(quota(need=8, headroom=128)),
+        first: spot_entry(quota(need=100, headroom=450)),
+        big: spot_entry(quota(need=384, headroom=450)),
+        last: spot_entry(quota(need=8, headroom=450)),
     }
     publish_offered(kube, offered_configmap(entries))
     with caplog.at_level("INFO"):
-        assert plan_wet(kube, keeper_skus) == ["small"]
-    assert "autoPlan defers oci/big: spot quota busy" in caplog.text
-
-
-@pytest.mark.offered
-def test_a_big_sku_is_planned_when_nothing_else_holds_the_quota(kube, keeper_skus):
-    keeper_skus["oci"] = {"big": {}, "small": {}}
-    entries = {"big": spot_entry(quota(need=384, headroom=512)), "small": spot_entry(quota(need=8, headroom=512))}
-    publish_offered(kube, offered_configmap(entries))
-    assert sorted(plan_wet(kube, keeper_skus)) == ["big", "small"]
+        assert plan_wet(kube, keeper_skus) == [first, last]  # `big` does not fit after `first`; `last` still does
+    assert f"autoPlan defers oci/{big}: spot quota busy" in caplog.text
+    for name in list(kube.objects):
+        kube.set_status(name, phase="Done")  # the quota is free again
+    assert plan_wet(kube, keeper_skus) == [big]
 
 
 @pytest.mark.offered
